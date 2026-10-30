@@ -86,7 +86,7 @@ async fn login(http: &rein_llm::reqwest::Client) -> CliResult {
     }
     store::write_json_private(&path, &credentials).map_err(describe)?;
 
-    let who = credentials.email.as_deref().unwrap_or("your ChatGPT account");
+    let who = credentials.email.as_deref().map_or_else(|| "your ChatGPT account".to_owned(), mask_email);
     if !credentials.plan_enabled() {
         eprintln!(
             "Signed in as {who}, but rein wasn't allowed to use your ChatGPT plan. \
@@ -250,6 +250,15 @@ fn host_id(dir: &Path) -> CliResult<String> {
     Ok(id)
 }
 
+/// `someone@example.com` -> `so•••@example.com`: enough to recognize your own
+/// account, safe to show on a screen recording or stream.
+fn mask_email(email: &str) -> String {
+    match email.split_once('@') {
+        Some((name, domain)) => format!("{}•••@{domain}", name.chars().take(2).collect::<String>()),
+        None => "•••".to_owned(),
+    }
+}
+
 fn open_browser(url: &str) -> bool {
     let mut command = if cfg!(target_os = "macos") {
         Command::new("open")
@@ -261,4 +270,16 @@ fn open_browser(url: &str) -> bool {
         Command::new("xdg-open")
     };
     command.arg(url).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masks_emails() {
+        assert_eq!(mask_email("someone@example.com"), "so•••@example.com");
+        assert_eq!(mask_email("a@example.com"), "a•••@example.com");
+        assert_eq!(mask_email("not-an-email"), "•••");
+    }
 }
