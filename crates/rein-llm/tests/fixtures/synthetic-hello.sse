@@ -1,0 +1,14 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_test","status":"in_progress"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_test","output_index":0,"content_index":0,"delta":"Hello"}
+
+: keep-alive
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_test","output_index":0,"content_index":0,"delta":", world! 👋"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_test","status":"completed","usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":4},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":19}}}
+
