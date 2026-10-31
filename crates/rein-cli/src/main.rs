@@ -535,7 +535,7 @@ impl Ui for Terminal {
 
     fn tool_started(&mut self, call: &ToolCall) {
         self.end_line();
-        eprintln!("> {}", show(call));
+        eprintln!("• {}", show(call));
     }
 
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
