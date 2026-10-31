@@ -1,6 +1,6 @@
 # rein
 
-A tiny, fast coding agent. You hold the reins.
+A tiny, fast agent harness. You hold the reins.
 
 rein is an open-source agent harness written in Rust, built to be the
 fastest and smallest harness around, and a smart one. It's early: today it can sign in and

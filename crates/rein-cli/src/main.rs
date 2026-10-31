@@ -1,4 +1,4 @@
-//! `rein`: a tiny, fast coding agent. You hold the reins.
+//! `rein`: a tiny, fast agent harness. You hold the reins.
 
 use std::fs::File;
 use std::io::Write;
@@ -18,7 +18,7 @@ const CREDENTIALS_FILE: &str = "chatgpt.json";
 const HOST_ID_FILE: &str = "host-id";
 
 const HELP: &str = "\
-rein: a tiny, fast coding agent. You hold the reins.
+rein: a tiny, fast agent harness. You hold the reins.
 
 Usage:
   rein login                     Continue with ChatGPT (use your ChatGPT plan)

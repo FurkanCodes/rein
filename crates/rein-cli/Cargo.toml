@@ -2,7 +2,7 @@
 name = "rein-cli"
 version.workspace = true
 edition.workspace = true
-description = "rein: a tiny, fast coding agent. You hold the reins."
+description = "rein: a tiny, fast agent harness. You hold the reins."
 
 [dependencies]
 rein-llm = { version = "0.1.0", path = "../rein-llm" }
