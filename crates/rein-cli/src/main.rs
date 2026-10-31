@@ -24,10 +24,13 @@ const HELP: &str = "\
 rein: a tiny, fast agent harness. You hold the reins.
 
 Usage:
+  rein [options]                 Start a conversation in this folder
+  rein [options] <prompt...>     Do one task and exit
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
   rein models                    List the models you can use
-  rein [options] <prompt...>     Ask rein to do something. It can read, write
-                                 and edit files in this folder and run commands
+
+rein can read, write and edit files in this folder and run commands. In a
+conversation, type /exit or press Ctrl-D to leave.
 
 Options:
   -m, --model <id>      Model to use (default: $REIN_MODEL, or gpt-6.1-sol)
@@ -71,7 +74,7 @@ async fn run(args: Vec<String>) -> CliResult {
         .map_err(|e| e.to_string())?;
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
-        [] | ["-h" | "--help"] => {
+        ["-h" | "--help"] => {
             println!("{HELP}");
             Ok(())
         }
@@ -140,7 +143,8 @@ struct AskArgs {
     system: Option<String>,
     mode: Mode,
     record: Option<PathBuf>,
-    prompt: String,
+    /// `None` starts a conversation instead of doing one task.
+    prompt: Option<String>,
 }
 
 impl AskArgs {
@@ -166,10 +170,8 @@ impl AskArgs {
                 _ => words.push(arg),
             }
         }
-        if words.is_empty() {
-            return Err("nothing to ask; see `rein --help`".into());
-        }
-        Ok(AskArgs { model, effort, system, mode, record, prompt: words.join(" ") })
+        let prompt = if words.is_empty() { None } else { Some(words.join(" ")) };
+        Ok(AskArgs { model, effort, system, mode, record, prompt })
     }
 }
 
@@ -196,11 +198,44 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         history: Vec::new(),
     };
     let mut terminal = Terminal::default();
-    let outcome = agent.send(args.prompt, &mut terminal).await;
+    match args.prompt {
+        Some(prompt) => turn(&mut agent, prompt, &mut terminal).await,
+        None => conversation(&mut agent, &mut terminal).await,
+    }
+}
+
+/// One message from you, worked on until the model is done.
+async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal) -> CliResult {
+    let outcome = agent.send(prompt, terminal).await;
     terminal.end_line();
     match outcome.map_err(describe)? {
         Outcome::Done => Ok(()),
         Outcome::TurnLimit => Err(format!("stopped after {MAX_TURNS} turns of tool calls; ask again to continue")),
+    }
+}
+
+/// Message after message with the same agent, so it remembers the whole
+/// conversation, until /exit or Ctrl-D. A failed turn is reported and the
+/// conversation goes on.
+async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> CliResult {
+    eprintln!("Type a message. /exit or Ctrl-D to leave.");
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("\n> ");
+        let mut line = String::new();
+        if stdin.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            eprintln!();
+            return Ok(()); // Ctrl-D
+        }
+        match line.trim() {
+            "" => continue,
+            "/exit" | "/quit" => return Ok(()),
+            message => {
+                if let Err(e) = turn(agent, message.to_owned(), terminal).await {
+                    eprintln!("rein: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -452,7 +487,8 @@ mod tests {
         assert_eq!(approval("\n"), Approval::No);
         assert_eq!(approval("yolo"), Approval::No);
         let parsed = args("--mode edits fix the bug").unwrap();
-        assert_eq!((parsed.mode, parsed.prompt.as_str()), (Mode::Edits, "fix the bug"));
+        assert_eq!((parsed.mode, parsed.prompt.as_deref()), (Mode::Edits, Some("fix the bug")));
+        assert_eq!(args("--mode edits").unwrap().prompt, None, "no task: a conversation");
         assert_eq!(args("--mode yolo hi").err().as_deref(), Some("unknown mode yolo; use ask, edits, read-only or trust"));
     }
 
@@ -478,7 +514,7 @@ mod tests {
     fn parses_a_system_prompt() {
         let parsed = args("-s Be-brief what is a harness").unwrap();
         assert_eq!(parsed.system.as_deref(), Some("Be-brief"));
-        assert_eq!(parsed.prompt, "what is a harness");
+        assert_eq!(parsed.prompt.as_deref(), Some("what is a harness"));
 
         assert_eq!(args("what is a harness").unwrap().system, None);
         assert_eq!(args("--system").err().as_deref(), Some("--system needs a value"));
