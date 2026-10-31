@@ -830,7 +830,11 @@ fn show(call: &ToolCall) -> String {
         },
         ("write" | "edit", Some(path), _) => format!("{} {path}", call.name),
         ("bash", _, Some(command)) => format!("`{command}`"),
-        ("recall", _, _) => format!("recall \"{}\"", args["query"].as_str().unwrap_or_default()),
+        ("recall", _, _) => match args["query"].as_str().unwrap_or_default() {
+            // Models often quote their own search words already.
+            query if query.contains('"') => format!("recall {query}"),
+            query => format!("recall \"{query}\""),
+        },
         _ => format!("{} {}", call.name, call.arguments),
     }
 }
