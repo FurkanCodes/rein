@@ -44,6 +44,18 @@ enum Line {
     ToolCall { call_id: String, name: String, arguments: String },
     ToolResult { call_id: String, output: String },
     Opaque { value: serde_json::Value },
+    /// Tool outputs replaced to save space (see `compact`). The originals
+    /// stay in the file, earlier.
+    Retired { outputs: Vec<RetiredOutput> },
+    /// The conversation was compacted: from here on it's the first message,
+    /// this summary, and `kept`, its latest part word for word.
+    Compaction { summary: String, kept: Vec<Line> },
+}
+
+#[derive(Serialize, Deserialize)]
+struct RetiredOutput {
+    call_id: String,
+    output: String,
 }
 
 impl Line {
@@ -60,7 +72,7 @@ impl Line {
     /// The conversation item this line holds; `None` for the header.
     fn into_item(self) -> Option<Item> {
         Some(match self {
-            Line::Session(_) => return None,
+            Line::Session(_) | Line::Retired { .. } | Line::Compaction { .. } => return None,
             Line::Context { text } | Line::User { text } => Item::User(text),
             Line::Assistant { text } => Item::Assistant(text),
             Line::ToolCall { call_id, name, arguments } => Item::ToolCall(ToolCall { call_id, name, arguments }),
@@ -68,6 +80,15 @@ impl Line {
             Line::Opaque { value } => Item::Opaque(value),
         })
     }
+}
+
+/// A saved conversation, read back.
+pub struct Loaded {
+    pub session: Session,
+    /// What the next request sends.
+    pub history: Vec<Item>,
+    /// Everything ever said, including what compaction removed.
+    pub full: Vec<Item>,
 }
 
 /// A conversation's file. Nothing is written until the first item, so a
@@ -88,17 +109,36 @@ impl Session {
         Session { path: dir.join(format!("{stamp}-{short}.jsonl")), header, file: None, unfinished: false }
     }
 
-    /// Reads a saved conversation, ready to continue. Lines that don't
-    /// parse, like one cut off by a crash, are skipped.
-    pub fn load(path: &Path) -> Result<(Session, Vec<Item>)> {
+    /// Reads a saved conversation, ready to continue: it replays the file,
+    /// compactions included, so the history comes out exactly as it was.
+    /// Lines that don't parse, like one cut off by a crash, are skipped.
+    pub fn load(path: &Path) -> Result<Loaded> {
         let text = fs::read_to_string(path)?;
         let mut lines = text.lines().filter_map(|line| serde_json::from_str::<Line>(line).ok());
         let Some(Line::Session(header)) = lines.next() else {
             return Err(std::io::Error::other(format!("{} isn't a rein conversation", path.display())).into());
         };
-        let items = lines.filter_map(Line::into_item).collect();
+        let (mut history, mut full) = (Vec::new(), Vec::new());
+        for line in lines {
+            match line {
+                Line::Retired { outputs } => {
+                    let outputs: Vec<(String, String)> = outputs.into_iter().map(|o| (o.call_id, o.output)).collect();
+                    crate::compact::retire(&mut history, &outputs);
+                }
+                Line::Compaction { summary, kept } => {
+                    let pinned = history.first().filter(|item| crate::context::is_context(item)).cloned();
+                    history = pinned.into_iter().chain([Item::User(summary)]).chain(kept.into_iter().filter_map(Line::into_item)).collect();
+                }
+                line => {
+                    if let Some(item) = line.into_item() {
+                        full.push(item.clone());
+                        history.push(item);
+                    }
+                }
+            }
+        }
         let unfinished = !text.is_empty() && !text.ends_with('\n');
-        Ok((Session { path: path.to_owned(), header, file: None, unfinished }, items))
+        Ok(Loaded { session: Session { path: path.to_owned(), header, file: None, unfinished }, history, full })
     }
 
     pub fn header(&self) -> &Header {
@@ -115,6 +155,15 @@ impl Session {
 
     pub fn append_context(&mut self, text: &str) -> Result<()> {
         self.write(&Line::Context { text: text.to_owned() })
+    }
+
+    pub fn append_retired(&mut self, outputs: &[(String, String)]) -> Result<()> {
+        let outputs = outputs.iter().map(|(call_id, output)| RetiredOutput { call_id: call_id.clone(), output: output.clone() }).collect();
+        self.write(&Line::Retired { outputs })
+    }
+
+    pub fn append_compaction(&mut self, summary: &str, kept: &[Item]) -> Result<()> {
+        self.write(&Line::Compaction { summary: summary.to_owned(), kept: kept.iter().map(Line::from_item).collect() })
     }
 
     fn write(&mut self, line: &Line) -> Result<()> {
@@ -241,7 +290,7 @@ mod tests {
             assert_eq!(fs::metadata(session.path()).unwrap().permissions().mode() & 0o777, 0o600);
         }
 
-        let (loaded, history) = Session::load(session.path()).unwrap();
+        let Loaded { session: loaded, history, .. } = Session::load(session.path()).unwrap();
         assert_eq!(loaded.header(), &header("abcdef123456"));
         assert_eq!(history[0], Item::User("<environment>…</environment>".into()));
         assert_eq!(&history[1..], &items[..]);
@@ -261,10 +310,10 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(session.path()).unwrap();
         file.write_all(br#"{"type":"assistant","te"#).unwrap();
 
-        let (mut session, history) = Session::load(session.path()).unwrap();
+        let Loaded { session: mut reopened, history, .. } = Session::load(session.path()).unwrap();
         assert_eq!(history, vec![Item::User("one".into())]);
-        session.append(&Item::User("two".into())).unwrap();
-        let (_, history) = Session::load(session.path()).unwrap();
+        reopened.append(&Item::User("two".into())).unwrap();
+        let history = Session::load(reopened.path()).unwrap().history;
         assert_eq!(history, vec![Item::User("one".into()), Item::User("two".into())]);
     }
 

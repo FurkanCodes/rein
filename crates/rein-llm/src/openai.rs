@@ -55,6 +55,8 @@ pub fn new_session_id() -> Result<String> {
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
+    /// How many tokens one request may carry, when the list says.
+    pub context_window: Option<u64>,
 }
 
 impl Client {
@@ -169,12 +171,16 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
             .filter(|m| m["visibility"].as_str().is_none_or(|v| v == "list"))
             .filter_map(|m| {
                 let id = m["slug"].as_str()?;
-                Some(ModelInfo { id: id.to_owned(), name: m["display_name"].as_str().unwrap_or(id).to_owned() })
+                Some(ModelInfo {
+                    id: id.to_owned(),
+                    name: m["display_name"].as_str().unwrap_or(id).to_owned(),
+                    context_window: m["context_window"].as_u64(),
+                })
             })
             .collect();
     }
     let ids = body["data"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str());
-    ids.map(|id| ModelInfo { id: id.to_owned(), name: id.to_owned() }).collect()
+    ids.map(|id| ModelInfo { id: id.to_owned(), name: id.to_owned(), context_window: None }).collect()
 }
 
 /// A streaming answer. Call [`ResponseStream::next`] until it returns `None`.
@@ -401,12 +407,12 @@ mod tests {
     #[test]
     fn parses_both_model_list_shapes() {
         let chatgpt = json!({"models": [
-            {"slug": "a", "display_name": "Model A", "visibility": "list"},
+            {"slug": "a", "display_name": "Model A", "visibility": "list", "context_window": 500000},
             {"slug": "hidden", "display_name": "Hidden", "visibility": "hide"},
         ]});
-        assert_eq!(parse_models(&chatgpt), [ModelInfo { id: "a".into(), name: "Model A".into() }]);
+        assert_eq!(parse_models(&chatgpt), [ModelInfo { id: "a".into(), name: "Model A".into(), context_window: Some(500_000) }]);
         let api_key = json!({"data": [{"id": "b"}]});
-        assert_eq!(parse_models(&api_key), [ModelInfo { id: "b".into(), name: "b".into() }]);
+        assert_eq!(parse_models(&api_key), [ModelInfo { id: "b".into(), name: "b".into(), context_window: None }]);
     }
 
     #[test]

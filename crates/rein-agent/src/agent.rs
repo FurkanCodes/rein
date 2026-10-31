@@ -5,8 +5,10 @@ use std::fs::File;
 use std::future::Future;
 
 use rein_llm::openai::{Client, Request};
-use rein_llm::{Error, Event, Item, Result, ToolCall, Usage};
+use rein_llm::{Error, Event, Item, Result, Tool, ToolCall, Usage};
 
+use crate::compact;
+use crate::context;
 use crate::permissions::{Decision, Permissions};
 use crate::session::Session;
 use crate::tools::Tools;
@@ -42,6 +44,40 @@ pub trait Ui {
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str);
     fn tool_finished(&mut self, call: &ToolCall, output: &str);
     fn usage(&mut self, usage: &Usage);
+    /// Compaction is starting. A summary, if one is written, streams
+    /// through `text`.
+    fn compacting(&mut self) {}
+    fn compacted(&mut self, _report: &Compacted) {}
+}
+
+/// What a compaction did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compacted {
+    /// About how many tokens the conversation took, before and after.
+    pub before: u64,
+    pub after: u64,
+    /// How many stale tool outputs were retired.
+    pub retired: usize,
+    /// The model wrote a summary; otherwise retiring was enough.
+    pub summarized: bool,
+}
+
+/// How full the conversation is, and what compaction needs to know.
+pub struct Window {
+    /// Compact once a request would carry more than this many tokens.
+    pub limit: u64,
+    /// The provider's token count for the last request, and how many
+    /// history items that request carried.
+    pub measured: Option<(u64, usize)>,
+    /// Everything said so far, compacted away or not: rein's record and
+    /// `recall` work from it. It's never sent as is.
+    pub full: Vec<Item>,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Window { limit: compact::DEFAULT_LIMIT, measured: None, full: Vec::new() }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +105,7 @@ pub struct Agent<M> {
     /// What the model is told before the first message (see
     /// [`crate::context`]); it goes in when the first message does.
     pub context: Option<String>,
+    pub window: Window,
 }
 
 impl<M: Model> Agent<M> {
@@ -81,20 +118,32 @@ impl<M: Model> Agent<M> {
             if let Some(session) = &mut self.session {
                 session.append_context(&context)?;
             }
+            self.window.full.push(Item::User(context.clone()));
             self.history.push(Item::User(context));
         }
         self.record(Item::User(prompt))?;
+        // Compact at most once per message, so a summary that is itself too
+        // big can't start a loop of summaries.
+        let mut compacted = false;
         for _ in 0..MAX_TURNS {
-            let request = Request {
-                model: self.model_name.clone(),
-                instructions: self.instructions.clone(),
-                input: self.history.clone(),
-                tools: self.tools.specs(),
-                reasoning_effort: self.reasoning_effort.clone(),
-                session_id: self.session_id.clone(),
+            if !compacted && self.estimated() > self.window.limit {
+                self.compact(None, false, ui).await?;
+                compacted = true;
+            }
+            let request = self.request(self.history.clone());
+            let sent = self.history.len();
+            let (items, usage) = match self.model.respond(&request, &mut |text| ui.text(text)).await {
+                // The provider says it's too long after all: make room and
+                // try again, once.
+                Err(e) if !compacted && e.code() == Some("context_length_exceeded") => {
+                    self.compact(None, true, ui).await?;
+                    compacted = true;
+                    continue;
+                }
+                other => other?,
             };
-            let (items, usage) = self.model.respond(&request, &mut |text| ui.text(text)).await?;
             ui.usage(&usage);
+            self.window.measured = Some((usage.input_tokens, sent));
 
             let calls: Vec<ToolCall> = items
                 .iter()
@@ -113,6 +162,15 @@ impl<M: Model> Agent<M> {
             }
 
             for call in calls {
+                // Searching the conversation is rein's own business: no
+                // permission needed, nothing outside is touched.
+                if call.name == "recall" {
+                    ui.tool_started(&call);
+                    let output = compact::recall(&self.window.full, &call.arguments);
+                    ui.tool_finished(&call, &output);
+                    self.record(Item::ToolResult { call_id: call.call_id, output })?;
+                    continue;
+                }
                 let approved = match self.permissions.decide(&call) {
                     Decision::Allow => Ok(()),
                     Decision::Deny(reason) => {
@@ -144,15 +202,121 @@ impl<M: Model> Agent<M> {
         }
         Ok(Outcome::TurnLimit)
     }
+
+    /// Makes room in the conversation. If retiring stale tool output is
+    /// enough to get well under the limit, and `summarize` is false, that's
+    /// all. Otherwise the model writes a summary, and the conversation
+    /// becomes the first message, the summary with rein's own record, and
+    /// its latest part word for word, with stale output there retired.
+    /// `focus` is what the user asked the summary to keep in mind
+    /// (`/compact <focus>`).
+    pub async fn compact(&mut self, focus: Option<&str>, summarize: bool, ui: &mut impl Ui) -> Result<Compacted> {
+        ui.compacting();
+        let before = self.estimated();
+        let retired = compact::stale(&self.history);
+        let freed: u64 = retired
+            .iter()
+            .map(|(id, text)| {
+                let old = self.history.iter().find_map(|item| match item {
+                    Item::ToolResult { call_id, output } if call_id == id => Some(output.len()),
+                    _ => None,
+                });
+                compact::estimate(old.unwrap_or(0).saturating_sub(text.len()))
+            })
+            .sum();
+        if !summarize && before.saturating_sub(freed) <= self.window.limit * 6 / 10 {
+            if let Some(session) = &mut self.session {
+                session.append_retired(&retired)?;
+            }
+            compact::retire(&mut self.history, &retired);
+            self.window.measured = None;
+            let report = Compacted { before, after: self.estimated(), retired: retired.len(), summarized: false };
+            ui.compacted(&report);
+            return Ok(report);
+        }
+
+        // The conversation as it is, untouched, plus the request for a
+        // summary: it starts exactly like the last request, so the cache
+        // serves most of it. (Retiring first would change it early on and
+        // lose the cache from there.)
+        let mut input = self.history.clone();
+        input.push(Item::User(compact::prompt(focus)));
+        let (items, usage) = self.model.respond(&self.request(input), &mut |text| ui.text(text)).await?;
+        ui.usage(&usage);
+        let summary: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if summary.iter().all(|text| text.trim().is_empty()) {
+            return Err(Error::Incomplete("the model wrote no summary".into()));
+        }
+        let message = compact::summary_message(&summary.join("\n"), &compact::record(&self.window.full));
+
+        let pinned = usize::from(self.history.first().is_some_and(context::is_context));
+        // Keep less word for word when the limit is small (as in tests).
+        let budget = compact::KEEP_RECENT.min(self.window.limit / 5);
+        let start = compact::recent_start(&self.history, pinned, budget);
+        let mut kept = self.history[start..].to_vec();
+        compact::retire(&mut kept, &retired);
+        if let Some(session) = &mut self.session {
+            session.append_compaction(&message, &kept)?;
+        }
+        self.history.truncate(pinned);
+        self.history.push(Item::User(message));
+        self.history.extend(kept);
+        self.window.measured = None;
+        let report = Compacted { before, after: self.estimated(), retired: retired.len(), summarized: true };
+        ui.compacted(&report);
+        Ok(report)
+    }
 }
 
 impl<M> Agent<M> {
+    /// The tools offered. `recall` is there from the start, though it only
+    /// matters after a compaction: the tool list comes before everything
+    /// else in a request, so changing it would lose the whole cache.
+    fn specs(&self) -> Vec<Tool> {
+        let mut specs = self.tools.specs();
+        specs.push(compact::recall_spec());
+        specs
+    }
+
+    fn request(&self, input: Vec<Item>) -> Request {
+        Request {
+            model: self.model_name.clone(),
+            instructions: self.instructions.clone(),
+            input,
+            tools: self.specs(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            session_id: self.session_id.clone(),
+        }
+    }
+
+    /// About how many tokens the next request will carry: the provider's
+    /// count for the last one, plus an estimate for what was added since.
+    /// Without a count, all of it is estimated.
+    pub fn estimated(&self) -> u64 {
+        let added = |items: &[Item]| items.iter().map(|item| compact::estimate(compact::size(item))).sum::<u64>();
+        match self.window.measured {
+            Some((tokens, sent)) if sent <= self.history.len() => tokens + added(&self.history[sent..]),
+            _ => {
+                let tools: usize = self.specs().iter().map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len()).sum();
+                let instructions = self.instructions.as_deref().map_or(0, str::len);
+                compact::estimate(tools + instructions) + added(&self.history)
+            }
+        }
+    }
+
     /// Adds an item to the history, saving it first. What [`Agent::repair`]
     /// fills in isn't saved: loading and repairing again gives the same.
     fn record(&mut self, item: Item) -> Result<()> {
         if let Some(session) = &mut self.session {
             session.append(&item)?;
         }
+        self.window.full.push(item.clone());
         self.history.push(item);
         Ok(())
     }
@@ -291,6 +455,7 @@ mod tests {
             history: Vec::new(),
             session: None,
             context: None,
+            window: Window::default(),
         }
     }
 
@@ -352,10 +517,67 @@ mod tests {
         agent.repair();
 
         let path = agent.session.as_ref().unwrap().path().to_owned();
-        let (_, mut loaded) = Session::load(&path).unwrap();
-        let mut resumed = Agent { history: std::mem::take(&mut loaded), ..self::agent("save-resumed", vec![]) };
+        let loaded = Session::load(&path).unwrap();
+        let mut resumed = Agent { history: loaded.history, ..self::agent("save-resumed", vec![]) };
         resumed.repair();
         assert_eq!(resumed.history, agent.history, "a continued conversation sends exactly the same history");
+    }
+
+    #[tokio::test]
+    async fn compacts_when_the_conversation_outgrows_its_limit() {
+        let read = |id: &str| Item::ToolCall(ToolCall { call_id: id.into(), name: "read".into(), arguments: json!({ "path": "big.txt" }).to_string() });
+        let recall = Item::ToolCall(ToolCall { call_id: "q1".into(), name: "recall".into(), arguments: json!({ "query": "needle" }).to_string() });
+        let mut agent = agent(
+            "compact",
+            vec![
+                vec![read("r1")],
+                vec![Item::Assistant("Goal: find the needle.".into())],
+                vec![Item::Assistant("It's in big.txt.".into())],
+                vec![recall],
+                vec![Item::Assistant("needle 42".into())],
+            ],
+        );
+        let root = std::env::temp_dir().join(format!("rein-agent-{}-compact", std::process::id()));
+        std::fs::write(root.join("big.txt"), format!("{}needle 42\n", "hay\n".repeat(3000))).unwrap();
+        let folder = root.join(".sessions");
+        agent.session = Some(Session::new(&folder, "t", crate::session::Header {
+            id: "session-1".into(),
+            cwd: "/p".into(),
+            started: "now".into(),
+            model: "m".into(),
+            instructions: None,
+        }));
+        agent.window.limit = 2_000;
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("where is the needle?".into(), &mut person).await.unwrap();
+
+        // The file pushed the conversation past the limit, so before the
+        // next request the model was asked for a summary...
+        let requests = agent.model.requests.borrow().clone();
+        let ask = &requests[1];
+        assert!(ask.input.starts_with(&requests[0].input), "it starts like the last request");
+        assert_eq!(ask.input.len(), 4, "the question, the read, its result, then the ask");
+        assert!(matches!(ask.input.last(), Some(Item::User(text)) if text.starts_with("Pause the work")));
+        assert_eq!(ask.tools, requests[0].tools, "same tools, so the cache still applies");
+        // ...and the conversation went on from the summary and rein's record.
+        let Item::User(summary) = &requests[2].input[0] else { panic!("no summary") };
+        assert!(summary.starts_with("<summary>") && summary.contains("Goal: find the needle."));
+        assert!(summary.contains("- where is the needle?\nFiles changed: none\nFiles read: big.txt"));
+        assert!(!requests[2].input.contains(&read("r1")), "the big read is gone");
+        assert!(requests[0].tools.iter().any(|tool| tool.name == "recall"));
+
+        // What was compacted away can still be found.
+        agent.send("what line was it?".into(), &mut person).await.unwrap();
+        let found = agent.history.iter().find_map(|item| match item {
+            Item::ToolResult { call_id, output } if call_id == "q1" => Some(output.clone()),
+            _ => None,
+        });
+        assert!(found.unwrap().contains("needle 42"));
+
+        // And the saved file gives back exactly the same conversation.
+        let loaded = Session::load(agent.session.as_ref().unwrap().path()).unwrap();
+        assert_eq!(loaded.history, agent.history);
+        assert_eq!(loaded.full, agent.window.full);
     }
 
     #[tokio::test]

@@ -8,6 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rein_llm::Item;
+
 /// Instruction files are cut off after this many bytes in total, like
 /// Codex's default `project_doc_max_bytes`.
 pub const MAX_BYTES: usize = 32 * 1024;
@@ -60,6 +62,11 @@ fn cut(text: &str, max: usize) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+
+/// Whether `item` is the first message, built by [`message`].
+pub fn is_context(item: &Item) -> bool {
+    matches!(item, Item::User(text) if text.starts_with("<environment>"))
 }
 
 /// The first message: the environment, then each instruction file. The

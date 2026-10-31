@@ -19,6 +19,8 @@ read rather than cat.
 again; ask, or suggest another way.
 - A tool result saying the user interrupted it means it may have partly run. \
 Check before assuming either way.
+- A long conversation gets compacted into a summary. If you need a detail from \
+earlier that you can't see, search for it with recall before saying you don't know.
 
 The first message holds <environment> (working folder, operating system, \
 today's date) and any <project_instructions> from AGENTS.md or CLAUDE.md files. \
