@@ -7,7 +7,9 @@ description = "rein: a tiny, fast agent harness. You hold the reins."
 [dependencies]
 rein-agent = { version = "0.1.0", path = "../rein-agent" }
 rein-llm = { version = "0.1.0", path = "../rein-llm" }
+libc = "0.2.191"
 rustyline = { version = "19.0.0", default-features = false }
+unicode-width = "0.2.3"
 tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "sync"] }
 
 [[bin]]

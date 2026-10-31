@@ -197,7 +197,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         session_id: Some(rein_llm::openai::new_session_id().map_err(describe)?),
         history: Vec::new(),
     };
-    let mut terminal = Terminal { mid_line: false, input: Input::start(), interrupted: Default::default() };
+    let mut terminal = Terminal { mid_line: false, wrap: None, input: Input::start(), interrupted: Default::default() };
     match args.prompt {
         Some(prompt) => turn(&mut agent, prompt, &mut terminal).await,
         None => conversation(&mut agent, &mut terminal).await,
@@ -311,6 +311,90 @@ async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time:
     }
 }
 
+/// The width of the terminal showing rein's answers, if stdout is one.
+fn terminal_width() -> Option<usize> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: TIOCGWINSZ only writes a `winsize` into the struct we pass.
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0;
+    (ok && size.ws_col > 0).then_some(size.ws_col as usize)
+}
+
+/// Wraps streamed text at word boundaries. Words and the spaces before
+/// them are held until the word is complete: printed text can't be taken
+/// back, so a space is only printed once the next word is known to fit on
+/// the same line. Indentation at the start of a line is kept; the space
+/// where a line wraps is dropped. A word longer than a whole line is
+/// printed as is, so the terminal breaks it rather than rein.
+struct Wrap {
+    width: usize,
+    column: usize,
+    spaces: String,
+    word: String,
+}
+
+impl Wrap {
+    fn new(width: usize) -> Self {
+        Wrap { width, column: 0, spaces: String::new(), word: String::new() }
+    }
+
+    /// Takes the next piece of text and returns what can be printed now.
+    fn push(&mut self, text: &str) -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            match c {
+                '\n' => {
+                    self.flush(&mut out);
+                    self.spaces.clear(); // trailing spaces show nothing
+                    out.push('\n');
+                    self.column = 0;
+                }
+                ' ' | '\t' => {
+                    self.flush(&mut out);
+                    self.spaces.push(c);
+                }
+                c => self.word.push(c),
+            }
+        }
+        out
+    }
+
+    /// Whatever is still held back, at the end of an answer.
+    fn finish(&mut self) -> String {
+        let mut out = String::new();
+        self.flush(&mut out);
+        self.spaces.clear();
+        out
+    }
+
+    fn flush(&mut self, out: &mut String) {
+        if self.word.is_empty() {
+            return;
+        }
+        let mut column = self.column;
+        for c in self.spaces.chars() {
+            column += if c == '\t' { 8 - column % 8 } else { 1 };
+        }
+        let width = unicode_width::UnicodeWidthStr::width(self.word.as_str());
+        if self.column > 0 && column + width > self.width {
+            out.push('\n'); // the spaces before the word are dropped
+            column = 0;
+        } else {
+            out.push_str(&self.spaces);
+        }
+        self.spaces.clear();
+        out.push_str(&self.word);
+        self.word.clear();
+        self.column = column + width;
+        if self.column > self.width {
+            // Longer than a line: the terminal breaks it; follow along.
+            self.column %= self.width.max(1);
+        }
+    }
+}
+
 /// What reading a line produced.
 enum Read {
     Line(String),
@@ -389,6 +473,9 @@ impl Input {
 /// (tool activity, questions, token counts) on stderr.
 struct Terminal {
     mid_line: bool,
+    /// Wraps answer text at the terminal's edge; `None` when output isn't a
+    /// terminal, so piped answers come out exactly as the model wrote them.
+    wrap: Option<Wrap>,
     input: Input,
     /// Ctrl-C pressed at a question; the turn waits on this to stop.
     interrupted: std::sync::Arc<tokio::sync::Notify>,
@@ -396,6 +483,11 @@ struct Terminal {
 
 impl Terminal {
     fn end_line(&mut self) {
+        if let Some(wrap) = &mut self.wrap {
+            print!("{}", wrap.finish());
+        }
+        // Measured again for the next answer, in case the window changed.
+        self.wrap = None;
         if self.mid_line {
             println!();
             self.mid_line = false;
@@ -405,7 +497,13 @@ impl Terminal {
 
 impl Ui for Terminal {
     fn text(&mut self, delta: &str) {
-        print!("{delta}");
+        if self.wrap.is_none() {
+            self.wrap = terminal_width().map(Wrap::new);
+        }
+        match &mut self.wrap {
+            Some(wrap) => print!("{}", wrap.push(delta)),
+            None => print!("{delta}"),
+        }
         std::io::stdout().flush().ok();
         self.mid_line = !delta.ends_with('\n');
     }
@@ -618,6 +716,27 @@ mod tests {
         assert_eq!((parsed.mode, parsed.prompt.as_deref()), (Mode::Edits, Some("fix the bug")));
         assert_eq!(args("--mode edits").unwrap().prompt, None, "no task: a conversation");
         assert_eq!(args("--mode yolo hi").err().as_deref(), Some("unknown mode yolo; use ask, edits, read-only or trust"));
+    }
+
+    /// Feeds `text` to a wrapper in uneven pieces, the way it streams in.
+    fn wrapped(width: usize, text: &str) -> String {
+        let mut wrap = Wrap::new(width);
+        let chars: Vec<char> = text.chars().collect();
+        let mut out: String = chars.chunks(3).map(|piece| wrap.push(&piece.iter().collect::<String>())).collect();
+        out.push_str(&wrap.finish());
+        out
+    }
+
+    #[test]
+    fn wraps_at_words_not_inside_them() {
+        assert_eq!(wrapped(20, "manages its workflow and memory"), "manages its workflow\nand memory");
+        assert_eq!(wrapped(16, "manages its workflow and memory"), "manages its\nworkflow and\nmemory");
+        // Lines the model ended itself stay as they are, indentation too.
+        assert_eq!(wrapped(20, "fn main() {\n    let x = 1;\n}"), "fn main() {\n    let x = 1;\n}");
+        // A word longer than the line isn't broken by rein.
+        assert_eq!(wrapped(10, "see https://example.com/long/path now"), "see\nhttps://example.com/long/path\nnow");
+        // Wide characters count double.
+        assert_eq!(wrapped(10, "日本語 日本語"), "日本語\n日本語");
     }
 
     #[test]

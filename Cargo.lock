@@ -797,10 +797,12 @@ dependencies = [
 name = "rein-cli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rein-agent",
  "rein-llm",
  "rustyline",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]
