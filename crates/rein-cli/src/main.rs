@@ -743,7 +743,12 @@ fn usage_line(u: &Usage) -> String {
 fn show(call: &ToolCall) -> String {
     let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).unwrap_or_default();
     match (call.name.as_str(), args["path"].as_str(), args["command"].as_str()) {
-        ("read" | "write" | "edit", Some(path), _) => format!("{} {path}", call.name),
+        ("read", Some(path), _) => match (args["start_line"].as_u64(), args["line_count"].as_u64()) {
+            (None, None) => format!("read {path}"),
+            (start, Some(count)) => format!("read {path}, lines {}-{}", start.unwrap_or(1), start.unwrap_or(1) + count.max(1) - 1),
+            (Some(start), None) => format!("read {path}, from line {start}"),
+        },
+        ("write" | "edit", Some(path), _) => format!("{} {path}", call.name),
         ("bash", _, Some(command)) => format!("`{command}`"),
         _ => format!("{} {}", call.name, call.arguments),
     }

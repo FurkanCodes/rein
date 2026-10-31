@@ -25,6 +25,10 @@ pub struct Tools {
 #[derive(Deserialize)]
 struct ReadArgs {
     path: String,
+    /// The first line to return, counting from 1.
+    start_line: Option<usize>,
+    /// How many lines to return; all the rest when missing.
+    line_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -61,9 +65,13 @@ impl Tools {
         vec![
             Tool {
                 name: "read".into(),
-                description: "Read a UTF-8 text file in the project and return its contents.".into(),
+                description: "Read a UTF-8 text file in the project. A long file comes back in parts: the \
+                              reply ends by saying which lines it holds and where to continue."
+                    .into(),
                 parameters: object(json!({
-                    "path": { "type": "string", "description": "Path relative to the project root." }
+                    "path": { "type": "string", "description": "Path relative to the project root." },
+                    "start_line": { "type": ["integer", "null"], "description": "The first line to read, counting from 1. Null for the start." },
+                    "line_count": { "type": ["integer", "null"], "description": "How many lines to read. Null for as many as fit." }
                 })),
             },
             Tool {
@@ -117,7 +125,8 @@ impl Tools {
         let args: ReadArgs = parse(arguments)?;
         let path = self.inside_root(&args.path)?;
         let bytes = tokio::fs::read(&path).await.map_err(|e| format!("can't read {}: {e}", args.path))?;
-        String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))
+        let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
+        lines(&text, &args)
     }
 
     /// Resolves `path`, following symlinks, and refuses anything outside the
@@ -251,6 +260,45 @@ fn object(properties: Value) -> Value {
     json!({ "type": "object", "properties": properties, "required": required, "additionalProperties": false })
 }
 
+/// The lines of `text` that `args` asks for, as many whole lines as fit in
+/// one output. Anything short of the whole file ends with a note saying
+/// which lines these are and where to continue, so the model can page
+/// through a long file instead of losing its end.
+fn lines(text: &str, args: &ReadArgs) -> Result<String, String> {
+    let all: Vec<&str> = text.split_inclusive('\n').collect();
+    let total = all.len();
+    let start = args.start_line.unwrap_or(1).max(1);
+    if total == 0 {
+        return Ok(String::new());
+    }
+    if start > total {
+        return Err(format!("{} has only {total} lines", args.path));
+    }
+    let last = args.line_count.map_or(total, |n| (start - 1 + n.max(1)).min(total));
+    // Leave room for the note, so `truncate` never cuts it off.
+    let budget = MAX_OUTPUT - 200;
+    let mut out = String::new();
+    let mut end = start - 1;
+    for line in &all[start - 1..last] {
+        // A single line longer than the budget is still returned; `truncate`
+        // cuts it.
+        if !out.is_empty() && out.len() + line.len() > budget {
+            break;
+        }
+        out.push_str(line);
+        end += 1;
+    }
+    if start == 1 && end == total {
+        return Ok(out);
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    let more = if end < total { format!("; read again with start_line {} for more", end + 1) } else { String::new() };
+    out.push_str(&format!("[lines {start}-{end} of {total}{more}]"));
+    Ok(out)
+}
+
 /// Cuts `text` to `MAX_OUTPUT` bytes, on a character boundary, and says so.
 fn truncate(mut text: String) -> String {
     if text.len() <= MAX_OUTPUT {
@@ -291,6 +339,28 @@ mod tests {
         assert_eq!(tools.run(&call("read", json!({"path": "a.txt"}))).await, "hello");
         let missing = tools.run(&call("read", json!({"path": "nope.txt"}))).await;
         assert!(missing.starts_with("error: can't read nope.txt"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn read_pages_through_long_files() {
+        let text: String = (1..=5000).map(|n| format!("line {n}\n")).collect();
+        let tools = Tools::new(project("pages", &[("long.txt", &text), ("short.txt", "a\nb\nc\n")]));
+
+        let first = tools.run(&call("read", json!({"path": "long.txt", "start_line": null, "line_count": null}))).await;
+        assert!(first.starts_with("line 1\n"));
+        assert!(first.len() <= MAX_OUTPUT);
+        let note = first.lines().last().unwrap();
+        assert!(note.starts_with("[lines 1-") && note.contains(" of 5000; read again with start_line ") && note.ends_with(" for more]"), "{note}");
+
+        let middle = tools.run(&call("read", json!({"path": "long.txt", "start_line": 4000, "line_count": 3}))).await;
+        assert_eq!(middle, "line 4000\nline 4001\nline 4002\n[lines 4000-4002 of 5000; read again with start_line 4003 for more]");
+
+        let end = tools.run(&call("read", json!({"path": "long.txt", "start_line": 4999, "line_count": null}))).await;
+        assert_eq!(end, "line 4999\nline 5000\n[lines 4999-5000 of 5000]");
+
+        assert_eq!(tools.run(&call("read", json!({"path": "short.txt"}))).await, "a\nb\nc\n");
+        let past = tools.run(&call("read", json!({"path": "short.txt", "start_line": 9, "line_count": null}))).await;
+        assert_eq!(past, "error: short.txt has only 3 lines");
     }
 
     #[tokio::test]
