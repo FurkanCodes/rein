@@ -78,12 +78,17 @@ impl Credentials {
 /// A new random ID for this installation ("agent host"). Create it once and
 /// keep it: OpenAI uses it to tell a user's machines apart.
 pub fn new_host_id() -> Result<String> {
+    Ok(format!("urn:uuid:{}", new_uuid()?))
+}
+
+/// A random version 4 UUID, like `0f8fad5b-d9cb-469f-a165-70867728950e`.
+pub(crate) fn new_uuid() -> Result<String> {
     let mut b = [0u8; 16];
     fill_random(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40; // UUID version 4
     b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    Ok(format!("urn:uuid:{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
+    Ok(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
 }
 
 /// A sign-in waiting for the browser to come back.

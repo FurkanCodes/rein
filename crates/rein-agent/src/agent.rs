@@ -43,6 +43,8 @@ pub struct Agent<M> {
     pub model_name: String,
     pub instructions: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// One ID for the whole conversation, so its requests share a prompt cache.
+    pub session_id: Option<String>,
     /// The whole conversation. Every request sends all of it.
     pub history: Vec<Item>,
 }
@@ -58,6 +60,7 @@ impl<M: Model> Agent<M> {
                 input: self.history.clone(),
                 tools: self.tools.specs(),
                 reasoning_effort: self.reasoning_effort.clone(),
+                session_id: self.session_id.clone(),
             };
             let (items, usage) = self.model.respond(&request, &mut |text| ui.text(text)).await?;
             ui.usage(&usage);
@@ -188,6 +191,7 @@ mod tests {
             model_name: "m".into(),
             instructions: None,
             reasoning_effort: None,
+            session_id: Some("session-1".into()),
             history: Vec::new(),
         }
     }
@@ -218,6 +222,8 @@ mod tests {
             ]
         );
         assert_eq!(agent.history.last(), Some(&Item::Assistant("It printed hi.".into())));
+        // Both turns are one conversation, so they share one cache session.
+        assert!(requests.iter().all(|r| r.session_id.as_deref() == Some("session-1")));
     }
 
     #[tokio::test]

@@ -171,6 +171,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         model_name: args.model,
         instructions: args.system,
         reasoning_effort: args.effort,
+        session_id: Some(rein_llm::openai::new_session_id().map_err(describe)?),
         history: Vec::new(),
     };
     let mut terminal = Terminal::default();
@@ -225,11 +226,18 @@ impl Ui for Terminal {
 
     fn usage(&mut self, usage: &Usage) {
         self.end_line();
-        eprintln!(
-            "[{} in ({} cached), {} out ({} reasoning)]",
-            usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_tokens
-        );
+        eprintln!("[{}]", usage_line(usage));
     }
+}
+
+/// Token counts for one request, with the share served from the prompt
+/// cache, so you can see whether caching is working.
+fn usage_line(u: &Usage) -> String {
+    let cached = match u.cached_input_tokens {
+        0 => "0 cached".to_owned(),
+        n => format!("{n} cached, {}%", n * 100 / u.input_tokens.max(1)),
+    };
+    format!("{} in ({cached}), {} out ({} reasoning)", u.input_tokens, u.output_tokens, u.reasoning_tokens)
 }
 
 /// A tool call as a person reads it: `read src/main.rs`, `bash `ls``.
@@ -323,6 +331,13 @@ fn open_browser(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_shows_the_cache_hit_rate() {
+        let usage = |input, cached| Usage { input_tokens: input, cached_input_tokens: cached, output_tokens: 6, reasoning_tokens: 0 };
+        assert_eq!(usage_line(&usage(5347, 0)), "5347 in (0 cached), 6 out (0 reasoning)");
+        assert_eq!(usage_line(&usage(5506, 5248)), "5506 in (5248 cached, 95%), 6 out (0 reasoning)");
+    }
 
     #[test]
     fn masks_emails() {

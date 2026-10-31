@@ -40,6 +40,15 @@ pub struct Request {
     pub tools: Vec<Tool>,
     /// For example "low", "medium" or "high". `None` uses the model default.
     pub reasoning_effort: Option<String>,
+    /// The same ID on every request of one conversation. Sign in with ChatGPT
+    /// routes requests to its prompt cache by the `session-id` header, so
+    /// without it nothing is ever cached; see [`new_session_id`].
+    pub session_id: Option<String>,
+}
+
+/// A fresh ID for one conversation, for [`Request::session_id`].
+pub fn new_session_id() -> Result<String> {
+    signin::new_uuid()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,14 +77,18 @@ impl Client {
 
     /// Sends the request and returns the answer as a stream of events.
     pub async fn stream(&self, request: &Request) -> Result<ResponseStream> {
-        let response = self
+        let mut builder = self
             .http
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.bearer)
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&request_body(request))
-            .send()
-            .await?;
+            .json(&request_body(request));
+        if let Some(id) = &request.session_id {
+            // The prompt cache follows this header, not `prompt_cache_key`:
+            // the server replaces that with a random key on every request.
+            builder = builder.header("session-id", id);
+        }
+        let response = builder.send().await?;
         Ok(ResponseStream { response: check(response).await?, decoder: EventDecoder::default(), record: None })
     }
 }
@@ -326,6 +339,7 @@ mod tests {
             input: vec![Item::User("hi".into()), Item::Assistant("hello".into()), Item::User("bye".into())],
             tools: vec![],
             reasoning_effort: Some("low".into()),
+            session_id: None,
         };
         assert_eq!(
             request_body(&request),
@@ -358,6 +372,7 @@ mod tests {
             ],
             tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
             reasoning_effort: None,
+            session_id: None,
         };
         let body = request_body(&request);
         assert_eq!(body["tools"][0]["type"], "namespace");
@@ -372,6 +387,15 @@ mod tests {
         // The model's call comes back as the same item.
         let done = json!({"type": "function_call", "call_id": "call_1", "namespace": "rein", "name": "read", "arguments": "{\"path\":\"a.rs\"}"});
         assert_eq!(decode_item(&done), Some(Item::ToolCall(call)));
+    }
+
+    #[test]
+    fn session_ids_are_fresh_v4_uuids() {
+        let (a, b) = (new_session_id().unwrap(), new_session_id().unwrap());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4", "version 4: {a}");
+        assert!("89ab".contains(&a[19..20]), "RFC 4122 variant: {a}");
     }
 
     #[test]
