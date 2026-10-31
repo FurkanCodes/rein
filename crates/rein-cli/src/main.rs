@@ -7,8 +7,10 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use rein_llm::openai::signin::{self, Credentials};
-use rein_llm::openai::{Client, Request};
-use rein_llm::{Event, Item, store};
+use rein_agent::agent::{Agent, MAX_TURNS, OpenAi, Outcome, Ui};
+use rein_agent::tools::Tools;
+use rein_llm::openai::Client;
+use rein_llm::{ToolCall, Usage, store};
 
 /// The name OpenAI shows for rein when someone signs in.
 const AGENT_NAME: &str = "rein";
@@ -23,7 +25,8 @@ rein: a tiny, fast agent harness. You hold the reins.
 Usage:
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
   rein models                    List the models you can use
-  rein [options] <prompt...>     Ask the model and stream the answer
+  rein [options] <prompt...>     Ask rein to do something. It can read files
+                                 in this folder and run commands, asking first
 
 Options:
   -m, --model <id>      Model to use (default: $REIN_MODEL, or gpt-6.1-sol)
@@ -157,48 +160,86 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> CliResult<Strin
 
 async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     let client = client(http).await?;
-    let request = Request {
-        model: args.model,
-        instructions: args.system,
-        input: vec![Item::User(args.prompt)],
-        tools: vec![],
-        reasoning_effort: args.effort,
+    let record = match &args.record {
+        Some(path) => Some(File::create(path).map_err(|e| format!("can't create {}: {e}", path.display()))?),
+        None => None,
     };
-    let mut stream = client.stream(&request).await.map_err(describe)?;
-    if let Some(path) = &args.record {
-        let file = File::create(path).map_err(|e| format!("can't create {}: {e}", path.display()))?;
-        stream.record_to(file);
+    let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
+    let mut agent = Agent {
+        model: OpenAi { client, record },
+        tools: Tools::new(root),
+        model_name: args.model,
+        instructions: args.system,
+        reasoning_effort: args.effort,
+        history: Vec::new(),
+    };
+    let mut terminal = Terminal::default();
+    let outcome = agent.send(args.prompt, &mut terminal).await;
+    terminal.end_line();
+    match outcome.map_err(describe)? {
+        Outcome::Done => Ok(()),
+        Outcome::TurnLimit => Err(format!("stopped after {MAX_TURNS} turns of tool calls; ask again to continue")),
     }
+}
 
-    let mut stdout = std::io::stdout();
-    let mut mid_line = false;
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(Event::TextDelta(text)) => {
-                print!("{text}");
-                stdout.flush().ok();
-                mid_line = !text.ends_with('\n');
-            }
-            // Finished items matter once there's a conversation to keep.
-            Ok(Event::Item(_)) => {}
-            Ok(Event::Completed { usage }) => {
-                if mid_line {
-                    println!();
-                }
-                eprintln!(
-                    "[{} in ({} cached), {} out ({} reasoning)]",
-                    usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_tokens
-                );
-            }
-            Err(e) => {
-                if mid_line {
-                    println!();
-                }
-                return Err(describe(e));
-            }
+/// The terminal as rein's [`Ui`]: answer text on stdout, everything else
+/// (tool activity, questions, token counts) on stderr.
+#[derive(Default)]
+struct Terminal {
+    mid_line: bool,
+}
+
+impl Terminal {
+    fn end_line(&mut self) {
+        if self.mid_line {
+            println!();
+            self.mid_line = false;
         }
     }
-    Ok(())
+}
+
+impl Ui for Terminal {
+    fn text(&mut self, delta: &str) {
+        print!("{delta}");
+        std::io::stdout().flush().ok();
+        self.mid_line = !delta.ends_with('\n');
+    }
+
+    fn approve(&mut self, call: &ToolCall) -> bool {
+        self.end_line();
+        eprint!("run {}? [y/N] ", show(call));
+        let mut answer = String::new();
+        // No answer (for example, input isn't a terminal) means no.
+        std::io::stdin().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes")
+    }
+
+    fn tool_started(&mut self, call: &ToolCall) {
+        self.end_line();
+        eprintln!("> {}", show(call));
+    }
+
+    fn tool_finished(&mut self, _call: &ToolCall, output: &str) {
+        let lines = output.lines().count();
+        eprintln!("  ({lines} line{} back to the model)", if lines == 1 { "" } else { "s" });
+    }
+
+    fn usage(&mut self, usage: &Usage) {
+        self.end_line();
+        eprintln!(
+            "[{} in ({} cached), {} out ({} reasoning)]",
+            usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_tokens
+        );
+    }
+}
+
+/// A tool call as a person reads it: `read src/main.rs`, `bash `ls``.
+fn show(call: &ToolCall) -> String {
+    let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).unwrap_or_default();
+    match (call.name.as_str(), args["path"].as_str(), args["command"].as_str()) {
+        ("read", Some(path), _) => format!("read {path}"),
+        ("bash", _, Some(command)) => format!("`{command}`"),
+        _ => format!("{} {}", call.name, call.arguments),
+    }
 }
 
 /// A client using the saved ChatGPT sign-in, or else `OPENAI_API_KEY`.

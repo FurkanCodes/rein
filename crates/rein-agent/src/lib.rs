@@ -2,4 +2,5 @@
 //! the loop that runs them. It never sees a provider's wire format, only
 //! rein-llm's `Item`s and `Event`s.
 
+pub mod agent;
 pub mod tools;

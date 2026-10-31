@@ -770,6 +770,7 @@ dependencies = [
 name = "rein-cli"
 version = "0.1.0"
 dependencies = [
+ "rein-agent",
  "rein-llm",
  "tokio",
 ]

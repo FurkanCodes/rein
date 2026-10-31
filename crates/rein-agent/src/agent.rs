@@ -1,0 +1,246 @@
+//! The agent loop: ask the model, run the tools it asks for, send back what
+//! they produced, and repeat until it answers without asking for anything.
+
+use std::fs::File;
+use std::future::Future;
+
+use rein_llm::openai::{Client, Request};
+use rein_llm::{Error, Event, Item, Result, ToolCall, Usage};
+
+use crate::tools::Tools;
+
+/// After this many model turns in a row, stop and give the user control back.
+pub const MAX_TURNS: usize = 25;
+
+/// Something that answers requests. The real one is OpenAI; tests script one.
+pub trait Model {
+    /// Sends one request, passing answer text to `on_text` as it streams, and
+    /// returns the finished items and the token counts.
+    fn respond(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> impl Future<Output = Result<(Vec<Item>, Usage)>>;
+}
+
+/// Whoever is at the keyboard: sees what happens, and decides what may run.
+pub trait Ui {
+    fn text(&mut self, delta: &str);
+    /// Asked before every command. Return `false` to refuse it.
+    fn approve(&mut self, call: &ToolCall) -> bool;
+    fn tool_started(&mut self, call: &ToolCall);
+    fn tool_finished(&mut self, call: &ToolCall, output: &str);
+    fn usage(&mut self, usage: &Usage);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The model answered without asking for a tool.
+    Done,
+    /// It kept asking for tools; we stopped after `MAX_TURNS`.
+    TurnLimit,
+}
+
+pub struct Agent<M> {
+    pub model: M,
+    pub tools: Tools,
+    pub model_name: String,
+    pub instructions: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// The whole conversation. Every request sends all of it.
+    pub history: Vec<Item>,
+}
+
+impl<M: Model> Agent<M> {
+    /// Adds the user's message and works on it until the model is done.
+    pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
+        self.history.push(Item::User(prompt));
+        for _ in 0..MAX_TURNS {
+            let request = Request {
+                model: self.model_name.clone(),
+                instructions: self.instructions.clone(),
+                input: self.history.clone(),
+                tools: self.tools.specs(),
+                reasoning_effort: self.reasoning_effort.clone(),
+            };
+            let (items, usage) = self.model.respond(&request, &mut |text| ui.text(text)).await?;
+            ui.usage(&usage);
+
+            let calls: Vec<ToolCall> = items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect();
+            // Everything the model produced goes into the history, in order:
+            // text, encrypted reasoning, and the calls themselves.
+            self.history.extend(items);
+            if calls.is_empty() {
+                return Ok(Outcome::Done);
+            }
+
+            for call in calls {
+                let output = if call.name == "bash" && !ui.approve(&call) {
+                    "The user declined to run this command.".to_owned()
+                } else {
+                    ui.tool_started(&call);
+                    self.tools.run(&call).await
+                };
+                ui.tool_finished(&call, &output);
+                self.history.push(Item::ToolResult { call_id: call.call_id, output });
+            }
+        }
+        Ok(Outcome::TurnLimit)
+    }
+}
+
+/// OpenAI as a [`Model`], optionally saving every raw response stream to
+/// `record` for replay tests.
+pub struct OpenAi {
+    pub client: Client,
+    pub record: Option<File>,
+}
+
+impl Model for OpenAi {
+    async fn respond(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<(Vec<Item>, Usage)> {
+        let mut stream = self.client.stream(request).await?;
+        if let Some(file) = &self.record {
+            stream.record_to(file.try_clone()?);
+        }
+        let mut items = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event? {
+                Event::TextDelta(text) => on_text(&text),
+                Event::Item(item) => items.push(item),
+                Event::Completed { usage } => return Ok((items, usage)),
+            }
+        }
+        // The stream only ends after `Completed` or an error, both handled above.
+        Err(Error::Interrupted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    use serde_json::json;
+
+    use super::*;
+
+    /// Plays back scripted turns and remembers every request it was sent.
+    struct Scripted {
+        turns: RefCell<VecDeque<Vec<Item>>>,
+        requests: RefCell<Vec<Request>>,
+    }
+
+    impl Scripted {
+        fn new(turns: Vec<Vec<Item>>) -> Self {
+            Scripted { turns: RefCell::new(turns.into()), requests: RefCell::new(Vec::new()) }
+        }
+    }
+
+    impl Model for Scripted {
+        async fn respond(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<(Vec<Item>, Usage)> {
+            self.requests.borrow_mut().push(request.clone());
+            let items = self.turns.borrow_mut().pop_front().expect("the loop asked for more turns than scripted");
+            for item in &items {
+                if let Item::Assistant(text) = item {
+                    on_text(text);
+                }
+            }
+            Ok((items, Usage::default()))
+        }
+    }
+
+    /// Approves (or refuses) every command and keeps a log of what it saw.
+    struct Person {
+        approves: bool,
+        log: Vec<String>,
+    }
+
+    impl Ui for Person {
+        fn text(&mut self, delta: &str) {
+            self.log.push(format!("text {delta}"));
+        }
+        fn approve(&mut self, call: &ToolCall) -> bool {
+            self.log.push(format!("asked {}", call.arguments));
+            self.approves
+        }
+        fn tool_started(&mut self, call: &ToolCall) {
+            self.log.push(format!("ran {}", call.name));
+        }
+        fn tool_finished(&mut self, _: &ToolCall, output: &str) {
+            self.log.push(format!("result {output}"));
+        }
+        fn usage(&mut self, _: &Usage) {}
+    }
+
+    fn bash(id: &str, command: &str) -> Item {
+        Item::ToolCall(ToolCall { call_id: id.into(), name: "bash".into(), arguments: json!({ "command": command }).to_string() })
+    }
+
+    fn agent(dir: &str, turns: Vec<Vec<Item>>) -> Agent<Scripted> {
+        let root = std::env::temp_dir().join(format!("rein-agent-{}-{dir}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Agent {
+            model: Scripted::new(turns),
+            tools: Tools::new(root),
+            model_name: "m".into(),
+            instructions: None,
+            reasoning_effort: None,
+            history: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_approved_tools_and_sends_the_results_back() {
+        let mut agent = agent(
+            "loop",
+            vec![
+                vec![Item::Opaque(json!({"type": "reasoning"})), bash("c1", "echo hi")],
+                vec![Item::Assistant("It printed hi.".into())],
+            ],
+        );
+        let mut person = Person { approves: true, log: Vec::new() };
+        assert_eq!(agent.send("say hi".into(), &mut person).await.unwrap(), Outcome::Done);
+
+        assert_eq!(person.log, [r#"asked {"command":"echo hi"}"#, "ran bash", "result hi\n[exit code 0]", "text It printed hi."]);
+        // The second request carried everything: the prompt, the reasoning,
+        // the call, and its result.
+        let requests = agent.model.requests.borrow();
+        assert_eq!(
+            requests[1].input,
+            [
+                Item::User("say hi".into()),
+                Item::Opaque(json!({"type": "reasoning"})),
+                bash("c1", "echo hi"),
+                Item::ToolResult { call_id: "c1".into(), output: "hi\n[exit code 0]".into() },
+            ]
+        );
+        assert_eq!(agent.history.last(), Some(&Item::Assistant("It printed hi.".into())));
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_never_runs() {
+        let mut agent =
+            agent("refuse", vec![vec![bash("c1", "touch made-it")], vec![Item::Assistant("Okay.".into())]]);
+        let mut person = Person { approves: false, log: Vec::new() };
+        agent.send("make a file".into(), &mut person).await.unwrap();
+
+        assert!(!person.log.contains(&"ran bash".to_owned()));
+        let root = std::env::temp_dir().join(format!("rein-agent-{}-refuse", std::process::id()));
+        assert!(!root.join("made-it").exists());
+        assert!(agent.history.contains(&Item::ToolResult {
+            call_id: "c1".into(),
+            output: "The user declined to run this command.".into()
+        }));
+    }
+
+    #[tokio::test]
+    async fn stops_a_model_that_never_stops_asking() {
+        let turns = (0..MAX_TURNS).map(|i| vec![bash(&format!("c{i}"), "true")]).collect();
+        let mut agent = agent("limit", turns);
+        let mut person = Person { approves: true, log: Vec::new() };
+        assert_eq!(agent.send("loop".into(), &mut person).await.unwrap(), Outcome::TurnLimit);
+    }
+}
