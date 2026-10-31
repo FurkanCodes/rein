@@ -28,6 +28,7 @@ Usage:
 Options:
   -m, --model <id>      Model to use (default: $REIN_MODEL, or gpt-6.1-sol)
       --effort <level>  Reasoning effort: low, medium, high, ...
+  -s, --system <text>   Standing instructions for the model (the system prompt)
       --record <file>   Also save the raw response stream, for tests
 
 Without `rein login`, rein uses $OPENAI_API_KEY, billed to your API account.";
@@ -119,6 +120,8 @@ async fn models(http: &rein_llm::reqwest::Client) -> CliResult {
 struct AskArgs {
     model: String,
     effort: Option<String>,
+    /// The system prompt: standing instructions sent with every request.
+    system: Option<String>,
     record: Option<PathBuf>,
     prompt: String,
 }
@@ -126,12 +129,13 @@ struct AskArgs {
 impl AskArgs {
     fn parse(args: Vec<String>) -> CliResult<Self> {
         let mut model = std::env::var("REIN_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
-        let (mut effort, mut record, mut words) = (None, None, Vec::new());
+        let (mut effort, mut system, mut record, mut words) = (None, None, None, Vec::new());
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-m" | "--model" => model = value(&mut args, &arg)?,
                 "--effort" => effort = Some(value(&mut args, &arg)?),
+                "-s" | "--system" => system = Some(value(&mut args, &arg)?),
                 "--record" => record = Some(PathBuf::from(value(&mut args, &arg)?)),
                 "--" => words.extend(args.by_ref()),
                 flag if flag.starts_with('-') && flag.len() > 1 => {
@@ -143,7 +147,7 @@ impl AskArgs {
         if words.is_empty() {
             return Err("nothing to ask; see `rein --help`".into());
         }
-        Ok(AskArgs { model, effort, record, prompt: words.join(" ") })
+        Ok(AskArgs { model, effort, system, record, prompt: words.join(" ") })
     }
 }
 
@@ -155,7 +159,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     let client = client(http).await?;
     let request = Request {
         model: args.model,
-        instructions: None,
+        instructions: args.system,
         input: vec![Message::user(args.prompt)],
         reasoning_effort: args.effort,
     };
@@ -281,5 +285,19 @@ mod tests {
         assert_eq!(mask_email("someone@example.com"), "so•••@example.com");
         assert_eq!(mask_email("a@example.com"), "a•••@example.com");
         assert_eq!(mask_email("not-an-email"), "•••");
+    }
+
+    fn args(line: &str) -> CliResult<AskArgs> {
+        AskArgs::parse(line.split(' ').map(str::to_owned).collect())
+    }
+
+    #[test]
+    fn parses_a_system_prompt() {
+        let parsed = args("-s Be-brief what is a harness").unwrap();
+        assert_eq!(parsed.system.as_deref(), Some("Be-brief"));
+        assert_eq!(parsed.prompt, "what is a harness");
+
+        assert_eq!(args("what is a harness").unwrap().system, None);
+        assert_eq!(args("--system").err().as_deref(), Some("--system needs a value"));
     }
 }
