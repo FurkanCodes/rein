@@ -8,6 +8,7 @@ use rein_llm::openai::{Client, Request};
 use rein_llm::{Error, Event, Item, Result, ToolCall, Usage};
 
 use crate::permissions::{Decision, Permissions};
+use crate::session::Session;
 use crate::tools::Tools;
 
 /// After this many model turns in a row, stop and give the user control back.
@@ -63,6 +64,11 @@ pub struct Agent<M> {
     pub session_id: Option<String>,
     /// The whole conversation. Every request sends all of it.
     pub history: Vec<Item>,
+    /// Where the conversation is saved as it grows, if anywhere.
+    pub session: Option<Session>,
+    /// What the model is told before the first message (see
+    /// [`crate::context`]); it goes in when the first message does.
+    pub context: Option<String>,
 }
 
 impl<M: Model> Agent<M> {
@@ -71,7 +77,13 @@ impl<M: Model> Agent<M> {
     /// the history valid again, and `send` calls it first anyway.
     pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
         self.repair();
-        self.history.push(Item::User(prompt));
+        if let Some(context) = self.context.take() {
+            if let Some(session) = &mut self.session {
+                session.append_context(&context)?;
+            }
+            self.history.push(Item::User(context));
+        }
+        self.record(Item::User(prompt))?;
         for _ in 0..MAX_TURNS {
             let request = Request {
                 model: self.model_name.clone(),
@@ -93,7 +105,9 @@ impl<M: Model> Agent<M> {
                 .collect();
             // Everything the model produced goes into the history, in order:
             // text, encrypted reasoning, and the calls themselves.
-            self.history.extend(items);
+            for item in items {
+                self.record(item)?;
+            }
             if calls.is_empty() {
                 return Ok(Outcome::Done);
             }
@@ -125,7 +139,7 @@ impl<M: Model> Agent<M> {
                     Err(reason) => reason,
                 };
                 ui.tool_finished(&call, &output);
-                self.history.push(Item::ToolResult { call_id: call.call_id, output });
+                self.record(Item::ToolResult { call_id: call.call_id, output })?;
             }
         }
         Ok(Outcome::TurnLimit)
@@ -133,6 +147,16 @@ impl<M: Model> Agent<M> {
 }
 
 impl<M> Agent<M> {
+    /// Adds an item to the history, saving it first. What [`Agent::repair`]
+    /// fills in isn't saved: loading and repairing again gives the same.
+    fn record(&mut self, item: Item) -> Result<()> {
+        if let Some(session) = &mut self.session {
+            session.append(&item)?;
+        }
+        self.history.push(item);
+        Ok(())
+    }
+
     /// Gives every tool call that never got a result one now. A turn cut
     /// short (by Ctrl-C, say) can leave a call unanswered, and providers
     /// reject a conversation like that. Codex and pi do the same repair.
@@ -265,6 +289,8 @@ mod tests {
             reasoning_effort: None,
             session_id: Some("session-1".into()),
             history: Vec::new(),
+            session: None,
+            context: None,
         }
     }
 
@@ -296,6 +322,40 @@ mod tests {
         assert_eq!(agent.history.last(), Some(&Item::Assistant("It printed hi.".into())));
         // Both turns are one conversation, so they share one cache session.
         assert!(requests.iter().all(|r| r.session_id.as_deref() == Some("session-1")));
+    }
+
+    #[tokio::test]
+    async fn saves_the_conversation_and_loads_it_back_the_same() {
+        let mut agent = agent(
+            "save",
+            vec![vec![bash("c1", "echo hi")], vec![Item::Assistant("Done.".into())]],
+        );
+        let folder = std::env::temp_dir().join(format!("rein-agent-{}-save-sessions", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        agent.session = Some(Session::new(&folder, "t", crate::session::Header {
+            id: "session-1".into(),
+            cwd: "/p".into(),
+            started: "now".into(),
+            model: "m".into(),
+            instructions: None,
+        }));
+        agent.context = Some("<environment>here</environment>".into());
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("first".into(), &mut person).await.unwrap();
+        // The context went in once, in front of the first message.
+        assert_eq!(agent.history[0], Item::User("<environment>here</environment>".into()));
+        assert_eq!(agent.history[1], Item::User("first".into()));
+
+        // A turn stopped while its command runs leaves a call unanswered,
+        // which the next request repairs.
+        agent.record(bash("c2", "sleep 100")).unwrap();
+        agent.repair();
+
+        let path = agent.session.as_ref().unwrap().path().to_owned();
+        let (_, mut loaded) = Session::load(&path).unwrap();
+        let mut resumed = Agent { history: std::mem::take(&mut loaded), ..self::agent("save-resumed", vec![]) };
+        resumed.repair();
+        assert_eq!(resumed.history, agent.history, "a continued conversation sends exactly the same history");
     }
 
     #[tokio::test]
