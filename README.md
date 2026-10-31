@@ -3,9 +3,9 @@
 A tiny, fast agent harness. You hold the reins.
 
 rein is an open-source agent harness written in Rust, built to be the
-fastest and smallest harness around, and a smart one. It's early: today it can
-read, write and edit files in the folder you run it in, and run commands, asking
-you first. Each run is one task; conversations you can continue come next.
+fastest and smallest harness around, and a smart one. It's early: today it holds
+a conversation in the folder you run it in, reading, writing and editing files
+and running commands, asking you first.
 
 ## Build
 
@@ -33,9 +33,22 @@ rein prints which one it's using on every run.
 ```sh
 rein login                      # continue with ChatGPT
 rein models                     # list the models you can use
-rein "explain what a harness is"
+rein                            # a conversation in this folder
+rein "explain what a harness is"   # one task, then exit
 rein --model gpt-6.1-sol --effort low "say hi"
 ```
+
+In a conversation:
+
+| Key | What it does |
+|---|---|
+| ↑ / ↓ | your earlier messages |
+| `\` at the end of a line | keep typing on the next line |
+| Ctrl-C while rein works | stop that turn; the conversation goes on |
+| Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
+| Ctrl-D or `/exit` | leave |
+
+A conversation lasts until you leave; saving and resuming one comes later.
 
 Credentials live in `~/.config/rein/` (or `$REIN_HOME`), readable only by you.
 
