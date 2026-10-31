@@ -8,16 +8,56 @@ pub mod sse;
 pub mod store;
 
 pub use reqwest;
+pub use serde_json;
 
 use std::fmt;
 
 /// One thing that happened while the model was answering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// A piece of the visible answer text.
+    /// A piece of the visible answer text, for showing as it's written.
     TextDelta(String),
+    /// A finished piece of the answer. Append it to the conversation: the
+    /// next request has to send it back.
+    Item(Item),
     /// The response finished normally. Always the last event.
     Completed { usage: Usage },
+}
+
+/// One entry in a conversation. The model remembers nothing, so every
+/// request carries all of them, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Item {
+    /// What the user typed.
+    User(String),
+    /// What the model wrote.
+    Assistant(String),
+    /// The model asking rein to run a tool.
+    ToolCall(ToolCall),
+    /// What running that tool produced, sent back to the model.
+    ToolResult { call_id: String, output: String },
+    /// Provider data that has to be sent back unchanged, such as OpenAI's
+    /// encrypted reasoning. rein never looks inside.
+    Opaque(serde_json::Value),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    /// Pairs the call with its result.
+    pub call_id: String,
+    pub name: String,
+    /// The arguments as a JSON object, still encoded as text.
+    pub arguments: String,
+}
+
+/// A tool the model may call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tool {
+    pub name: String,
+    /// Tells the model what the tool does and when to use it.
+    pub description: String,
+    /// A JSON Schema for the arguments.
+    pub parameters: serde_json::Value,
 }
 
 /// Token counts reported when a response completes.

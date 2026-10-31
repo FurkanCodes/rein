@@ -4,7 +4,7 @@
 //! Record real ones with `rein --record tests/fixtures/<name>.sse "<prompt>"`.
 
 use rein_llm::openai::EventDecoder;
-use rein_llm::{Error, Event, Usage};
+use rein_llm::{Error, Event, Item, ToolCall, Usage};
 
 const HELLO: &[u8] = include_bytes!("fixtures/synthetic-hello.sse");
 
@@ -28,6 +28,7 @@ fn text_and_usage(events: Vec<rein_llm::Result<Event>>) -> (String, Option<Usage
     for event in events {
         match event.expect("no errors") {
             Event::TextDelta(delta) => text.push_str(&delta),
+            Event::Item(_) => {}
             Event::Completed { usage: u } => usage = Some(u),
         }
     }
@@ -51,6 +52,25 @@ fn replays_a_real_recorded_stream() {
     let (text, usage) = text_and_usage(replay(real, 100));
     assert_eq!(text, "Hello, world!");
     assert_eq!(usage, Some(Usage { input_tokens: 13, cached_input_tokens: 0, output_tokens: 8, reasoning_tokens: 0 }));
+}
+
+#[test]
+fn replays_a_real_tool_call() {
+    // Recorded from gpt-6.1-sol through Sign in with ChatGPT, with one tool
+    // in the `rein` namespace. The model answered by calling it.
+    let real = include_bytes!("fixtures/real-tool-call.sse");
+    let events: Vec<Event> = replay(real, 64).into_iter().map(|e| e.expect("no errors")).collect();
+    let calls: Vec<&ToolCall> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Item(Item::ToolCall(call)) => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "read");
+    assert_eq!(calls[0].arguments, r#"{"path":"crates/rein-cli/Cargo.toml"}"#);
+    assert!(matches!(events.last(), Some(Event::Completed { .. })));
 }
 
 /// Recorded streams include the account's `safety_identifier`; fixtures are

@@ -12,9 +12,13 @@ use std::io::Write;
 use serde_json::{Value, json};
 
 use crate::sse::{SseEvent, SseParser};
-use crate::{Error, Event, Result, Usage};
+use crate::{Error, Event, Item, Result, Tool, ToolCall, Usage};
 
 pub const API_BASE: &str = "https://api.openai.com/v1";
+
+/// Sign in with ChatGPT only accepts function tools grouped in a namespace,
+/// so all of rein's tools live in this one.
+const NAMESPACE: &str = "rein";
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -31,31 +35,11 @@ pub struct Request {
     pub instructions: Option<String>,
     /// The whole conversation so far. Sign in with ChatGPT keeps no
     /// server-side history, so every request carries it all.
-    pub input: Vec<Message>,
+    pub input: Vec<Item>,
+    /// The tools the model may call.
+    pub tools: Vec<Tool>,
     /// For example "low", "medium" or "high". `None` uses the model default.
     pub reasoning_effort: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    User,
-    Assistant,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message {
-    pub role: Role,
-    pub text: String,
-}
-
-impl Message {
-    pub fn user(text: impl Into<String>) -> Self {
-        Message { role: Role::User, text: text.into() }
-    }
-
-    pub fn assistant(text: impl Into<String>) -> Self {
-        Message { role: Role::Assistant, text: text.into() }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,17 +81,7 @@ impl Client {
 }
 
 fn request_body(request: &Request) -> Value {
-    let input: Vec<Value> = request
-        .input
-        .iter()
-        .map(|m| {
-            let role = match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            };
-            json!({ "role": role, "content": m.text })
-        })
-        .collect();
+    let input: Vec<Value> = request.input.iter().map(item_json).collect();
     // Sign in with ChatGPT requires `store: false` and `stream: true`, and
     // rejects fields like `temperature` and `max_output_tokens`. Sending only
     // what it accepts keeps one request shape for both ways of paying.
@@ -118,7 +92,32 @@ fn request_body(request: &Request) -> Value {
     if let Some(effort) = &request.reasoning_effort {
         body["reasoning"] = json!({ "effort": effort });
     }
+    if !request.tools.is_empty() {
+        let tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| json!({ "type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": true }))
+            .collect();
+        body["tools"] = json!([{ "type": "namespace", "name": NAMESPACE, "description": "rein's tools for working in the user's project.", "tools": tools }]);
+    }
     body
+}
+
+/// One conversation item in the Responses API's input format.
+fn item_json(item: &Item) -> Value {
+    match item {
+        Item::User(text) => json!({ "role": "user", "content": text }),
+        Item::Assistant(text) => json!({ "role": "assistant", "content": text }),
+        Item::ToolCall(call) => json!({
+            "type": "function_call",
+            "call_id": call.call_id,
+            "namespace": NAMESPACE,
+            "name": call.name,
+            "arguments": call.arguments,
+        }),
+        Item::ToolResult { call_id, output } => json!({ "type": "function_call_output", "call_id": call_id, "output": output }),
+        Item::Opaque(value) => value.clone(),
+    }
 }
 
 /// Turns a non-2xx response into [`Error::Api`], keeping the request ID,
@@ -259,6 +258,7 @@ fn decode(sse: &SseEvent) -> Option<Result<Event>> {
     };
     match v["type"].as_str().or(sse.event.as_deref())? {
         "response.output_text.delta" => Some(Ok(Event::TextDelta(v["delta"].as_str()?.to_owned()))),
+        "response.output_item.done" => decode_item(&v["item"]).map(|item| Ok(Event::Item(item))),
         "response.completed" => Some(Ok(Event::Completed { usage: parse_usage(&v["response"]["usage"]) })),
         "response.failed" => Some(Err(api_error(&v["response"]["error"], "the response failed"))),
         "response.incomplete" => {
@@ -266,8 +266,27 @@ fn decode(sse: &SseEvent) -> Option<Result<Event>> {
             Some(Err(Error::Incomplete(reason.to_owned())))
         }
         "error" => Some(Err(api_error(if v["error"].is_object() { &v["error"] } else { &v }, "stream error"))),
-        // Many other events (reasoning, item boundaries, ...) arrive too;
-        // stage 1 only needs the text and the end.
+        // Many other events (reasoning summaries, argument deltas, ...)
+        // arrive too; the finished items above carry what rein needs.
+        _ => None,
+    }
+}
+
+/// A finished output item, as rein's conversation item.
+fn decode_item(item: &Value) -> Option<Item> {
+    match item["type"].as_str()? {
+        "message" => {
+            let parts = item["content"].as_array()?.iter();
+            let text: String = parts.filter(|p| p["type"] == "output_text").filter_map(|p| p["text"].as_str()).collect();
+            Some(Item::Assistant(text))
+        }
+        "function_call" => Some(Item::ToolCall(ToolCall {
+            call_id: item["call_id"].as_str()?.to_owned(),
+            name: item["name"].as_str()?.to_owned(),
+            arguments: item["arguments"].as_str().unwrap_or("{}").to_owned(),
+        })),
+        // Encrypted reasoning: the next request must carry it back as is.
+        "reasoning" => Some(Item::Opaque(item.clone())),
         _ => None,
     }
 }
@@ -304,7 +323,8 @@ mod tests {
         let request = Request {
             model: "m".into(),
             instructions: Some("be brief".into()),
-            input: vec![Message::user("hi"), Message::assistant("hello"), Message::user("bye")],
+            input: vec![Item::User("hi".into()), Item::Assistant("hello".into()), Item::User("bye".into())],
+            tools: vec![],
             reasoning_effort: Some("low".into()),
         };
         assert_eq!(
@@ -322,6 +342,36 @@ mod tests {
                 "stream": true,
             })
         );
+    }
+
+    #[test]
+    fn tools_go_in_a_namespace_and_calls_round_trip() {
+        let call = ToolCall { call_id: "call_1".into(), name: "read".into(), arguments: r#"{"path":"a.rs"}"#.into() };
+        let request = Request {
+            model: "m".into(),
+            instructions: None,
+            input: vec![
+                Item::User("open a.rs".into()),
+                Item::Opaque(json!({"type": "reasoning", "encrypted_content": "xyz"})),
+                Item::ToolCall(call.clone()),
+                Item::ToolResult { call_id: "call_1".into(), output: "fn main() {}".into() },
+            ],
+            tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
+            reasoning_effort: None,
+        };
+        let body = request_body(&request);
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(body["tools"][0]["tools"][0]["name"], "read");
+        assert_eq!(body["input"][1], json!({"type": "reasoning", "encrypted_content": "xyz"}));
+        assert_eq!(
+            body["input"][2],
+            json!({"type": "function_call", "call_id": "call_1", "namespace": "rein", "name": "read", "arguments": "{\"path\":\"a.rs\"}"})
+        );
+        assert_eq!(body["input"][3], json!({"type": "function_call_output", "call_id": "call_1", "output": "fn main() {}"}));
+
+        // The model's call comes back as the same item.
+        let done = json!({"type": "function_call", "call_id": "call_1", "namespace": "rein", "name": "read", "arguments": "{\"path\":\"a.rs\"}"});
+        assert_eq!(decode_item(&done), Some(Item::ToolCall(call)));
     }
 
     #[test]

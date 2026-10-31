@@ -7,8 +7,8 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use rein_llm::openai::signin::{self, Credentials};
-use rein_llm::openai::{Client, Message, Request};
-use rein_llm::{Event, store};
+use rein_llm::openai::{Client, Request};
+use rein_llm::{Event, Item, store};
 
 /// The name OpenAI shows for rein when someone signs in.
 const AGENT_NAME: &str = "rein";
@@ -160,7 +160,8 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     let request = Request {
         model: args.model,
         instructions: args.system,
-        input: vec![Message::user(args.prompt)],
+        input: vec![Item::User(args.prompt)],
+        tools: vec![],
         reasoning_effort: args.effort,
     };
     let mut stream = client.stream(&request).await.map_err(describe)?;
@@ -178,6 +179,8 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
                 stdout.flush().ok();
                 mid_line = !text.ends_with('\n');
             }
+            // Finished items matter once there's a conversation to keep.
+            Ok(Event::Item(_)) => {}
             Ok(Event::Completed { usage }) => {
                 if mid_line {
                     println!();
