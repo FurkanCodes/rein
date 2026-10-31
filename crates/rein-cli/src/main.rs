@@ -197,17 +197,28 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         session_id: Some(rein_llm::openai::new_session_id().map_err(describe)?),
         history: Vec::new(),
     };
-    let mut terminal = Terminal::default();
+    let mut terminal = Terminal { mid_line: false, input: Input::start() };
     match args.prompt {
         Some(prompt) => turn(&mut agent, prompt, &mut terminal).await,
         None => conversation(&mut agent, &mut terminal).await,
     }
 }
 
-/// One message from you, worked on until the model is done.
+/// One message from you, worked on until the model is done, or until
+/// Ctrl-C. Interrupting drops the turn mid-flight: the request is closed,
+/// a running command is killed, and the history is repaired so the
+/// conversation can go on.
 async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal) -> CliResult {
-    let outcome = agent.send(prompt, terminal).await;
+    let outcome = tokio::select! {
+        outcome = agent.send(prompt, terminal) => Some(outcome),
+        _ = tokio::signal::ctrl_c() => None,
+    };
     terminal.end_line();
+    let Some(outcome) = outcome else {
+        agent.repair();
+        eprintln!("(interrupted)");
+        return Ok(());
+    };
     match outcome.map_err(describe)? {
         Outcome::Done => Ok(()),
         Outcome::TurnLimit => Err(format!("stopped after {MAX_TURNS} turns of tool calls; ask again to continue")),
@@ -218,15 +229,27 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
 /// conversation, until /exit or Ctrl-D. A failed turn is reported and the
 /// conversation goes on.
 async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> CliResult {
-    eprintln!("Type a message. /exit or Ctrl-D to leave.");
-    let stdin = std::io::stdin();
+    eprintln!("Type a message. Ctrl-C stops an answer; /exit or Ctrl-D leaves.");
+    let mut last_interrupt: Option<std::time::Instant> = None;
     loop {
         eprint!("\n> ");
-        let mut line = String::new();
-        if stdin.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+        let line = tokio::select! {
+            line = terminal.input.line() => line,
+            _ = tokio::signal::ctrl_c() => {
+                // The terminal already threw away what was typed.
+                if last_interrupt.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                    eprintln!();
+                    return Ok(());
+                }
+                last_interrupt = Some(std::time::Instant::now());
+                eprint!("\n(press Ctrl-C again to leave)");
+                continue;
+            }
+        };
+        let Some(line) = line else {
             eprintln!();
             return Ok(()); // Ctrl-D
-        }
+        };
         match line.trim() {
             "" => continue,
             "/exit" | "/quit" => return Ok(()),
@@ -262,11 +285,37 @@ fn load_permissions(root: &Path, mode: Mode) -> CliResult<Permissions> {
     Ok(permissions)
 }
 
+/// Lines typed at the keyboard. A thread does the blocking reads, so
+/// waiting for a line never stops rein from noticing Ctrl-C.
+struct Input {
+    lines: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+impl Input {
+    fn start() -> Self {
+        let (tx, lines) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Input { lines }
+    }
+
+    /// The next line, or `None` once input has ended (Ctrl-D).
+    async fn line(&mut self) -> Option<String> {
+        self.lines.recv().await
+    }
+}
+
 /// The terminal as rein's [`Ui`]: answer text on stdout, everything else
 /// (tool activity, questions, token counts) on stderr.
-#[derive(Default)]
 struct Terminal {
     mid_line: bool,
+    input: Input,
 }
 
 impl Terminal {
@@ -285,7 +334,7 @@ impl Ui for Terminal {
         self.mid_line = !delta.ends_with('\n');
     }
 
-    fn approve(&mut self, call: &ToolCall) -> Approval {
+    async fn approve(&mut self, call: &ToolCall) -> Approval {
         self.end_line();
         if let Some(preview) = preview(call) {
             eprint!("{preview}");
@@ -299,12 +348,11 @@ impl Ui for Terminal {
             _ => "a = yes, and don't ask again about file changes",
         };
         eprint!("{question} [y/N/a] ({always}) ");
-        let mut answer = String::new();
-        // No answer (for example, input isn't a terminal) means no.
-        if std::io::stdin().read_line(&mut answer).is_err() {
-            return Approval::No;
+        // No answer (input has ended) means no.
+        match self.input.line().await {
+            Some(answer) => approval(&answer),
+            None => Approval::No,
         }
-        approval(&answer)
     }
 
     fn tool_started(&mut self, call: &ToolCall) {

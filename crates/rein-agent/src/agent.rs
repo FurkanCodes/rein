@@ -33,8 +33,9 @@ pub enum Approval {
 /// Whoever is at the keyboard: sees what happens, and decides what may run.
 pub trait Ui {
     fn text(&mut self, delta: &str);
-    /// Asked when the permissions say to ask.
-    fn approve(&mut self, call: &ToolCall) -> Approval;
+    /// Asked when the permissions say to ask. It's async so that an
+    /// interrupt can cancel the turn even while it waits for an answer.
+    fn approve(&mut self, call: &ToolCall) -> impl Future<Output = Approval>;
     fn tool_started(&mut self, call: &ToolCall);
     /// A call the permissions refused without asking, and why.
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str);
@@ -66,7 +67,10 @@ pub struct Agent<M> {
 
 impl<M: Model> Agent<M> {
     /// Adds the user's message and works on it until the model is done.
+    /// Dropping the future cancels the turn; [`Agent::repair`] then makes
+    /// the history valid again, and `send` calls it first anyway.
     pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
+        self.repair();
         self.history.push(Item::User(prompt));
         for _ in 0..MAX_TURNS {
             let request = Request {
@@ -101,7 +105,7 @@ impl<M: Model> Agent<M> {
                         ui.tool_blocked(&call, &reason);
                         Err(reason)
                     }
-                    Decision::Ask => match ui.approve(&call) {
+                    Decision::Ask => match ui.approve(&call).await {
                         Approval::Yes => Ok(()),
                         Approval::Always => {
                             self.permissions.remember(&call);
@@ -125,6 +129,35 @@ impl<M: Model> Agent<M> {
             }
         }
         Ok(Outcome::TurnLimit)
+    }
+}
+
+impl<M> Agent<M> {
+    /// Gives every tool call that never got a result one now. A turn cut
+    /// short (by Ctrl-C, say) can leave a call unanswered, and providers
+    /// reject a conversation like that. Codex and pi do the same repair.
+    pub fn repair(&mut self) {
+        let answered: Vec<String> = self
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut repaired = Vec::with_capacity(self.history.len());
+        for item in std::mem::take(&mut self.history) {
+            let orphan = match &item {
+                Item::ToolCall(call) if !answered.contains(&call.call_id) => Some(call.call_id.clone()),
+                _ => None,
+            };
+            repaired.push(item);
+            if let Some(call_id) = orphan {
+                let output = "The user interrupted this before it finished. It may have partly run.".to_owned();
+                repaired.push(Item::ToolResult { call_id, output });
+            }
+        }
+        self.history = repaired;
     }
 }
 
@@ -199,7 +232,7 @@ mod tests {
         fn text(&mut self, delta: &str) {
             self.log.push(format!("text {delta}"));
         }
-        fn approve(&mut self, call: &ToolCall) -> Approval {
+        async fn approve(&mut self, call: &ToolCall) -> Approval {
             self.log.push(format!("asked {}", call.arguments));
             self.answer
         }
@@ -322,6 +355,23 @@ mod tests {
         let asked = person.log.iter().filter(|l| l.starts_with("asked")).count();
         assert_eq!(asked, 1, "{:?}", person.log);
         assert_eq!(person.log.iter().filter(|l| *l == "ran bash").count(), 2);
+    }
+
+    #[test]
+    fn repair_answers_calls_a_cancelled_turn_left_open() {
+        let mut agent = agent("repair", vec![]);
+        agent.history = vec![
+            Item::User("go".into()),
+            bash("c1", "echo done"),
+            Item::ToolResult { call_id: "c1".into(), output: "done".into() },
+            bash("c2", "sleep 100"),
+        ];
+        agent.repair();
+        assert_eq!(agent.history.len(), 5);
+        assert!(matches!(&agent.history[4], Item::ToolResult { call_id, output } if call_id == "c2" && output.contains("interrupted")));
+        // Repairing twice changes nothing.
+        agent.repair();
+        assert_eq!(agent.history.len(), 5);
     }
 
     #[tokio::test]
