@@ -1,7 +1,7 @@
 //! `rein`: a tiny, fast agent harness. You hold the reins.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
@@ -197,7 +197,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         session_id: Some(rein_llm::openai::new_session_id().map_err(describe)?),
         history: Vec::new(),
     };
-    let mut terminal = Terminal { mid_line: false, input: Input::start() };
+    let mut terminal = Terminal { mid_line: false, input: Input::start(), interrupted: Default::default() };
     match args.prompt {
         Some(prompt) => turn(&mut agent, prompt, &mut terminal).await,
         None => conversation(&mut agent, &mut terminal).await,
@@ -209,9 +209,11 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
 /// a running command is killed, and the history is repaired so the
 /// conversation can go on.
 async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal) -> CliResult {
+    let interrupted = terminal.interrupted.clone();
     let outcome = tokio::select! {
         outcome = agent.send(prompt, terminal) => Some(outcome),
         _ = tokio::signal::ctrl_c() => None,
+        _ = interrupted.notified() => None,
     };
     terminal.end_line();
     let Some(outcome) = outcome else {
@@ -229,26 +231,13 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
 /// conversation, until /exit or Ctrl-D. A failed turn is reported and the
 /// conversation goes on.
 async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> CliResult {
-    eprintln!("Type a message. Ctrl-C stops an answer; /exit or Ctrl-D leaves.");
+    eprintln!("Type a message. End a line with \\ to keep typing on the next.");
+    eprintln!("Ctrl-C stops an answer; /exit or Ctrl-D leaves.");
     let mut last_interrupt: Option<std::time::Instant> = None;
     loop {
-        eprint!("\n> ");
-        let line = tokio::select! {
-            line = terminal.input.line() => line,
-            _ = tokio::signal::ctrl_c() => {
-                // The terminal already threw away what was typed.
-                if last_interrupt.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
-                    eprintln!();
-                    return Ok(());
-                }
-                last_interrupt = Some(std::time::Instant::now());
-                eprint!("\n(press Ctrl-C again to leave)");
-                continue;
-            }
-        };
-        let Some(line) = line else {
-            eprintln!();
-            return Ok(()); // Ctrl-D
+        eprintln!();
+        let Some(line) = message(terminal, &mut last_interrupt).await else {
+            return Ok(());
         };
         match line.trim() {
             "" => continue,
@@ -285,29 +274,114 @@ fn load_permissions(root: &Path, mode: Mode) -> CliResult<Permissions> {
     Ok(permissions)
 }
 
-/// Lines typed at the keyboard. A thread does the blocking reads, so
-/// waiting for a line never stops rein from noticing Ctrl-C.
+/// Reads your next message. A line ending in `\` continues on the next.
+/// Ctrl-C clears what you typed; a second one within two seconds, or
+/// Ctrl-D, ends the conversation (`None`).
+async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time::Instant>) -> Option<String> {
+    let mut text = String::new();
+    loop {
+        let prompt = if text.is_empty() { "> " } else { "… " };
+        let read = tokio::select! {
+            read = terminal.input.read(prompt, true) => read,
+            // Without an editor, Ctrl-C is a signal; the terminal has
+            // already thrown away what was typed.
+            _ = tokio::signal::ctrl_c() => Read::Interrupted,
+        };
+        match read {
+            Read::Line(line) => match line.strip_suffix('\\') {
+                Some(more) => {
+                    text.push_str(more);
+                    text.push('\n');
+                }
+                None => {
+                    text.push_str(&line);
+                    return Some(text);
+                }
+            },
+            Read::Interrupted => {
+                if last_interrupt.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                    return None;
+                }
+                *last_interrupt = Some(std::time::Instant::now());
+                eprintln!("(press Ctrl-C again to leave)");
+                text.clear();
+            }
+            Read::Eof => return None,
+        }
+    }
+}
+
+/// What reading a line produced.
+enum Read {
+    Line(String),
+    /// Ctrl-C while typing. In a real terminal the editor turns it into a
+    /// keypress, so it arrives here instead of as a signal.
+    Interrupted,
+    /// Ctrl-D, or input ended.
+    Eof,
+}
+
+/// Lines typed at the keyboard, read by a thread so that waiting for one
+/// never stops rein from noticing Ctrl-C. In a real terminal the thread
+/// runs a line editor (arrow keys, history); otherwise it reads plain
+/// lines, so piping answers into rein keeps working.
 struct Input {
-    lines: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// Prompts to show; the thread reads one line for each.
+    requests: std::sync::mpsc::Sender<(String, bool)>,
+    replies: tokio::sync::mpsc::UnboundedReceiver<Read>,
+    /// A read asked for but not answered yet, kept if the asker gave up.
+    pending: bool,
 }
 
 impl Input {
     fn start() -> Self {
-        let (tx, lines) = tokio::sync::mpsc::unbounded_channel();
+        let (requests, asked) = std::sync::mpsc::channel::<(String, bool)>();
+        let (tx, replies) = tokio::sync::mpsc::unbounded_channel();
+        let interactive = std::io::stdin().is_terminal();
         std::thread::spawn(move || {
-            for line in std::io::stdin().lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
+            let mut editor = if interactive { rustyline::DefaultEditor::new().ok() } else { None };
+            for (prompt, remember) in asked {
+                let read = match &mut editor {
+                    Some(editor) => match editor.readline(&prompt) {
+                        Ok(line) => {
+                            if remember {
+                                let _ = editor.add_history_entry(line.as_str());
+                            }
+                            Read::Line(line)
+                        }
+                        Err(rustyline::error::ReadlineError::Interrupted) => Read::Interrupted,
+                        Err(_) => Read::Eof,
+                    },
+                    None => {
+                        eprint!("{prompt}");
+                        let mut line = String::new();
+                        match std::io::stdin().read_line(&mut line) {
+                            Ok(0) | Err(_) => Read::Eof,
+                            Ok(_) => Read::Line(line.trim_end_matches(['\n', '\r']).to_owned()),
+                        }
+                    }
+                };
+                if tx.send(read).is_err() {
                     break;
                 }
             }
         });
-        Input { lines }
+        Input { requests, replies, pending: false }
     }
 
-    /// The next line, or `None` once input has ended (Ctrl-D).
-    async fn line(&mut self) -> Option<String> {
-        self.lines.recv().await
+    /// Shows `prompt` and reads one line. `remember` puts it in the
+    /// history you reach with the up arrow: your messages, not answers to
+    /// questions.
+    async fn read(&mut self, prompt: &str, remember: bool) -> Read {
+        if !self.pending {
+            if self.requests.send((prompt.to_owned(), remember)).is_err() {
+                return Read::Eof;
+            }
+            self.pending = true;
+        }
+        let read = self.replies.recv().await.unwrap_or(Read::Eof);
+        self.pending = false;
+        read
     }
 }
 
@@ -316,6 +390,8 @@ impl Input {
 struct Terminal {
     mid_line: bool,
     input: Input,
+    /// Ctrl-C pressed at a question; the turn waits on this to stop.
+    interrupted: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl Terminal {
@@ -347,11 +423,15 @@ impl Ui for Terminal {
             "bash" => "a = yes, and don't ask again for this command",
             _ => "a = yes, and don't ask again about file changes",
         };
-        eprint!("{question} [y/N/a] ({always}) ");
-        // No answer (input has ended) means no.
-        match self.input.line().await {
-            Some(answer) => approval(&answer),
-            None => Approval::No,
+        match self.input.read(&format!("{question} [y/N/a] ({always}) "), false).await {
+            Read::Line(answer) => approval(&answer),
+            // Ctrl-C at a question stops the whole turn.
+            Read::Interrupted => {
+                self.interrupted.notify_one();
+                std::future::pending().await
+            }
+            // No answer (input has ended) means no.
+            Read::Eof => Approval::No,
         }
     }
 
