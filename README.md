@@ -35,6 +35,8 @@ rein login                      # continue with ChatGPT
 rein models                     # list the models you can use
 rein                            # a conversation in this folder
 rein "explain what a harness is"   # one task, then exit
+rein -c                         # continue the latest conversation here
+rein -r                         # choose a saved conversation to continue
 rein --model gpt-6.1-sol --effort low "say hi"
 ```
 
@@ -48,7 +50,21 @@ In a conversation:
 | Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
 | Ctrl-D or `/exit` | leave |
 
-A conversation lasts until you leave; saving and resuming one comes later.
+Every conversation is saved as it goes, one JSON line per message, tool call
+and result, in `~/.config/rein/sessions/<this folder>/`. The files are readable
+only by you. `rein -c` picks up the latest one in the folder you're in, with
+the same history, system prompt and cache key, so it usually starts warm.
+
+## What rein tells the model
+
+- **A short system prompt** of its own (`crates/rein-agent/src/prompt.rs`), with
+  nothing in it that changes over time. `-s "..."` adds your standing
+  instructions to it.
+- **A first message** with the working folder, the operating system, today's
+  date (no time of day) and the project's instructions: `AGENTS.md` files from
+  the repository root down to the folder you're in (`CLAUDE.md` where a folder
+  has none), plus your own `~/.config/rein/AGENTS.md`, 32 KB at most. It's
+  saved with the conversation, so a continued one starts with the same text.
 
 Credentials live in `~/.config/rein/` (or `$REIN_HOME`), readable only by you.
 
@@ -87,7 +103,7 @@ doesn't stop `/bin/rm`.
 | Crate | What it is |
 |---|---|
 | `crates/rein-llm` | Streaming LLM provider layer: SSE parsing, the Responses API, Sign in with ChatGPT |
-| `crates/rein-agent` | The agent loop, the tools, and the permission engine |
+| `crates/rein-agent` | The agent loop, the tools, the permission engine, saved conversations, and what the model is told first |
 | `crates/rein-cli` | The `rein` command |
 
 ## Tests
