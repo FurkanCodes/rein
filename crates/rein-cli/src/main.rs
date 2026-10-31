@@ -4,12 +4,15 @@ use std::fs::File;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rein_llm::openai::signin::{self, Credentials};
 use rein_agent::agent::{Agent, Approval, MAX_TURNS, OpenAi, Outcome, Ui};
 use rein_agent::permissions::{Mode, Permissions};
+use rein_agent::session::{self, Header, Session};
 use rein_agent::tools::Tools;
+use rein_agent::{context, prompt};
+use rein_llm::Item;
 use rein_llm::openai::Client;
 use rein_llm::{ToolCall, Usage, store};
 
@@ -26,16 +29,25 @@ rein: a tiny, fast agent harness. You hold the reins.
 Usage:
   rein [options]                 Start a conversation in this folder
   rein [options] <prompt...>     Do one task and exit
+  rein -c [<prompt...>]          Continue the latest conversation in this folder
+  rein -r [<prompt...>]          Choose a saved conversation to continue
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
   rein models                    List the models you can use
 
 rein can read, write and edit files in this folder and run commands. In a
-conversation, type /exit or press Ctrl-D to leave.
+conversation, type /exit or press Ctrl-D to leave. Conversations are saved in
+~/.config/rein/sessions, readable only by you.
+
+rein tells the model about the project with its AGENTS.md files, from the
+repository's root down to this folder (CLAUDE.md where a folder has no
+AGENTS.md), plus your own ~/.config/rein/AGENTS.md. 32 KB at most.
 
 Options:
   -m, --model <id>      Model to use (default: $REIN_MODEL, or gpt-6.1-sol)
       --effort <level>  Reasoning effort: low, medium, high, ...
-  -s, --system <text>   Standing instructions for the model (the system prompt)
+  -c, --continue        Continue the latest conversation in this folder
+  -r, --resume          Choose which saved conversation to continue
+  -s, --system <text>   Standing instructions, added to rein's system prompt
       --mode <mode>     What runs without asking:
                           ask        nothing; ask about every change (default)
                           edits      file changes in this folder
@@ -136,8 +148,21 @@ async fn models(http: &rein_llm::reqwest::Client) -> CliResult {
     Ok(())
 }
 
+/// Which conversation to work in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    New,
+    /// The most recently used one in this folder.
+    Latest,
+    /// One the user picks from a list.
+    Pick,
+}
+
 struct AskArgs {
     model: String,
+    /// `-m` was given, so a continued conversation switches to `model`.
+    model_given: bool,
+    resume: Resume,
     effort: Option<String>,
     /// The system prompt: standing instructions sent with every request.
     system: Option<String>,
@@ -152,10 +177,16 @@ impl AskArgs {
         let mut model = std::env::var("REIN_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
         let (mut effort, mut system, mut record, mut words) = (None, None, None, Vec::new());
         let mut mode = Mode::Ask;
+        let (mut model_given, mut resume) = (false, Resume::New);
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "-m" | "--model" => model = value(&mut args, &arg)?,
+                "-m" | "--model" => {
+                    model = value(&mut args, &arg)?;
+                    model_given = true;
+                }
+                "-c" | "--continue" => resume = Resume::Latest,
+                "-r" | "--resume" => resume = Resume::Pick,
                 "--effort" => effort = Some(value(&mut args, &arg)?),
                 "--mode" => {
                     let name = value(&mut args, &arg)?;
@@ -171,7 +202,7 @@ impl AskArgs {
             }
         }
         let prompt = if words.is_empty() { None } else { Some(words.join(" ")) };
-        Ok(AskArgs { model, effort, system, mode, record, prompt })
+        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, prompt })
     }
 }
 
@@ -187,17 +218,63 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     };
     let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
     let permissions = load_permissions(&root, args.mode)?;
+    let mut terminal = Terminal { mid_line: false, wrap: None, input: Input::start(), interrupted: Default::default() };
+    let dir = config_dir()?;
+    let folder = session::folder(&dir.join("sessions"), &root);
+
+    let saved = match args.resume {
+        Resume::New => None,
+        Resume::Latest => match session::list(&folder, 1).into_iter().next() {
+            Some(latest) => Some(latest.path),
+            None => return Err("no saved conversation in this folder yet".into()),
+        },
+        Resume::Pick => match pick(&folder, &mut terminal).await? {
+            Some(path) => Some(path),
+            None => return Ok(()),
+        },
+    };
+    let (session, history, context) = match saved {
+        Some(path) => {
+            if args.system.is_some() {
+                return Err("-s can't change a saved conversation's system prompt; start a new one instead".into());
+            }
+            let (session, history) = Session::load(&path).map_err(describe)?;
+            say_where_we_were(session.header(), &history);
+            (session, history, None)
+        }
+        None => {
+            let now = local_time(SystemTime::now());
+            let header = Header {
+                id: rein_llm::openai::new_session_id().map_err(describe)?,
+                cwd: root.clone(),
+                started: format!("{} {:02}:{:02}", now.date(), now.hour, now.minute),
+                model: args.model.clone(),
+                instructions: Some(prompt::system(args.system.as_deref())),
+            };
+            let stamp = format!("{}T{:02}-{:02}-{:02}", now.date(), now.hour, now.minute, now.second);
+            let files = context::find(&root, Some(&dir.join("AGENTS.md")));
+            if !files.is_empty() {
+                let names: Vec<String> = files.iter().map(|f| shown_path(&f.path, &root)).collect();
+                eprintln!("Instructions: {}", names.join(", "));
+            }
+            let context = context::message(&root, std::env::consts::OS, &now.date(), &files);
+            (Session::new(&folder, &stamp, header), Vec::new(), Some(context))
+        }
+    };
+    let header = session.header().clone();
     let mut agent = Agent {
         model: OpenAi { client, record },
         tools: Tools::new(root),
         permissions,
-        model_name: args.model,
-        instructions: args.system,
+        // A continued conversation keeps its model unless -m says otherwise.
+        model_name: if args.model_given || args.resume == Resume::New { args.model } else { header.model },
+        instructions: header.instructions,
         reasoning_effort: args.effort,
-        session_id: Some(rein_llm::openai::new_session_id().map_err(describe)?),
-        history: Vec::new(),
+        session_id: Some(header.id),
+        history,
+        session: Some(session),
+        context,
     };
-    let mut terminal = Terminal { mid_line: false, wrap: None, input: Input::start(), interrupted: Default::default() };
     match args.prompt {
         Some(prompt) => turn(&mut agent, prompt, &mut terminal).await,
         None => conversation(&mut agent, &mut terminal).await,
@@ -224,6 +301,104 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
     match outcome.map_err(describe)? {
         Outcome::Done => Ok(()),
         Outcome::TurnLimit => Err(format!("stopped after {MAX_TURNS} turns of tool calls; ask again to continue")),
+    }
+}
+
+/// Lists this folder's recent conversations and asks which to continue.
+/// `None` if the user changes their mind.
+async fn pick(folder: &Path, terminal: &mut Terminal) -> CliResult<Option<PathBuf>> {
+    let saved = session::list(folder, 10);
+    if saved.is_empty() {
+        return Err("no saved conversations in this folder yet".into());
+    }
+    for (i, conversation) in saved.iter().enumerate() {
+        let when = local_time(conversation.modified);
+        let first = conversation.first.as_deref().map(|text| shorten(text, 50)).unwrap_or_default();
+        let messages = format!("{} message{}", conversation.messages, if conversation.messages == 1 { "" } else { "s" });
+        eprintln!("{:>2}  {} {:02}:{:02}  {messages:<12}  {first}", i + 1, when.date(), when.hour, when.minute);
+    }
+    loop {
+        match terminal.input.read("Continue which one? (number, or Enter to cancel) ", false).await {
+            Read::Line(line) if line.trim().is_empty() => return Ok(None),
+            Read::Line(line) => match line.trim().parse::<usize>() {
+                Ok(n) if (1..=saved.len()).contains(&n) => return Ok(Some(saved[n - 1].path.clone())),
+                _ => eprintln!("Type a number from 1 to {}.", saved.len()),
+            },
+            Read::Interrupted | Read::Eof => return Ok(None),
+        }
+    }
+}
+
+/// A reminder of where a continued conversation left off.
+fn say_where_we_were(header: &Header, history: &[Item]) {
+    // The first message is the context rein added, not something typed.
+    let typed: Vec<&str> = history
+        .iter()
+        .skip(1)
+        .filter_map(|item| match item {
+            Item::User(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    eprintln!("Continuing the conversation from {} ({} message{} so far).", header.started, typed.len(), if typed.len() == 1 { "" } else { "s" });
+    if let Some(last) = typed.last() {
+        eprintln!("Last message: {}", shorten(last, 70));
+    }
+}
+
+/// The first line of `text`, at most `max` characters.
+fn shorten(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or_default();
+    if line.chars().count() <= max && !text.trim_end().contains('\n') {
+        return line.to_owned();
+    }
+    let cut: String = line.chars().take(max - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// `path` relative to the working folder (`../AGENTS.md`), so it reads
+/// shorter; absolute when they only share the filesystem root.
+fn shown_path(path: &Path, cwd: &Path) -> String {
+    for (up, folder) in cwd.ancestors().enumerate() {
+        if folder.parent().is_none() {
+            break;
+        }
+        if let Ok(rest) = path.strip_prefix(folder) {
+            return format!("{}{}", "../".repeat(up), rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// A moment in the computer's local time zone.
+struct LocalTime {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+}
+
+impl LocalTime {
+    fn date(&self) -> String {
+        format!("{}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+}
+
+fn local_time(time: SystemTime) -> LocalTime {
+    let seconds = time.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as libc::time_t;
+    // SAFETY: an all-zero `tm` is a valid value, and localtime_r only
+    // writes into the one we pass.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&seconds, &mut tm) };
+    LocalTime {
+        year: tm.tm_year + 1900,
+        month: (tm.tm_mon + 1) as u32,
+        day: tm.tm_mday as u32,
+        hour: tm.tm_hour as u32,
+        minute: tm.tm_min as u32,
+        second: tm.tm_sec as u32,
     }
 }
 
