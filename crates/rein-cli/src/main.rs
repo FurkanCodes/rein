@@ -7,9 +7,10 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rein_llm::openai::signin::{self, Credentials};
-use rein_agent::agent::{Agent, Approval, MAX_TURNS, OpenAi, Outcome, Ui};
+use rein_agent::agent::{Agent, Approval, Compacted, MAX_TURNS, OpenAi, Outcome, Ui, Window};
+use rein_agent::compact;
 use rein_agent::permissions::{Mode, Permissions};
-use rein_agent::session::{self, Header, Session};
+use rein_agent::session::{self, Header, Loaded, Session};
 use rein_agent::tools::Tools;
 use rein_agent::{context, prompt};
 use rein_llm::Item;
@@ -37,6 +38,11 @@ Usage:
 rein can read, write and edit files in this folder and run commands. In a
 conversation, type /exit or press Ctrl-D to leave. Conversations are saved in
 ~/.config/rein/sessions, readable only by you.
+
+A long conversation is compacted when it nears $REIN_COMPACT_AT tokens
+(default 150000): stale tool output goes first, then the model summarizes.
+Type /compact [focus] to do it now. Nothing is lost: the model can search
+the whole conversation with its recall tool.
 
 rein tells the model about the project with its AGENTS.md files, from the
 repository's root down to this folder (CLAUDE.md where a folder has no
@@ -212,13 +218,19 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> CliResult<Strin
 
 async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     let client = client(http).await?;
+    // The model list says how big each model's context window is. Fetched
+    // while everything else gets ready.
+    let models = {
+        let client = client.clone();
+        tokio::spawn(async move { client.list_models().await })
+    };
     let record = match &args.record {
         Some(path) => Some(File::create(path).map_err(|e| format!("can't create {}: {e}", path.display()))?),
         None => None,
     };
     let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
     let permissions = load_permissions(&root, args.mode)?;
-    let mut terminal = Terminal { mid_line: false, wrap: None, input: Input::start(), interrupted: Default::default() };
+    let mut terminal = Terminal { mid_line: false, wrap: None, input: Input::start(), interrupted: Default::default(), context_limit: compact::DEFAULT_LIMIT };
     let dir = config_dir()?;
     let folder = session::folder(&dir.join("sessions"), &root);
 
@@ -233,14 +245,14 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
             None => return Ok(()),
         },
     };
-    let (session, history, context) = match saved {
+    let (loaded, context) = match saved {
         Some(path) => {
             if args.system.is_some() {
                 return Err("-s can't change a saved conversation's system prompt; start a new one instead".into());
             }
-            let (session, history) = Session::load(&path).map_err(describe)?;
-            say_where_we_were(session.header(), &history);
-            (session, history, None)
+            let loaded = Session::load(&path).map_err(describe)?;
+            say_where_we_were(loaded.session.header(), &loaded.full);
+            (loaded, None)
         }
         None => {
             let now = local_time(SystemTime::now());
@@ -258,22 +270,31 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
                 eprintln!("Instructions: {}", names.join(", "));
             }
             let context = context::message(&root, std::env::consts::OS, &now.date(), &files);
-            (Session::new(&folder, &stamp, header), Vec::new(), Some(context))
+            let session = Session::new(&folder, &stamp, header);
+            (Loaded { session, history: Vec::new(), full: Vec::new() }, Some(context))
         }
     };
-    let header = session.header().clone();
+    let header = loaded.session.header().clone();
+    // A continued conversation keeps its model unless -m says otherwise.
+    let model_name = if args.model_given || args.resume == Resume::New { args.model } else { header.model };
+    let window = match tokio::time::timeout(Duration::from_secs(5), models).await {
+        Ok(Ok(Ok(models))) => models.into_iter().find(|m| m.id == model_name).and_then(|m| m.context_window),
+        _ => None,
+    };
+    let limit = compact_limit(window)?;
+    terminal.context_limit = limit;
     let mut agent = Agent {
         model: OpenAi { client, record },
         tools: Tools::new(root),
         permissions,
-        // A continued conversation keeps its model unless -m says otherwise.
-        model_name: if args.model_given || args.resume == Resume::New { args.model } else { header.model },
+        model_name,
         instructions: header.instructions,
         reasoning_effort: args.effort,
         session_id: Some(header.id),
-        history,
-        session: Some(session),
+        history: loaded.history,
+        session: Some(loaded.session),
         context,
+        window: Window { limit, measured: None, full: loaded.full },
     };
     match args.prompt {
         Some(prompt) => turn(&mut agent, prompt, &mut terminal).await,
@@ -301,6 +322,35 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
     match outcome.map_err(describe)? {
         Outcome::Done => Ok(()),
         Outcome::TurnLimit => Err(format!("stopped after {MAX_TURNS} turns of tool calls; ask again to continue")),
+    }
+}
+
+/// When to compact: $REIN_COMPACT_AT tokens if set, otherwise rein's
+/// default, and never later than 90% of the model's window, when known.
+fn compact_limit(window: Option<u64>) -> CliResult<u64> {
+    let wanted = match std::env::var("REIN_COMPACT_AT") {
+        Ok(value) => value.trim().parse::<u64>().map_err(|_| format!("REIN_COMPACT_AT should be a number of tokens, not {value}"))?,
+        Err(_) => compact::DEFAULT_LIMIT,
+    };
+    Ok(window.map_or(wanted, |window| wanted.min(window / 10 * 9)))
+}
+
+/// Compacts the conversation now, keeping `focus` in mind. Ctrl-C stops it
+/// and leaves the conversation as it was.
+async fn compact_now(agent: &mut Agent<OpenAi>, focus: Option<&str>, terminal: &mut Terminal) -> CliResult {
+    let interrupted = terminal.interrupted.clone();
+    let done = tokio::select! {
+        done = agent.compact(focus, true, terminal) => Some(done),
+        _ = tokio::signal::ctrl_c() => None,
+        _ = interrupted.notified() => None,
+    };
+    terminal.end_line();
+    match done {
+        Some(done) => done.map(|_| ()).map_err(describe),
+        None => {
+            eprintln!("(interrupted; nothing was compacted)");
+            Ok(())
+        }
     }
 }
 
@@ -407,7 +457,7 @@ fn local_time(time: SystemTime) -> LocalTime {
 /// conversation goes on.
 async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> CliResult {
     eprintln!("Type a message. End a line with \\ to keep typing on the next.");
-    eprintln!("Ctrl-C stops an answer; /exit or Ctrl-D leaves.");
+    eprintln!("Ctrl-C stops an answer; /compact makes room; /exit or Ctrl-D leaves.");
     let mut last_interrupt: Option<std::time::Instant> = None;
     loop {
         eprintln!();
@@ -417,6 +467,12 @@ async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> Cli
         match line.trim() {
             "" => continue,
             "/exit" | "/quit" => return Ok(()),
+            message if message == "/compact" || message.starts_with("/compact ") => {
+                let focus = message["/compact".len()..].trim();
+                if let Err(e) = compact_now(agent, (!focus.is_empty()).then_some(focus), terminal).await {
+                    eprintln!("rein: {e}");
+                }
+            }
             message => {
                 if let Err(e) = turn(agent, message.to_owned(), terminal).await {
                     eprintln!("rein: {e}");
@@ -654,6 +710,9 @@ struct Terminal {
     input: Input,
     /// Ctrl-C pressed at a question; the turn waits on this to stop.
     interrupted: std::sync::Arc<tokio::sync::Notify>,
+    /// When the conversation gets compacted, in tokens, for showing how
+    /// full it is.
+    context_limit: u64,
 }
 
 impl Terminal {
@@ -725,12 +784,33 @@ impl Ui for Terminal {
 
     fn usage(&mut self, usage: &Usage) {
         self.end_line();
-        eprintln!("[{}]", usage_line(usage));
+        eprintln!("[{} · context {}/{}]", usage_line(usage), thousands(usage.input_tokens), thousands(self.context_limit));
+    }
+
+    fn compacting(&mut self) {
+        self.end_line();
+        eprintln!("Compacting the conversation…");
+    }
+
+    fn compacted(&mut self, report: &Compacted) {
+        self.end_line();
+        let retired = match report.retired {
+            0 => String::new(),
+            1 => ", 1 stale tool output retired".to_owned(),
+            n => format!(", {n} stale tool outputs retired"),
+        };
+        let how = if report.summarized { "summarized" } else { "no summary needed" };
+        eprintln!("Compacted: about {} → {} tokens ({how}{retired}).", thousands(report.before), thousands(report.after));
     }
 }
 
 /// Token counts for one request, with the share served from the prompt
 /// cache, so you can see whether caching is working.
+/// `12345` → `12k`: token counts read at a glance.
+fn thousands(n: u64) -> String {
+    if n < 1000 { n.to_string() } else { format!("{}k", (n + 500) / 1000) }
+}
+
 fn usage_line(u: &Usage) -> String {
     let cached = match u.cached_input_tokens {
         0 => "0 cached".to_owned(),
@@ -750,6 +830,7 @@ fn show(call: &ToolCall) -> String {
         },
         ("write" | "edit", Some(path), _) => format!("{} {path}", call.name),
         ("bash", _, Some(command)) => format!("`{command}`"),
+        ("recall", _, _) => format!("recall \"{}\"", args["query"].as_str().unwrap_or_default()),
         _ => format!("{} {}", call.name, call.arguments),
     }
 }
