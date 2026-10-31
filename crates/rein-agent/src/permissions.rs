@@ -115,6 +115,10 @@ impl Permissions {
         Ok(Permissions { mode, rules: parsed, ..Default::default() })
     }
 
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
     pub fn decide(&self, call: &ToolCall) -> Decision {
         match call.name.as_str() {
             // `read` can only look, and only inside the project.

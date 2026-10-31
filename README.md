@@ -3,8 +3,9 @@
 A tiny, fast agent harness. You hold the reins.
 
 rein is an open-source agent harness written in Rust, built to be the
-fastest and smallest harness around, and a smart one. It's early: today it can sign in and
-stream an answer. The agent loop and tools come next.
+fastest and smallest harness around, and a smart one. It's early: today it can
+read, write and edit files in the folder you run it in, and run commands, asking
+you first. Each run is one task; conversations you can continue come next.
 
 ## Build
 
@@ -38,11 +39,42 @@ rein --model gpt-6.1-sol --effort low "say hi"
 
 Credentials live in `~/.config/rein/` (or `$REIN_HOME`), readable only by you.
 
+## What rein may do
+
+rein's tools are `read`, `write`, `edit` and `bash`. They only touch files
+inside the folder you run it in. Before a file change you see the lines it
+removes and adds. At each question, answer `y`, `n`, or `a` for "yes, and
+don't ask again this run".
+
+`--mode` sets what runs without asking:
+
+| Mode | File changes | Commands |
+|---|---|---|
+| `ask` (default) | ask | ask |
+| `edits` | allowed | ask |
+| `read-only` | refused | refused |
+| `trust` | allowed | allowed, except deny rules |
+
+Rules in `.rein/permissions` refine this for commands:
+
+```
+allow cargo test
+ask   git commit
+deny  git push
+```
+
+Deny beats ask beats allow. A command runs without asking only if every part
+of it is allowed, so `allow cargo test` doesn't cover `cargo test && rm -rf x`.
+Anything rein can't take apart, like `$(...)`, redirects or globs, is asked
+about. Rules decide when rein asks; they aren't a sandbox, so `deny rm`
+doesn't stop `/bin/rm`.
+
 ## Layout
 
 | Crate | What it is |
 |---|---|
 | `crates/rein-llm` | Streaming LLM provider layer: SSE parsing, the Responses API, Sign in with ChatGPT |
+| `crates/rein-agent` | The agent loop, the tools, and the permission engine |
 | `crates/rein-cli` | The `rein` command |
 
 ## Tests

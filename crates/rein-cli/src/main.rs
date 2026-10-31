@@ -7,8 +7,8 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use rein_llm::openai::signin::{self, Credentials};
-use rein_agent::agent::{Agent, MAX_TURNS, OpenAi, Outcome, Ui};
-use rein_agent::permissions::Permissions;
+use rein_agent::agent::{Agent, Approval, MAX_TURNS, OpenAi, Outcome, Ui};
+use rein_agent::permissions::{Mode, Permissions};
 use rein_agent::tools::Tools;
 use rein_llm::openai::Client;
 use rein_llm::{ToolCall, Usage, store};
@@ -26,14 +26,26 @@ rein: a tiny, fast agent harness. You hold the reins.
 Usage:
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
   rein models                    List the models you can use
-  rein [options] <prompt...>     Ask rein to do something. It can read files
-                                 in this folder and run commands, asking first
+  rein [options] <prompt...>     Ask rein to do something. It can read, write
+                                 and edit files in this folder and run commands
 
 Options:
   -m, --model <id>      Model to use (default: $REIN_MODEL, or gpt-6.1-sol)
       --effort <level>  Reasoning effort: low, medium, high, ...
   -s, --system <text>   Standing instructions for the model (the system prompt)
+      --mode <mode>     What runs without asking:
+                          ask        nothing; ask about every change (default)
+                          edits      file changes in this folder
+                          read-only  nothing runs or changes; only reading
+                          trust      everything, except what deny rules block
       --record <file>   Also save the raw response stream, for tests
+
+Rules in .rein/permissions refine the mode for commands, one per line:
+  allow cargo test
+  ask   git commit
+  deny  git push
+Deny beats ask beats allow, and a command only runs without asking if every
+part of it is allowed. Rules decide when rein asks; they aren't a sandbox.
 
 Without `rein login`, rein uses $OPENAI_API_KEY, billed to your API account.";
 
@@ -126,6 +138,7 @@ struct AskArgs {
     effort: Option<String>,
     /// The system prompt: standing instructions sent with every request.
     system: Option<String>,
+    mode: Mode,
     record: Option<PathBuf>,
     prompt: String,
 }
@@ -134,11 +147,16 @@ impl AskArgs {
     fn parse(args: Vec<String>) -> CliResult<Self> {
         let mut model = std::env::var("REIN_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
         let (mut effort, mut system, mut record, mut words) = (None, None, None, Vec::new());
+        let mut mode = Mode::Ask;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-m" | "--model" => model = value(&mut args, &arg)?,
                 "--effort" => effort = Some(value(&mut args, &arg)?),
+                "--mode" => {
+                    let name = value(&mut args, &arg)?;
+                    mode = Mode::parse(&name).ok_or(format!("unknown mode {name}; use ask, edits, read-only or trust"))?;
+                }
                 "-s" | "--system" => system = Some(value(&mut args, &arg)?),
                 "--record" => record = Some(PathBuf::from(value(&mut args, &arg)?)),
                 "--" => words.extend(args.by_ref()),
@@ -151,7 +169,7 @@ impl AskArgs {
         if words.is_empty() {
             return Err("nothing to ask; see `rein --help`".into());
         }
-        Ok(AskArgs { model, effort, system, record, prompt: words.join(" ") })
+        Ok(AskArgs { model, effort, system, mode, record, prompt: words.join(" ") })
     }
 }
 
@@ -166,10 +184,11 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         None => None,
     };
     let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
+    let permissions = load_permissions(&root, args.mode)?;
     let mut agent = Agent {
         model: OpenAi { client, record },
         tools: Tools::new(root),
-        permissions: Permissions::default(),
+        permissions,
         model_name: args.model,
         instructions: args.system,
         reasoning_effort: args.effort,
@@ -183,6 +202,29 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         Outcome::Done => Ok(()),
         Outcome::TurnLimit => Err(format!("stopped after {MAX_TURNS} turns of tool calls; ask again to continue")),
     }
+}
+
+/// The mode plus the project's `.rein/permissions`, if it has one. Says what
+/// it's using whenever that's anything other than the plain default.
+fn load_permissions(root: &Path, mode: Mode) -> CliResult<Permissions> {
+    let path = root.join(".rein").join("permissions");
+    let rules = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("can't read .rein/permissions: {e}")),
+    };
+    let permissions = Permissions::new(mode, &rules).map_err(|e| format!(".rein/permissions {e}"))?;
+    let count = permissions.rule_count();
+    if count > 0 {
+        eprintln!("Using {count} rule{} from .rein/permissions", if count == 1 { "" } else { "s" });
+    }
+    match mode {
+        Mode::Ask => {}
+        Mode::Edits => eprintln!("Mode: edits (file changes in this folder don't ask; commands do)"),
+        Mode::ReadOnly => eprintln!("Mode: read-only (nothing runs or changes)"),
+        Mode::Trust => eprintln!("Mode: trust. Commands run and files change without asking; only deny rules stop them"),
+    }
+    Ok(permissions)
 }
 
 /// The terminal as rein's [`Ui`]: answer text on stdout, everything else
@@ -208,7 +250,7 @@ impl Ui for Terminal {
         self.mid_line = !delta.ends_with('\n');
     }
 
-    fn approve(&mut self, call: &ToolCall) -> bool {
+    fn approve(&mut self, call: &ToolCall) -> Approval {
         self.end_line();
         if let Some(preview) = preview(call) {
             eprint!("{preview}");
@@ -217,15 +259,27 @@ impl Ui for Terminal {
             "bash" => format!("run {}?", show(call)),
             _ => format!("{}?", show(call)),
         };
-        eprint!("{question} [y/N] ");
+        let always = match call.name.as_str() {
+            "bash" => "a = yes, and don't ask again for this command",
+            _ => "a = yes, and don't ask again about file changes",
+        };
+        eprint!("{question} [y/N/a] ({always}) ");
         let mut answer = String::new();
         // No answer (for example, input isn't a terminal) means no.
-        std::io::stdin().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes")
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            return Approval::No;
+        }
+        approval(&answer)
     }
 
     fn tool_started(&mut self, call: &ToolCall) {
         self.end_line();
         eprintln!("> {}", show(call));
+    }
+
+    fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
+        self.end_line();
+        eprintln!("x {}: {reason}", show(call));
     }
 
     fn tool_finished(&mut self, _call: &ToolCall, output: &str) {
@@ -256,6 +310,15 @@ fn show(call: &ToolCall) -> String {
         ("read" | "write" | "edit", Some(path), _) => format!("{} {path}", call.name),
         ("bash", _, Some(command)) => format!("`{command}`"),
         _ => format!("{} {}", call.name, call.arguments),
+    }
+}
+
+/// Reads a typed answer: y or a; anything else, including nothing, is no.
+fn approval(answer: &str) -> Approval {
+    match answer.trim() {
+        "y" | "Y" | "yes" => Approval::Yes,
+        "a" | "A" | "always" => Approval::Always,
+        _ => Approval::No,
     }
 }
 
@@ -380,6 +443,17 @@ mod tests {
         let write = call("write", rein_llm::serde_json::json!({"path": "n.txt", "content": "hi\nthere"}));
         assert_eq!(preview(&write).unwrap(), "  + hi\n  + there\n");
         assert_eq!(preview(&call("bash", rein_llm::serde_json::json!({"command": "ls"}))), None);
+    }
+
+    #[test]
+    fn reads_answers_and_modes() {
+        assert_eq!(approval("y\n"), Approval::Yes);
+        assert_eq!(approval("a\n"), Approval::Always);
+        assert_eq!(approval("\n"), Approval::No);
+        assert_eq!(approval("yolo"), Approval::No);
+        let parsed = args("--mode edits fix the bug").unwrap();
+        assert_eq!((parsed.mode, parsed.prompt.as_str()), (Mode::Edits, "fix the bug"));
+        assert_eq!(args("--mode yolo hi").err().as_deref(), Some("unknown mode yolo; use ask, edits, read-only or trust"));
     }
 
     #[test]

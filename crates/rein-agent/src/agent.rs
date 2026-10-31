@@ -20,12 +20,24 @@ pub trait Model {
     fn respond(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> impl Future<Output = Result<(Vec<Item>, Usage)>>;
 }
 
+/// The answer to "may this run?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    Yes,
+    /// Yes, and don't ask again this session: for this exact command, or
+    /// for all file changes.
+    Always,
+    No,
+}
+
 /// Whoever is at the keyboard: sees what happens, and decides what may run.
 pub trait Ui {
     fn text(&mut self, delta: &str);
-    /// Asked before every command and file change. Return `false` to refuse.
-    fn approve(&mut self, call: &ToolCall) -> bool;
+    /// Asked when the permissions say to ask.
+    fn approve(&mut self, call: &ToolCall) -> Approval;
     fn tool_started(&mut self, call: &ToolCall);
+    /// A call the permissions refused without asking, and why.
+    fn tool_blocked(&mut self, call: &ToolCall, reason: &str);
     fn tool_finished(&mut self, call: &ToolCall, output: &str);
     fn usage(&mut self, usage: &Usage);
 }
@@ -85,12 +97,21 @@ impl<M: Model> Agent<M> {
             for call in calls {
                 let approved = match self.permissions.decide(&call) {
                     Decision::Allow => Ok(()),
-                    Decision::Deny(reason) => Err(reason),
-                    Decision::Ask if ui.approve(&call) => Ok(()),
-                    Decision::Ask => Err(match call.name.as_str() {
-                        "bash" => "The user declined to run this command.".to_owned(),
-                        _ => "The user declined this change.".to_owned(),
-                    }),
+                    Decision::Deny(reason) => {
+                        ui.tool_blocked(&call, &reason);
+                        Err(reason)
+                    }
+                    Decision::Ask => match ui.approve(&call) {
+                        Approval::Yes => Ok(()),
+                        Approval::Always => {
+                            self.permissions.remember(&call);
+                            Ok(())
+                        }
+                        Approval::No => Err(match call.name.as_str() {
+                            "bash" => "The user declined to run this command.".to_owned(),
+                            _ => "The user declined this change.".to_owned(),
+                        }),
+                    },
                 };
                 let output = match approved {
                     Ok(()) => {
@@ -168,9 +189,9 @@ mod tests {
         }
     }
 
-    /// Approves (or refuses) every command and keeps a log of what it saw.
+    /// Gives the same answer every time and keeps a log of what it saw.
     struct Person {
-        approves: bool,
+        answer: Approval,
         log: Vec<String>,
     }
 
@@ -178,12 +199,15 @@ mod tests {
         fn text(&mut self, delta: &str) {
             self.log.push(format!("text {delta}"));
         }
-        fn approve(&mut self, call: &ToolCall) -> bool {
+        fn approve(&mut self, call: &ToolCall) -> Approval {
             self.log.push(format!("asked {}", call.arguments));
-            self.approves
+            self.answer
         }
         fn tool_started(&mut self, call: &ToolCall) {
             self.log.push(format!("ran {}", call.name));
+        }
+        fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
+            self.log.push(format!("blocked {}: {reason}", call.name));
         }
         fn tool_finished(&mut self, _: &ToolCall, output: &str) {
             self.log.push(format!("result {output}"));
@@ -220,7 +244,7 @@ mod tests {
                 vec![Item::Assistant("It printed hi.".into())],
             ],
         );
-        let mut person = Person { approves: true, log: Vec::new() };
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         assert_eq!(agent.send("say hi".into(), &mut person).await.unwrap(), Outcome::Done);
 
         assert_eq!(person.log, [r#"asked {"command":"echo hi"}"#, "ran bash", "result hi\n[exit code 0]", "text It printed hi."]);
@@ -245,7 +269,7 @@ mod tests {
     async fn a_refused_command_never_runs() {
         let mut agent =
             agent("refuse", vec![vec![bash("c1", "touch made-it")], vec![Item::Assistant("Okay.".into())]]);
-        let mut person = Person { approves: false, log: Vec::new() };
+        let mut person = Person { answer: Approval::No, log: Vec::new() };
         agent.send("make a file".into(), &mut person).await.unwrap();
 
         assert!(!person.log.contains(&"ran bash".to_owned()));
@@ -265,7 +289,7 @@ mod tests {
             arguments: json!({"path": "notes.txt", "content": "hi"}).to_string(),
         });
         let mut agent = agent("refuse-write", vec![vec![write], vec![Item::Assistant("Okay.".into())]]);
-        let mut person = Person { approves: false, log: Vec::new() };
+        let mut person = Person { answer: Approval::No, log: Vec::new() };
         agent.send("write a note".into(), &mut person).await.unwrap();
 
         assert!(person.log[0].starts_with("asked"), "{:?}", person.log);
@@ -279,20 +303,32 @@ mod tests {
         let turns = vec![vec![bash("c1", "echo allowed"), bash("c2", "git push")], vec![Item::Assistant("Done.".into())]];
         let mut agent = agent("rules", turns);
         agent.permissions = Permissions::new(Mode::Ask, "allow echo\ndeny git push").unwrap();
-        let mut person = Person { approves: true, log: Vec::new() };
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("go".into(), &mut person).await.unwrap();
 
         // Nothing was asked: one rule allowed, the other blocked.
         assert!(!person.log.iter().any(|l| l.starts_with("asked")), "{:?}", person.log);
         assert!(person.log.contains(&"result allowed\n[exit code 0]".to_owned()));
         assert!(agent.history.contains(&Item::ToolResult { call_id: "c2".into(), output: "Blocked by a rule: `deny git push`.".into() }));
+        assert!(person.log.contains(&"blocked bash: Blocked by a rule: `deny git push`.".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn always_means_not_asking_again() {
+        let turns = vec![vec![bash("c1", "echo once")], vec![bash("c2", "echo once")], vec![Item::Assistant("Done.".into())]];
+        let mut agent = agent("always", turns);
+        let mut person = Person { answer: Approval::Always, log: Vec::new() };
+        agent.send("go".into(), &mut person).await.unwrap();
+        let asked = person.log.iter().filter(|l| l.starts_with("asked")).count();
+        assert_eq!(asked, 1, "{:?}", person.log);
+        assert_eq!(person.log.iter().filter(|l| *l == "ran bash").count(), 2);
     }
 
     #[tokio::test]
     async fn stops_a_model_that_never_stops_asking() {
         let turns = (0..MAX_TURNS).map(|i| vec![bash(&format!("c{i}"), "true")]).collect();
         let mut agent = agent("limit", turns);
-        let mut person = Person { approves: true, log: Vec::new() };
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         assert_eq!(agent.send("loop".into(), &mut person).await.unwrap(), Outcome::TurnLimit);
     }
 }
