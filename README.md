@@ -48,12 +48,34 @@ In a conversation:
 | `\` at the end of a line | keep typing on the next line |
 | Ctrl-C while rein works | stop that turn; the conversation goes on |
 | Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
+| `/compact [focus]` | make room now; the summary keeps `focus` in mind |
 | Ctrl-D or `/exit` | leave |
 
 Every conversation is saved as it goes, one JSON line per message, tool call
 and result, in `~/.config/rein/sessions/<this folder>/`. The files are readable
 only by you. `rein -c` picks up the latest one in the folder you're in, with
 the same history, system prompt and cache key, so it usually starts warm.
+
+## When the conversation gets long
+
+Every request carries the whole conversation, so the usage line after each
+one also says how full it is: `context 42k/150k`. Past the limit (150,000
+tokens, or `$REIN_COMPACT_AT`, and never more than 90% of the model's window)
+rein makes room, cheapest first:
+
+1. **Stale tool output is retired:** an old read of a file that was read or
+   changed again later, and command output from before your last two
+   messages. Each becomes one line saying what was there. When that's enough,
+   nothing else happens.
+2. **Otherwise the model writes a summary.** It's asked with the conversation
+   exactly as it was plus one more message, so the request is mostly served
+   from the prompt cache. rein adds its own record of your messages, the
+   files changed and the commands run, so those facts can't be misremembered.
+   The conversation then continues from the first message, the summary, and
+   its latest part word for word.
+
+Nothing is lost: the session file keeps everything, and the model's `recall`
+tool searches the whole conversation, including what was compacted away.
 
 ## What rein tells the model
 
