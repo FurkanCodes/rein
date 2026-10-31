@@ -12,6 +12,12 @@ use crate::tools::Tools;
 /// After this many model turns in a row, stop and give the user control back.
 pub const MAX_TURNS: usize = 25;
 
+/// Tools that change something on your computer, so they ask you first.
+/// `read` doesn't: it can only look inside the project.
+fn needs_approval(tool: &str) -> bool {
+    matches!(tool, "bash" | "write" | "edit")
+}
+
 /// Something that answers requests. The real one is OpenAI; tests script one.
 pub trait Model {
     /// Sends one request, passing answer text to `on_text` as it streams, and
@@ -22,7 +28,7 @@ pub trait Model {
 /// Whoever is at the keyboard: sees what happens, and decides what may run.
 pub trait Ui {
     fn text(&mut self, delta: &str);
-    /// Asked before every command. Return `false` to refuse it.
+    /// Asked before every command and file change. Return `false` to refuse.
     fn approve(&mut self, call: &ToolCall) -> bool;
     fn tool_started(&mut self, call: &ToolCall);
     fn tool_finished(&mut self, call: &ToolCall, output: &str);
@@ -80,8 +86,12 @@ impl<M: Model> Agent<M> {
             }
 
             for call in calls {
-                let output = if call.name == "bash" && !ui.approve(&call) {
-                    "The user declined to run this command.".to_owned()
+                let output = if needs_approval(&call.name) && !ui.approve(&call) {
+                    match call.name.as_str() {
+                        "bash" => "The user declined to run this command.",
+                        _ => "The user declined this change.",
+                    }
+                    .to_owned()
                 } else {
                     ui.tool_started(&call);
                     self.tools.run(&call).await
@@ -240,6 +250,23 @@ mod tests {
             call_id: "c1".into(),
             output: "The user declined to run this command.".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn file_changes_ask_first_too() {
+        let write = Item::ToolCall(ToolCall {
+            call_id: "c1".into(),
+            name: "write".into(),
+            arguments: json!({"path": "notes.txt", "content": "hi"}).to_string(),
+        });
+        let mut agent = agent("refuse-write", vec![vec![write], vec![Item::Assistant("Okay.".into())]]);
+        let mut person = Person { approves: false, log: Vec::new() };
+        agent.send("write a note".into(), &mut person).await.unwrap();
+
+        assert!(person.log[0].starts_with("asked"), "{:?}", person.log);
+        let root = std::env::temp_dir().join(format!("rein-agent-{}-refuse-write", std::process::id()));
+        assert!(!root.join("notes.txt").exists());
+        assert!(agent.history.contains(&Item::ToolResult { call_id: "c1".into(), output: "The user declined this change.".into() }));
     }
 
     #[tokio::test]

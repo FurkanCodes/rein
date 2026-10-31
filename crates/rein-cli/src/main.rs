@@ -208,7 +208,14 @@ impl Ui for Terminal {
 
     fn approve(&mut self, call: &ToolCall) -> bool {
         self.end_line();
-        eprint!("run {}? [y/N] ", show(call));
+        if let Some(preview) = preview(call) {
+            eprint!("{preview}");
+        }
+        let question = match call.name.as_str() {
+            "bash" => format!("run {}?", show(call)),
+            _ => format!("{}?", show(call)),
+        };
+        eprint!("{question} [y/N] ");
         let mut answer = String::new();
         // No answer (for example, input isn't a terminal) means no.
         std::io::stdin().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes")
@@ -244,10 +251,40 @@ fn usage_line(u: &Usage) -> String {
 fn show(call: &ToolCall) -> String {
     let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).unwrap_or_default();
     match (call.name.as_str(), args["path"].as_str(), args["command"].as_str()) {
-        ("read", Some(path), _) => format!("read {path}"),
+        ("read" | "write" | "edit", Some(path), _) => format!("{} {path}", call.name),
         ("bash", _, Some(command)) => format!("`{command}`"),
         _ => format!("{} {}", call.name, call.arguments),
     }
+}
+
+/// What a file change would do, shown before you approve it: the lines an
+/// edit removes (`-`) and adds (`+`), or the start of a file being written.
+fn preview(call: &ToolCall) -> Option<String> {
+    let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).ok()?;
+    let mut out = String::new();
+    match call.name.as_str() {
+        "edit" => {
+            if args["replace_all"].as_bool() == Some(true) {
+                out.push_str("  (every occurrence)\n");
+            }
+            out.push_str(&marked(args["old_text"].as_str()?, '-'));
+            out.push_str(&marked(args["new_text"].as_str()?, '+'));
+        }
+        "write" => out.push_str(&marked(args["content"].as_str()?, '+')),
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// The first lines of `text`, each prefixed with `mark`.
+fn marked(text: &str, mark: char) -> String {
+    const SHOWN: usize = 12;
+    let mut out: String = text.lines().take(SHOWN).map(|line| format!("  {mark} {line}\n")).collect();
+    let more = text.lines().count().saturating_sub(SHOWN);
+    if more > 0 {
+        out.push_str(&format!("  {mark} … {more} more lines\n"));
+    }
+    out
 }
 
 /// A client using the saved ChatGPT sign-in, or else `OPENAI_API_KEY`.
@@ -331,6 +368,17 @@ fn open_browser(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edits_are_previewed_before_approval() {
+        let call = |name: &str, args: rein_llm::serde_json::Value| ToolCall { call_id: "c".into(), name: name.into(), arguments: args.to_string() };
+        let edit = call("edit", rein_llm::serde_json::json!({"path": "a.rs", "old_text": "fn a() {}", "new_text": "fn b() {}", "replace_all": false}));
+        assert_eq!(show(&edit), "edit a.rs");
+        assert_eq!(preview(&edit).unwrap(), "  - fn a() {}\n  + fn b() {}\n");
+        let write = call("write", rein_llm::serde_json::json!({"path": "n.txt", "content": "hi\nthere"}));
+        assert_eq!(preview(&write).unwrap(), "  + hi\n  + there\n");
+        assert_eq!(preview(&call("bash", rein_llm::serde_json::json!({"command": "ls"}))), None);
+    }
 
     #[test]
     fn usage_shows_the_cache_hit_rate() {

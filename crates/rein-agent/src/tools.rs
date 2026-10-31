@@ -2,7 +2,7 @@
 //! returns text for the model, also when something goes wrong: an error the
 //! model can read is one it can work around.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -32,6 +32,20 @@ struct BashArgs {
     command: String,
 }
 
+#[derive(Deserialize)]
+struct WriteArgs {
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct EditArgs {
+    path: String,
+    old_text: String,
+    new_text: String,
+    replace_all: bool,
+}
+
 impl Tools {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Tools { root: root.into(), timeout: Duration::from_secs(60) }
@@ -53,6 +67,29 @@ impl Tools {
                 })),
             },
             Tool {
+                name: "write".into(),
+                description: "Create a text file, or replace an existing file's whole contents. Missing folders \
+                              are created. To change part of a file, use edit instead."
+                    .into(),
+                parameters: object(json!({
+                    "path": { "type": "string", "description": "Path relative to the project root." },
+                    "content": { "type": "string", "description": "The complete new contents of the file." }
+                })),
+            },
+            Tool {
+                name: "edit".into(),
+                description: "Replace text in a file. old_text must match the file exactly, spaces and \
+                              indentation included, and appear exactly once unless replace_all is true: add \
+                              surrounding lines to make it unique. Read the file first if you haven't."
+                    .into(),
+                parameters: object(json!({
+                    "path": { "type": "string", "description": "Path relative to the project root." },
+                    "old_text": { "type": "string", "description": "The exact text to replace." },
+                    "new_text": { "type": "string", "description": "The text to put in its place." },
+                    "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of exactly one." }
+                })),
+            },
+            Tool {
                 name: "bash".into(),
                 description: "Run a shell command in the project root and return its output and exit code. \
                               The user approves each command before it runs."
@@ -69,6 +106,8 @@ impl Tools {
         let result = match call.name.as_str() {
             "read" => self.read(&call.arguments).await,
             "bash" => self.bash(&call.arguments).await,
+            "write" => self.write(&call.arguments).await,
+            "edit" => self.edit(&call.arguments).await,
             other => Err(format!("there is no tool called {other}")),
         };
         truncate(result.unwrap_or_else(|e| format!("error: {e}")))
@@ -87,6 +126,55 @@ impl Tools {
         let root = self.root.canonicalize().map_err(|e| format!("can't open the project directory: {e}"))?;
         let full = root.join(path).canonicalize().map_err(|e| format!("can't read {path}: {e}"))?;
         if full.starts_with(&root) { Ok(full) } else { Err(format!("{path} is outside the project")) }
+    }
+
+    /// Where `path` may be written: inside the project, even for a file or
+    /// folders that don't exist yet. The deepest part that does exist is
+    /// resolved, following symlinks, and must be inside the project.
+    fn writable(&self, path: &str) -> Result<PathBuf, String> {
+        let root = self.root.canonicalize().map_err(|e| format!("can't open the project directory: {e}"))?;
+        if Path::new(path).components().any(|c| c == Component::ParentDir) {
+            return Err(format!("{path} contains `..`; use a path inside the project"));
+        }
+        let full = root.join(path);
+        // Walk up to the deepest part that exists. `symlink_metadata` doesn't
+        // follow links, so a link pointing nowhere still counts as existing
+        // and gets resolved (and refused) below.
+        let mut existing = full.as_path();
+        let mut missing = Vec::new();
+        while existing.symlink_metadata().is_err() {
+            missing.push(existing.file_name().ok_or_else(|| format!("{path} isn't a file path"))?);
+            existing = existing.parent().ok_or_else(|| format!("{path} isn't a file path"))?;
+        }
+        let resolved = existing.canonicalize().map_err(|e| format!("can't write {path}: {e}"))?;
+        if !resolved.starts_with(&root) {
+            return Err(format!("{path} is outside the project"));
+        }
+        Ok(missing.iter().rev().fold(resolved, |dir, name| dir.join(name)))
+    }
+
+    async fn write(&self, arguments: &str) -> Result<String, String> {
+        let args: WriteArgs = parse(arguments)?;
+        let path = self.writable(&args.path)?;
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir).await.map_err(|e| format!("can't create the folders for {}: {e}", args.path))?;
+        }
+        let existed = path.exists();
+        tokio::fs::write(&path, &args.content).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
+        let verb = if existed { "replaced" } else { "created" };
+        let lines = args.content.lines().count();
+        Ok(format!("{verb} {} ({lines} line{})", args.path, if lines == 1 { "" } else { "s" }))
+    }
+
+    async fn edit(&self, arguments: &str) -> Result<String, String> {
+        let args: EditArgs = parse(arguments)?;
+        let path = self.inside_root(&args.path)?;
+        let bytes = tokio::fs::read(&path).await.map_err(|e| format!("can't read {}: {e}", args.path))?;
+        let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
+        let edited = replace(&text, &args.old_text, &args.new_text, args.replace_all).map_err(|e| format!("{e} in {}", args.path))?;
+        tokio::fs::write(&path, edited.text).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
+        let times = if edited.count == 1 { "1 place".to_owned() } else { format!("{} places", edited.count) };
+        Ok(format!("edited {}: replaced {times}", args.path))
     }
 
     async fn bash(&self, arguments: &str) -> Result<String, String> {
@@ -114,6 +202,42 @@ impl Tools {
         };
         Ok(format!("{text}[{status}]"))
     }
+}
+
+struct Edited {
+    text: String,
+    count: usize,
+}
+
+/// Replaces `old` with `new` in a file's text. Matching ignores the file's
+/// line endings and byte-order mark, and the result keeps both, so the
+/// model never has to know about either.
+fn replace(file: &str, old: &str, new: &str, replace_all: bool) -> Result<Edited, String> {
+    let (bom, body) = match file.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", file),
+    };
+    let crlf = body.contains("\r\n");
+    let lf = |s: &str| s.replace("\r\n", "\n");
+    let (body, old, new) = (lf(body), lf(old), lf(new));
+    if old.is_empty() {
+        return Err("old_text is empty; to create a file, use write".into());
+    }
+    if old == new {
+        return Err("old_text and new_text are the same".into());
+    }
+    let count = body.matches(&old).count();
+    match count {
+        0 => return Err("old_text wasn't found; it must match exactly, spaces and indentation included. Read the file and copy the text".into()),
+        1 => {}
+        n if !replace_all => return Err(format!("old_text appears {n} times; add surrounding lines to make it unique, or set replace_all")),
+        _ => {}
+    }
+    let mut text = body.replace(&old, &new);
+    if crlf {
+        text = text.replace('\n', "\r\n");
+    }
+    Ok(Edited { text: format!("{bom}{text}"), count })
 }
 
 fn parse<T: DeserializeOwned>(arguments: &str) -> Result<T, String> {
@@ -200,6 +324,57 @@ mod tests {
         assert_eq!(tools.run(&call("rm", json!({}))).await, "error: there is no tool called rm");
         let bad = tools.run(&call("read", json!({"file": "a.txt"}))).await;
         assert!(bad.starts_with("error: bad arguments: missing field `path`"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn write_creates_files_and_folders_inside_the_project() {
+        let dir = project("write", &[]);
+        let tools = Tools::new(&dir);
+        let created = tools.run(&call("write", json!({"path": "src/new/a.txt", "content": "one\ntwo\n"}))).await;
+        assert_eq!(created, "created src/new/a.txt (2 lines)");
+        assert_eq!(std::fs::read_to_string(dir.join("src/new/a.txt")).unwrap(), "one\ntwo\n");
+        let replaced = tools.run(&call("write", json!({"path": "src/new/a.txt", "content": "three"}))).await;
+        assert_eq!(replaced, "replaced src/new/a.txt (1 line)");
+    }
+
+    #[tokio::test]
+    async fn write_refuses_paths_outside_the_project() {
+        let dir = project("write-outside", &[]);
+        let outside = std::env::temp_dir().join(format!("rein-tools-{}-elsewhere", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        let tools = Tools::new(&dir);
+        for (path, error) in [
+            ("../escape.txt", "error: ../escape.txt contains `..`; use a path inside the project"),
+            ("/tmp/escape.txt", "error: /tmp/escape.txt is outside the project"),
+            ("link/escape.txt", "error: link/escape.txt is outside the project"),
+        ] {
+            assert_eq!(tools.run(&call("write", json!({"path": path, "content": "x"}))).await, error);
+        }
+        assert!(!outside.join("escape.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_exactly_one_match() {
+        let dir = project("edit", &[("a.rs", "fn a() {}\nfn b() {}\n")]);
+        let tools = Tools::new(&dir);
+        let edit = |old: &str, new: &str, all: bool| call("edit", json!({"path": "a.rs", "old_text": old, "new_text": new, "replace_all": all}));
+        assert_eq!(tools.run(&edit("fn b() {}", "fn c() {}", false)).await, "edited a.rs: replaced 1 place");
+        assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "fn a() {}\nfn c() {}\n");
+
+        let twice = tools.run(&edit("() {}", "() { todo!() }", false)).await;
+        assert_eq!(twice, "error: old_text appears 2 times; add surrounding lines to make it unique, or set replace_all in a.rs");
+        assert_eq!(tools.run(&edit("() {}", "() { todo!() }", true)).await, "edited a.rs: replaced 2 places");
+
+        let missing = tools.run(&edit("fn z() {}", "fn y() {}", false)).await;
+        assert!(missing.starts_with("error: old_text wasn't found"), "{missing}");
+    }
+
+    #[test]
+    fn edits_keep_line_endings_and_the_byte_order_mark() {
+        let edited = replace("\u{feff}one\r\ntwo\r\n", "one\ntwo", "uno\ndos", false).unwrap();
+        assert_eq!(edited.text, "\u{feff}uno\r\ndos\r\n");
+        assert_eq!(replace("a\n", "a", "a", false).err().as_deref(), Some("old_text and new_text are the same"));
     }
 
     #[test]
