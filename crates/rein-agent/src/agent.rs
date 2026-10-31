@@ -7,16 +7,11 @@ use std::future::Future;
 use rein_llm::openai::{Client, Request};
 use rein_llm::{Error, Event, Item, Result, ToolCall, Usage};
 
+use crate::permissions::{Decision, Permissions};
 use crate::tools::Tools;
 
 /// After this many model turns in a row, stop and give the user control back.
 pub const MAX_TURNS: usize = 25;
-
-/// Tools that change something on your computer, so they ask you first.
-/// `read` doesn't: it can only look inside the project.
-fn needs_approval(tool: &str) -> bool {
-    matches!(tool, "bash" | "write" | "edit")
-}
 
 /// Something that answers requests. The real one is OpenAI; tests script one.
 pub trait Model {
@@ -46,6 +41,8 @@ pub enum Outcome {
 pub struct Agent<M> {
     pub model: M,
     pub tools: Tools,
+    /// What may run without asking.
+    pub permissions: Permissions,
     pub model_name: String,
     pub instructions: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -86,15 +83,21 @@ impl<M: Model> Agent<M> {
             }
 
             for call in calls {
-                let output = if needs_approval(&call.name) && !ui.approve(&call) {
-                    match call.name.as_str() {
-                        "bash" => "The user declined to run this command.",
-                        _ => "The user declined this change.",
+                let approved = match self.permissions.decide(&call) {
+                    Decision::Allow => Ok(()),
+                    Decision::Deny(reason) => Err(reason),
+                    Decision::Ask if ui.approve(&call) => Ok(()),
+                    Decision::Ask => Err(match call.name.as_str() {
+                        "bash" => "The user declined to run this command.".to_owned(),
+                        _ => "The user declined this change.".to_owned(),
+                    }),
+                };
+                let output = match approved {
+                    Ok(()) => {
+                        ui.tool_started(&call);
+                        self.tools.run(&call).await
                     }
-                    .to_owned()
-                } else {
-                    ui.tool_started(&call);
-                    self.tools.run(&call).await
+                    Err(reason) => reason,
                 };
                 ui.tool_finished(&call, &output);
                 self.history.push(Item::ToolResult { call_id: call.call_id, output });
@@ -138,6 +141,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::permissions::Mode;
 
     /// Plays back scripted turns and remembers every request it was sent.
     struct Scripted {
@@ -198,6 +202,7 @@ mod tests {
         Agent {
             model: Scripted::new(turns),
             tools: Tools::new(root),
+            permissions: Permissions::default(),
             model_name: "m".into(),
             instructions: None,
             reasoning_effort: None,
@@ -267,6 +272,20 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rein-agent-{}-refuse-write", std::process::id()));
         assert!(!root.join("notes.txt").exists());
         assert!(agent.history.contains(&Item::ToolResult { call_id: "c1".into(), output: "The user declined this change.".into() }));
+    }
+
+    #[tokio::test]
+    async fn rules_run_or_block_without_asking() {
+        let turns = vec![vec![bash("c1", "echo allowed"), bash("c2", "git push")], vec![Item::Assistant("Done.".into())]];
+        let mut agent = agent("rules", turns);
+        agent.permissions = Permissions::new(Mode::Ask, "allow echo\ndeny git push").unwrap();
+        let mut person = Person { approves: true, log: Vec::new() };
+        agent.send("go".into(), &mut person).await.unwrap();
+
+        // Nothing was asked: one rule allowed, the other blocked.
+        assert!(!person.log.iter().any(|l| l.starts_with("asked")), "{:?}", person.log);
+        assert!(person.log.contains(&"result allowed\n[exit code 0]".to_owned()));
+        assert!(agent.history.contains(&Item::ToolResult { call_id: "c2".into(), output: "Blocked by a rule: `deny git push`.".into() }));
     }
 
     #[tokio::test]

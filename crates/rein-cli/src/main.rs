@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use rein_llm::openai::signin::{self, Credentials};
 use rein_agent::agent::{Agent, MAX_TURNS, OpenAi, Outcome, Ui};
+use rein_agent::permissions::Permissions;
 use rein_agent::tools::Tools;
 use rein_llm::openai::Client;
 use rein_llm::{ToolCall, Usage, store};
@@ -168,6 +169,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     let mut agent = Agent {
         model: OpenAi { client, record },
         tools: Tools::new(root),
+        permissions: Permissions::default(),
         model_name: args.model,
         instructions: args.system,
         reasoning_effort: args.effort,

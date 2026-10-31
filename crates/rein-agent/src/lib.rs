@@ -3,4 +3,5 @@
 //! rein-llm's `Item`s and `Event`s.
 
 pub mod agent;
+pub mod permissions;
 pub mod tools;

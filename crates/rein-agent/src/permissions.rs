@@ -1,0 +1,380 @@
+//! What the model may do without asking. A mode sets the broad policy;
+//! rules in a project file refine it for specific commands:
+//!
+//! ```text
+//! # .rein/permissions: one rule per line
+//! allow cargo test
+//! allow git status
+//! ask   git commit
+//! deny  git push
+//! ```
+//!
+//! Deny beats ask beats allow. A command only runs without asking if every
+//! part of it is allowed: `allow cargo test` doesn't cover
+//! `cargo test && rm -rf target`. Anything the splitter can't take apart,
+//! like `$(...)`, redirects or globs, is asked about, never allowed.
+//!
+//! Rules aren't a sandbox: `deny rm` doesn't stop `/bin/rm`, or a script
+//! that deletes files itself. They decide when rein asks you.
+
+use rein_llm::ToolCall;
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Ask before every command and file change.
+    #[default]
+    Ask,
+    /// File changes inside the project are fine; commands still ask.
+    Edits,
+    /// Look, never change: file changes and commands are refused.
+    ReadOnly,
+    /// Run everything without asking, except what deny rules block.
+    Trust,
+}
+
+impl Mode {
+    pub fn parse(name: &str) -> Option<Mode> {
+        match name {
+            "ask" => Some(Mode::Ask),
+            "edits" => Some(Mode::Edits),
+            "read-only" => Some(Mode::ReadOnly),
+            "trust" => Some(Mode::Trust),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Ask,
+    /// Refused, with the reason the model is told.
+    Deny(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Rule {
+    kind: Kind,
+    /// The command's first words, e.g. `["cargo", "test"]`.
+    prefix: Vec<String>,
+}
+
+impl Rule {
+    /// Whole words only: `ls` matches `ls -la` but not `lsof`.
+    fn matches(&self, command: &[String]) -> bool {
+        command.starts_with(&self.prefix)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Permissions {
+    pub mode: Mode,
+    rules: Vec<Rule>,
+    /// Exact commands you said yes to for the rest of this session.
+    approved: Vec<Vec<String>>,
+    /// Whether you said yes to all file changes for this session.
+    approved_edits: bool,
+}
+
+#[derive(Deserialize)]
+struct Command {
+    command: String,
+}
+
+impl Permissions {
+    /// Reads rules in the format shown at the top of this file. Blank lines
+    /// and `#` comments are skipped.
+    pub fn new(mode: Mode, rules: &str) -> Result<Self, String> {
+        let mut parsed = Vec::new();
+        for (n, line) in rules.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+            let kind = match word {
+                "allow" => Kind::Allow,
+                "ask" => Kind::Ask,
+                "deny" => Kind::Deny,
+                _ => return Err(format!("line {}: start with allow, ask or deny", n + 1)),
+            };
+            let prefix = match split_command(rest).as_deref() {
+                Some([one]) => one.clone(),
+                _ => return Err(format!("line {}: give one plain command, like `cargo test`", n + 1)),
+            };
+            parsed.push(Rule { kind, prefix });
+        }
+        Ok(Permissions { mode, rules: parsed, ..Default::default() })
+    }
+
+    pub fn decide(&self, call: &ToolCall) -> Decision {
+        match call.name.as_str() {
+            // `read` can only look, and only inside the project.
+            "read" => Decision::Allow,
+            "write" | "edit" => match self.mode {
+                Mode::ReadOnly => Decision::Deny("File changes are turned off: rein is in read-only mode.".into()),
+                Mode::Edits | Mode::Trust => Decision::Allow,
+                Mode::Ask if self.approved_edits => Decision::Allow,
+                Mode::Ask => Decision::Ask,
+            },
+            "bash" => match serde_json::from_str::<Command>(&call.arguments) {
+                Ok(c) => self.decide_command(&c.command),
+                Err(_) => Decision::Ask,
+            },
+            _ => Decision::Ask,
+        }
+    }
+
+    fn decide_command(&self, line: &str) -> Decision {
+        let parts = split_command(line);
+        // Deny first. When the splitter gives up, check every run of words
+        // in the line instead, so a deny rule still can't be dodged by
+        // adding a `$` somewhere.
+        let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+        let fallback: Vec<&[String]> = (0..words.len()).map(|i| &words[i..]).collect();
+        let candidates: Vec<&[String]> = match &parts {
+            Some(parts) => parts.iter().map(Vec::as_slice).collect(),
+            None => fallback,
+        };
+        if let Some(rule) = self.rules.iter().find(|r| r.kind == Kind::Deny && candidates.iter().any(|c| r.matches(c))) {
+            return Decision::Deny(format!("Blocked by a rule: `deny {}`.", rule.prefix.join(" ")));
+        }
+        match self.mode {
+            Mode::Trust => return Decision::Allow,
+            Mode::ReadOnly => return Decision::Deny("Commands are turned off: rein is in read-only mode.".into()),
+            Mode::Ask | Mode::Edits => {}
+        }
+        let Some(parts) = parts else { return Decision::Ask };
+        let rule = |part: &Vec<String>, kind: Kind| self.rules.iter().any(|r| r.kind == kind && r.matches(part));
+        if parts.iter().any(|p| rule(p, Kind::Ask)) {
+            return Decision::Ask;
+        }
+        if parts.iter().all(|p| rule(p, Kind::Allow) || self.approved.contains(p)) {
+            return Decision::Allow;
+        }
+        Decision::Ask
+    }
+
+    /// "Yes, and don't ask again this session": for a command, exactly these
+    /// commands; for a file change, all file changes.
+    pub fn remember(&mut self, call: &ToolCall) {
+        match call.name.as_str() {
+            "write" | "edit" => self.approved_edits = true,
+            "bash" => {
+                if let Ok(c) = serde_json::from_str::<Command>(&call.arguments)
+                    && let Some(parts) = split_command(&c.command)
+                {
+                    self.approved.extend(parts);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Splits a shell command line into its commands, each as a list of words,
+/// or returns `None` for anything it can't fully understand. It knows plain
+/// words, quotes, and `&&`, `||`, `;`, `|` and newlines between commands.
+/// Everything that could run or read something else gives up: `$`,
+/// backticks, `( )`, `{ }`, `< >`, globs, `~`, a lone `&`, and leading
+/// `NAME=value` settings.
+pub fn split_command(line: &str) -> Option<Vec<Vec<String>>> {
+    let mut commands = vec![Vec::new()];
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars().peekable();
+
+    fn end_word(commands: &mut [Vec<String>], word: &mut String, in_word: &mut bool) {
+        if *in_word {
+            commands.last_mut().expect("never empty").push(std::mem::take(word));
+            *in_word = false;
+        }
+    }
+
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => end_word(&mut commands, &mut word, &mut in_word),
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        // Expansion and escapes still work inside double quotes.
+                        '$' | '`' | '\\' => return None,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                match chars.next()? {
+                    '\n' => return None,
+                    c => word.push(c),
+                }
+            }
+            '&' | '|' | ';' | '\n' => {
+                match (c, chars.peek()) {
+                    ('&', Some('&')) | ('|', Some('|')) => {
+                        chars.next();
+                    }
+                    ('&', _) => return None, // `&` alone runs in the background
+                    _ => {}
+                }
+                end_word(&mut commands, &mut word, &mut in_word);
+                if commands.last().expect("never empty").is_empty() {
+                    return None; // `&& ls`, `ls ;; ls`
+                }
+                commands.push(Vec::new());
+            }
+            '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '*' | '?' | '[' | ']' | '~' | '!' | '#' => return None,
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    end_word(&mut commands, &mut word, &mut in_word);
+    // A trailing separator leaves an empty last command: `ls &&` is incomplete.
+    if commands.iter().any(Vec::is_empty) {
+        return None;
+    }
+    // `NAME=value cmd` changes the environment `cmd` runs in.
+    if commands.iter().any(|c| c[0].contains('=')) {
+        return None;
+    }
+    Some(commands)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn split(line: &str) -> Option<Vec<Vec<String>>> {
+        split_command(line)
+    }
+
+    fn cmds(commands: &[&[&str]]) -> Option<Vec<Vec<String>>> {
+        Some(commands.iter().map(|c| c.iter().map(|w| w.to_string()).collect()).collect())
+    }
+
+    #[test]
+    fn splits_plain_commands_and_quotes() {
+        assert_eq!(split("cargo test"), cmds(&[&["cargo", "test"]]));
+        assert_eq!(split("cargo test && rm -rf target"), cmds(&[&["cargo", "test"], &["rm", "-rf", "target"]]));
+        assert_eq!(split("git log | head -5; git status"), cmds(&[&["git", "log"], &["head", "-5"], &["git", "status"]]));
+        // Quotes keep operators inside one word.
+        assert_eq!(split("git commit -m 'fix: a && b'"), cmds(&[&["git", "commit", "-m", "fix: a && b"]]));
+        assert_eq!(split(r#"echo "two words" plain\ space"#), cmds(&[&["echo", "two words", "plain space"]]));
+        assert_eq!(split("cargo test --features=x"), cmds(&[&["cargo", "test", "--features=x"]]));
+    }
+
+    #[test]
+    fn gives_up_on_anything_it_cant_understand() {
+        for line in [
+            "echo $(pwd)",
+            "echo `pwd`",
+            "echo $HOME",
+            r#"echo "hi $USER""#,
+            "ls > out.txt",
+            "cat < secret",
+            "echo hi & echo bye",
+            "ls *.rs",
+            "cat ~/.ssh/id_rsa",
+            "(cd x && ls)",
+            "FOO=1 cargo test",
+            "cargo test &&",
+            "&& ls",
+            "echo 'unclosed",
+            "ls # comment",
+        ] {
+            assert_eq!(split_command(line), None, "{line}");
+        }
+    }
+
+    fn bash(command: &str) -> ToolCall {
+        ToolCall { call_id: "c".into(), name: "bash".into(), arguments: json!({ "command": command }).to_string() }
+    }
+
+    fn file(tool: &str) -> ToolCall {
+        ToolCall { call_id: "c".into(), name: tool.into(), arguments: json!({"path": "a.txt", "content": "x"}).to_string() }
+    }
+
+    const RULES: &str = "# rules\nallow cargo test\nallow git status\nallow ls\nask git status --short\ndeny git push\n";
+
+    #[test]
+    fn every_part_must_be_allowed() {
+        let p = Permissions::new(Mode::Ask, RULES).unwrap();
+        assert_eq!(p.decide(&bash("cargo test")), Decision::Allow);
+        assert_eq!(p.decide(&bash("cargo test --release && git status")), Decision::Allow);
+        assert_eq!(p.decide(&bash("cargo test && rm -rf target")), Decision::Ask);
+        assert_eq!(p.decide(&bash("cargo test > log.txt")), Decision::Ask);
+        // Whole words: `ls` doesn't cover `lsof`.
+        assert_eq!(p.decide(&bash("lsof -i")), Decision::Ask);
+    }
+
+    #[test]
+    fn deny_beats_ask_beats_allow() {
+        let p = Permissions::new(Mode::Ask, RULES).unwrap();
+        // `ask git status --short` wins over `allow git status`.
+        assert_eq!(p.decide(&bash("git status --short")), Decision::Ask);
+        let blocked = Decision::Deny("Blocked by a rule: `deny git push`.".into());
+        assert_eq!(p.decide(&bash("cargo test && git push")), blocked);
+        // Even when the splitter gives up, and even in trust mode.
+        assert_eq!(p.decide(&bash("echo $X; git push origin main")), blocked);
+        let trusting = Permissions::new(Mode::Trust, RULES).unwrap();
+        assert_eq!(trusting.decide(&bash("git push --force")), blocked);
+        assert_eq!(trusting.decide(&bash("rm -rf target")), Decision::Allow);
+    }
+
+    #[test]
+    fn modes_decide_file_changes_and_commands() {
+        let ask = Permissions::new(Mode::Ask, "").unwrap();
+        assert_eq!(ask.decide(&file("write")), Decision::Ask);
+        assert_eq!(ask.decide(&file("read")), Decision::Allow);
+        let edits = Permissions::new(Mode::Edits, "").unwrap();
+        assert_eq!(edits.decide(&file("edit")), Decision::Allow);
+        assert_eq!(edits.decide(&bash("ls")), Decision::Ask);
+        let read_only = Permissions::new(Mode::ReadOnly, RULES).unwrap();
+        assert!(matches!(read_only.decide(&file("write")), Decision::Deny(_)));
+        assert!(matches!(read_only.decide(&bash("cargo test")), Decision::Deny(_)));
+        assert_eq!(read_only.decide(&file("read")), Decision::Allow);
+    }
+
+    #[test]
+    fn remembering_covers_exactly_what_was_approved() {
+        let mut p = Permissions::new(Mode::Ask, "").unwrap();
+        p.remember(&bash("cargo build && cargo test"));
+        assert_eq!(p.decide(&bash("cargo test")), Decision::Allow);
+        assert_eq!(p.decide(&bash("cargo test --release")), Decision::Ask);
+        p.remember(&file("edit"));
+        assert_eq!(p.decide(&file("write")), Decision::Allow);
+    }
+
+    #[test]
+    fn bad_rules_are_reported_with_their_line() {
+        assert_eq!(Permissions::new(Mode::Ask, "allow ls\npermit ls").unwrap_err(), "line 2: start with allow, ask or deny");
+        assert_eq!(
+            Permissions::new(Mode::Ask, "allow ls && rm").unwrap_err(),
+            "line 1: give one plain command, like `cargo test`"
+        );
+    }
+}
