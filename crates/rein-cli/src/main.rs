@@ -1057,6 +1057,10 @@ struct Terminal {
     after_step: bool,
     /// rein's label has been shown this turn; what follows lines up under it.
     labeled: bool,
+    /// What the model says it was thinking about, as it streams in, and
+    /// how many of its headlines are on screen.
+    thoughts: String,
+    thoughts_shown: usize,
     /// The model is writing a summary, not an answer.
     compacting: bool,
     turn: TurnStats,
@@ -1106,6 +1110,8 @@ impl Terminal {
             step: None,
             after_step: false,
             labeled: false,
+            thoughts: String::new(),
+            thoughts_shown: 0,
             compacting: false,
             turn: TurnStats::default(),
         }
@@ -1207,6 +1213,19 @@ impl Terminal {
         if self.labeled { " ".repeat(GUTTER) } else { self.err.label("rein") }
     }
 
+    /// `rein ◐ Thinking… (3s · ctrl-c to stop)`.
+    fn spin_thinking(&mut self) {
+        if !self.fancy {
+            return;
+        }
+        let s = self.err;
+        let lead = self.peek_lead();
+        self.spinner = Some(Spinner::start(move |frame, seconds| {
+            let line = format!("{lead}{} Thinking… {}", s.yellow(&frame.to_string()), s.dim(&format!("({seconds}s · ctrl-c to stop)")));
+            ui::style::fit(&line, ui::screen::size().1.saturating_sub(1))
+        }));
+    }
+
     fn columns(&self) -> usize {
         terminal_width().unwrap_or(80)
     }
@@ -1266,11 +1285,26 @@ impl Ui for Terminal {
     fn thinking(&mut self) {
         self.end_line();
         if self.fancy {
-            let s = self.err;
-            let lead = self.peek_lead();
-            self.spinner = Some(Spinner::start(move |frame, seconds| {
-                format!("{lead}{} Thinking… {}", s.yellow(&frame.to_string()), s.dim(&format!("({seconds}s · ctrl-c to stop)")))
-            }));
+            self.thoughts.clear();
+            self.thoughts_shown = 0;
+            self.spin_thinking();
+        }
+    }
+
+    /// Each headline of the model's reasoning summary, once it's complete,
+    /// becomes one dim line: what the model was thinking about. (On this
+    /// route they arrive when the thinking is done, not during it.)
+    fn thought(&mut self, delta: &str) {
+        self.thoughts.push_str(delta);
+        let headlines = headlines(&self.thoughts);
+        if headlines.len() > self.thoughts_shown && self.fancy {
+            self.quiet();
+            for headline in &headlines[self.thoughts_shown..] {
+                let lead = self.lead();
+                say!("{lead}{}", self.err.dim(&format!("✻ {headline}")));
+            }
+            self.thoughts_shown = headlines.len();
+            self.spin_thinking();
         }
     }
 
@@ -1411,6 +1445,23 @@ impl Ui for Terminal {
     }
 }
 
+/// The finished `**headlines**` in a reasoning summary, which is how the
+/// model titles each part: `Checking the tests`.
+fn headlines(thoughts: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = thoughts;
+    while let Some(start) = rest.find("**") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("**") else { break };
+        let title = after[..end].trim();
+        if !title.is_empty() {
+            found.push(title.to_owned());
+        }
+        rest = &after[end + 2..];
+    }
+    found
+}
+
 /// `12345` → `12k`: token counts read at a glance.
 fn thousands(n: u64) -> String {
     if n < 1000 { n.to_string() } else { format!("{}k", (n + 500) / 1000) }
@@ -1528,6 +1579,13 @@ mod tests {
 
     fn args(line: &str) -> CliResult<AskArgs> {
         AskArgs::parse(line.split(' ').map(str::to_owned).collect(), &Settings::default())
+    }
+
+    #[test]
+    fn finds_the_headlines() {
+        assert_eq!(headlines("**Deriving the list**\n\nsome text **Checking Pell solutions**"), ["Deriving the list", "Checking Pell solutions"]);
+        assert!(headlines("**Half writ").is_empty());
+        assert_eq!(headlines("**First** and **Sec"), ["First"]);
     }
 
     #[test]

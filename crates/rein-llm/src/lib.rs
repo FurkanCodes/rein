@@ -17,6 +17,9 @@ use std::fmt;
 pub enum Event {
     /// A piece of the visible answer text, for showing as it's written.
     TextDelta(String),
+    /// A piece of a short summary of the model's reasoning, written while
+    /// it thinks. Only shown; the reasoning itself comes as an item.
+    Thought(String),
     /// A finished piece of the answer. Append it to the conversation: the
     /// next request has to send it back.
     Item(Item),

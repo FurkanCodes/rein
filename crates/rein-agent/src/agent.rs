@@ -16,11 +16,19 @@ use crate::tools::Tools;
 /// After this many model turns in a row, stop and give the user control back.
 pub const MAX_TURNS: usize = 25;
 
+/// What streams in while the model answers.
+pub enum Streamed<'a> {
+    /// A piece of the answer.
+    Text(&'a str),
+    /// A piece of a short summary of what the model is thinking.
+    Thought(&'a str),
+}
+
 /// Something that answers requests. The real one is OpenAI; tests script one.
 pub trait Model {
-    /// Sends one request, passing answer text to `on_text` as it streams, and
-    /// returns the finished items and the token counts.
-    fn respond(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> impl Future<Output = Result<(Vec<Item>, Usage)>>;
+    /// Sends one request, passing what streams in to `on` as it arrives,
+    /// and returns the finished items and the token counts.
+    fn respond(&self, request: &Request, on: &mut dyn FnMut(Streamed)) -> impl Future<Output = Result<(Vec<Item>, Usage)>>;
 }
 
 /// The answer to "may this run?".
@@ -36,6 +44,9 @@ pub enum Approval {
 /// Whoever is at the keyboard: sees what happens, and decides what may run.
 pub trait Ui {
     fn text(&mut self, delta: &str);
+    /// A piece of a summary of the model's thinking, like `**Checking the
+    /// tests**`.
+    fn thought(&mut self, _delta: &str) {}
     /// Asked when the permissions say to ask. It's async so that an
     /// interrupt can cancel the turn even while it waits for an answer.
     fn approve(&mut self, call: &ToolCall) -> impl Future<Output = Approval>;
@@ -135,7 +146,7 @@ impl<M: Model> Agent<M> {
             let request = self.request(self.history.clone());
             let sent = self.history.len();
             ui.thinking();
-            let (items, usage) = match self.model.respond(&request, &mut |text| ui.text(text)).await {
+            let (items, usage) = match self.model.respond(&request, &mut |streamed| stream_to(ui, streamed)).await {
                 // The provider says it's too long after all: make room and
                 // try again, once.
                 Err(e) if !compacted && e.code() == Some("context_length_exceeded") => {
@@ -245,7 +256,7 @@ impl<M: Model> Agent<M> {
         let mut input = self.history.clone();
         input.push(Item::User(compact::prompt(focus)));
         ui.thinking();
-        let (items, usage) = self.model.respond(&self.request(input), &mut |text| ui.text(text)).await?;
+        let (items, usage) = self.model.respond(&self.request(input), &mut |streamed| stream_to(ui, streamed)).await?;
         ui.usage(&usage);
         let summary: Vec<&str> = items
             .iter()
@@ -295,6 +306,7 @@ impl<M> Agent<M> {
             input,
             tools: self.specs(),
             reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_summary: true,
             session_id: self.session_id.clone(),
         }
     }
@@ -360,11 +372,18 @@ pub struct OpenAi {
     pub record: Option<File>,
 }
 
+fn stream_to(ui: &mut impl Ui, streamed: Streamed) {
+    match streamed {
+        Streamed::Text(text) => ui.text(text),
+        Streamed::Thought(text) => ui.thought(text),
+    }
+}
+
 /// How long to wait before each retry of a failed request.
 const RETRY_WAITS: [u64; 3] = [1, 2, 4];
 
 impl Model for OpenAi {
-    async fn respond(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<(Vec<Item>, Usage)> {
+    async fn respond(&self, request: &Request, on: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
         // Only the request itself is retried: once the answer has started,
         // trying again would show it twice.
         let mut waits = RETRY_WAITS.iter();
@@ -382,7 +401,8 @@ impl Model for OpenAi {
         let mut items = Vec::new();
         while let Some(event) = stream.next().await {
             match event? {
-                Event::TextDelta(text) => on_text(&text),
+                Event::TextDelta(text) => on(Streamed::Text(&text)),
+                Event::Thought(text) => on(Streamed::Thought(&text)),
                 Event::Item(item) => items.push(item),
                 Event::Completed { usage } => return Ok((items, usage)),
             }
@@ -415,12 +435,12 @@ mod tests {
     }
 
     impl Model for Scripted {
-        async fn respond(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<(Vec<Item>, Usage)> {
+        async fn respond(&self, request: &Request, on: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
             self.requests.borrow_mut().push(request.clone());
             let items = self.turns.borrow_mut().pop_front().expect("the loop asked for more turns than scripted");
             for item in &items {
                 if let Item::Assistant(text) = item {
-                    on_text(text);
+                    on(Streamed::Text(text));
                 }
             }
             Ok((items, Usage::default()))

@@ -40,6 +40,9 @@ pub struct Request {
     pub tools: Vec<Tool>,
     /// For example "low", "medium" or "high". `None` uses the model default.
     pub reasoning_effort: Option<String>,
+    /// Ask for short summaries of the model's reasoning as it thinks
+    /// ([`Event::Thought`]). Only for models that reason.
+    pub reasoning_summary: bool,
     /// The same ID on every request of one conversation. Sign in with ChatGPT
     /// routes requests to its prompt cache by the `session-id` header, so
     /// without it nothing is ever cached; see [`new_session_id`].
@@ -106,6 +109,9 @@ fn request_body(request: &Request) -> Value {
     }
     if let Some(effort) = &request.reasoning_effort {
         body["reasoning"] = json!({ "effort": effort });
+    }
+    if request.reasoning_summary {
+        body["reasoning"]["summary"] = json!("auto");
     }
     if !request.tools.is_empty() {
         let tools: Vec<Value> = request
@@ -277,6 +283,9 @@ fn decode(sse: &SseEvent) -> Option<Result<Event>> {
     };
     match v["type"].as_str().or(sse.event.as_deref())? {
         "response.output_text.delta" => Some(Ok(Event::TextDelta(v["delta"].as_str()?.to_owned()))),
+        "response.reasoning_summary_text.delta" => Some(Ok(Event::Thought(v["delta"].as_str()?.to_owned()))),
+        // A new part of the summary: keep it apart from the last one.
+        "response.reasoning_summary_part.added" => Some(Ok(Event::Thought("\n\n".into()))),
         "response.output_item.done" => decode_item(&v["item"]).map(|item| Ok(Event::Item(item))),
         "response.completed" => Some(Ok(Event::Completed { usage: parse_usage(&v["response"]["usage"]) })),
         "response.failed" => Some(Err(api_error(&v["response"]["error"], "the response failed"))),
@@ -345,6 +354,7 @@ mod tests {
             input: vec![Item::User("hi".into()), Item::Assistant("hello".into()), Item::User("bye".into())],
             tools: vec![],
             reasoning_effort: Some("low".into()),
+            reasoning_summary: false,
             session_id: None,
         };
         assert_eq!(
@@ -378,6 +388,7 @@ mod tests {
             ],
             tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
             reasoning_effort: None,
+            reasoning_summary: false,
             session_id: None,
         };
         let body = request_body(&request);
