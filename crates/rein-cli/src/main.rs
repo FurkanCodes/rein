@@ -100,9 +100,13 @@ Deny beats ask beats allow, and a command only runs without asking if every
 part of it is allowed. Rules decide when rein asks; they aren't a sandbox.
 
 Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
-compact_at and bell (on or off), like `mode = edits`. Flags win over
-$REIN_MODEL, $REIN_EFFORT, $REIN_MODE, $REIN_COMPACT_AT and $REIN_BELL, which
-win over the file.
+compact_at, bell and compress (on or off), like `mode = edits`. Flags win
+over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE, $REIN_COMPACT_AT, $REIN_BELL and
+$REIN_COMPRESS, which win over the file.
+
+Each request carries the whole conversation, so rein gzips it on the way:
+about three times fewer bytes, and the same text for the model. A server that
+doesn't take compressed requests gets them uncompressed instead.
 
 Without `rein login`, rein uses $OPENAI_API_KEY, billed to your API account,
 and $OPENAI_BASE_URL if set, for another server that speaks the Responses API.";
@@ -217,6 +221,8 @@ struct AskArgs {
     record: Option<PathBuf>,
     /// Ring the bell when rein needs you and you're away.
     bell: bool,
+    /// Gzip request bodies.
+    compress: bool,
     /// `None` starts a conversation instead of doing one task.
     prompt: Option<String>,
 }
@@ -231,11 +237,12 @@ impl AskArgs {
             Some(name) => Mode::parse(&name).ok_or(format!("unknown mode {name} in the settings; use ask, edits, read-only or trust"))?,
             None => Mode::Ask,
         };
-        let bell = match settings.get("bell", "REIN_BELL").as_deref() {
-            None | Some("on") => true,
-            Some("off") => false,
-            Some(other) => return Err(format!("bell should be on or off, not {other}")),
+        let switch = |key: &str, env: &str| match settings.get(key, env).as_deref() {
+            None | Some("on") => Ok(true),
+            Some("off") => Ok(false),
+            Some(other) => Err(format!("{key} should be on or off, not {other}")),
         };
+        let (bell, compress) = (switch("bell", "REIN_BELL")?, switch("compress", "REIN_COMPRESS")?);
         let (mut model_given, mut resume) = (false, Resume::New);
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -261,7 +268,7 @@ impl AskArgs {
             }
         }
         let prompt = if words.is_empty() { None } else { Some(words.join(" ")) };
-        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, prompt })
+        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, prompt })
     }
 }
 
@@ -270,7 +277,10 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> CliResult<Strin
 }
 
 async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option<String>) -> CliResult {
-    let client = client(http).await?;
+    let mut client = client(http).await?;
+    if !args.compress {
+        client = client.without_compression();
+    }
     // The model list says how big each model's context window is. Fetched
     // while everything else gets ready.
     let models = {
@@ -430,6 +440,11 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
         return Ok(());
     };
     terminal.end_turn();
+    // Said once: rein's requests to this server go uncompressed.
+    let refused = agent.model.client.traffic().compression == rein_llm::openai::Compression::Refused;
+    if refused && !std::mem::replace(&mut terminal.said_uncompressed, true) {
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(this server doesn't take compressed requests, so they go uncompressed)"));
+    }
     match outcome.map_err(describe)? {
         Outcome::Done => Ok(()),
         Outcome::Stopped => {
@@ -714,6 +729,7 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
                 ("mode", mode_description(agent.permissions.mode).to_owned()),
                 ("rules", format!("{} from .rein/permissions", agent.permissions.rule_count())),
                 ("context", format!("about {} of {} tokens before compacting", thousands(agent.estimated()), thousands(agent.window.limit))),
+                ("sent", traffic(agent.model.client.traffic())),
                 ("started", header.map(|h| format!("{} · {messages} message{} so far", h.started, if messages == 1 { "" } else { "s" })).unwrap_or_default()),
                 ("folder", setup.root.display().to_string()),
             ];
@@ -947,6 +963,8 @@ struct Terminal {
     plan: Vec<String>,
     /// The model is writing a summary, not an answer.
     compacting: bool,
+    /// It's been said that requests go uncompressed.
+    said_uncompressed: bool,
     turn: TurnStats,
 }
 
@@ -1009,6 +1027,7 @@ impl Terminal {
             thoughts_shown: 0,
             plan: Vec::new(),
             compacting: false,
+            said_uncompressed: false,
             turn: TurnStats::default(),
         }
     }
@@ -1492,6 +1511,29 @@ fn headlines(thoughts: &str) -> Vec<String> {
     found
 }
 
+/// What the requests cost on the wire: `412 KB as 128 KB (gzip, 3.2× fewer bytes)`.
+fn traffic(t: rein_llm::openai::Traffic) -> String {
+    use rein_llm::openai::Compression;
+    if t.json == 0 {
+        return "nothing yet".to_owned();
+    }
+    match t.compression {
+        Compression::Gzip if t.sent < t.json => format!("{} as {} (gzip, {:.1}× fewer bytes)", bytes(t.json), bytes(t.sent), t.json as f64 / t.sent as f64),
+        Compression::Gzip => format!("{} (too little to compress yet)", bytes(t.sent)),
+        Compression::Off => format!("{}, uncompressed: compress is off in the settings", bytes(t.sent)),
+        Compression::Refused => format!("{}, uncompressed: the server doesn't take compressed requests", bytes(t.sent)),
+    }
+}
+
+/// `950 bytes`, `412 KB`, `3.1 MB`.
+fn bytes(n: u64) -> String {
+    match n {
+        0..1000 => format!("{n} bytes"),
+        1000..1_000_000 => format!("{} KB", n.div_ceil(1000)),
+        _ => format!("{:.1} MB", n as f64 / 1e6),
+    }
+}
+
 /// `12345` → `12k`: token counts read at a glance.
 fn thousands(n: u64) -> String {
     if n < 1000 { n.to_string() } else { format!("{}k", (n + 500) / 1000) }
@@ -1622,6 +1664,13 @@ mod tests {
 
     fn args(line: &str) -> CliResult<AskArgs> {
         AskArgs::parse(line.split(' ').map(str::to_owned).collect(), &Settings::default())
+    }
+
+    #[test]
+    fn says_how_many_bytes() {
+        assert_eq!(bytes(950), "950 bytes");
+        assert_eq!(bytes(412_300), "413 KB");
+        assert_eq!(bytes(3_140_000), "3.1 MB");
     }
 
     #[test]

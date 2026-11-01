@@ -137,10 +137,12 @@ effort = "medium"
 mode = "edits"
 compact_at = 120000
 bell = off
+compress = off
 ```
 
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
-`$REIN_COMPACT_AT` and `$REIN_BELL`, which win over the file.
+`$REIN_COMPACT_AT`, `$REIN_BELL` and `$REIN_COMPRESS`, which win over the
+file.
 
 ## Small things that matter
 
@@ -150,6 +152,23 @@ A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
   minutes for a slow build or test suite.
 - For work with several steps the model keeps a plan, shown as a checklist.
 - What the model thought about shows as one dim line: `✻ Checking the tests`.
+
+## What goes to the model
+
+Nothing is uploaded up front: no files, no folder listing. The model asks
+for what it needs with `read`, `grep` and `glob`, and gets it back as text,
+as part of the conversation. Each request carries the whole conversation,
+since the server keeps none of it, so a long one sends the same hundreds of
+kilobytes again and again.
+
+So rein gzips every request body. `api.openai.com` unpacks it before the
+model sees anything, so the model reads the same text and the tokens are the
+same; what changes is the upload, about three times smaller for rein's
+JSON, which shows on a slow connection. `/status` says how much went and how
+much it saved. A server that turns a compressed request away, as many local
+ones behind `$OPENAI_BASE_URL` would, gets the same request again
+uncompressed, and nothing compressed after that; rein says so once.
+`compress = off` in the settings turns it off.
 
 ## What rein tells the model
 

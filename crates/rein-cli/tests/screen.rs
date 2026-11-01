@@ -52,36 +52,65 @@ impl Turn {
 struct Model {
     base: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    /// Whether each request came gzipped, those turned away included.
+    gzipped: Arc<Mutex<Vec<bool>>>,
 }
 
 impl Model {
     fn start(turns: Vec<Turn>) -> Model {
+        Model::serve(turns, true)
+    }
+
+    /// A server that, like many a local one, can't unpack a compressed
+    /// body, and says it's a bad request.
+    fn without_gzip(turns: Vec<Turn>) -> Model {
+        Model::serve(turns, false)
+    }
+
+    fn serve(turns: Vec<Turn>, takes_gzip: bool) -> Model {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let seen = requests.clone();
+        let (requests, gzipped) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let (seen, how) = (requests.clone(), gzipped.clone());
         std::thread::spawn(move || {
             let mut turns = turns.into_iter();
             for socket in listener.incoming() {
                 let Ok(mut socket) = socket else { break };
                 let Some((head, body)) = read_request(&mut socket) else { continue };
                 let reply = if head.starts_with("GET") {
-                    http("application/json", json!({ "data": [{ "id": "test-model" }] }).to_string().as_bytes())
+                    http(200, "application/json", json!({ "data": [{ "id": "test-model" }] }).to_string().as_bytes())
                 } else {
-                    seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or(Value::Null));
-                    let turn = turns.next().unwrap_or_else(|| says("(the script has no more turns)"));
-                    std::thread::sleep(turn.delay);
-                    http("text/event-stream", sse(&turn).as_bytes())
+                    let gzip = head.lines().any(|line| line.to_ascii_lowercase().starts_with("content-encoding:") && line.contains("gzip"));
+                    how.lock().unwrap().push(gzip);
+                    if gzip && !takes_gzip {
+                        http(400, "application/json", br#"{"detail":"Bad Request"}"#)
+                    } else {
+                        let body = if gzip { gunzip(&body) } else { body };
+                        seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                        let turn = turns.next().unwrap_or_else(|| says("(the script has no more turns)"));
+                        std::thread::sleep(turn.delay);
+                        http(200, "text/event-stream", sse(&turn).as_bytes())
+                    }
                 };
                 let _ = socket.write_all(&reply);
             }
         });
-        Model { base, requests }
+        Model { base, requests, gzipped }
     }
 
     fn requests(&self) -> Vec<Value> {
         self.requests.lock().unwrap().clone()
     }
+
+    fn gzipped(&self) -> Vec<bool> {
+        self.gzipped.lock().unwrap().clone()
+    }
+}
+
+fn gunzip(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(body).read_to_end(&mut out).unwrap();
+    out
 }
 
 fn read_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
@@ -112,8 +141,9 @@ fn read_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     Some((head, data[head_end..].to_vec()))
 }
 
-fn http(kind: &str, body: &[u8]) -> Vec<u8> {
-    let mut reply = format!("HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).into_bytes();
+fn http(status: u16, kind: &str, body: &[u8]) -> Vec<u8> {
+    let reason = if status == 200 { "OK" } else { "Bad Request" };
+    let mut reply = format!("HTTP/1.1 {status} {reason}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).into_bytes();
     reply.extend_from_slice(body);
     reply
 }
@@ -357,7 +387,33 @@ fn an_answer_appears_above_the_box() {
     assert!(screen.contains("rein   Hello there, how can I help?"), "{screen}");
     assert!(screen.contains("context"), "the status bar is under the box:\n{screen}");
     assert!(model.requests()[0].to_string().contains("\"hi\""), "the model was sent the message");
+    assert_eq!(model.gzipped(), [true], "the conversation went gzipped");
     assert_eq!(term.bells(), 0, "you were there: no bell");
+    term.keys("/status\r");
+    term.wait_for("fewer bytes)");
+    let screen = term.text();
+    let row = screen.lines().find(|row| row.contains("sent ")).unwrap_or_default();
+    assert!(row.contains(" KB as ") && row.contains("(gzip, "), "{screen}");
+}
+
+#[test]
+fn a_server_that_cant_unpack_gzip_gets_it_plain() {
+    let model = Model::without_gzip(vec![says("Hello there."), says("Still here.")]);
+    let mut term = Term::start(&model, "plain", 24, 90);
+    term.wait_for(IDLE);
+    term.keys("hi\r");
+    term.wait_for("Hello there.");
+    term.wait_for("(this server doesn't take compressed requests, so they go uncompressed)");
+    term.wait_for(IDLE);
+    term.keys("and again\r");
+    term.wait_for("Still here.");
+    assert_eq!(model.gzipped(), [true, false, false], "turned away once, then sent as it is");
+    assert_eq!(model.requests().len(), 2, "both messages were answered");
+    let notes = term.text().matches("doesn't take compressed").count();
+    assert_eq!(notes, 1, "said once");
+    term.wait_for(IDLE);
+    term.keys("/status\r");
+    term.wait_for("uncompressed: the server doesn't take compressed requests");
 }
 
 #[test]

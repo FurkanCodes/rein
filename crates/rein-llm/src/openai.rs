@@ -2,12 +2,23 @@
 //!
 //! An API key and a Sign in with ChatGPT access token both go in the same
 //! `Authorization: Bearer` header; only who pays differs.
+//!
+//! Every request carries the whole conversation, so a long one sends the
+//! same hundreds of kilobytes again and again. Bodies of any size are
+//! gzipped on the way (`Content-Encoding: gzip`), which `api.openai.com`
+//! takes, and which makes rein's JSON about three times smaller. The model
+//! reads the same text either way: the server unpacks it first. A server
+//! that turns a compressed request away, like many a local one behind
+//! `OPENAI_BASE_URL`, gets it again uncompressed, and nothing compressed
+//! after that.
 
 pub mod signin;
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 
@@ -25,6 +36,41 @@ pub struct Client {
     http: reqwest::Client,
     base_url: String,
     bearer: String,
+    /// How requests went over the wire, shared by the client's clones.
+    wire: Arc<Wire>,
+}
+
+/// Bodies smaller than this go as they are: there'd be little to save.
+const COMPRESS_FROM: usize = 1024;
+
+#[derive(Debug, Default)]
+struct Wire {
+    /// Compression was turned off.
+    off: AtomicBool,
+    /// The server turned a compressed request away, so it's off.
+    refused: AtomicBool,
+    /// Request bodies' bytes as JSON, and as they were sent.
+    json: AtomicU64,
+    sent: AtomicU64,
+}
+
+/// What requests have cost on the wire so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Traffic {
+    /// The request bodies' bytes, as JSON.
+    pub json: u64,
+    /// The bytes that went: fewer, once compressed.
+    pub sent: u64,
+    pub compression: Compression,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    Gzip,
+    /// Turned off by the user.
+    Off,
+    /// The server didn't take a compressed request.
+    Refused,
 }
 
 /// One request to the model.
@@ -65,7 +111,22 @@ pub struct ModelInfo {
 impl Client {
     /// `bearer` is an OpenAI API key or a Sign in with ChatGPT access token.
     pub fn new(http: reqwest::Client, bearer: impl Into<String>) -> Self {
-        Client { http, base_url: API_BASE.to_owned(), bearer: bearer.into() }
+        Client { http, base_url: API_BASE.to_owned(), bearer: bearer.into(), wire: Arc::default() }
+    }
+
+    /// Sends request bodies as they are, uncompressed.
+    pub fn without_compression(self) -> Self {
+        self.wire.off.store(true, Ordering::Relaxed);
+        self
+    }
+
+    pub fn traffic(&self) -> Traffic {
+        let compression = match (self.wire.refused.load(Ordering::Relaxed), self.wire.off.load(Ordering::Relaxed)) {
+            (true, _) => Compression::Refused,
+            (false, true) => Compression::Off,
+            (false, false) => Compression::Gzip,
+        };
+        Traffic { json: self.wire.json.load(Ordering::Relaxed), sent: self.wire.sent.load(Ordering::Relaxed), compression }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -82,20 +143,56 @@ impl Client {
 
     /// Sends the request and returns the answer as a stream of events.
     pub async fn stream(&self, request: &Request) -> Result<ResponseStream> {
+        let body = serde_json::to_vec(&request_body(request))?;
+        let gzipped = (body.len() >= COMPRESS_FROM && !self.wire.off.load(Ordering::Relaxed)).then(|| gzip(&body)).flatten();
+        let compressed = gzipped.is_some();
+        let response = match check(self.post(request, &body, gzipped).await?).await {
+            // A server that can't unpack the body can't read it: the same
+            // request again as it is. If that goes through, compression was
+            // the trouble, and it's off from now on; if not, it wasn't.
+            Err(Error::Api { status: Some(400 | 415 | 422), .. }) if compressed => {
+                let plain = check(self.post(request, &body, None).await?).await?;
+                self.wire.refused.store(true, Ordering::Relaxed);
+                self.wire.off.store(true, Ordering::Relaxed);
+                plain
+            }
+            other => other?,
+        };
+        Ok(ResponseStream { response, decoder: EventDecoder::default(), record: None })
+    }
+
+    /// Posts `body`, or `gzipped` in its place when there is one.
+    async fn post(&self, request: &Request, body: &[u8], gzipped: Option<Vec<u8>>) -> Result<reqwest::Response> {
         let mut builder = self
             .http
             .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.bearer)
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&request_body(request));
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
         if let Some(id) = &request.session_id {
             // The prompt cache follows this header, not `prompt_cache_key`:
             // the server replaces that with a random key on every request.
             builder = builder.header("session-id", id);
         }
-        let response = builder.send().await?;
-        Ok(ResponseStream { response: check(response).await?, decoder: EventDecoder::default(), record: None })
+        let sent = match gzipped {
+            Some(gzipped) => {
+                builder = builder.header(reqwest::header::CONTENT_ENCODING, "gzip");
+                gzipped
+            }
+            None => body.to_vec(),
+        };
+        self.wire.json.fetch_add(body.len() as u64, Ordering::Relaxed);
+        self.wire.sent.fetch_add(sent.len() as u64, Ordering::Relaxed);
+        Ok(builder.body(sent).send().await?)
     }
+}
+
+/// `bytes` gzipped. Level 6, zlib's own default: within a few percent of the
+/// smallest, at a fraction of the time.
+fn gzip(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 3), flate2::Compression::new(6));
+    encoder.write_all(bytes).ok()?;
+    encoder.finish().ok()
 }
 
 fn request_body(request: &Request) -> Value {
