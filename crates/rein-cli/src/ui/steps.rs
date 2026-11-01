@@ -5,6 +5,9 @@
 //!
 //! ```text
 //! rein   ● Read  todo.py  164 lines
+//!        ● Search "parse_list" (*.rs)  3 matches in 2 files
+//!          └ src/main.rs
+//!            src/parser.rs
 //!        ● Run   cargo test  exit 101
 //!          └ test parser::trailing_comma ... FAILED
 //!          … 209 more lines
@@ -42,6 +45,23 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             };
             ("Read", path + &range)
         }
+        "grep" => {
+            let mut target = format!("\"{}\"", args["pattern"].as_str().unwrap_or_default());
+            if !path.is_empty() && path != "." {
+                target += &format!(" in {path}");
+            }
+            if let Some(glob) = args["glob"].as_str() {
+                target += &format!(" ({glob})");
+            }
+            ("Search", target)
+        }
+        "glob" => {
+            let mut target = args["pattern"].as_str().unwrap_or_default().to_owned();
+            if !path.is_empty() && path != "." {
+                target += &format!(" in {path}");
+            }
+            ("Find", target)
+        }
         "write" => ("Write", path),
         "edit" => ("Edit", path),
         "bash" => {
@@ -76,6 +96,8 @@ pub fn doing(call: &ToolCall) -> String {
         "Edit" => "Editing",
         "Write" => "Writing",
         "Recall" => "Searching the conversation for",
+        "Search" => "Searching for",
+        "Find" => "Finding",
         "Plan" => return "Updating the plan".to_owned(),
         _ => "Using",
     };
@@ -103,10 +125,12 @@ pub struct Outcome {
     pub status: String,
     pub details: Vec<String>,
     pub more: usize,
+    /// What `more` counts: `line`, or `file`.
+    pub unit: &'static str,
 }
 
 pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
-    let plain = |ok: Option<bool>, status: String| Outcome { ok, status, details: Vec::new(), more: 0 };
+    let plain = |ok: Option<bool>, status: String| Outcome { ok, status, details: Vec::new(), more: 0, unit: "line" };
     if let Some(error) = output.strip_prefix("error: ") {
         return plain(Some(false), style.red(&first_line(error)));
     }
@@ -141,7 +165,7 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             if shown.is_empty() {
                 shown = body[body.len().saturating_sub(SHOWN)..].to_vec();
             }
-            Outcome { ok: Some(!failed), status, more: body.len() - shown.len(), details: shown.into_iter().map(str::to_owned).collect() }
+            Outcome { ok: Some(!failed), status, more: body.len() - shown.len(), details: shown.into_iter().map(str::to_owned).collect(), unit: "line" }
         }
         "read" => {
             // A partial read ends with a note saying which lines it holds.
@@ -177,7 +201,23 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
                     }
                 })
                 .collect();
-            Outcome { ok: Some(true), status: String::new(), details, more: 0 }
+            Outcome { ok: Some(true), status: String::new(), details, more: 0, unit: "line" }
+        }
+        // The summary, and which files: the first few, then how many more.
+        "grep" | "glob" => {
+            let summary = first_line(output);
+            if summary.starts_with("No ") {
+                return plain(Some(true), style.dim(if call.name == "grep" { "nothing found" } else { "no files" }));
+            }
+            let mut files = found_files(output);
+            // A search of one file: its line names it already.
+            let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+            if files.len() == 1 && args["path"].as_str().map(|path| path.trim_start_matches("./")) == Some(files[0].as_str()) {
+                files.clear();
+            }
+            let shown: Vec<String> = files.iter().take(SHOWN).cloned().collect();
+            let status = style.dim(summary.split(';').next().unwrap_or_default());
+            Outcome { ok: Some(true), status, more: files.len() - shown.len(), details: shown, unit: "file" }
         }
         "recall" => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
@@ -219,7 +259,7 @@ pub fn detail_lines(outcome: &Outcome, style: Style, columns: usize, viewer: boo
     if outcome.more > 0 {
         let s = if outcome.more == 1 { "" } else { "s" };
         let hint = if viewer { " · ctrl-o to see all" } else { "" };
-        lines.push(format!("{pad}{}", style.dim(&format!("… {} more line{s}{hint}", outcome.more))));
+        lines.push(format!("{pad}{}", style.dim(&format!("… {} more {}{s}{hint}", outcome.more, outcome.unit))));
     }
     lines
 }
@@ -278,6 +318,30 @@ pub fn diff_box(call: &ToolCall, root: &Path, style: Style, columns: usize, appl
     lines.extend(body.into_iter().map(|line| format!("{pad}{} {line}", style.dim("│"))));
     lines.push(format!("{pad}{}", style.dim(&format!("└{rule}"))));
     lines
+}
+
+/// The files a search's output names, as far as it shows them: a path per
+/// line after the summary for `glob`, `path (N matches)` per line for
+/// `grep`'s files, and each group's first line for the lines it found.
+fn found_files(output: &str) -> Vec<String> {
+    let mut lines = output.lines();
+    let summary = lines.next().unwrap_or_default();
+    if summary.contains(" with matches (") {
+        return lines.map(|line| line.rsplit_once(" (").map_or(line, |(path, _)| path).to_owned()).collect();
+    }
+    if !summary.contains(" match") {
+        return lines.map(str::to_owned).collect();
+    }
+    let mut files = Vec::new();
+    let mut next_is_file = true;
+    for line in lines {
+        if line.is_empty() {
+            next_is_file = true;
+        } else if std::mem::take(&mut next_is_file) {
+            files.push(line.to_owned());
+        }
+    }
+    files
 }
 
 fn first_line(text: &str) -> String {
@@ -378,6 +442,29 @@ mod tests {
     }
 
     #[test]
+    fn sums_up_searches() {
+        let grep = call("grep", json!({"pattern": "parse_list", "path": "src", "glob": "*.rs"}));
+        assert_eq!(describe(&grep), ("Search", "\"parse_list\" in src (*.rs)".into()));
+        assert_eq!(doing(&grep), "Searching for \"parse_list\" in src (*.rs)");
+        let lines = "3 matches in 3 files\nsrc/main.rs\n2:    parse_list();\n\nsrc/parser.rs\n2:fn parse_list() {}\n\nsrc/lib.rs\n9:x";
+        assert_eq!(status("grep", json!({}), lines), ("3 matches in 3 files".into(), vec!["src/main.rs".into(), "src/parser.rs".into()], 1));
+        let files = "2 files with matches (4 matching lines)\nsrc/main.rs (1 match)\nsrc/parser.rs (3 matches)";
+        assert_eq!(status("grep", json!({}), files).1, ["src/main.rs", "src/parser.rs"]);
+        assert_eq!(status("grep", json!({}), "No matches in 4 files (files that .gitignore leaves out aren't searched).").0, "nothing found");
+        let one = outcome(&call("grep", json!({"pattern": "fn", "path": "src/a.rs"})), "4 matches in 1 file\nsrc/a.rs\n1:fn a", Style::plain());
+        assert!(one.details.is_empty(), "the step names the file it searched");
+        let cut = "301 matches in 2 files; not all shown: narrow the pattern\na.txt\n1:match";
+        assert_eq!(status("grep", json!({}), cut).0, "301 matches in 2 files");
+
+        let glob = call("glob", json!({"pattern": "*.rs", "path": null}));
+        assert_eq!(describe(&glob), ("Find", "*.rs".into()));
+        let o = outcome(&glob, "3 files\nsrc/main.rs\nsrc/ui/box.rs\ntests/screen.rs", Style::plain());
+        assert_eq!((o.status.as_str(), o.details.len(), o.more), ("3 files", 2, 1));
+        assert_eq!(detail_lines(&o, Style::plain(), 80, true)[2], "         … 1 more file · ctrl-o to see all");
+        assert_eq!(status("glob", json!({}), "No files match \"*.py\" (…).").0, "no files");
+    }
+
+    #[test]
     fn frames_a_change_with_line_numbers() {
         let dir = std::env::temp_dir().join(format!("rein-steps-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -397,7 +484,7 @@ mod tests {
 
     #[test]
     fn shows_details_under_the_step() {
-        let o = Outcome { ok: Some(true), status: String::new(), details: vec!["first".into(), "second".into()], more: 1 };
+        let o = Outcome { ok: Some(true), status: String::new(), details: vec!["first".into(), "second".into()], more: 1, unit: "line" };
         assert_eq!(detail_lines(&o, Style::plain(), 80, false), ["         └ first", "           second", "         … 1 more line"]);
         assert_eq!(detail_lines(&o, Style::plain(), 80, true)[2], "         … 1 more line · ctrl-o to see all");
     }

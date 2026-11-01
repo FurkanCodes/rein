@@ -127,9 +127,9 @@ impl Permissions {
 
     pub fn decide(&self, call: &ToolCall) -> Decision {
         match call.name.as_str() {
-            // `read` can only look, and only inside the project; `plan`
-            // only writes a checklist on screen.
-            "read" | "plan" => Decision::Allow,
+            // `read`, `grep` and `glob` can only look, and only inside the
+            // project; `plan` only writes a checklist on screen.
+            "read" | "grep" | "glob" | "plan" => Decision::Allow,
             "write" | "edit" => match self.mode {
                 Mode::ReadOnly => Decision::Deny("File changes are turned off: rein is in read-only mode.".into()),
                 Mode::Edits | Mode::Trust => Decision::Allow,
@@ -368,6 +368,11 @@ mod tests {
         assert!(matches!(read_only.decide(&file("write")), Decision::Deny(_)));
         assert!(matches!(read_only.decide(&bash("cargo test")), Decision::Deny(_)));
         assert_eq!(read_only.decide(&file("read")), Decision::Allow);
+        // Searching only looks, so it never asks, in any mode.
+        for tool in ["grep", "glob"] {
+            assert_eq!(ask.decide(&file(tool)), Decision::Allow);
+            assert_eq!(read_only.decide(&file(tool)), Decision::Allow);
+        }
     }
 
     #[test]

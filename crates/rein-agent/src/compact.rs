@@ -90,6 +90,8 @@ struct Call {
     name: String,
     path: Option<String>,
     command: Option<String>,
+    /// What a search looked for.
+    pattern: Option<String>,
 }
 
 fn calls(history: &[Item]) -> HashMap<&str, (usize, Call)> {
@@ -101,7 +103,8 @@ fn calls(history: &[Item]) -> HashMap<&str, (usize, Call)> {
                 let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
                 let path = args["path"].as_str().map(|p| p.trim_start_matches("./").to_owned());
                 let command = args["command"].as_str().map(str::to_owned);
-                Some((call.call_id.as_str(), (i, Call { name: call.name.clone(), path, command })))
+                let pattern = args["pattern"].as_str().map(str::to_owned);
+                Some((call.call_id.as_str(), (i, Call { name: call.name.clone(), path, command, pattern })))
             }
             _ => None,
         })
@@ -131,7 +134,10 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
         let Some((_, call)) = calls.get(call_id.as_str()) else { continue };
         match (call.name.as_str(), &call.path, &call.command) {
             ("read", Some(path), _) => {
-                let touched_later = calls.values().any(|(j, later)| *j > i && later.path.as_ref() == Some(path));
+                // Read again or changed: a search in it doesn't count.
+                let touched_later = calls
+                    .values()
+                    .any(|(j, later)| *j > i && later.path.as_ref() == Some(path) && matches!(later.name.as_str(), "read" | "write" | "edit"));
                 if touched_later {
                     retired.push((
                         call_id.clone(),
@@ -146,6 +152,11 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
                     call_id.clone(),
                     format!("{RETIRED} the output of `{command}` ({lines} lines{code}). Run it again, or use recall to search it.]"),
                 ));
+            }
+            ("grep" | "glob", _, _) if i < recent => {
+                let pattern = call.pattern.as_deref().unwrap_or_default();
+                let found = output.lines().next().unwrap_or_default().trim_end_matches('.');
+                retired.push((call_id.clone(), format!("{RETIRED} an older search for `{pattern}`: {found}. Search again if you need it.]")));
             }
             _ => {}
         }
@@ -396,20 +407,27 @@ mod tests {
             result("b1", &(big("test output") + "[exit code 1]")),
             call("e1", "edit", json!({"path": "./a.py"})),
             result("e1", "edited a.py"),
+            call("g1", "grep", json!({"pattern": "def main", "path": "b.py"})),
+            result("g1", &format!("12 matches in 3 files\n{}", big("b.py:1:def main"))),
             Item::User("now b.py".into()),
             call("r2", "read", json!({"path": "b.py"})),
             result("r2", &big("b")),
+            call("g2", "grep", json!({"pattern": "import", "path": "b.py"})),
+            result("g2", &big("1:import os")),
             Item::User("and run it".into()),
             call("b2", "bash", json!({"command": "python b.py"})),
             result("b2", &big("fresh output")),
         ];
         let retired = stale(&history);
         let ids: Vec<&str> = retired.iter().map(|(id, _)| id.as_str()).collect();
-        // a.py was edited later; cargo test ran before the last two messages.
-        // b.py's only read and the latest command stay.
-        assert_eq!(ids, ["r1", "b1"]);
+        // a.py was edited later; cargo test and the first search ran before
+        // the last two messages. b.py's only read stays, though it was
+        // searched after: a search isn't a read. So do the latest command
+        // and search.
+        assert_eq!(ids, ["r1", "b1", "g1"]);
         assert!(retired[0].1.contains("an older read of a.py"));
         assert!(retired[1].1.contains("`cargo test` (101 lines, exit code 1)"));
+        assert!(retired[2].1.contains("an older search for `def main`: 12 matches in 3 files."), "{}", retired[2].1);
 
         let mut history = history;
         retire(&mut history, &retired);

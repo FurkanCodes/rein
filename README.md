@@ -166,9 +166,16 @@ Credentials live in `~/.config/rein/` (or `$REIN_HOME`), readable only by you.
 
 ## What rein may do
 
-rein's tools are `read`, `write`, `edit` and `bash`. They only touch files
-inside the folder you run it in. Before a file change you see the lines it
-removes and adds. At each question, answer `y`, `n`, `a` for "yes, and
+rein's tools are `read`, `grep`, `glob`, `write`, `edit` and `bash`. They
+only touch files inside the folder you run it in. Before a file change you
+see the lines it removes and adds.
+
+`grep` searches what files say, with a regular expression, and `glob` finds
+files by name or path, like `src/**/*.rs`. Both only look, so they never
+ask, in any mode, and they're how the model finds its way around instead of
+`grep` or `rg` in `bash`. They skip what the project's `.gitignore` files
+leave out, binary files, `.git` and anything behind a symlink, and they
+search on every core at once. At each question, answer `y`, `n`, `a` for "yes, and
 don't ask again this run", or Esc to say no and tell rein what to do instead.
 
 `--mode` sets what runs without asking:

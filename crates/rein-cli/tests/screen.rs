@@ -24,8 +24,8 @@ struct Turn {
 
 enum Out {
     Text(String),
-    /// A `bash` call.
-    Run(String),
+    /// A call of the tool named, with these arguments.
+    Call(&'static str, Value),
 }
 
 fn says(text: &str) -> Turn {
@@ -33,7 +33,11 @@ fn says(text: &str) -> Turn {
 }
 
 fn runs(command: &str) -> Turn {
-    Turn { out: vec![Out::Run(command.to_owned())], delay: Duration::ZERO }
+    calls("bash", json!({ "command": command, "timeout_seconds": null }))
+}
+
+fn calls(tool: &'static str, arguments: Value) -> Turn {
+    Turn { out: vec![Out::Call(tool, arguments)], delay: Duration::ZERO }
 }
 
 impl Turn {
@@ -128,10 +132,9 @@ fn sse(turn: &Turn) -> String {
                 let message = json!({ "type": "message", "content": [{ "type": "output_text", "text": text }] });
                 event(json!({ "type": "response.output_item.done", "item": message }));
             }
-            Out::Run(command) => {
+            Out::Call(tool, arguments) => {
                 let call_id = format!("call_{}", CALLS.fetch_add(1, Ordering::Relaxed));
-                let arguments = json!({ "command": command }).to_string();
-                let call = json!({ "type": "function_call", "call_id": call_id, "namespace": "rein", "name": "bash", "arguments": arguments });
+                let call = json!({ "type": "function_call", "call_id": call_id, "namespace": "rein", "name": tool, "arguments": arguments.to_string() });
                 event(json!({ "type": "response.output_item.done", "item": call }));
             }
         }
@@ -546,4 +549,26 @@ fn the_bell_rings_when_rein_needs_you_and_youre_away() {
     term.wait_for("Done.");
     // Done, and you're still away: your turn.
     term.wait_bells(2);
+}
+
+#[test]
+fn a_search_runs_without_asking() {
+    let grep = json!({ "pattern": r"fn parse_\w+", "path": null, "glob": "*.rs", "ignore_case": false, "output": "lines", "context": null });
+    let model = Model::start(vec![calls("grep", grep), says("It's in src/parser.rs, line 2.")]);
+    let mut term = Term::start(&model, "search", 24, 80);
+    let project = term.dir.join("project");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(project.join("src/parser.rs"), "use x;\nfn parse_list() {}\n").unwrap();
+    std::fs::write(project.join("notes.md"), "fn parse_list in prose\n").unwrap();
+    term.wait_for(IDLE);
+    term.keys("where is parse_list\r");
+    term.wait_for("line 2.");
+    let screen = term.text();
+    assert!(screen.contains(r#"● Search "fn parse_\w+" (*.rs)  1 match in 1 file"#), "{screen}");
+    assert!(screen.contains("└ src/parser.rs"), "{screen}");
+    assert!(!screen.contains("Allow"), "a search is never asked about:\n{screen}");
+    let tools = model.requests()[0]["tools"].to_string();
+    assert!(tools.contains("\"grep\"") && tools.contains("\"glob\""), "the model is told about both: {tools}");
+    let sent = model.requests()[1].to_string();
+    assert!(sent.contains(r"1 match in 1 file\nsrc/parser.rs\n2:fn parse_list() {}"), "the model got the line: {sent}");
 }

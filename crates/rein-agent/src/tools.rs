@@ -7,6 +7,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use rein_llm::{Tool, ToolCall};
+
+use crate::search;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -36,6 +38,24 @@ struct ReadArgs {
     start_line: Option<usize>,
     /// How many lines to return; all the rest when missing.
     line_count: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct GrepArgs {
+    pattern: String,
+    path: Option<String>,
+    glob: Option<String>,
+    #[serde(default)]
+    ignore_case: bool,
+    /// `lines` or `files`.
+    output: Option<String>,
+    context: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct GlobArgs {
+    pattern: String,
+    path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +160,33 @@ impl Tools {
                 })),
             },
             Tool {
+                name: "grep".into(),
+                description: "Search what the project's files say with a regular expression (Rust syntax), and \
+                              get the matching lines with their numbers, grouped by file. Files that .gitignore \
+                              leaves out, binary files and .git aren't searched. Use this rather than grep or rg \
+                              in bash: it needs no approval."
+                    .into(),
+                parameters: object(json!({
+                    "pattern": { "type": "string", "description": "A regular expression, like `fn parse_\\w+` or `TODO|FIXME`. ^ and $ are a line's start and end. Escape ( . [ and the like to match them as they are." },
+                    "path": { "type": ["string", "null"], "description": "A file or folder to search, relative to the project root. Null for the whole project." },
+                    "glob": { "type": ["string", "null"], "description": "Only files matching this glob: `*.rs` or `*.{ts,tsx}` match names in any folder; with a slash, like `src/**/*.rs`, the path. Null for every file." },
+                    "ignore_case": { "type": "boolean", "description": "Match upper and lower case alike (ASCII letters)." },
+                    "output": { "type": "string", "enum": ["lines", "files"], "description": "lines: the matching lines. files: only which files match, and how many lines in each; cheaper for a first look." },
+                    "context": { "type": ["integer", "null"], "description": "How many lines to show before and after each match, at most 5. Null for none." }
+                })),
+            },
+            Tool {
+                name: "glob".into(),
+                description: "Find files in the project by name or path, like `*.rs`, `src/**/test_*.py` or \
+                              `Cargo.toml`. Returns their paths relative to the project root, sorted. Files that \
+                              .gitignore leaves out aren't listed."
+                    .into(),
+                parameters: object(json!({
+                    "pattern": { "type": "string", "description": "A glob: * and ? within one folder, ** across folders, {a,b} for either. Without a slash it matches file names in any folder." },
+                    "path": { "type": ["string", "null"], "description": "A folder to look in, relative to the project root. Null for the whole project." }
+                })),
+            },
+            Tool {
                 name: "write".into(),
                 description: "Create a text file, or replace an existing file's whole contents. Missing folders \
                               are created. To change part of a file, use edit instead."
@@ -201,6 +248,8 @@ impl Tools {
     pub async fn run(&self, call: &ToolCall) -> String {
         let result = match call.name.as_str() {
             "read" => self.read(&call.arguments).await,
+            "grep" => self.grep(&call.arguments).await,
+            "glob" => self.glob(&call.arguments).await,
             "bash" => self.bash(&call.arguments).await,
             "write" => self.write(&call.arguments).await,
             "edit" => self.edit(&call.arguments).await,
@@ -220,6 +269,45 @@ impl Tools {
         let bytes = tokio::fs::read(&path).await.map_err(|e| format!("can't read {}: {e}", args.path))?;
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
         lines(&text, &args)
+    }
+
+    async fn grep(&self, arguments: &str) -> Result<String, String> {
+        let args: GrepArgs = parse(arguments)?;
+        let (root, start) = self.search_root(args.path.as_deref())?;
+        // A search of a big project takes a while: off the loop's thread,
+        // so Esc can still stop the turn.
+        tokio::task::spawn_blocking(move || {
+            let grep = search::Grep {
+                pattern: &args.pattern,
+                start: &start,
+                glob: args.glob.as_deref(),
+                ignore_case: args.ignore_case,
+                files_only: args.output.as_deref() == Some("files"),
+                context: args.context.unwrap_or(0),
+            };
+            search::grep(&root, &grep)
+        })
+        .await
+        .map_err(|e| format!("the search failed: {e}"))?
+    }
+
+    async fn glob(&self, arguments: &str) -> Result<String, String> {
+        let args: GlobArgs = parse(arguments)?;
+        let (root, start) = self.search_root(args.path.as_deref())?;
+        if !start.is_dir() {
+            return Err(format!("{} isn't a folder", args.path.unwrap_or_default()));
+        }
+        tokio::task::spawn_blocking(move || search::glob(&root, &args.pattern, &start)).await.map_err(|e| format!("the search failed: {e}"))?
+    }
+
+    /// The project, resolved, and where in it to search: `path`, or all of it.
+    fn search_root(&self, path: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
+        let root = self.root.canonicalize().map_err(|e| format!("can't open the project directory: {e}"))?;
+        let start = match path.map(str::trim).filter(|p| !p.is_empty() && *p != ".") {
+            Some(path) => self.inside_root(path)?,
+            None => root.clone(),
+        };
+        Ok((root, start))
     }
 
     /// Resolves `path`, following symlinks, and refuses anything outside the
@@ -468,6 +556,20 @@ mod tests {
             let answer = tools.run(&call("read", json!({ "path": path }))).await;
             assert_eq!(answer, format!("error: {path} is outside the project"));
         }
+    }
+
+    #[tokio::test]
+    async fn searches_stay_in_the_project() {
+        let tools = Tools::new(project("search", &[("a.rs", "fn main() {}\n"), ("b.md", "main ideas\n")]));
+        let grep = |path: Value, output: &str| call("grep", json!({"pattern": "main", "path": path, "glob": null, "ignore_case": false, "output": output, "context": null}));
+        assert_eq!(tools.run(&grep(Value::Null, "files")).await, "2 files with matches (2 matching lines)\na.rs (1 match)\nb.md (1 match)");
+        assert_eq!(tools.run(&grep(json!("a.rs"), "lines")).await, "1 match in 1 file\na.rs\n1:fn main() {}");
+        assert_eq!(tools.run(&call("glob", json!({"pattern": "*.md", "path": null}))).await, "1 file\nb.md");
+        let climb = format!("{}etc", "../".repeat(20));
+        for path in ["/etc", climb.as_str()] {
+            assert_eq!(tools.run(&grep(json!(path), "lines")).await, format!("error: {path} is outside the project"));
+        }
+        assert_eq!(tools.run(&call("glob", json!({"pattern": "*", "path": "a.rs"}))).await, "error: a.rs isn't a folder");
     }
 
     #[tokio::test]
