@@ -30,6 +30,8 @@ macro_rules! out {
 }
 
 mod commands;
+mod settings;
+use settings::Settings;
 mod ui;
 use commands::Slash;
 use ui::editor::{Action, Editor};
@@ -93,6 +95,10 @@ Rules in .rein/permissions refine the mode for commands, one per line:
 Deny beats ask beats allow, and a command only runs without asking if every
 part of it is allowed. Rules decide when rein asks; they aren't a sandbox.
 
+Defaults go in ~/.config/rein/config, one per line: model, effort, mode and
+compact_at, like `mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT,
+$REIN_MODE and $REIN_COMPACT_AT, which win over the file.
+
 Without `rein login`, rein uses $OPENAI_API_KEY, billed to your API account.";
 
 type CliResult<T = ()> = Result<T, String>;
@@ -123,7 +129,11 @@ async fn run(args: Vec<String>) -> CliResult {
         }
         ["login"] => login(&http).await,
         ["models"] => models(&http).await,
-        _ => ask(&http, AskArgs::parse(args)?).await,
+        _ => {
+            let settings = Settings::load(&config_dir()?.join(settings::FILE))?;
+            let compact_at = settings.get("compact_at", "REIN_COMPACT_AT");
+            ask(&http, AskArgs::parse(args, &settings)?, compact_at).await
+        }
     }
 }
 
@@ -204,10 +214,15 @@ struct AskArgs {
 }
 
 impl AskArgs {
-    fn parse(args: Vec<String>) -> CliResult<Self> {
-        let mut model = std::env::var("REIN_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
-        let (mut effort, mut system, mut record, mut words) = (None, None, None, Vec::new());
-        let mut mode = Mode::Ask;
+    /// Flags first; what they don't say comes from `settings` (and the
+    /// environment), then rein's defaults.
+    fn parse(args: Vec<String>, settings: &Settings) -> CliResult<Self> {
+        let mut model = settings.get("model", "REIN_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+        let (mut effort, mut system, mut record, mut words) = (settings.get("effort", "REIN_EFFORT"), None, None, Vec::new());
+        let mut mode = match settings.get("mode", "REIN_MODE") {
+            Some(name) => Mode::parse(&name).ok_or(format!("unknown mode {name} in the settings; use ask, edits, read-only or trust"))?,
+            None => Mode::Ask,
+        };
         let (mut model_given, mut resume) = (false, Resume::New);
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -241,7 +256,7 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> CliResult<Strin
     args.next().ok_or_else(|| format!("{flag} needs a value"))
 }
 
-async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
+async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option<String>) -> CliResult {
     let client = client(http).await?;
     // The model list says how big each model's context window is. Fetched
     // while everything else gets ready.
@@ -263,6 +278,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         root: root.clone(),
         system: args.system.clone(),
         models: Vec::new(),
+        compact_at,
     };
 
     let saved = match args.resume {
@@ -292,7 +308,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         Ok(Ok(Ok(models))) => models,
         _ => Vec::new(),
     };
-    let limit = compact_limit(setup.window(&model_name))?;
+    let limit = setup.limit(&model_name)?;
     terminal.context_limit = limit;
     terminal.model = model_name.clone();
     terminal.input.set_bar(terminal.bar());
@@ -330,6 +346,8 @@ struct Setup {
     system: Option<String>,
     /// The models you can use, with their context windows.
     models: Vec<rein_llm::openai::ModelInfo>,
+    /// `compact_at` from the settings or the environment.
+    compact_at: Option<String>,
 }
 
 impl Setup {
@@ -360,9 +378,10 @@ impl Setup {
         Ok((Loaded { session, history: Vec::new(), full: Vec::new() }, Some(context)))
     }
 
-    /// `model`'s context window, if the model list says.
-    fn window(&self, model: &str) -> Option<u64> {
-        self.models.iter().find(|m| m.id == model).and_then(|m| m.context_window)
+    /// When to compact with `model`: see [`compact_limit`].
+    fn limit(&self, model: &str) -> CliResult<u64> {
+        let window = self.models.iter().find(|m| m.id == model).and_then(|m| m.context_window);
+        compact_limit(window, self.compact_at.as_deref())
     }
 }
 
@@ -391,12 +410,13 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
     }
 }
 
-/// When to compact: $REIN_COMPACT_AT tokens if set, otherwise rein's
-/// default, and never later than 90% of the model's window, when known.
-fn compact_limit(window: Option<u64>) -> CliResult<u64> {
-    let wanted = match std::env::var("REIN_COMPACT_AT") {
-        Ok(value) => value.trim().parse::<u64>().map_err(|_| format!("REIN_COMPACT_AT should be a number of tokens, not {value}"))?,
-        Err(_) => compact::DEFAULT_LIMIT,
+/// When to compact: `compact_at` tokens if set (the settings, or
+/// $REIN_COMPACT_AT), otherwise rein's default, and never later than 90% of
+/// the model's window, when known.
+fn compact_limit(window: Option<u64>, compact_at: Option<&str>) -> CliResult<u64> {
+    let wanted = match compact_at {
+        Some(value) => value.trim().parse::<u64>().map_err(|_| format!("compact_at should be a number of tokens, not {value}"))?,
+        None => compact::DEFAULT_LIMIT,
     };
     Ok(window.map_or(wanted, |window| wanted.min(window / 10 * 9)))
 }
@@ -601,7 +621,7 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             if !setup.models.is_empty() && !setup.models.iter().any(|m| m.id == id) {
                 return Err(format!("no model called {id}; /model lists them"));
             }
-            agent.window.limit = compact_limit(setup.window(&id))?;
+            agent.window.limit = setup.limit(&id)?;
             terminal.context_limit = agent.window.limit;
             if let Some(session) = &mut agent.session {
                 session.append_model(&id).map_err(describe)?;
@@ -646,7 +666,7 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             let model = loaded.session.header().model.clone();
             switch(agent, loaded, context);
             if model != agent.model_name {
-                agent.window.limit = compact_limit(setup.window(&model))?;
+                agent.window.limit = setup.limit(&model)?;
                 terminal.context_limit = agent.window.limit;
                 agent.model_name = model.clone();
                 terminal.model = model;
@@ -1507,7 +1527,16 @@ mod tests {
     }
 
     fn args(line: &str) -> CliResult<AskArgs> {
-        AskArgs::parse(line.split(' ').map(str::to_owned).collect())
+        AskArgs::parse(line.split(' ').map(str::to_owned).collect(), &Settings::default())
+    }
+
+    #[test]
+    fn flags_win_over_the_settings() {
+        let settings = Settings::parse("mode = edits\nmodel = from-file\neffort = low").unwrap();
+        let parsed = AskArgs::parse(vec!["hi".into()], &settings).unwrap();
+        assert_eq!((parsed.mode, parsed.effort.as_deref()), (Mode::Edits, Some("low")));
+        let parsed = AskArgs::parse(["--mode", "trust", "-m", "flagged", "hi"].map(str::to_owned).to_vec(), &settings).unwrap();
+        assert_eq!((parsed.mode, parsed.model.as_str()), (Mode::Trust, "flagged"));
     }
 
     #[test]
