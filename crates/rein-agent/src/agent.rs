@@ -360,9 +360,22 @@ pub struct OpenAi {
     pub record: Option<File>,
 }
 
+/// How long to wait before each retry of a failed request.
+const RETRY_WAITS: [u64; 3] = [1, 2, 4];
+
 impl Model for OpenAi {
     async fn respond(&self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<(Vec<Item>, Usage)> {
-        let mut stream = self.client.stream(request).await?;
+        // Only the request itself is retried: once the answer has started,
+        // trying again would show it twice.
+        let mut waits = RETRY_WAITS.iter();
+        let mut stream = loop {
+            match self.client.stream(request).await {
+                Err(e) if e.retryable() && let Some(&seconds) = waits.next() => {
+                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                }
+                result => break result?,
+            }
+        };
         if let Some(file) = &self.record {
             stream.record_to(file.try_clone()?);
         }

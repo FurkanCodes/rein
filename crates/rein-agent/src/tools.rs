@@ -34,7 +34,12 @@ struct ReadArgs {
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
+    /// How long it may run, if longer than the default.
+    timeout_seconds: Option<u64>,
 }
+
+/// The longest a command may ask to run.
+const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Deserialize)]
 struct WriteArgs {
@@ -100,10 +105,12 @@ impl Tools {
             Tool {
                 name: "bash".into(),
                 description: "Run a shell command in the project root and return its output and exit code. \
-                              The user approves each command before it runs."
+                              The user approves each command before it runs. Commands are stopped after 60 seconds \
+                              unless you ask for longer, up to 600, for slow builds and test suites."
                     .into(),
                 parameters: object(json!({
-                    "command": { "type": "string", "description": "The command line, run with `sh -c`." }
+                    "command": { "type": "string", "description": "The command line, run with `sh -c`." },
+                    "timeout_seconds": { "type": ["integer", "null"], "description": "How long it may run, at most 600. Null for 60." }
                 })),
             },
         ]
@@ -188,6 +195,7 @@ impl Tools {
 
     async fn bash(&self, arguments: &str) -> Result<String, String> {
         let args: BashArgs = parse(arguments)?;
+        let timeout = args.timeout_seconds.map_or(self.timeout, |s| Duration::from_secs(s).clamp(Duration::from_secs(1), MAX_TIMEOUT));
         let child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&args.command)
@@ -199,9 +207,9 @@ impl Tools {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("can't start sh: {e}"))?;
-        let output = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(result) => result.map_err(|e| format!("the command failed to run: {e}"))?,
-            Err(_) => return Err(format!("the command took longer than {:?} and was stopped", self.timeout)),
+            Err(_) => return Err(format!("the command took longer than {timeout:?} and was stopped")),
         };
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -386,6 +394,10 @@ mod tests {
         let tools = Tools::new(project("slow", &[])).with_timeout(Duration::from_millis(200));
         let answer = tools.run(&call("bash", json!({"command": "sleep 5"}))).await;
         assert_eq!(answer, "error: the command took longer than 200ms and was stopped");
+        // Asking for longer works, within the limit.
+        let tools = Tools::new(project("slow-ok", &[])).with_timeout(Duration::from_millis(200));
+        let answer = tools.run(&call("bash", json!({"command": "sleep 1.2; echo done", "timeout_seconds": 3}))).await;
+        assert_eq!(answer, "done\n[exit code 0]");
     }
 
     #[tokio::test]

@@ -100,6 +100,22 @@ impl Error {
         }
     }
 
+    /// Worth sending the same request again after a pause: the network
+    /// failed, the provider is busy (429), or it had an error of its own
+    /// (5xx). Not when you've run out of usage: waiting a few seconds won't
+    /// change that.
+    pub fn retryable(&self) -> bool {
+        let code = self.code().unwrap_or_default();
+        if code.contains("usage_limit") || code.contains("quota") {
+            return false;
+        }
+        match self {
+            Error::Http(e) => e.is_connect() || e.is_timeout() || e.is_request() || e.status().is_some_and(|s| s.is_server_error()),
+            Error::Api { status: Some(status), .. } => *status == 429 || (500..600).contains(status),
+            _ => false,
+        }
+    }
+
     /// The HTTP status the provider answered with, if any.
     pub fn status(&self) -> Option<u16> {
         match self {
@@ -159,3 +175,22 @@ impl From<serde_json::Error> for Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api(status: u16, code: Option<&str>) -> Error {
+        Error::Api { status: Some(status), code: code.map(str::to_owned), message: String::new(), request_id: None }
+    }
+
+    #[test]
+    fn retries_only_what_a_pause_can_fix() {
+        assert!(api(429, Some("rate_limit_exceeded")).retryable());
+        assert!(api(503, None).retryable());
+        assert!(!api(429, Some("subscription_sharing_usage_limit_exceeded")).retryable());
+        assert!(!api(400, None).retryable());
+        assert!(!api(401, None).retryable());
+        assert!(!Error::Interrupted.retryable(), "half an answer was shown already");
+    }
+}
