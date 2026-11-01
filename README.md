@@ -40,29 +40,52 @@ rein -r                         # choose a saved conversation to continue
 rein --model gpt-6.1-sol --effort low "say hi"
 ```
 
-In a conversation, your message goes in a box pinned to the bottom of the
-terminal, with a status bar under it: the model, the mode, how full the
-context is, how much came from the cache, and how long the last turn took.
-The conversation scrolls above it as usual, so you can scroll back and copy
-from it. Each step rein takes appears under a label (`read`, `edit`, `run`),
-with a short result and the output lines worth seeing; edits show as a
-framed diff before you approve them. Answers are rendered from Markdown.
-`NO_COLOR`, and output that isn't a terminal, get plain text.
+In a conversation rein takes the whole window, as `less` and `vim` do: the
+conversation above, and your message in a box at the bottom, with a status
+bar under it: the model and its effort, the mode, how full the context is,
+how much came from the cache, and how long the last turn took. While rein
+works, a line over the box says what it's doing and for how long. Each step
+appears on one line once it's done (`Read`, `Edit`, `Run`), with a short
+result and the output lines worth seeing; edits show as a framed diff
+before you approve them. Answers are rendered from Markdown.
+
+rein keeps the conversation as text and lays it out for the window's width,
+so when the window changes size nothing is lost and words wrap where they
+should. Scroll it with the mouse wheel, PgUp/PgDn or Shift-↑↓; drag over
+text to copy it. What the terminal showed before rein is left as it was,
+and when you leave, the conversation is printed there, so it stays in the
+scrollback. `rein "task"` and output that isn't a terminal get plain lines
+instead, printed as they come; `NO_COLOR` turns colour off.
+
+When rein needs your go-ahead, the box turns yellow and asks, with the whole
+command in view: **y** yes, **a** yes and don't ask again, **n** no, or
+**Esc** no, and stop so you can say what to do instead. The arrows and Enter,
+or 1–4, work too. Keys typed in the moment it appears still go to your
+message, so typing ahead can't answer it by accident.
 
 | Key | What it does |
 |---|---|
 | ↑ / ↓ | your earlier messages |
-| `\` at the end of a line, or Ctrl-J | a new line in your message |
-| `/` | the commands, as you type; Tab completes one. `/help` lists them |
+| Shift-Enter, Ctrl-J, or `\` at the end of a line | a new line in your message (Shift-Enter where the terminal tells it apart from Enter) |
+| `/` | the commands that match, as you type: ↑↓ pick one, Tab completes it, Enter runs it. `/help` lists them |
+| Shift-Tab | the next mode: ask → edits → read-only |
+| Enter while rein works | queue your message; it's sent when rein is done. Esc puts it back in the box |
+| Esc or Ctrl-C while rein works | stop that turn; the conversation goes on |
+| Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
+| Alt-← / Alt-→ | a word left or right |
+| Ctrl-O | see every step's full output: ↑↓ scroll, ←→ other steps, `/` search, Esc back |
+| Mouse wheel, PgUp / PgDn, Shift-↑ / ↓ | scroll the conversation |
+| Drag over text | select it and copy it to the clipboard |
+| Ctrl-L | draw the window again |
 | `/mode [ask\|edits\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
 | `/model [id]`, `/effort [level]` | list or switch the model; show or change reasoning effort |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
-| Ctrl-O | see every step's full output: ↑↓ scroll, ←→ other steps, `/` search, Esc back |
-| Ctrl-C while rein works | stop that turn; the conversation goes on |
-| Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
 | Ctrl-D or `/exit` | leave |
+
+A big paste shows in the box as one piece, `[pasted 40 lines]`, which
+Backspace takes out whole; the model gets all of it.
 
 Every conversation is saved as it goes, one JSON line per message, tool call
 and result, in `~/.config/rein/sessions/<this folder>/`. The files are readable
@@ -130,8 +153,8 @@ Credentials live in `~/.config/rein/` (or `$REIN_HOME`), readable only by you.
 
 rein's tools are `read`, `write`, `edit` and `bash`. They only touch files
 inside the folder you run it in. Before a file change you see the lines it
-removes and adds. At each question, answer `y`, `n`, or `a` for "yes, and
-don't ask again this run".
+removes and adds. At each question, answer `y`, `n`, `a` for "yes, and
+don't ask again this run", or Esc to say no and tell rein what to do instead.
 
 `--mode` sets what runs without asking:
 

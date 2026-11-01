@@ -46,6 +46,12 @@ impl Style {
         format!("{} ", self.paint("1;34", &format!("{name:<width$}", width = GUTTER - 1)))
     }
 
+    /// `you`: your messages' label, grey, so that rein's blue one stands
+    /// out from it, padded to the gutter.
+    pub fn you(self) -> String {
+        format!("{} ", self.paint("90", &format!("{:<width$}", "you", width = GUTTER - 1)))
+    }
+
     pub fn bold(self, text: &str) -> String {
         self.paint("1", text)
     }

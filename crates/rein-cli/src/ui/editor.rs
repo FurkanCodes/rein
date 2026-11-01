@@ -1,5 +1,8 @@
 //! The text in the input box and where the cursor is in it. Nothing here
 //! touches the terminal: keys go in, and `layout` says what to draw.
+//!
+//! A big paste shows as one piece, `[pasted 40 lines]`, which the cursor
+//! steps over and Backspace takes out whole; what's sent is the text.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -14,7 +17,18 @@ pub struct Editor {
     history: Vec<String>,
     /// Where ↑ has got to in `history`, and what was typed before it.
     browsing: Option<(usize, String)>,
+    /// Big pastes, each standing in `text` as one character of its own:
+    /// [`PASTED`] plus its index here.
+    pastes: Vec<String>,
 }
+
+/// Where the characters that stand for pastes start: a private-use plane
+/// of Unicode, which nobody types.
+const PASTED: u32 = 0xF0000;
+
+/// A paste longer than this shows as one piece.
+const BIG_PASTE_LINES: usize = 5;
+const BIG_PASTE_CHARS: usize = 1000;
 
 /// What a key asks for, beyond changing the text.
 #[derive(Debug, PartialEq, Eq)]
@@ -26,8 +40,34 @@ pub enum Action {
 }
 
 impl Editor {
+    /// The text, with pastes in full.
     pub fn text(&self) -> String {
-        self.text.iter().collect()
+        let mut out = String::new();
+        for &c in &self.text {
+            match self.paste(c) {
+                Some(paste) => out.push_str(paste),
+                None => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// The text as the box shows it, pastes as their labels.
+    pub fn shown_text(&self) -> String {
+        self.text.iter().map(|&c| self.shown(c).unwrap_or_else(|| c.to_string())).collect()
+    }
+
+    /// The paste `c` stands for, if it stands for one.
+    fn paste(&self, c: char) -> Option<&str> {
+        let index = (c as u32).checked_sub(PASTED)? as usize;
+        self.pastes.get(index).map(String::as_str)
+    }
+
+    /// How a character looks in the box: a paste as its label.
+    fn shown(&self, c: char) -> Option<String> {
+        let paste = self.paste(c)?;
+        let lines = paste.lines().count();
+        Some(if lines > 1 { format!("[pasted {lines} lines]") } else { format!("[pasted {} characters]", paste.chars().count()) })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -44,6 +84,7 @@ impl Editor {
     pub fn take(&mut self) -> String {
         let text = self.text();
         self.text.clear();
+        self.pastes.clear();
         self.cursor = 0;
         self.browsing = None;
         text
@@ -69,6 +110,11 @@ impl Editor {
             }
             Key::Newline => self.insert("\n"),
             Key::Char(c) => self.insert(&c.to_string()),
+            Key::Paste(text) if text.lines().count() > BIG_PASTE_LINES || text.chars().count() > BIG_PASTE_CHARS => {
+                let stand_in = char::from_u32(PASTED + self.pastes.len() as u32).unwrap_or('?');
+                self.pastes.push(text.clone());
+                self.insert(&stand_in.to_string());
+            }
             Key::Paste(text) => self.insert(text),
             Key::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
@@ -79,6 +125,22 @@ impl Editor {
             }
             Key::Left => self.cursor = self.cursor.saturating_sub(1),
             Key::Right => self.cursor = (self.cursor + 1).min(self.text.len()),
+            Key::WordLeft => {
+                while self.cursor > 0 && !self.text[self.cursor - 1].is_alphanumeric() {
+                    self.cursor -= 1;
+                }
+                while self.cursor > 0 && self.text[self.cursor - 1].is_alphanumeric() {
+                    self.cursor -= 1;
+                }
+            }
+            Key::WordRight => {
+                while self.cursor < self.text.len() && !self.text[self.cursor].is_alphanumeric() {
+                    self.cursor += 1;
+                }
+                while self.cursor < self.text.len() && self.text[self.cursor].is_alphanumeric() {
+                    self.cursor += 1;
+                }
+            }
             Key::Home => self.cursor = self.line_start(),
             Key::End => self.cursor = self.line_end(),
             Key::DeleteWord => {
@@ -181,6 +243,7 @@ impl Editor {
 
     fn set(&mut self, text: &str) {
         self.text = text.chars().collect();
+        self.pastes.clear();
         self.cursor = self.text.len();
     }
 
@@ -200,15 +263,23 @@ impl Editor {
                 column = 0;
                 continue;
             }
-            let w = c.width().unwrap_or(0);
-            if column + w > width {
+            let shown = self.shown(c);
+            let w = match &shown {
+                Some(label) => unicode_width::UnicodeWidthStr::width(label.as_str()),
+                None => c.width().unwrap_or(0),
+            };
+            if column + w > width && column > 0 {
                 lines.push(String::new());
                 column = 0;
                 if i == self.cursor {
                     cursor = (lines.len() - 1, 0);
                 }
             }
-            lines.last_mut().expect("never empty").push(c);
+            let line = lines.last_mut().expect("never empty");
+            match shown {
+                Some(label) => line.push_str(&label),
+                None => line.push(c),
+            }
             column += w;
         }
         if self.cursor == self.text.len() {
@@ -246,6 +317,13 @@ mod tests {
         e.key(&Key::End);
         e.key(&Key::Backspace);
         assert_eq!(e.text(), "Fix the test");
+        e.key(&Key::WordLeft);
+        typed(&mut e, "unit ");
+        assert_eq!(e.text(), "Fix the unit test");
+        e.key(&Key::Home);
+        e.key(&Key::WordRight);
+        typed(&mut e, "ed");
+        assert_eq!(e.text(), "Fixed the unit test");
         assert_eq!(e.key(&Key::Enter), Action::Submit);
     }
 
@@ -279,6 +357,26 @@ mod tests {
         e.key(&Key::Down);
         e.key(&Key::Down);
         assert_eq!(e.text(), "draft");
+    }
+
+    #[test]
+    fn a_big_paste_is_one_piece() {
+        let mut e = Editor::default();
+        typed(&mut e, "look: ");
+        let log: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        e.key(&Key::Paste(log.clone()));
+        typed(&mut e, " why?");
+        assert_eq!(e.layout(80).0, ["look: [pasted 40 lines] why?"]);
+        assert_eq!(e.text(), format!("look: {log} why?"), "what's sent is the whole paste");
+        assert_eq!(e.shown_text(), "look: [pasted 40 lines] why?");
+        // Backspace over it takes it out whole.
+        for _ in 0..6 {
+            e.key(&Key::Backspace);
+        }
+        assert_eq!(e.text(), "look: ");
+        // A short paste is just text.
+        e.key(&Key::Paste("two\nlines".into()));
+        assert_eq!(e.layout(80).0, ["look: two", "lines"]);
     }
 
     #[test]

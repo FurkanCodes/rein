@@ -4,14 +4,20 @@
 //! for anything beyond ASCII), Ctrl-C as byte 3, arrows as escape
 //! sequences like `ESC [ A`. Pasted text comes wrapped in `ESC [ 200~` and
 //! `ESC [ 201~`, so its newlines aren't taken for Enter.
+//!
+//! Terminals that speak the kitty keyboard protocol, which rein asks for,
+//! spell out keys pressed with Shift, Alt or Ctrl as `ESC [ code ; mods u`,
+//! so Shift-Enter can mean a new line, and send Esc as `ESC [ 27 u`.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
     Char(char),
     Tab,
     Enter,
-    /// A newline in the message: Ctrl-J, or Alt-Enter.
+    /// A newline in the message: Shift-Enter, Alt-Enter or Ctrl-J.
     Newline,
+    /// Shift-Tab.
+    BackTab,
     Backspace,
     Delete,
     Left,
@@ -20,8 +26,18 @@ pub enum Key {
     Down,
     Home,
     End,
+    /// A word to the left or right: Alt or Ctrl with an arrow.
+    WordLeft,
+    WordRight,
     PageUp,
     PageDown,
+    /// Shift-↑ and Shift-↓: the conversation, a line at a time.
+    ScrollUp,
+    ScrollDown,
+    /// The mouse, as the terminal reports it once asked: which button
+    /// (64 and 65 are the wheel; 32 is added while dragging), where, from
+    /// 1, and whether it was let go.
+    Mouse { button: u16, x: usize, y: usize, up: bool },
     /// Delete the word before the cursor.
     DeleteWord,
     /// Delete everything before the cursor.
@@ -31,11 +47,10 @@ pub enum Key {
     CtrlC,
     CtrlD,
     CtrlO,
+    /// Ctrl-L: draw the screen again.
+    Redraw,
     Esc,
     Paste(String),
-    /// Not a key: the terminal saying where the cursor is (row, column),
-    /// when rein asked.
-    CursorAt(usize, usize),
 }
 
 #[derive(Default)]
@@ -119,6 +134,7 @@ fn decode(bytes: &[u8]) -> Decoded {
         0x08 | 0x7f => key(Key::Backspace, 1),
         0x0a => key(Key::Newline, 1),
         0x0b => key(Key::DeleteToEnd, 1),
+        0x0c => key(Key::Redraw, 1),
         0x0d => key(Key::Enter, 1),
         0x0e => key(Key::Down, 1),
         0x0f => key(Key::CtrlO, 1),
@@ -151,7 +167,9 @@ fn escape(bytes: &[u8]) -> Decoded {
     match bytes.get(1) {
         None => Decoded::Incomplete,
         Some(b'\r') => key(Key::Newline, 2),
-        Some(0x7f) => key(Key::DeleteWord, 2),
+        Some(0x7f | 0x08) => key(Key::DeleteWord, 2),
+        Some(b'b') => key(Key::WordLeft, 2),
+        Some(b'f') => key(Key::WordRight, 2),
         Some(b'O') => match bytes.get(2) {
             None => Decoded::Incomplete,
             Some(b'H') => key(Key::Home, 3),
@@ -165,11 +183,17 @@ fn escape(bytes: &[u8]) -> Decoded {
             };
             let used = end + 3;
             let params = &bytes[2..end + 2];
+            // With Alt or Ctrl (`1;3`, `1;5`), the side arrows go by words.
+            let by_word = modifiers(params).is_some_and(|m| m & (ALT | CTRL) != 0);
+            let shifted = modifiers(params) == Some(SHIFT);
             match (params, bytes[end + 2]) {
-                (_, b'A') => key(Key::Up, used),
-                (_, b'B') => key(Key::Down, used),
-                (_, b'C') => key(Key::Right, used),
-                (_, b'D') => key(Key::Left, used),
+                (p, b'M' | b'm') if p.starts_with(b"<") => mouse(&p[1..], bytes[end + 2] == b'm').map_or(Decoded::Skip(used), |k| key(k, used)),
+                (_, b'A') => key(if shifted { Key::ScrollUp } else { Key::Up }, used),
+                (_, b'B') => key(if shifted { Key::ScrollDown } else { Key::Down }, used),
+                (_, b'C') => key(if by_word { Key::WordRight } else { Key::Right }, used),
+                (_, b'D') => key(if by_word { Key::WordLeft } else { Key::Left }, used),
+                (_, b'Z') => key(Key::BackTab, used),
+                (_, b'u') => spelled(params).map_or(Decoded::Skip(used), |k| key(k, used)),
                 (_, b'H') => key(Key::Home, used),
                 (_, b'F') => key(Key::End, used),
                 (b"1" | b"7", b'~') => key(Key::Home, used),
@@ -178,19 +202,82 @@ fn escape(bytes: &[u8]) -> Decoded {
                 (b"5", b'~') => key(Key::PageUp, used),
                 (b"6", b'~') => key(Key::PageDown, used),
                 (b"200", b'~') => Decoded::PasteStart(used),
-                (_, b'R') => match std::str::from_utf8(params).ok().and_then(|p| p.split_once(';')) {
-                    Some((row, column)) => match (row.parse(), column.parse()) {
-                        (Ok(row), Ok(column)) => key(Key::CursorAt(row, column), used),
-                        _ => Decoded::Skip(used),
-                    },
-                    None => Decoded::Skip(used),
-                },
+                // xterm's way of spelling out a key: `27 ; mods ; code ~`.
+                (p, b'~') if p.starts_with(b"27;") => {
+                    let rest = std::str::from_utf8(&p[3..]).unwrap_or_default();
+                    let (mods, code) = rest.split_once(';').unwrap_or_default();
+                    spelled(format!("{code};{mods}").as_bytes()).map_or(Decoded::Skip(used), |k| key(k, used))
+                }
                 _ => Decoded::Skip(used),
             }
         }
         // Alt plus a key: not used.
         Some(_) => Decoded::Skip(2),
     }
+}
+
+/// `button ; x ; y`, from `ESC [ < … M` (pressed) or `m` (let go).
+fn mouse(params: &[u8], up: bool) -> Option<Key> {
+    let text = std::str::from_utf8(params).ok()?;
+    let mut parts = text.split(';').map(str::parse::<usize>);
+    let (button, x, y) = (parts.next()?.ok()?, parts.next()?.ok()?, parts.next()?.ok()?);
+    Some(Key::Mouse { button: u16::try_from(button).ok()?, x, y, up })
+}
+
+const SHIFT: u32 = 1;
+const ALT: u32 = 2;
+const CTRL: u32 = 4;
+
+/// The modifier keys in `1;5`-style parameters, as bits: Shift 1, Alt 2,
+/// Ctrl 4. Caps Lock and Num Lock don't count.
+fn modifiers(params: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(params).ok()?;
+    let (_, mods) = text.split_once(';')?;
+    let mods: u32 = mods.split(':').next()?.parse().ok()?;
+    Some(mods.saturating_sub(1) & !(64 | 128))
+}
+
+/// A key the kitty protocol spelled out: `code ; mods`, where `code` is
+/// the key's character.
+fn spelled(params: &[u8]) -> Option<Key> {
+    let text = std::str::from_utf8(params).ok()?;
+    let code: u32 = text.split([';', ':']).next()?.parse().ok()?;
+    let mods = modifiers(params).unwrap_or(0);
+    let (shift, alt, ctrl) = (mods & SHIFT != 0, mods & ALT != 0, mods & CTRL != 0);
+    Some(match code {
+        13 if shift || alt || ctrl => Key::Newline,
+        // The keypad's Enter has a code of its own.
+        13 | 57414 => Key::Enter,
+        27 => Key::Esc,
+        9 if shift => Key::BackTab,
+        9 => Key::Tab,
+        8 | 127 if alt || ctrl => Key::DeleteWord,
+        8 | 127 => Key::Backspace,
+        _ => {
+            let c = char::from_u32(code)?;
+            match (ctrl, alt, c.to_ascii_lowercase()) {
+                (true, false, 'a') => Key::Home,
+                (true, false, 'b') => Key::Left,
+                (true, false, 'c') => Key::CtrlC,
+                (true, false, 'd') => Key::CtrlD,
+                (true, false, 'e') => Key::End,
+                (true, false, 'f') => Key::Right,
+                (true, false, 'h') => Key::Backspace,
+                (true, false, 'j') => Key::Newline,
+                (true, false, 'k') => Key::DeleteToEnd,
+                (true, false, 'l') => Key::Redraw,
+                (true, false, 'n') => Key::Down,
+                (true, false, 'o') => Key::CtrlO,
+                (true, false, 'p') => Key::Up,
+                (true, false, 'u') => Key::DeleteToStart,
+                (true, false, 'w') => Key::DeleteWord,
+                (false, true, 'b') => Key::WordLeft,
+                (false, true, 'f') => Key::WordRight,
+                (false, false, _) if !c.is_control() => Key::Char(if shift { c.to_uppercase().next()? } else { c }),
+                _ => return None,
+            }
+        }
+    })
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -211,8 +298,30 @@ mod tests {
         assert_eq!(keys(b"\x03\x04\x7f\x17"), [Key::CtrlC, Key::CtrlD, Key::Backspace, Key::DeleteWord]);
         assert_eq!(keys(b"\x1b[A\x1b[D\x1b[3~\x1b[H\x1bOF"), [Key::Up, Key::Left, Key::Delete, Key::Home, Key::End]);
         assert_eq!(keys(b"\x1b"), [Key::Esc]);
-        assert_eq!(keys(b"\x1b[99Zx"), [Key::Char('x')], "unknown sequences are skipped");
-        assert_eq!(keys(b"\x1b[4;12Rx"), [Key::CursorAt(4, 12), Key::Char('x')], "a cursor report isn't typing");
+        assert_eq!(keys(b"\x1b[99Xx"), [Key::Char('x')], "unknown sequences are skipped");
+        assert_eq!(keys(b"\x1b[4;12Rx"), [Key::Char('x')], "a cursor report isn't typing");
+    }
+
+    #[test]
+    fn reads_keys_the_kitty_protocol_spells_out() {
+        assert_eq!(keys(b"\x1b[13;2u\x1b[13u"), [Key::Newline, Key::Enter], "Shift-Enter is a new line");
+        assert_eq!(keys(b"\x1b[27u\x1b[99;5u\x1b[100;5u"), [Key::Esc, Key::CtrlC, Key::CtrlD]);
+        assert_eq!(keys(b"\x1b[111;5u\x1b[106;5u\x1b[9;2u"), [Key::CtrlO, Key::Newline, Key::BackTab]);
+        assert_eq!(keys(b"\x1b[127;3u\x1b[99;69u"), [Key::DeleteWord, Key::CtrlC], "Caps Lock doesn't change Ctrl-C");
+        assert_eq!(keys(b"\x1b[27;2;13~"), [Key::Newline], "xterm spells Shift-Enter this way");
+        assert_eq!(keys(b"\x1b[1;3D\x1b[1;5C\x1bb\x1b[1;2D"), [Key::WordLeft, Key::WordRight, Key::WordLeft, Key::Left]);
+        assert_eq!(keys(b"\x1b[Z"), [Key::BackTab]);
+    }
+
+    #[test]
+    fn reads_the_mouse_and_scrolling_keys() {
+        assert_eq!(keys(b"\x1b[<64;10;5M"), [Key::Mouse { button: 64, x: 10, y: 5, up: false }], "the wheel, up");
+        assert_eq!(keys(b"\x1b[<0;3;4M\x1b[<32;6;4M\x1b[<0;6;4m"), [
+            Key::Mouse { button: 0, x: 3, y: 4, up: false },
+            Key::Mouse { button: 32, x: 6, y: 4, up: false },
+            Key::Mouse { button: 0, x: 6, y: 4, up: true },
+        ]);
+        assert_eq!(keys(b"\x1b[1;2A\x1b[1;2B\x1b[A"), [Key::ScrollUp, Key::ScrollDown, Key::Up]);
     }
 
     #[test]

@@ -6,11 +6,16 @@
 /// the same line. Every line starts at `indent`, so text lines up after
 /// the label column. Colour codes are part of words but take no room. A
 /// word longer than a whole line is printed as is, so the terminal breaks
-/// it rather than rein.
+/// it rather than rein. A list item's lines after its first start under
+/// its text, not under its bullet.
 pub struct Wrap {
     width: usize,
     indent: usize,
     column: usize,
+    /// Where this line's next lines start, when it's a list item.
+    hang: Option<usize>,
+    /// Nothing but spaces on this line yet.
+    fresh: bool,
     spaces: String,
     word: String,
     /// Inside a colour code, which ends at its first letter.
@@ -20,7 +25,7 @@ pub struct Wrap {
 impl Wrap {
     /// `column` is where the cursor already is, after a label.
     pub fn new(width: usize, indent: usize, column: usize) -> Self {
-        Wrap { width, indent, column, spaces: String::new(), word: String::new(), escape: false }
+        Wrap { width, indent, column, hang: None, fresh: true, spaces: String::new(), word: String::new(), escape: false }
     }
 
     /// The window changed size: lines from here on fit the new width.
@@ -47,6 +52,8 @@ impl Wrap {
                     self.spaces.clear(); // trailing spaces show nothing
                     out.push('\n');
                     self.column = 0;
+                    self.hang = None;
+                    self.fresh = true;
                 }
                 ' ' | '\t' => {
                     self.flush(&mut out);
@@ -79,11 +86,16 @@ impl Wrap {
             column += if c == '\t' { 8 - column % 8 } else { 1 };
         }
         let width = super::style::width(&self.word);
+        if std::mem::take(&mut self.fresh) && bullet(&super::style::strip(&self.word)) {
+            // The text starts after the bullet and one space.
+            self.hang = Some(column + width + 1);
+        }
         if self.column > self.indent && column + width > self.width {
             // The spaces before the word are dropped.
+            let hang = self.hang.filter(|&hang| hang + width <= self.width).unwrap_or(self.indent);
             out.push('\n');
-            out.push_str(&" ".repeat(self.indent));
-            column = self.indent;
+            out.push_str(&" ".repeat(hang));
+            column = hang;
         } else {
             out.push_str(&self.spaces);
         }
@@ -96,6 +108,12 @@ impl Wrap {
             self.column %= self.width.max(1);
         }
     }
+}
+
+/// What starts a list item: `·`, `-`, `1.`, `☐`…
+fn bullet(word: &str) -> bool {
+    let digits = word.chars().take_while(char::is_ascii_digit).count();
+    matches!(word, "·" | "-" | "*" | "+" | "•" | "☐" | "☑" | "▸") || (digits > 0 && matches!(&word[digits..], "." | ")"))
 }
 
 #[cfg(test)]
@@ -126,6 +144,14 @@ mod tests {
         assert_eq!(wrapped(16, 7, "one two three four\nfive"), "one two\n       three\n       four\n       five");
         // Blank lines stay blank.
         assert_eq!(wrapped(30, 7, "a\n\nb"), "a\n\n       b");
+    }
+
+    #[test]
+    fn a_list_item_lines_up_under_its_text() {
+        assert_eq!(wrapped(20, 2, "· one two three four five"), "· one two three\n    four five");
+        assert_eq!(wrapped(20, 0, "  12. alpha beta gamma delta"), "  12. alpha beta\n      gamma delta");
+        // Only the line that starts with the bullet hangs.
+        assert_eq!(wrapped(12, 0, "· a\nplain words here"), "· a\nplain words\nhere");
     }
 
     #[test]

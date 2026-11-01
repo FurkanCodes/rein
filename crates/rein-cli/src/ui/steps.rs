@@ -60,6 +60,28 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
     }
 }
 
+/// A command step's whole command.
+pub fn command(call: &ToolCall) -> Option<String> {
+    let args: Value = serde_json::from_str(&call.arguments).ok()?;
+    args["command"].as_str().map(str::to_owned)
+}
+
+/// What rein is doing while a step runs, for the line over the box:
+/// `Running cargo test`.
+pub fn doing(call: &ToolCall) -> String {
+    let (name, target) = describe(call);
+    let verb = match name {
+        "Run" => "Running",
+        "Read" => "Reading",
+        "Edit" => "Editing",
+        "Write" => "Writing",
+        "Recall" => "Searching the conversation for",
+        "Plan" => return "Updating the plan".to_owned(),
+        _ => "Using",
+    };
+    format!("{verb} {target}")
+}
+
 /// A step's line: `lead` (rein's label, or room for it), `mark`, the tool,
 /// its target, then `status`. It never wraps: the target is cut to fit
 /// `columns`, so a long command takes one line.
@@ -73,6 +95,7 @@ pub fn line(call: &ToolCall, lead: &str, mark: &str, status: &str, style: Style,
 
 /// What a step's output came to: a short result for its first line, the
 /// output lines worth showing under it, and how many more there are.
+#[derive(Clone)]
 pub struct Outcome {
     /// It worked (a green dot), failed (red), or neither, like a declined
     /// step (grey).
@@ -300,6 +323,13 @@ mod tests {
         assert_eq!(describe(&call("bash", json!({"command": "cargo test"}))), ("Run", "cargo test".into()));
         assert_eq!(describe(&call("bash", json!({"command": "cd x\nmake"}))), ("Run", "cd x …".into()));
         assert_eq!(describe(&call("read", json!({"path": "a.rs", "start_line": 10, "line_count": 5}))), ("Read", "a.rs, lines 10-14".into()));
+    }
+
+    #[test]
+    fn says_what_a_running_step_is_doing() {
+        assert_eq!(doing(&call("bash", json!({"command": "cargo test"}))), "Running cargo test");
+        assert_eq!(doing(&call("read", json!({"path": "a.rs"}))), "Reading a.rs");
+        assert_eq!(doing(&call("plan", json!({"steps": []}))), "Updating the plan");
     }
 
     #[test]

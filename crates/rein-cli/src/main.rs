@@ -30,18 +30,16 @@ macro_rules! out {
 }
 
 mod commands;
+mod input;
 mod settings;
 use settings::Settings;
 mod ui;
 use commands::Slash;
-use ui::editor::{Action, Editor};
-use ui::keys::{Key, Keys};
+use input::{Input, Question, Read};
 use ui::markdown::Markdown;
-use ui::screen::{self, Bottom, Pinned, Raw};
 use ui::spinner::Spinner;
 use ui::steps;
 use ui::style::{GUTTER, Style, strip};
-use ui::viewer::{Entry, Viewer};
 use ui::wrap::Wrap;
 
 /// The name OpenAI shows for rein when someone signs in.
@@ -273,6 +271,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
     let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none());
     // The box goes up now, so typing can start while the model list loads.
     terminal.model = args.model.clone();
+    terminal.effort = args.effort.clone();
     terminal.input.set_bar(terminal.bar());
     let dir = config_dir()?;
     let mut setup = Setup {
@@ -328,6 +327,9 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
         context,
         window: Window { limit, measured: None, full: loaded.full },
     };
+    // A continued conversation is as full as it was.
+    terminal.context_used = agent.estimated();
+    terminal.input.set_bar(terminal.bar());
     match args.prompt {
         Some(prompt) => {
             terminal.start_turn(Some(&prompt));
@@ -400,15 +402,22 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
         _ = interrupted.notified() => None,
     };
     terminal.end_line();
+    if std::mem::take(&mut terminal.after_you) && terminal.fancy {
+        say!();
+    }
     let Some(outcome) = outcome else {
         agent.repair();
-        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(interrupted)"));
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(interrupted; what should rein do instead?)"));
         terminal.end_turn();
         return Ok(());
     };
     terminal.end_turn();
     match outcome.map_err(describe)? {
         Outcome::Done => Ok(()),
+        Outcome::Stopped => {
+            say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(stopped; what should rein do instead?)"));
+            Ok(())
+        }
         Outcome::TurnLimit => Err(format!("stopped after {MAX_TURNS} turns of tool calls; ask again to continue")),
     }
 }
@@ -467,6 +476,7 @@ async fn pick(folder: &Path, terminal: &mut Terminal) -> CliResult<Option<PathBu
                 _ => say!("{pad}Type a number from 1 to {}.", saved.len()),
             },
             Read::Interrupted | Read::Eof => return Ok(None),
+            Read::NextMode => {}
         }
     }
 }
@@ -558,39 +568,63 @@ async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal, setup:
         if !terminal.input.pinned() {
             say!();
         }
-        let Some(line) = message(terminal, &mut last_interrupt).await else {
-            return Ok(());
+        let line = match message(terminal, &mut last_interrupt).await {
+            Said::Message(line) => line,
+            Said::NextMode => {
+                let mode = next_mode(agent.permissions.mode);
+                agent.permissions.mode = mode;
+                terminal.mode = mode_name(mode);
+                terminal.input.set_bar(terminal.bar());
+                terminal.input.notice(&format!("{} · shift-tab for the next", mode_description(mode)));
+                continue;
+            }
+            Said::Leave => break,
         };
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        let pad = " ".repeat(GUTTER);
         match commands::parse(line) {
-            Some(Ok(Slash::Exit)) => return Ok(()),
-            Some(Ok(command)) => {
+            Some(Ok(Slash::Exit)) => break,
+            Some(parsed) => {
                 if terminal.input.pinned() {
-                    say!("\n{}{line}", terminal.err.label("you"));
+                    say!("\n{}", you_said(line, terminal.err, terminal.wrap_width().unwrap_or(80)));
                 }
-                if let Err(e) = run_command(command, agent, terminal, setup).await {
-                    say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&e));
+                let done = match parsed {
+                    Ok(command) => run_command(command, agent, terminal, setup).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = done {
+                    say!("{pad}{}", terminal.err.red(&format!("✗ {e}")));
                 }
                 terminal.input.set_bar(terminal.bar());
-            }
-            Some(Err(e)) => {
-                if terminal.input.pinned() {
-                    say!("\n{}{line}", terminal.err.label("you"));
-                }
-                say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&e));
             }
             None => {
                 // A plain terminal already shows what was typed; the box doesn't.
                 let echo = terminal.input.pinned().then_some(line);
                 terminal.start_turn(echo);
                 if let Err(e) = turn(agent, line.to_owned(), terminal).await {
-                    say!("rein: {e}");
+                    say!("{pad}{}", terminal.err.red(&format!("✗ {e}")));
                 }
             }
         }
+    }
+    // Everything was saved as it went: say how to come back to it.
+    let talked = agent.window.full.iter().skip(1).any(|item| matches!(item, Item::User(_)));
+    if talked && terminal.fancy {
+        say!("\n{}", terminal.err.dim("rein -c continues this conversation"));
+    }
+    Ok(())
+}
+
+/// Shift-Tab's order: asking about everything, then about commands only,
+/// then nothing running at all. `trust` is only for asking by name.
+fn next_mode(mode: Mode) -> Mode {
+    match mode {
+        Mode::Ask => Mode::Edits,
+        Mode::Edits => Mode::ReadOnly,
+        Mode::ReadOnly | Mode::Trust => Mode::Ask,
     }
 }
 
@@ -604,7 +638,14 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             for line in commands::help() {
                 say!("{pad}{line}");
             }
-            say!("{pad}{}", s.dim("Ctrl-O shows a step's full output; \\ or Ctrl-J starts a new line."));
+            for keys in [
+                "shift-enter, ctrl-j or \\ at the end starts a new line · shift-tab changes the mode",
+                "enter while rein works queues your message · esc or ctrl-c stops the turn",
+                "wheel, pgup/pgdn or shift-↑↓ scroll · drag over text to copy it",
+                "ctrl-o shows every step's full output · ctrl-l draws the window again",
+            ] {
+                say!("{pad}{}", s.dim(keys));
+            }
         }
         Slash::Mode(None) => say!("{pad}{}", mode_description(agent.permissions.mode)),
         Slash::Mode(Some(mode)) => {
@@ -642,6 +683,7 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
         }
         Slash::Effort(Some(level)) => {
             agent.reasoning_effort = level;
+            terminal.effort = agent.reasoning_effort.clone();
             say!("{pad}{} reasoning effort: {}", s.green("✓"), agent.reasoning_effort.as_deref().unwrap_or("the model's default"));
         }
         Slash::Status => {
@@ -673,6 +715,7 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
         Slash::New => {
             let (loaded, context) = setup.open(None, &agent.model_name)?;
             switch(agent, loaded, context);
+            (terminal.context_used, terminal.last_cache) = (0, None);
             say!("{pad}{} a fresh conversation; the last one is saved, /resume brings it back", s.green("✓"));
         }
         Slash::Resume => {
@@ -680,6 +723,7 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             let (loaded, context) = setup.open(Some(path), &agent.model_name)?;
             let model = loaded.session.header().model.clone();
             switch(agent, loaded, context);
+            (terminal.context_used, terminal.last_cache) = (agent.estimated(), None);
             if model != agent.model_name {
                 agent.window.limit = setup.limit(&model)?;
                 terminal.context_limit = agent.window.limit;
@@ -747,10 +791,19 @@ fn load_permissions(root: &Path, mode: Mode) -> CliResult<Permissions> {
     Ok(permissions)
 }
 
+/// What you did at the prompt.
+enum Said {
+    Message(String),
+    /// Shift-Tab: on to the next mode.
+    NextMode,
+    /// Ctrl-D, or Ctrl-C twice.
+    Leave,
+}
+
 /// Reads your next message. A line ending in `\` continues on the next.
 /// Ctrl-C clears what you typed; a second one within two seconds, or
-/// Ctrl-D, ends the conversation (`None`).
-async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time::Instant>) -> Option<String> {
+/// Ctrl-D, ends the conversation.
+async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time::Instant>) -> Said {
     let mut text = String::new();
     loop {
         let prompt = if text.is_empty() { "you    " } else { "…      " };
@@ -768,18 +821,23 @@ async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time:
                 }
                 None => {
                     text.push_str(&line);
-                    return Some(text);
+                    return Said::Message(text);
                 }
             },
             Read::Interrupted => {
                 if last_interrupt.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
-                    return None;
+                    return Said::Leave;
                 }
                 *last_interrupt = Some(std::time::Instant::now());
-                say!("{}", terminal.err.dim("(press Ctrl-C again to leave)"));
+                if terminal.input.pinned() {
+                    terminal.input.notice("press ctrl-c again to leave");
+                } else {
+                    say!("{}", terminal.err.dim("(press Ctrl-C again to leave)"));
+                }
                 text.clear();
             }
-            Read::Eof => return None,
+            Read::Eof => return Said::Leave,
+            Read::NextMode => return Said::NextMode,
         }
     }
 }
@@ -795,285 +853,17 @@ fn terminal_width() -> Option<usize> {
     (ok && size.ws_col > 0).then_some(size.ws_col as usize)
 }
 
-/// What reading a line produced.
-enum Read {
-    Line(String),
-    /// Ctrl-C while typing. In a real terminal the editor turns it into a
-    /// keypress, so it arrives here instead of as a signal.
-    Interrupted,
-    /// Ctrl-D, or input ended.
-    Eof,
-}
-
-/// What the keyboard is for right now.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Waiting {
-    /// rein is working; keys type ahead, Ctrl-C or Esc stop the turn.
-    Nothing,
-    Message,
-    /// The answer to a question, like y, n or a.
-    Answer,
-}
-
-/// The keyboard, read by its own thread so that waiting for a key never
-/// stops rein from noticing Ctrl-C. In a terminal it drives the pinned
-/// input box; otherwise it reads plain lines, so piping into rein works.
-struct Input {
-    /// Plain lines: prompts to show; the thread reads one line for each.
-    requests: std::sync::mpsc::Sender<String>,
-    replies: tokio::sync::mpsc::UnboundedReceiver<Read>,
-    /// A read asked for but not answered yet, kept if the asker gave up.
-    pending: bool,
-    /// The pinned box and bar, when rein runs in a terminal.
-    boxed: Option<std::sync::Arc<std::sync::Mutex<Boxed>>>,
-    /// Puts the keyboard back when rein ends.
-    _raw: Option<Raw>,
-}
-
-/// The input box, shared by the keyboard's thread and the rest of rein.
-struct Boxed {
-    pinned: Pinned,
-    editor: Editor,
-    waiting: Waiting,
-    /// The question being answered, shown in the empty box.
-    question: String,
-    /// Every step's full output, for the viewer (Ctrl-O).
-    outputs: Vec<Entry>,
-    viewer: Option<Viewer>,
-    bar: String,
-    replies: tokio::sync::mpsc::UnboundedSender<Read>,
-    interrupted: std::sync::Arc<tokio::sync::Notify>,
-}
-
-impl Boxed {
-    /// The viewer, if it's open, or the box, at the window's new size.
-    fn redraw(&mut self) {
-        match &mut self.viewer {
-            Some(viewer) => {
-                let (rows, cols) = screen::size();
-                let shown = viewer.render(rows, cols, Style::stderr());
-                self.pinned.show_viewer(&shown);
-            }
-            None => self.draw(),
-        }
-    }
-
-    fn draw(&mut self) {
-        let (lines, cursor) = self.editor.layout(self.pinned.text_width());
-        let placeholder = match self.waiting {
-            Waiting::Message => "type a message · / for commands · \\ or ctrl-j for a new line",
-            Waiting::Answer => self.question.as_str(),
-            Waiting::Nothing => "type ahead while rein works · ctrl-c stops it · ctrl-o shows output",
-        };
-        // While a command's name is being typed, the bar shows the
-        // commands it could be.
-        let typed = self.editor.text();
-        let hints = if self.waiting == Waiting::Message { commands::matching(&typed) } else { Vec::new() };
-        let bar = if hints.is_empty() {
-            self.bar.clone()
-        } else {
-            let s = Style::stderr();
-            let (_, cols) = screen::size();
-            let tab = if commands::completion(&typed).is_some() { s.dim("  · tab completes") } else { String::new() };
-            // With what each does, if that fits; otherwise just the names.
-            let long: Vec<String> = hints.iter().map(|(name, _, what)| format!("{} {}", s.bold(name), s.dim(what))).collect();
-            let long = format!(" {}{tab}", long.join(&s.dim("  ·  ")));
-            if ui::style::width(&long) < cols {
-                long
-            } else {
-                let names: Vec<String> = hints.iter().map(|(name, _, _)| s.bold(name)).collect();
-                format!(" {}{tab}", names.join("  "))
-            }
-        };
-        let bottom = Bottom { focused: self.waiting != Waiting::Nothing, lines, cursor, placeholder: placeholder.into(), bar };
-        self.pinned.draw(&bottom);
-    }
-
-    fn key(&mut self, key: Key) {
-        if let Key::CursorAt(row, column) = key {
-            self.pinned.cursor_at(row, column);
-            self.draw();
-            return;
-        }
-        if let Some(viewer) = &mut self.viewer {
-            let (rows, cols) = screen::size();
-            if viewer.key(&key) {
-                let shown = viewer.render(rows, cols, Style::stderr());
-                self.pinned.show_viewer(&shown);
-            } else {
-                self.viewer = None;
-                self.pinned.close_viewer();
-                self.draw();
-            }
-            return;
-        }
-        if key == Key::CtrlO && !self.outputs.is_empty() {
-            let mut viewer = Viewer::new(self.outputs.clone());
-            let (rows, cols) = screen::size();
-            let shown = viewer.render(rows, cols, Style::stderr());
-            self.pinned.open_viewer(&shown);
-            self.viewer = Some(viewer);
-            return;
-        }
-        match (self.waiting, &key) {
-            (Waiting::Nothing, Key::CtrlC | Key::Esc) => self.interrupted.notify_one(),
-            // Ctrl-C clears what you typed; on an empty box it's for leaving.
-            (Waiting::Message, Key::CtrlC) if !self.editor.is_empty() => {
-                self.editor.take();
-            }
-            (_, Key::CtrlC) => self.reply(Read::Interrupted),
-            (Waiting::Message, Key::CtrlD) if self.editor.is_empty() => self.reply(Read::Eof),
-            // What you type ahead is sent once rein is done and you press Enter.
-            (Waiting::Nothing, Key::Enter) => {}
-            // Tab completes a command's name, when only one fits.
-            (Waiting::Message, Key::Tab) => {
-                if let Some((name, args, _)) = commands::completion(&self.editor.text()) {
-                    self.editor.replace(&format!("{name}{}", if args.is_empty() { "" } else { " " }));
-                }
-            }
-            _ => {
-                if self.editor.key(&key) == Action::Submit {
-                    let text = self.editor.take();
-                    if self.waiting == Waiting::Message {
-                        self.editor.remember(&text);
-                    }
-                    self.reply(Read::Line(text));
-                }
-            }
-        }
-        self.draw();
-    }
-
-    fn reply(&mut self, read: Read) {
-        self.waiting = Waiting::Nothing;
-        let _ = self.replies.send(read);
-    }
-}
-
-impl Input {
-    /// `pinned` asks for the input box, which needs a terminal all round.
-    fn start(pinned: bool, interrupted: std::sync::Arc<tokio::sync::Notify>) -> Self {
-        let (requests, asked) = std::sync::mpsc::channel::<String>();
-        let (tx, replies) = tokio::sync::mpsc::unbounded_channel();
-        let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
-        if pinned && terminal && let Some(raw) = Raw::enter() {
-            screen::restore_on_panic();
-            let boxed = std::sync::Arc::new(std::sync::Mutex::new(Boxed {
-                pinned: Pinned::start(Style::stderr()),
-                editor: Editor::default(),
-                waiting: Waiting::Nothing,
-                question: String::new(),
-                outputs: Vec::new(),
-                viewer: None,
-                bar: String::new(),
-                replies: tx,
-                interrupted,
-            }));
-            // A window that changes size gets the box drawn again right
-            // away, not only at the next key.
-            if let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
-                let boxed = boxed.clone();
-                tokio::spawn(async move {
-                    while resized.recv().await.is_some() {
-                        // Dragging the window's edge sends many; draw once
-                        // it has stopped.
-                        while let Ok(Some(())) = tokio::time::timeout(Duration::from_millis(150), resized.recv()).await {}
-                        boxed.lock().unwrap_or_else(|p| p.into_inner()).redraw();
-                    }
-                });
-            }
-            let keyboard = boxed.clone();
-            std::thread::spawn(move || {
-                let mut keys = Keys::default();
-                let mut buffer = [0u8; 1024];
-                let mut stdin = std::io::stdin();
-                while let Ok(n @ 1..) = std::io::Read::read(&mut stdin, &mut buffer) {
-                    for key in keys.feed(&buffer[..n]) {
-                        keyboard.lock().unwrap_or_else(|p| p.into_inner()).key(key);
-                    }
-                }
-            });
-            return Input { requests, replies, pending: false, boxed: Some(boxed), _raw: Some(raw) };
-        }
-        std::thread::spawn(move || {
-            for prompt in asked {
-                eprint!("{prompt}");
-                let mut line = String::new();
-                let read = match std::io::stdin().read_line(&mut line) {
-                    Ok(0) | Err(_) => Read::Eof,
-                    Ok(_) => Read::Line(line.trim_end_matches(['\n', '\r']).to_owned()),
-                };
-                if tx.send(read).is_err() {
-                    break;
-                }
-            }
-        });
-        Input { requests, replies, pending: false, boxed: None, _raw: None }
-    }
-
-    fn pinned(&self) -> bool {
-        self.boxed.is_some()
-    }
-
-    /// Reads one line: a message (`message`, kept for ↑) or an answer to
-    /// a question. Plain lines show `prompt` first.
-    async fn read(&mut self, prompt: &str, message: bool) -> Read {
-        if !self.pending {
-            match &self.boxed {
-                Some(boxed) => {
-                    let mut boxed = boxed.lock().unwrap_or_else(|p| p.into_inner());
-                    boxed.waiting = if message { Waiting::Message } else { Waiting::Answer };
-                    boxed.question = prompt.trim().to_owned();
-                    boxed.draw();
-                }
-                None => {
-                    if self.requests.send(prompt.to_owned()).is_err() {
-                        return Read::Eof;
-                    }
-                }
-            }
-            self.pending = true;
-        }
-        let read = self.replies.recv().await.unwrap_or(Read::Eof);
-        self.pending = false;
-        read
-    }
-
-    /// Keeps a step's full output for the viewer.
-    fn keep_output(&self, title: String, output: &str) {
-        if let Some(boxed) = &self.boxed {
-            boxed.lock().unwrap_or_else(|p| p.into_inner()).outputs.push(Entry::new(title, output));
-        }
-    }
-
-    /// Shows `bar` under the box.
-    fn set_bar(&self, bar: String) {
-        if let Some(boxed) = &self.boxed {
-            let mut boxed = boxed.lock().unwrap_or_else(|p| p.into_inner());
-            boxed.bar = bar;
-            boxed.draw();
-        }
-    }
-}
-
-impl Drop for Input {
-    fn drop(&mut self) {
-        if let Some(boxed) = &self.boxed {
-            boxed.lock().unwrap_or_else(|p| p.into_inner()).pinned.stop();
-        }
-    }
-}
-
 /// The terminal as rein's [`Ui`]: answers on stdout, steps, questions and
 /// the status bar on stderr. Each step sits under a label in a column:
 ///
 /// ```text
 /// you    fix the trailing comma bug
 ///
-/// read   src/parser.rs  lines 190-240
-/// run    cargo test  ✗ exit 101
-///        └ test parser::trailing_comma ... FAILED
-/// rein   Found it: …
+/// rein   ● Read   src/parser.rs, lines 190-240
+///        ● Run    cargo test  exit 101
+///          └ test parser::trailing_comma ... FAILED
+///
+///        Found it: …
 /// ```
 ///
 /// When stdout or stderr isn't a terminal, that stream gets plain text.
@@ -1086,20 +876,35 @@ struct Terminal {
     /// The project folder, for line numbers in file changes.
     root: PathBuf,
     model: String,
+    effort: Option<String>,
     mode: &'static str,
     input: Input,
     /// Ctrl-C pressed at a question; the turn waits on this to stop.
     interrupted: std::sync::Arc<tokio::sync::Notify>,
     /// When the conversation gets compacted, in tokens.
     context_limit: u64,
+    /// How many tokens the conversation took at the last count.
+    context_used: u64,
+    /// How much of the last finished turn came from the prompt cache, in percent.
+    last_cache: Option<u64>,
     /// The answer being written, if one is.
     answer: Option<Answer>,
     mid_line: bool,
+    /// Without the box, what rein is doing spins on a line of its own.
     spinner: Option<Spinner>,
     /// The step on screen, between its question and its result.
     step: Option<Step>,
+    /// A note to show under the step once its line is up, like that it
+    /// won't be asked about again.
+    noted: Option<String>,
     /// A step was shown last, so an answer starts after a blank line.
     after_step: bool,
+    /// An answer was shown last, so a step starts after a blank line.
+    after_text: bool,
+    /// Your message was shown last, so whatever comes next starts after a
+    /// blank line. It waits until then, so the spinner's own gap isn't
+    /// doubled.
+    after_you: bool,
     /// rein's label has been shown this turn; what follows lines up under it.
     labeled: bool,
     /// What the model says it was thinking about, as it streams in, and
@@ -1134,11 +939,14 @@ struct Step {
 struct TurnStats {
     input: u64,
     cached: u64,
-    last_input: u64,
     started: Option<std::time::Instant>,
     /// How long it took, once it's over.
     took: Option<Duration>,
 }
+
+/// The most lines of your message the conversation shows again; the rest
+/// is counted.
+const ECHO_LINES: usize = 12;
 
 impl Terminal {
     fn new(root: PathBuf, mode: Mode, pinned: bool) -> Terminal {
@@ -1150,15 +958,21 @@ impl Terminal {
             fancy: std::io::stderr().is_terminal(),
             root,
             model: String::new(),
+            effort: None,
             mode,
             input: Input::start(pinned, interrupted.clone()),
             interrupted,
             context_limit: compact::DEFAULT_LIMIT,
+            context_used: 0,
+            last_cache: None,
             answer: None,
             mid_line: false,
             spinner: None,
             step: None,
+            noted: None,
             after_step: false,
+            after_text: false,
+            after_you: false,
             labeled: false,
             thoughts: String::new(),
             thoughts_shown: 0,
@@ -1175,6 +989,26 @@ impl Terminal {
         }
     }
 
+    /// Says what rein is doing: over the box, with the turn's time, or
+    /// without one, on a spinning line of its own until something prints.
+    fn doing(&mut self, what: &str) {
+        if self.input.pinned() {
+            self.input.busy(Some(what.to_owned()), self.turn.started.unwrap_or_else(std::time::Instant::now));
+            return;
+        }
+        if !self.fancy {
+            return;
+        }
+        self.quiet();
+        let s = self.err;
+        let lead = self.peek_lead();
+        let what = what.to_owned();
+        self.spinner = Some(Spinner::start(move |frame, seconds| {
+            let line = format!("{lead}{} {what}… {}", s.yellow(&frame.to_string()), s.dim(&format!("({seconds}s · ctrl-c to stop)")));
+            ui::style::fit(&line, ui::screen::size().1.saturating_sub(1))
+        }));
+    }
+
     /// Finishes whatever answer is on screen, so something else can follow.
     fn end_line(&mut self) {
         self.quiet();
@@ -1187,6 +1021,7 @@ impl Terminal {
             if !rest.is_empty() {
                 self.mid_line = !rest.ends_with('\n');
             }
+            self.after_text = true;
         }
         if self.mid_line {
             out!("\n");
@@ -1195,19 +1030,34 @@ impl Terminal {
         std::io::stdout().flush().ok();
     }
 
+    /// A blank line before a step that follows an answer or your message.
+    fn gap_before_step(&mut self) {
+        let after_you = std::mem::take(&mut self.after_you);
+        if (std::mem::take(&mut self.after_text) || after_you) && self.fancy {
+            say!();
+        }
+    }
+
     /// A new turn: your message under its label, then a blank line.
     fn start_turn(&mut self, echo: Option<&str>) {
         self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
         self.after_step = false;
+        self.after_text = false;
+        self.after_you = true;
         self.labeled = false;
-        if self.fancy {
-            if let Some(message) = echo {
-                let mut wrap = Wrap::new(terminal_width().unwrap_or(80), GUTTER, GUTTER);
-                let text = wrap.push(message) + &wrap.finish();
-                say!("\n{}{text}", self.err.label("you"));
-            }
-            say!();
+        if self.fancy
+            && let Some(message) = echo
+        {
+            let shown = self.input.shown(message);
+            say!("\n{}", you_said(&shown, self.err, self.wrap_width().unwrap_or(80)));
         }
+        // Without the box, the spinner's line comes straight after this one.
+        if self.fancy && !self.input.pinned() {
+            say!();
+            self.after_you = false;
+        }
+        // The last turn's time goes; the spinner counts this one.
+        self.input.set_bar(self.bar());
     }
 
     /// The end of a turn: the status bar.
@@ -1218,7 +1068,11 @@ impl Terminal {
     /// ```
     fn end_turn(&mut self) {
         self.end_line();
+        self.input.busy(None, std::time::Instant::now());
         self.turn.took = self.turn.started.map(|t| t.elapsed());
+        if let Some(cache) = (self.turn.cached * 100).checked_div(self.turn.input) {
+            self.last_cache = Some(cache);
+        }
         if !self.fancy {
             return;
         }
@@ -1233,24 +1087,31 @@ impl Terminal {
         say!("{bar}");
     }
 
-    /// The model, the mode, how full the context is, how much came from
-    /// the cache, and how long the turn took.
+    /// The model and its effort, the mode, how full the context is, how
+    /// much came from the cache, and how long the last turn took.
     fn bar(&self) -> String {
         let s = self.err;
-        let pct = (self.turn.last_input * 100 / self.context_limit.max(1)).min(100);
-        let cells = if self.turn.last_input == 0 { 0 } else { pct.div_ceil(10).clamp(1, 10) as usize };
+        let used = self.context_used;
+        // Never 0% once anything is in there, nor a full cell short of it.
+        let pct = if used == 0 { 0 } else { (used * 100).div_ceil(self.context_limit.max(1)).min(100) };
+        let cells = pct.div_ceil(10) as usize;
         let gauge = s.blue(&"▰".repeat(cells)) + &s.dim(&"▱".repeat(10 - cells));
-        let cache = (self.turn.cached * 100).checked_div(self.turn.input).unwrap_or(0);
         let dot = s.dim("  ·  ");
+        let model = match &self.effort {
+            Some(effort) => format!("{} {}", s.bold(&self.model), s.dim(effort)),
+            None => s.bold(&self.model),
+        };
+        // The modes that ask less stand out.
+        let mode = match self.mode {
+            "trust" => s.red(self.mode),
+            "edits" => s.yellow(self.mode),
+            mode => mode.to_owned(),
+        };
+        let cache = (self.turn.cached * 100).checked_div(self.turn.input).or(self.last_cache);
+        let cache = cache.map(|cache| format!("{dot}{} {cache}%", s.dim("cache"))).unwrap_or_default();
         // The time only once the turn is over; the spinner counts until then.
         let took = self.turn.took.map(|t| format!("{dot}{}", s.dim(&format!("{:.1}s", t.as_secs_f32())))).unwrap_or_default();
-        format!(
-            " {}{dot}{}{dot}{} {gauge} {pct}%{dot}{} {cache}%{took}",
-            s.bold(&self.model),
-            self.mode,
-            s.dim("context"),
-            s.dim("cache"),
-        )
+        format!(" {model}{dot}{mode}{dot}{} {gauge} {pct}%{cache}{took}", s.dim("context"))
     }
 
     /// What starts rein's next line: its label the first time in a turn,
@@ -1265,21 +1126,17 @@ impl Terminal {
         if self.labeled { " ".repeat(GUTTER) } else { self.err.label("rein") }
     }
 
-    /// `rein ◐ Thinking… (3s · ctrl-c to stop)`.
-    fn spin_thinking(&mut self) {
-        if !self.fancy {
-            return;
-        }
-        let s = self.err;
-        let lead = self.peek_lead();
-        self.spinner = Some(Spinner::start(move |frame, seconds| {
-            let line = format!("{lead}{} Thinking… {}", s.yellow(&frame.to_string()), s.dim(&format!("({seconds}s · ctrl-c to stop)")));
-            ui::style::fit(&line, ui::screen::size().1.saturating_sub(1))
-        }));
+    /// How wide text is wrapped as it's printed. On the full screen it
+    /// isn't: the screen lays it out itself, for whatever width the window
+    /// has, then and after every resize.
+    fn wrap_width(&self) -> Option<usize> {
+        if self.input.pinned() { Some(UNWRAPPED) } else { terminal_width() }
     }
 
-    fn columns(&self) -> usize {
-        terminal_width().unwrap_or(80)
+    /// Shows lines laid out for the window's width by `draw`: a step. On the
+    /// full screen they're laid out again whenever the width changes.
+    fn show(&self, draw: impl Fn(usize) -> Vec<String> + Send + 'static) {
+        ui::screen::show(Box::new(draw));
     }
 
     /// Prints a step's line before its question, with the change it would
@@ -1287,27 +1144,53 @@ impl Terminal {
     fn show_header(&mut self, call: &ToolCall) {
         let shown = self.step.as_ref().is_some_and(|step| step.call_id == call.call_id && step.header_shown);
         if !shown {
+            self.gap_before_step();
             let lead = self.lead();
-            say!("{}", steps::line(call, &lead, &self.err.dim("○"), "", self.err, self.columns()));
-            if matches!(call.name.as_str(), "edit" | "write") {
-                for line in steps::diff_box(call, &self.root, self.err, self.columns(), false) {
-                    say!("{line}");
-                }
-            }
+            let s = self.err;
+            let diff = if matches!(call.name.as_str(), "edit" | "write") { steps::diff_box(call, &self.root, s, WIDE, false) } else { Vec::new() };
+            let (call_, lead_) = (call.clone(), lead.clone());
+            self.show(move |width| {
+                let mut lines = vec![steps::line(&call_, &lead_, &s.dim("○"), "", s, width)];
+                lines.extend(diff.iter().map(|line| ui::style::fit(line, width)));
+                lines
+            });
             self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: false });
         }
     }
+}
+
+/// A width nothing is wrapped at: text goes to the full screen whole, and
+/// is laid out there.
+const UNWRAPPED: usize = usize::MAX / 4;
+
+/// The width a file change's frame is made at once, to be cut to the
+/// window's width as it's shown: it's worked out from the file as it is
+/// then, which may change later.
+const WIDE: usize = 400;
+
+/// Your message as the conversation shows it: under your label, wrapped,
+/// and only its first lines if it's long, like a big paste.
+fn you_said(message: &str, s: Style, columns: usize) -> String {
+    let lines: Vec<&str> = message.lines().collect();
+    let shown = if lines.len() > ECHO_LINES { &lines[..ECHO_LINES - 1] } else { &lines[..] };
+    let mut wrap = Wrap::new(columns, GUTTER, GUTTER);
+    let text = wrap.push(&shown.join("\n")) + &wrap.finish();
+    let mut out = format!("{}{}", s.you(), s.bold(&text));
+    if lines.len() > shown.len() {
+        let rest = lines.len() - shown.len();
+        out += &format!("\n{}{}", " ".repeat(GUTTER), s.dim(&format!("… {rest} more lines")));
+    }
+    out
 }
 
 impl Ui for Terminal {
     fn text(&mut self, delta: &str) {
         self.quiet();
         if self.answer.is_none() {
-            let width = terminal_width();
+            let width = self.wrap_width();
             if width.is_some() {
-                if self.after_step {
+                if std::mem::take(&mut self.after_step) | std::mem::take(&mut self.after_you) {
                     out!("\n");
-                    self.after_step = false;
                 }
                 // A summary has no label: it isn't an answer to you.
                 let lead = if self.compacting { " ".repeat(GUTTER) } else { self.lead() };
@@ -1319,14 +1202,18 @@ impl Ui for Terminal {
                 markdown: width.map(|_| Markdown::new(self.out.on())),
                 wrap: width.map(|width| Wrap::new(width, GUTTER, GUTTER)),
             });
+            if self.input.pinned() && !self.compacting {
+                self.doing("Writing");
+            }
         }
         let answer = self.answer.as_mut().expect("set above");
         let mut text = match &mut answer.markdown {
             Some(markdown) => markdown.push(delta),
             None => delta.to_owned(),
         };
+        let width = if self.input.pinned() { None } else { terminal_width() };
         if let Some(wrap) = &mut answer.wrap {
-            if let Some(width) = terminal_width() {
+            if let Some(width) = width {
                 wrap.set_width(width);
             }
             text = wrap.push(&text);
@@ -1342,7 +1229,7 @@ impl Ui for Terminal {
         if self.fancy {
             self.thoughts.clear();
             self.thoughts_shown = 0;
-            self.spin_thinking();
+            self.doing("Thinking");
         }
     }
 
@@ -1354,51 +1241,82 @@ impl Ui for Terminal {
         let headlines = headlines(&self.thoughts);
         if headlines.len() > self.thoughts_shown && self.fancy {
             self.quiet();
+            self.gap_before_step();
             for headline in &headlines[self.thoughts_shown..] {
                 let lead = self.lead();
                 say!("{lead}{}", self.err.dim(&format!("✻ {headline}")));
             }
             self.thoughts_shown = headlines.len();
-            self.spin_thinking();
+            if !self.input.pinned() {
+                self.doing("Thinking");
+            }
         }
     }
 
     async fn approve(&mut self, call: &ToolCall) -> Approval {
         self.end_line();
+        self.input.busy(None, std::time::Instant::now());
         self.step = None;
-        self.show_header(call);
-        let question = match call.name.as_str() {
-            "bash" => "Allow this command?",
-            "edit" => "Allow this edit?",
-            "write" => "Allow writing this file?",
-            _ => "Allow this?",
+        let (question, always) = match call.name.as_str() {
+            "bash" => ("Allow this command?", "Yes, and don't ask again for this command"),
+            "edit" => ("Allow this edit?", "Yes, and don't ask again for file changes"),
+            "write" => ("Allow writing this file?", "Yes, and don't ask again for file changes"),
+            _ => ("Allow this?", "Yes, and don't ask again"),
         };
-        let prompt = format!("{}{question}  [y]es  [n]o  [a]lways › ", " ".repeat(steps::INDENT));
-        match self.input.read(&prompt, false).await {
-            Read::Line(answer) => {
-                // The box keeps nothing; the conversation keeps the answer.
-                if self.input.pinned() {
-                    say!("{prompt}{}", self.err.bold(answer.trim()));
+        if !self.input.pinned() {
+            self.show_header(call);
+            let prompt = format!("{}{question}  [y]es  [n]o  [a]lways › ", " ".repeat(steps::INDENT));
+            return match self.input.read(&prompt, false).await {
+                Read::Line(answer) => approval(&answer),
+                // Ctrl-C at a question stops the whole turn.
+                Read::Interrupted => {
+                    self.interrupted.notify_one();
+                    std::future::pending().await
                 }
-                approval(&answer)
-            }
-            // Ctrl-C at a question stops the whole turn.
-            Read::Interrupted => {
-                self.interrupted.notify_one();
-                std::future::pending().await
-            }
-            // No answer (input has ended) means no.
-            Read::Eof => Approval::No,
+                // No answer (input has ended) means no.
+                Read::Eof | Read::NextMode => Approval::No,
+            };
         }
+        // A command is asked about in full, in the box, and its line comes
+        // once it's done. A file change shows its change above first, and
+        // so does a command too long for the box.
+        let command = if call.name == "bash" { steps::command(call) } else { None };
+        let long = command.as_deref().is_some_and(|command| input::command_lines(command, self.err, self.input.text_width()).len() > input::COMMAND_LINES);
+        if command.is_none() || long {
+            self.show_header(call);
+        }
+        if long && let Some(command) = command.clone() {
+            let s = self.err;
+            self.show(move |width| {
+                let pad = " ".repeat(steps::INDENT);
+                input::command_lines(&command, s, width.saturating_sub(steps::INDENT)).into_iter().map(|line| format!("{pad}{line}")).collect()
+            });
+        }
+        let answers = vec![("y", "Yes".to_owned()), ("a", always.to_owned()), ("n", "No".to_owned()), ("esc", "No, and tell rein what to do instead".to_owned())];
+        let answer = match self.input.ask(Question { title: question.to_owned(), command, answers }).await {
+            Read::Line(key) => approval(&key),
+            _ => Approval::No,
+        };
+        if answer == Approval::Always {
+            let what = if call.name == "bash" { "this command" } else { "file changes" };
+            self.noted = Some(format!("won't ask again for {what} in this conversation"));
+        }
+        answer
     }
 
     fn tool_started(&mut self, call: &ToolCall) {
         self.end_line();
         let asked = self.step.as_ref().is_some_and(|step| step.call_id == call.call_id);
         if !asked {
-            // Not asked about: the step's own line spins, then says how it went.
+            // Not asked about: the step's line shows once it's done, with
+            // how it went.
+            self.gap_before_step();
             let lead = self.lead();
             self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: false, done: false });
+        }
+        if self.input.pinned() {
+            self.doing(&steps::doing(call));
+            return;
         }
         if self.fancy {
             let s = self.err;
@@ -1421,10 +1339,12 @@ impl Ui for Terminal {
 
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
         self.end_line();
+        self.gap_before_step();
         self.step = None;
         let lead = self.lead();
         let s = self.err;
-        say!("{}", steps::line(call, &lead, &s.red("●"), &s.red(&format!("blocked: {reason}")), s, self.columns()));
+        let (call_, lead_, status) = (call.clone(), lead.clone(), s.red(&format!("blocked: {reason}")));
+        self.show(move |width| vec![steps::line(&call_, &lead_, &s.red("●"), &status, s, width)]);
         self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: true });
         self.after_step = true;
     }
@@ -1458,31 +1378,39 @@ impl Ui for Terminal {
             Some(false) => s.red("●"),
             None => s.dim("●"),
         };
-        match step {
-            // Asked about first: its line is up there; the result goes under it.
-            Some(step) if step.header_shown => say!("{}{dot} {}", " ".repeat(steps::INDENT), outcome.status),
+        // Asked about first: its line is up there; the result goes under it.
+        let lead = match step {
+            Some(step) if step.header_shown => None,
             step => {
-                let lead = step.map_or_else(|| self.lead(), |step| step.lead);
-                say!("{}", steps::line(call, &lead, &dot, &outcome.status, s, self.columns()));
+                // Never started, like a declined step: it's the first time it shows.
+                if step.is_none() {
+                    self.gap_before_step();
+                }
+                Some(step.map_or_else(|| self.lead(), |step| step.lead))
             }
-        }
-        for line in steps::detail_lines(&outcome, s, self.columns(), self.input.pinned()) {
-            say!("{line}");
-        }
+        };
+        let note = self.noted.take().map(|note| format!("{}{} {}", " ".repeat(steps::INDENT), s.green("✓"), s.dim(&note)));
         // An edit made without asking shows what it changed; a question
         // showed it already. A new file's whole text is Ctrl-O away.
-        if !asked && call.name == "edit" && outcome.ok == Some(true) {
-            for line in steps::diff_box(call, &self.root, s, self.columns(), true) {
-                say!("{line}");
-            }
-        }
+        let diff = if !asked && call.name == "edit" && outcome.ok == Some(true) { steps::diff_box(call, &self.root, s, WIDE, true) } else { Vec::new() };
+        let (call_, viewer) = (call.clone(), self.input.pinned());
+        self.show(move |width| {
+            let mut lines = vec![match &lead {
+                Some(lead) => steps::line(&call_, lead, &dot, &outcome.status, s, width),
+                None => format!("{}{dot} {}", " ".repeat(steps::INDENT), outcome.status),
+            }];
+            lines.extend(steps::detail_lines(&outcome, s, width, viewer));
+            lines.extend(note.clone());
+            lines.extend(diff.iter().map(|line| ui::style::fit(line, width)));
+            lines
+        });
         self.after_step = true;
     }
 
     fn usage(&mut self, usage: &Usage) {
         self.turn.input += usage.input_tokens;
         self.turn.cached += usage.cached_input_tokens;
-        self.turn.last_input = usage.input_tokens;
+        self.context_used = usage.input_tokens;
         // The box's bar follows along during the turn.
         if self.input.pinned() {
             self.input.set_bar(self.bar());
@@ -1491,14 +1419,17 @@ impl Ui for Terminal {
 
     fn compacting(&mut self) {
         self.end_line();
+        self.gap_before_step();
         let lead = self.lead();
         say!("{lead}{}", self.err.dim("compacting the conversation…"));
         self.compacting = true;
+        self.doing("Compacting the conversation");
     }
 
     fn compacted(&mut self, report: &Compacted) {
         self.end_line();
         self.compacting = false;
+        self.after_text = false;
         let retired = match report.retired {
             0 => String::new(),
             1 => ", 1 stale tool output retired".to_owned(),
@@ -1508,6 +1439,8 @@ impl Ui for Terminal {
         let line = format!("compacted: about {} → {} tokens ({how}{retired})", thousands(report.before), thousands(report.after));
         say!("{}{}", " ".repeat(GUTTER), self.err.dim(&line));
         self.after_step = true;
+        self.context_used = report.after;
+        self.input.set_bar(self.bar());
     }
 }
 
@@ -1538,6 +1471,8 @@ fn approval(answer: &str) -> Approval {
     match answer.trim() {
         "y" | "Y" | "yes" => Approval::Yes,
         "a" | "A" | "always" => Approval::Always,
+        // Esc, in the box: no, and stop to say what to do instead.
+        "esc" | "stop" => Approval::Stop,
         _ => Approval::No,
     }
 }

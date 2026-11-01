@@ -39,6 +39,8 @@ pub enum Approval {
     /// for all file changes.
     Always,
     No,
+    /// No, and stop the turn: the user wants to say what to do instead.
+    Stop,
 }
 
 /// Whoever is at the keyboard: sees what happens, and decides what may run.
@@ -99,6 +101,9 @@ pub enum Outcome {
     Done,
     /// It kept asking for tools; we stopped after `MAX_TURNS`.
     TurnLimit,
+    /// The user declined a step and stopped the turn, to say what to do
+    /// instead.
+    Stopped,
 }
 
 pub struct Agent<M> {
@@ -202,6 +207,12 @@ impl<M: Model> Agent<M> {
                             "bash" => "The user declined to run this command.".to_owned(),
                             _ => "The user declined this change.".to_owned(),
                         }),
+                        Approval::Stop => {
+                            let output = "The user declined this and stopped, to tell you what to do instead.".to_owned();
+                            ui.tool_finished(&call, &output);
+                            self.record(Item::ToolResult { call_id: call.call_id, output })?;
+                            return Ok(Outcome::Stopped);
+                        }
                     },
                 };
                 let output = match approved {
@@ -687,6 +698,19 @@ mod tests {
             call_id: "c1".into(),
             output: "The user declined to run this command.".into()
         }));
+    }
+
+    #[tokio::test]
+    async fn stopping_at_a_question_ends_the_turn() {
+        // The script has no second turn: asking the model again would panic.
+        let mut agent = agent("stop", vec![vec![bash("c1", "touch made-it")]]);
+        let mut person = Person { answer: Approval::Stop, log: Vec::new() };
+        assert_eq!(agent.send("make a file".into(), &mut person).await.unwrap(), Outcome::Stopped);
+
+        assert!(!person.log.contains(&"ran bash".to_owned()));
+        let output = "The user declined this and stopped, to tell you what to do instead.";
+        assert_eq!(person.log.last(), Some(&format!("result {output}")));
+        assert_eq!(agent.history.last(), Some(&Item::ToolResult { call_id: "c1".into(), output: output.into() }));
     }
 
     #[tokio::test]

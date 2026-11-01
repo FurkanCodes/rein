@@ -73,23 +73,13 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
     })
 }
 
-/// The commands that start with what's typed so far, for the hints under
+/// The commands that start with what's typed so far, for the list under
 /// the box. Only while the first word is still being typed.
 pub fn matching(typed: &str) -> Vec<(&'static str, &'static str, &'static str)> {
     if !typed.starts_with('/') || typed.contains(char::is_whitespace) {
         return Vec::new();
     }
     COMMANDS.iter().copied().filter(|(name, _, _)| name.starts_with(typed)).collect()
-}
-
-/// What Tab completes `typed` to: the command it names exactly, or the
-/// only one it could be.
-pub fn completion(typed: &str) -> Option<(&'static str, &'static str, &'static str)> {
-    let hints = matching(typed);
-    hints.iter().copied().find(|(name, _, _)| *name == typed).or(match hints[..] {
-        [only] => Some(only),
-        _ => None,
-    })
 }
 
 /// `/help`'s text.
@@ -140,9 +130,5 @@ mod tests {
         assert!(names("/mode ").is_empty());
         assert!(names("hello").is_empty());
         assert!(help()[1].starts_with("/mode [ask|edits|read-only|trust]"));
-        // Tab: the exact name wins over a longer one; otherwise only one may fit.
-        assert_eq!(completion("/mode").map(|c| c.0), Some("/mode"));
-        assert_eq!(completion("/mod"), None);
-        assert_eq!(completion("/sta").map(|c| c.0), Some("/status"));
     }
 }
