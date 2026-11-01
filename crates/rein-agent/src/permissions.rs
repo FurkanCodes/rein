@@ -127,8 +127,9 @@ impl Permissions {
 
     pub fn decide(&self, call: &ToolCall) -> Decision {
         match call.name.as_str() {
-            // `read` can only look, and only inside the project.
-            "read" => Decision::Allow,
+            // `read` can only look, and only inside the project; `plan`
+            // only writes a checklist on screen.
+            "read" | "plan" => Decision::Allow,
             "write" | "edit" => match self.mode {
                 Mode::ReadOnly => Decision::Deny("File changes are turned off: rein is in read-only mode.".into()),
                 Mode::Edits | Mode::Trust => Decision::Allow,

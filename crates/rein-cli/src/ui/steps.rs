@@ -51,6 +51,11 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             ("Run", format!("{first}{more}"))
         }
         "recall" => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
+        "plan" => {
+            let steps = args["steps"].as_array().map_or(0, Vec::len);
+            let done = args["steps"].as_array().into_iter().flatten().filter(|step| step["status"] == "done").count();
+            ("Plan", format!("{done} of {steps} done"))
+        }
         _ => ("Tool", format!("{} {}", call.name, call.arguments)),
     }
 }
@@ -133,6 +138,24 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
                 }
             }
         }
+        // The checklist itself, a line per step.
+        "plan" => {
+            let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+            let details = args["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|step| {
+                    let text = step["step"].as_str().unwrap_or_default();
+                    match step["status"].as_str() {
+                        Some("done") => style.dim(&format!("☑ {text}")),
+                        Some("in_progress") => style.bold(&format!("▸ {text}")),
+                        _ => format!("☐ {text}"),
+                    }
+                })
+                .collect();
+            Outcome { ok: Some(true), status: String::new(), details, more: 0 }
+        }
         "recall" => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
             if found == 0 {
@@ -164,7 +187,11 @@ pub fn detail_lines(outcome: &Outcome, style: Style, columns: usize, viewer: boo
         .details
         .iter()
         .enumerate()
-        .map(|(i, line)| format!("{pad}{}{}", style.dim(if i == 0 { "└ " } else { "  " }), style.dim(&fit(line, room))))
+        // A plan's lines are styled already; other output is dimmed.
+        .map(|(i, line)| {
+            let line = if line.contains('\x1b') || line.starts_with('☐') { fit_width(line, room) } else { style.dim(&fit(line, room)) };
+            format!("{pad}{}{line}", style.dim(if i == 0 { "└ " } else { "  " }))
+        })
         .collect();
     if outcome.more > 0 {
         let s = if outcome.more == 1 { "" } else { "s" };
@@ -295,6 +322,18 @@ mod tests {
         assert_eq!(status("bash", json!({}), "The user declined to run this command.").0, "declined");
         assert_eq!(status("bash", json!({}), "error: the command took longer than 60s and was stopped").0, "the command took longer than 60s and was stopped");
         assert_eq!(outcome(&call("bash", json!({})), "x\n[exit code 2]", Style::plain()).ok, Some(false));
+    }
+
+    #[test]
+    fn shows_a_plan_as_a_checklist() {
+        let plan = call("plan", json!({"steps": [
+            {"step": "Read the parser", "status": "done"},
+            {"step": "Fix trailing commas", "status": "in_progress"},
+            {"step": "Run the tests", "status": "pending"}
+        ]}));
+        assert_eq!(describe(&plan), ("Plan", "1 of 3 done".into()));
+        let o = outcome(&plan, "Plan updated: 1 of 3 done.", Style::plain());
+        assert_eq!(o.details, ["☑ Read the parser", "▸ Fix trailing commas", "☐ Run the tests"]);
     }
 
     #[test]

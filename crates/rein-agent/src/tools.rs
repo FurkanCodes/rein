@@ -32,6 +32,16 @@ struct ReadArgs {
 }
 
 #[derive(Deserialize)]
+struct PlanArgs {
+    steps: Vec<PlanStep>,
+}
+
+#[derive(Deserialize)]
+struct PlanStep {
+    status: String,
+}
+
+#[derive(Deserialize)]
 struct BashArgs {
     command: String,
     /// How long it may run, if longer than the default.
@@ -103,6 +113,27 @@ impl Tools {
                 })),
             },
             Tool {
+                name: "plan".into(),
+                description: "Keep a short checklist for work with several steps, so you and the user can see \
+                              where things stand. Send the whole list each time, with one step in_progress; mark \
+                              steps done as you finish them. Skip it for small tasks."
+                    .into(),
+                parameters: object(json!({
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": { "type": "string", "description": "What to do, in a few words." },
+                                "status": { "type": "string", "enum": ["pending", "in_progress", "done"] }
+                            },
+                            "required": ["step", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                })),
+            },
+            Tool {
                 name: "bash".into(),
                 description: "Run a shell command in the project root and return its output and exit code. \
                               The user approves each command before it runs. Commands are stopped after 60 seconds \
@@ -123,6 +154,11 @@ impl Tools {
             "bash" => self.bash(&call.arguments).await,
             "write" => self.write(&call.arguments).await,
             "edit" => self.edit(&call.arguments).await,
+            // The checklist is for showing; the model keeps it in its own words.
+            "plan" => parse::<PlanArgs>(&call.arguments).map(|plan| {
+                let done = plan.steps.iter().filter(|step| step.status == "done").count();
+                format!("Plan updated: {done} of {} done.", plan.steps.len())
+            }),
             other => Err(format!("there is no tool called {other}")),
         };
         truncate(result.unwrap_or_else(|e| format!("error: {e}")))

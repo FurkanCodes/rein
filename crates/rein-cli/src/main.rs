@@ -1061,6 +1061,9 @@ struct Terminal {
     /// how many of its headlines are on screen.
     thoughts: String,
     thoughts_shown: usize,
+    /// The plan's steps as last shown in full: an update that only moves
+    /// along it gets one line.
+    plan: Vec<String>,
     /// The model is writing a summary, not an answer.
     compacting: bool,
     turn: TurnStats,
@@ -1112,6 +1115,7 @@ impl Terminal {
             labeled: false,
             thoughts: String::new(),
             thoughts_shown: 0,
+            plan: Vec::new(),
             compacting: false,
             turn: TurnStats::default(),
         }
@@ -1382,7 +1386,18 @@ impl Ui for Terminal {
         }
         let s = self.err;
         let asked = step.as_ref().is_some_and(|step| step.header_shown);
-        let outcome = steps::outcome(call, output, s);
+        let mut outcome = steps::outcome(call, output, s);
+        if call.name == "plan" {
+            // The same steps as before: just say where things stand.
+            let names: Vec<String> = outcome.details.iter().map(|line| strip(line).chars().skip(2).collect()).collect();
+            if names == self.plan {
+                let now = outcome.details.iter().find(|line| strip(line).starts_with('▸')).map(|line| strip(line));
+                outcome.status = s.dim(&now.map_or("all done".to_owned(), |now| format!("· {now}")));
+                outcome.details.clear();
+            } else {
+                self.plan = names;
+            }
+        }
         if self.input.pinned() {
             let (name, target) = steps::describe(call);
             self.input.keep_output(format!("{name}  {target} · {}", strip(&outcome.status)), output);

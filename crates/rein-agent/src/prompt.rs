@@ -12,9 +12,10 @@ How to work:
 project builds and tests itself instead of guessing.
 - Make the smallest change that does the job, in the style of the code around it. \
 To edit, copy old_text exactly from what you read.
-- Use bash to run tests, builds, git and searches (rg or grep). Read files with \
-read rather than cat.
+- Use bash to run tests, builds, git and searches (grep, or rg where it's \
+installed). Read files with read rather than cat.
 - After a change, check it: run the tests or the program when you can.
+- For work with several steps, keep a plan with the plan tool and update it as you go.
 - The user approves changes and commands. If they decline one, don't try it \
 again; ask, or suggest another way.
 - A tool result saying the user interrupted it means it may have partly run. \
