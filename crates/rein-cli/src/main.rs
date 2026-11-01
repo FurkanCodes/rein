@@ -17,8 +17,23 @@ use rein_llm::Item;
 use rein_llm::openai::Client;
 use rein_llm::{ToolCall, Usage, store};
 
+/// `eprintln!` that waits its turn: the spinner and the input box draw
+/// from other threads.
+macro_rules! say {
+    () => { $crate::ui::screen::write("\n") };
+    ($($arg:tt)*) => { $crate::ui::screen::write(&format!("{}\n", format_args!($($arg)*))) };
+}
+
+/// `print!` to stdout that waits its turn, as `say!` does.
+macro_rules! out {
+    ($($arg:tt)*) => { $crate::ui::screen::write_out(&format!($($arg)*)) };
+}
+
 mod ui;
+use ui::editor::{Action, Editor};
+use ui::keys::{Key, Keys};
 use ui::markdown::Markdown;
+use ui::screen::{self, Bottom, Pinned, Raw};
 use ui::spinner::Spinner;
 use ui::steps;
 use ui::style::{GUTTER, Style};
@@ -85,7 +100,7 @@ async fn main() -> ExitCode {
     match run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("rein: {message}");
+            say!("rein: {message}");
             ExitCode::FAILURE
         }
     }
@@ -116,9 +131,9 @@ async fn login(http: &rein_llm::reqwest::Client) -> CliResult {
     let previous: Option<Credentials> = store::read_json(&path).map_err(describe)?;
 
     let pending = signin::begin(&host_id, AGENT_NAME, previous.as_ref()).await.map_err(describe)?;
-    eprintln!("Continue with ChatGPT: finish signing in in your browser...");
+    say!("Continue with ChatGPT: finish signing in in your browser...");
     if !open_browser(&pending.url) {
-        eprintln!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url);
+        say!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url);
     }
     let credentials = tokio::time::timeout(Duration::from_secs(600), pending.finish(http))
         .await
@@ -133,19 +148,19 @@ async fn login(http: &rein_llm::reqwest::Client) -> CliResult {
 
     let who = credentials.email.as_deref().map_or_else(|| "your ChatGPT account".to_owned(), mask_email);
     if !credentials.plan_enabled() {
-        eprintln!(
+        say!(
             "Signed in as {who}, but rein wasn't allowed to use your ChatGPT plan. \
              Run `rein login` again and allow it, or set OPENAI_API_KEY to pay with an API key."
         );
         return Ok(());
     }
     if previous.is_none() {
-        eprintln!(
+        say!(
             "\nYou're using your ChatGPT plan.\n\
              Eligible requests in rein use your ChatGPT plan. Manage usage: {USAGE_URL}\n"
         );
     }
-    eprintln!("Signed in as {who}.");
+    say!("Signed in as {who}.");
     Ok(())
 }
 
@@ -237,7 +252,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     };
     let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
     let permissions = load_permissions(&root, args.mode)?;
-    let mut terminal = Terminal::new(root.clone(), args.mode);
+    let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none());
     let dir = config_dir()?;
     let folder = session::folder(&dir.join("sessions"), &root);
 
@@ -274,7 +289,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
             let files = context::find(&root, Some(&dir.join("AGENTS.md")));
             if !files.is_empty() {
                 let names: Vec<String> = files.iter().map(|f| shown_path(&f.path, &root)).collect();
-                eprintln!("Instructions: {}", names.join(", "));
+                say!("Instructions: {}", names.join(", "));
             }
             let context = context::message(&root, std::env::consts::OS, &now.date(), &files);
             let session = Session::new(&folder, &stamp, header);
@@ -291,6 +306,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     let limit = compact_limit(window)?;
     terminal.context_limit = limit;
     terminal.model = model_name.clone();
+    terminal.input.set_bar(terminal.bar());
     let mut agent = Agent {
         model: OpenAi { client, record },
         tools: Tools::new(root),
@@ -327,7 +343,7 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
     terminal.end_line();
     let Some(outcome) = outcome else {
         agent.repair();
-        eprintln!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(interrupted)"));
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(interrupted)"));
         terminal.end_turn();
         return Ok(());
     };
@@ -361,7 +377,7 @@ async fn compact_now(agent: &mut Agent<OpenAi>, focus: Option<&str>, terminal: &
     match done {
         Some(done) => done.map(|_| ()).map_err(describe),
         None => {
-            eprintln!("(interrupted; nothing was compacted)");
+            say!("(interrupted; nothing was compacted)");
             Ok(())
         }
     }
@@ -378,14 +394,14 @@ async fn pick(folder: &Path, terminal: &mut Terminal) -> CliResult<Option<PathBu
         let when = local_time(conversation.modified);
         let first = conversation.first.as_deref().map(|text| shorten(text, 50)).unwrap_or_default();
         let messages = format!("{} message{}", conversation.messages, if conversation.messages == 1 { "" } else { "s" });
-        eprintln!("{:>2}  {} {:02}:{:02}  {messages:<12}  {first}", i + 1, when.date(), when.hour, when.minute);
+        say!("{:>2}  {} {:02}:{:02}  {messages:<12}  {first}", i + 1, when.date(), when.hour, when.minute);
     }
     loop {
         match terminal.input.read("Continue which one? (number, or Enter to cancel) ", false).await {
             Read::Line(line) if line.trim().is_empty() => return Ok(None),
             Read::Line(line) => match line.trim().parse::<usize>() {
                 Ok(n) if (1..=saved.len()).contains(&n) => return Ok(Some(saved[n - 1].path.clone())),
-                _ => eprintln!("Type a number from 1 to {}.", saved.len()),
+                _ => say!("Type a number from 1 to {}.", saved.len()),
             },
             Read::Interrupted | Read::Eof => return Ok(None),
         }
@@ -403,9 +419,9 @@ fn say_where_we_were(header: &Header, history: &[Item]) {
             _ => None,
         })
         .collect();
-    eprintln!("Continuing the conversation from {} ({} message{} so far).", header.started, typed.len(), if typed.len() == 1 { "" } else { "s" });
+    say!("Continuing the conversation from {} ({} message{} so far).", header.started, typed.len(), if typed.len() == 1 { "" } else { "s" });
     if let Some(last) = typed.last() {
-        eprintln!("Last message: {}", shorten(last, 70));
+        say!("Last message: {}", shorten(last, 70));
     }
 }
 
@@ -469,11 +485,16 @@ fn local_time(time: SystemTime) -> LocalTime {
 /// conversation, until /exit or Ctrl-D. A failed turn is reported and the
 /// conversation goes on.
 async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> CliResult {
-    eprintln!("Type a message. End a line with \\ to keep typing on the next.");
-    eprintln!("Ctrl-C stops an answer; /compact makes room; /exit or Ctrl-D leaves.");
+    if !terminal.input.pinned() {
+        say!("Type a message. End a line with \\ to keep typing on the next.");
+        say!("Ctrl-C stops an answer; /compact makes room; /exit or Ctrl-D leaves.");
+    }
     let mut last_interrupt: Option<std::time::Instant> = None;
     loop {
-        eprintln!();
+        // The box starts each message on its own; plain lines need a gap.
+        if !terminal.input.pinned() {
+            say!();
+        }
         let Some(line) = message(terminal, &mut last_interrupt).await else {
             return Ok(());
         };
@@ -483,13 +504,15 @@ async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> Cli
             message if message == "/compact" || message.starts_with("/compact ") => {
                 let focus = message["/compact".len()..].trim();
                 if let Err(e) = compact_now(agent, (!focus.is_empty()).then_some(focus), terminal).await {
-                    eprintln!("rein: {e}");
+                    say!("rein: {e}");
                 }
             }
             message => {
-                terminal.start_turn(None);
+                // A plain terminal already shows what was typed; the box doesn't.
+                let echo = terminal.input.pinned().then_some(message);
+                terminal.start_turn(echo);
                 if let Err(e) = turn(agent, message.to_owned(), terminal).await {
-                    eprintln!("rein: {e}");
+                    say!("rein: {e}");
                 }
             }
         }
@@ -508,13 +531,13 @@ fn load_permissions(root: &Path, mode: Mode) -> CliResult<Permissions> {
     let permissions = Permissions::new(mode, &rules).map_err(|e| format!(".rein/permissions {e}"))?;
     let count = permissions.rule_count();
     if count > 0 {
-        eprintln!("Using {count} rule{} from .rein/permissions", if count == 1 { "" } else { "s" });
+        say!("Using {count} rule{} from .rein/permissions", if count == 1 { "" } else { "s" });
     }
     match mode {
         Mode::Ask => {}
-        Mode::Edits => eprintln!("Mode: edits (file changes in this folder don't ask; commands do)"),
-        Mode::ReadOnly => eprintln!("Mode: read-only (nothing runs or changes)"),
-        Mode::Trust => eprintln!("Mode: trust. Commands run and files change without asking; only deny rules stop them"),
+        Mode::Edits => say!("Mode: edits (file changes in this folder don't ask; commands do)"),
+        Mode::ReadOnly => say!("Mode: read-only (nothing runs or changes)"),
+        Mode::Trust => say!("Mode: trust. Commands run and files change without asking; only deny rules stop them"),
     }
     Ok(permissions)
 }
@@ -525,7 +548,6 @@ fn load_permissions(root: &Path, mode: Mode) -> CliResult<Permissions> {
 async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time::Instant>) -> Option<String> {
     let mut text = String::new();
     loop {
-        // Plain text: the line editor can't measure colour codes.
         let prompt = if text.is_empty() { "you    " } else { "…      " };
         let read = tokio::select! {
             read = terminal.input.read(prompt, true) => read,
@@ -549,7 +571,7 @@ async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time:
                     return None;
                 }
                 *last_interrupt = Some(std::time::Instant::now());
-                eprintln!("(press Ctrl-C again to leave)");
+                say!("{}", terminal.err.dim("(press Ctrl-C again to leave)"));
                 text.clear();
             }
             Read::Eof => return None,
@@ -578,67 +600,174 @@ enum Read {
     Eof,
 }
 
-/// Lines typed at the keyboard, read by a thread so that waiting for one
-/// never stops rein from noticing Ctrl-C. In a real terminal the thread
-/// runs a line editor (arrow keys, history); otherwise it reads plain
-/// lines, so piping answers into rein keeps working.
+/// What the keyboard is for right now.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Waiting {
+    /// rein is working; keys type ahead, Ctrl-C or Esc stop the turn.
+    Nothing,
+    Message,
+    /// The answer to a question, like y, n or a.
+    Answer,
+}
+
+/// The keyboard, read by its own thread so that waiting for a key never
+/// stops rein from noticing Ctrl-C. In a terminal it drives the pinned
+/// input box; otherwise it reads plain lines, so piping into rein works.
 struct Input {
-    /// Prompts to show; the thread reads one line for each.
-    requests: std::sync::mpsc::Sender<(String, bool)>,
+    /// Plain lines: prompts to show; the thread reads one line for each.
+    requests: std::sync::mpsc::Sender<String>,
     replies: tokio::sync::mpsc::UnboundedReceiver<Read>,
     /// A read asked for but not answered yet, kept if the asker gave up.
     pending: bool,
+    /// The pinned box and bar, when rein runs in a terminal.
+    boxed: Option<std::sync::Arc<std::sync::Mutex<Boxed>>>,
+    /// Puts the keyboard back when rein ends.
+    _raw: Option<Raw>,
+}
+
+/// The input box, shared by the keyboard's thread and the rest of rein.
+struct Boxed {
+    pinned: Pinned,
+    editor: Editor,
+    waiting: Waiting,
+    /// The question being answered, shown in the empty box.
+    question: String,
+    bar: String,
+    replies: tokio::sync::mpsc::UnboundedSender<Read>,
+    interrupted: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Boxed {
+    fn draw(&mut self) {
+        let (lines, cursor) = self.editor.layout(self.pinned.text_width());
+        let placeholder = match self.waiting {
+            Waiting::Message => "type a message · \\ or ctrl-j for a new line · /compact · /exit",
+            Waiting::Answer => self.question.as_str(),
+            Waiting::Nothing => "type ahead while rein works · ctrl-c stops it",
+        };
+        let bottom = Bottom { focused: self.waiting != Waiting::Nothing, lines, cursor, placeholder: placeholder.into(), bar: self.bar.clone() };
+        self.pinned.draw(&bottom);
+    }
+
+    fn key(&mut self, key: Key) {
+        match (self.waiting, &key) {
+            (Waiting::Nothing, Key::CtrlC | Key::Esc) => self.interrupted.notify_one(),
+            // Ctrl-C clears what you typed; on an empty box it's for leaving.
+            (Waiting::Message, Key::CtrlC) if !self.editor.is_empty() => {
+                self.editor.take();
+            }
+            (_, Key::CtrlC) => self.reply(Read::Interrupted),
+            (Waiting::Message, Key::CtrlD) if self.editor.is_empty() => self.reply(Read::Eof),
+            // What you type ahead is sent once rein is done and you press Enter.
+            (Waiting::Nothing, Key::Enter) => {}
+            _ => {
+                if self.editor.key(&key) == Action::Submit {
+                    let text = self.editor.take();
+                    if self.waiting == Waiting::Message {
+                        self.editor.remember(&text);
+                    }
+                    self.reply(Read::Line(text));
+                }
+            }
+        }
+        self.draw();
+    }
+
+    fn reply(&mut self, read: Read) {
+        self.waiting = Waiting::Nothing;
+        let _ = self.replies.send(read);
+    }
 }
 
 impl Input {
-    fn start() -> Self {
-        let (requests, asked) = std::sync::mpsc::channel::<(String, bool)>();
+    /// `pinned` asks for the input box, which needs a terminal all round.
+    fn start(pinned: bool, interrupted: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        let (requests, asked) = std::sync::mpsc::channel::<String>();
         let (tx, replies) = tokio::sync::mpsc::unbounded_channel();
-        let interactive = std::io::stdin().is_terminal();
-        std::thread::spawn(move || {
-            let mut editor = if interactive { rustyline::DefaultEditor::new().ok() } else { None };
-            for (prompt, remember) in asked {
-                let read = match &mut editor {
-                    Some(editor) => match editor.readline(&prompt) {
-                        Ok(line) => {
-                            if remember {
-                                let _ = editor.add_history_entry(line.as_str());
-                            }
-                            Read::Line(line)
-                        }
-                        Err(rustyline::error::ReadlineError::Interrupted) => Read::Interrupted,
-                        Err(_) => Read::Eof,
-                    },
-                    None => {
-                        eprint!("{prompt}");
-                        let mut line = String::new();
-                        match std::io::stdin().read_line(&mut line) {
-                            Ok(0) | Err(_) => Read::Eof,
-                            Ok(_) => Read::Line(line.trim_end_matches(['\n', '\r']).to_owned()),
-                        }
+        let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
+        if pinned && terminal && let Some(raw) = Raw::enter() {
+            screen::restore_on_panic();
+            let boxed = std::sync::Arc::new(std::sync::Mutex::new(Boxed {
+                pinned: Pinned::start(Style::stderr()),
+                editor: Editor::default(),
+                waiting: Waiting::Nothing,
+                question: String::new(),
+                bar: String::new(),
+                replies: tx,
+                interrupted,
+            }));
+            let keyboard = boxed.clone();
+            std::thread::spawn(move || {
+                let mut keys = Keys::default();
+                let mut buffer = [0u8; 1024];
+                let mut stdin = std::io::stdin();
+                while let Ok(n @ 1..) = std::io::Read::read(&mut stdin, &mut buffer) {
+                    for key in keys.feed(&buffer[..n]) {
+                        keyboard.lock().unwrap_or_else(|p| p.into_inner()).key(key);
                     }
+                }
+            });
+            return Input { requests, replies, pending: false, boxed: Some(boxed), _raw: Some(raw) };
+        }
+        std::thread::spawn(move || {
+            for prompt in asked {
+                eprint!("{prompt}");
+                let mut line = String::new();
+                let read = match std::io::stdin().read_line(&mut line) {
+                    Ok(0) | Err(_) => Read::Eof,
+                    Ok(_) => Read::Line(line.trim_end_matches(['\n', '\r']).to_owned()),
                 };
                 if tx.send(read).is_err() {
                     break;
                 }
             }
         });
-        Input { requests, replies, pending: false }
+        Input { requests, replies, pending: false, boxed: None, _raw: None }
     }
 
-    /// Shows `prompt` and reads one line. `remember` puts it in the
-    /// history you reach with the up arrow: your messages, not answers to
-    /// questions.
-    async fn read(&mut self, prompt: &str, remember: bool) -> Read {
+    fn pinned(&self) -> bool {
+        self.boxed.is_some()
+    }
+
+    /// Reads one line: a message (`message`, kept for ↑) or an answer to
+    /// a question. Plain lines show `prompt` first.
+    async fn read(&mut self, prompt: &str, message: bool) -> Read {
         if !self.pending {
-            if self.requests.send((prompt.to_owned(), remember)).is_err() {
-                return Read::Eof;
+            match &self.boxed {
+                Some(boxed) => {
+                    let mut boxed = boxed.lock().unwrap_or_else(|p| p.into_inner());
+                    boxed.waiting = if message { Waiting::Message } else { Waiting::Answer };
+                    boxed.question = prompt.trim().to_owned();
+                    boxed.draw();
+                }
+                None => {
+                    if self.requests.send(prompt.to_owned()).is_err() {
+                        return Read::Eof;
+                    }
+                }
             }
             self.pending = true;
         }
         let read = self.replies.recv().await.unwrap_or(Read::Eof);
         self.pending = false;
         read
+    }
+
+    /// Shows `bar` under the box.
+    fn set_bar(&self, bar: String) {
+        if let Some(boxed) = &self.boxed {
+            let mut boxed = boxed.lock().unwrap_or_else(|p| p.into_inner());
+            boxed.bar = bar;
+            boxed.draw();
+        }
+    }
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        if let Some(boxed) = &self.boxed {
+            boxed.lock().unwrap_or_else(|p| p.into_inner()).pinned.stop();
+        }
     }
 }
 
@@ -706,13 +835,14 @@ struct TurnStats {
 }
 
 impl Terminal {
-    fn new(root: PathBuf, mode: Mode) -> Terminal {
+    fn new(root: PathBuf, mode: Mode, pinned: bool) -> Terminal {
         let mode = match mode {
             Mode::Ask => "ask",
             Mode::Edits => "edits",
             Mode::ReadOnly => "read-only",
             Mode::Trust => "trust",
         };
+        let interrupted: std::sync::Arc<tokio::sync::Notify> = Default::default();
         Terminal {
             out: Style::stdout(),
             err: Style::stderr(),
@@ -720,8 +850,8 @@ impl Terminal {
             root,
             model: String::new(),
             mode,
-            input: Input::start(),
-            interrupted: Default::default(),
+            input: Input::start(pinned, interrupted.clone()),
+            interrupted,
             context_limit: compact::DEFAULT_LIMIT,
             answer: None,
             mid_line: false,
@@ -748,13 +878,13 @@ impl Terminal {
             if let Some(wrap) = &mut answer.wrap {
                 rest = wrap.push(&rest) + &wrap.finish();
             }
-            print!("{rest}");
+            out!("{rest}");
             if !rest.is_empty() {
                 self.mid_line = !rest.ends_with('\n');
             }
         }
         if self.mid_line {
-            println!();
+            out!("\n");
             self.mid_line = false;
         }
         std::io::stdout().flush().ok();
@@ -766,9 +896,11 @@ impl Terminal {
         self.after_step = false;
         if self.fancy {
             if let Some(message) = echo {
-                eprintln!("{}{message}", self.err.label("you"));
+                let mut wrap = Wrap::new(terminal_width().unwrap_or(80), GUTTER, GUTTER);
+                let text = wrap.push(message) + &wrap.finish();
+                say!("\n{}{text}", self.err.label("you"));
             }
-            eprintln!();
+            say!();
         }
     }
 
@@ -783,34 +915,45 @@ impl Terminal {
         if !self.fancy {
             return;
         }
-        let s = self.err;
+        let bar = self.bar();
+        if self.input.pinned() {
+            self.input.set_bar(bar);
+            return;
+        }
         let columns = terminal_width().unwrap_or(80);
+        say!();
+        say!("{}", self.err.dim(&"─".repeat(columns.min(100))));
+        say!("{bar}");
+    }
+
+    /// The model, the mode, how full the context is, how much came from
+    /// the cache, and how long the turn took.
+    fn bar(&self) -> String {
+        let s = self.err;
         let pct = (self.turn.last_input * 100 / self.context_limit.max(1)).min(100);
         let cells = if self.turn.last_input == 0 { 0 } else { pct.div_ceil(10).clamp(1, 10) as usize };
         let gauge = s.blue(&"▰".repeat(cells)) + &s.dim(&"▱".repeat(10 - cells));
         let cache = (self.turn.cached * 100).checked_div(self.turn.input).unwrap_or(0);
         let seconds = self.turn.started.map_or(0.0, |t| t.elapsed().as_secs_f32());
         let dot = s.dim("  ·  ");
-        eprintln!();
-        eprintln!("{}", s.dim(&"─".repeat(columns.min(100))));
-        eprintln!(
+        format!(
             " {}{dot}{}{dot}{} {gauge} {pct}%{dot}{} {cache}%{dot}{}",
             s.bold(&self.model),
             self.mode,
             s.dim("context"),
             s.dim("cache"),
             s.dim(&format!("{seconds:.1}s")),
-        );
+        )
     }
 
     /// Prints a step's label line, unless its question already did.
     fn show_header(&mut self, call: &ToolCall) {
         let shown = self.step.as_ref().is_some_and(|step| step.call_id == call.call_id && step.header_shown);
         if !shown {
-            eprintln!("{}", steps::header(call, self.err));
+            say!("{}", steps::header(call, self.err));
             if matches!(call.name.as_str(), "edit" | "write") {
                 for line in steps::diff_box(call, &self.root, self.err, terminal_width().unwrap_or(80)) {
-                    eprintln!("{line}");
+                    say!("{line}");
                 }
             }
             self.step = Some(Step { call_id: call.call_id.clone(), header_shown: true, done: false });
@@ -825,11 +968,11 @@ impl Ui for Terminal {
             let width = terminal_width();
             if width.is_some() {
                 if self.after_step {
-                    println!();
+                    out!("\n");
                     self.after_step = false;
                 }
                 // A summary has no label: it isn't an answer to you.
-                print!("{}", if self.compacting { " ".repeat(GUTTER) } else { self.out.label("rein") });
+                out!("{}", if self.compacting { " ".repeat(GUTTER) } else { self.out.label("rein") });
             }
             self.answer = Some(Answer {
                 markdown: width.map(|_| Markdown::new(self.out.on())),
@@ -844,8 +987,7 @@ impl Ui for Terminal {
         if let Some(wrap) = &mut answer.wrap {
             text = wrap.push(&text);
         }
-        print!("{text}");
-        std::io::stdout().flush().ok();
+        out!("{text}");
         if !text.is_empty() {
             self.mid_line = !text.ends_with('\n');
         }
@@ -873,7 +1015,13 @@ impl Ui for Terminal {
         };
         let prompt = format!("{}{question}  [y]es  [n]o  [a]lways › ", " ".repeat(GUTTER));
         match self.input.read(&prompt, false).await {
-            Read::Line(answer) => approval(&answer),
+            Read::Line(answer) => {
+                // The box keeps nothing; the conversation keeps the answer.
+                if self.input.pinned() {
+                    say!("{prompt}{}", self.err.bold(answer.trim()));
+                }
+                approval(&answer)
+            }
             // Ctrl-C at a question stops the whole turn.
             Read::Interrupted => {
                 self.interrupted.notify_one();
@@ -909,7 +1057,7 @@ impl Ui for Terminal {
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
         self.end_line();
         self.step = None;
-        eprintln!("{}  {}", steps::header(call, self.err), self.err.red(&format!("✗ blocked: {reason}")));
+        say!("{}  {}", steps::header(call, self.err), self.err.red(&format!("✗ blocked: {reason}")));
         self.step = Some(Step { call_id: call.call_id.clone(), header_shown: true, done: true });
         self.after_step = true;
     }
@@ -922,12 +1070,12 @@ impl Ui for Terminal {
         }
         let outcome = steps::outcome(call, output, self.err);
         if step.is_some_and(|step| step.header_shown) {
-            eprintln!("{}{}", " ".repeat(GUTTER), outcome.status);
+            say!("{}{}", " ".repeat(GUTTER), outcome.status);
         } else {
-            eprintln!("{}  {}", steps::header(call, self.err), outcome.status);
+            say!("{}  {}", steps::header(call, self.err), outcome.status);
         }
         for line in steps::detail_lines(&outcome, self.err, terminal_width().unwrap_or(80)) {
-            eprintln!("{line}");
+            say!("{line}");
         }
         self.after_step = true;
     }
@@ -936,11 +1084,15 @@ impl Ui for Terminal {
         self.turn.input += usage.input_tokens;
         self.turn.cached += usage.cached_input_tokens;
         self.turn.last_input = usage.input_tokens;
+        // The box's bar follows along during the turn.
+        if self.input.pinned() {
+            self.input.set_bar(self.bar());
+        }
     }
 
     fn compacting(&mut self) {
         self.end_line();
-        eprintln!("{}{}", self.err.label("rein"), self.err.dim("compacting the conversation…"));
+        say!("{}{}", self.err.label("rein"), self.err.dim("compacting the conversation…"));
         self.compacting = true;
     }
 
@@ -954,7 +1106,7 @@ impl Ui for Terminal {
         };
         let how = if report.summarized { "summarized" } else { "no summary needed" };
         let line = format!("compacted: about {} → {} tokens ({how}{retired})", thousands(report.before), thousands(report.after));
-        eprintln!("{}{}", " ".repeat(GUTTER), self.err.dim(&line));
+        say!("{}{}", " ".repeat(GUTTER), self.err.dim(&line));
         self.after_step = true;
     }
 }
@@ -987,12 +1139,12 @@ async fn client(http: &rein_llm::reqwest::Client) -> CliResult<Client> {
             })?;
             store::write_json_private(&path, &credentials).map_err(describe)?;
         }
-        eprintln!("Using ChatGPT plan (manage usage: {USAGE_URL})");
+        say!("Using ChatGPT plan (manage usage: {USAGE_URL})");
         return Ok(Client::new(http.clone(), credentials.access_token));
     }
     match std::env::var("OPENAI_API_KEY") {
         Ok(key) if !key.is_empty() => {
-            eprintln!("Using OPENAI_API_KEY (billed to your API account)");
+            say!("Using OPENAI_API_KEY (billed to your API account)");
             Ok(Client::new(http.clone(), key))
         }
         _ => Err("not signed in. Run `rein login` to continue with ChatGPT, or set OPENAI_API_KEY.".into()),

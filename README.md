@@ -40,12 +40,19 @@ rein -r                         # choose a saved conversation to continue
 rein --model gpt-6.1-sol --effort low "say hi"
 ```
 
-In a conversation:
+In a conversation, your message goes in a box pinned to the bottom of the
+terminal, with a status bar under it: the model, the mode, how full the
+context is, how much came from the cache, and how long the last turn took.
+The conversation scrolls above it as usual, so you can scroll back and copy
+from it. Each step rein takes appears under a label (`read`, `edit`, `run`),
+with a short result and the output lines worth seeing; edits show as a
+framed diff before you approve them. Answers are rendered from Markdown.
+`NO_COLOR`, and output that isn't a terminal, get plain text.
 
 | Key | What it does |
 |---|---|
 | ↑ / ↓ | your earlier messages |
-| `\` at the end of a line | keep typing on the next line |
+| `\` at the end of a line, or Ctrl-J | a new line in your message |
 | Ctrl-C while rein works | stop that turn; the conversation goes on |
 | Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |

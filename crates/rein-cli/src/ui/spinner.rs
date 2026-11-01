@@ -30,10 +30,14 @@ impl Spinner {
                 if stopped.load(Ordering::Relaxed) {
                     break;
                 }
-                let _ = write!(stderr, "\r\x1b[2K{}", line(FRAMES[i % FRAMES.len()], started.elapsed().as_secs()));
-                let _ = stderr.flush();
+                {
+                    let _guard = super::screen::lock();
+                    let _ = write!(stderr, "\r\x1b[2K{}", line(FRAMES[i % FRAMES.len()], started.elapsed().as_secs()));
+                    let _ = stderr.flush();
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            let _guard = super::screen::lock();
             let _ = write!(stderr, "\r\x1b[2K");
             let _ = stderr.flush();
         });
