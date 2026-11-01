@@ -21,7 +21,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::{Mutex, MutexGuard};
 
-use super::style::{Style, strip, width};
+use super::style::{Style, fit, strip, width};
 
 static SCREEN: Mutex<()> = Mutex::new(());
 
@@ -180,6 +180,10 @@ pub struct Pinned {
     height: usize,
     /// The cursor sits in the box rather than in the conversation.
     in_box: bool,
+    /// The terminal says where the cursor is when asked (`ESC [ 6n`).
+    answers: bool,
+    /// Asked, after a resize, and waiting for the answer.
+    asked: bool,
 }
 
 /// The most text lines the box grows to.
@@ -189,24 +193,24 @@ impl Pinned {
     /// Starts keeping the bottom still, below where the cursor is now.
     pub fn start(style: Style) -> Pinned {
         let (rows, cols) = size();
-        let row = cursor_row().unwrap_or(rows);
-        let mut pinned = Pinned { style, rows, cols, height: 4, in_box: false };
+        let row = cursor_row();
+        let mut pinned = Pinned { style, rows, cols, height: 4, in_box: false, answers: row.is_some(), asked: false };
         let _guard = lock();
         let mut out = String::from("\x1b[?2004h"); // pasted text comes marked
-        out += &pinned.make_room(row);
+        out += &pinned.make_room(row.unwrap_or(rows), 1);
         write_raw(&out);
         pinned.in_box = false;
         pinned
     }
 
-    /// The width text gets inside the box.
+    /// The width text gets inside the box, at the window's size now.
     pub fn text_width(&self) -> usize {
-        self.cols.saturating_sub(6).max(10)
+        size().1.saturating_sub(6).max(10)
     }
 
     /// Sets the scroll region for the current height, scrolling the
     /// conversation up if the cursor (on `row`) would end up under the box.
-    fn make_room(&self, row: usize) -> String {
+    fn make_room(&self, row: usize, column: usize) -> String {
         let bottom = self.rows.saturating_sub(self.height).max(1);
         let mut out = String::new();
         let row = if row > bottom {
@@ -218,8 +222,20 @@ impl Pinned {
             row
         };
         // Setting the region moves the cursor to the top; put it back.
-        out += &format!("\x1b[1;{bottom}r\x1b[{row};1H");
+        out += &format!("\x1b[1;{bottom}r\x1b[{row};{column}H");
         out
+    }
+
+    /// The terminal's answer after a resize: the conversation's cursor is
+    /// on `row`, at `column`. Everything below it is the old box, which the
+    /// terminal rewrapped; it goes, and the conversation goes on from there.
+    pub fn cursor_at(&mut self, row: usize, column: usize) {
+        if !std::mem::take(&mut self.asked) {
+            return;
+        }
+        let _guard = lock();
+        (self.rows, self.cols) = size();
+        write_raw(&format!("\x1b[r\x1b[{row};{column}H\x1b[J{}", self.make_room(row, column)));
     }
 
     /// Opens the viewer's screen (the terminal's alternate screen, as `less`
@@ -256,7 +272,7 @@ impl Pinned {
     /// Draws the bottom: the box, then the bar. Takes the lock itself.
     pub fn draw(&mut self, bottom: &Bottom) {
         let _guard = lock();
-        if viewing() {
+        if viewing() || self.asked {
             return;
         }
         let mut out = String::new();
@@ -271,7 +287,13 @@ impl Pinned {
                 self.in_box = false;
             }
             let grow = height.saturating_sub(self.height);
-            if resized {
+            if resized && !self.in_box && self.answers {
+                // Text is coming in: ask where the terminal moved the
+                // cursor, so it can go on from there (`cursor_at`).
+                self.asked = true;
+                write_raw("\x1b[6n");
+                return;
+            } else if resized {
                 // The terminal rewrapped everything: clear where the old
                 // bottom was, and start over at the bottom.
                 let old_top = (self.rows + 1).saturating_sub(self.height).min(rows);
@@ -279,7 +301,7 @@ impl Pinned {
                 self.rows = rows;
                 self.cols = cols;
                 self.height = height;
-                out += &format!("\x1b[r\x1b[{};1H\x1b[J{}", old_top.min(new_top).max(1), self.make_room(rows));
+                out += &format!("\x1b[r\x1b[{};1H\x1b[J{}", old_top.min(new_top).max(1), self.make_room(rows, 1));
             } else if grow > 0 {
                 // Scroll the conversation up out of the way, keeping the
                 // cursor on its text.
@@ -324,7 +346,8 @@ impl Pinned {
             out += &format!("\x1b[{};1H\x1b[2K{} {mark} {text}{} {}", top + 1 + i, border("│"), " ".repeat(pad), border("│"));
         }
         out += &format!("\x1b[{};1H\x1b[2K{}", top + 1 + lines, border(&format!("╰{}╯", "─".repeat(inner + 2))));
-        out += &format!("\x1b[{};1H\x1b[2K{}", self.rows, bottom.bar);
+        // Cut to fit: a bar that wrapped would leave its end on screen.
+        out += &format!("\x1b[{};1H\x1b[2K{}", self.rows, fit(&bottom.bar, self.cols.saturating_sub(1)));
         if bottom.focused {
             let (line, column) = bottom.cursor;
             let line = line.saturating_sub(skip).min(lines - 1);

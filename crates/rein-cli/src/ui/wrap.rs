@@ -23,6 +23,11 @@ impl Wrap {
         Wrap { width, indent, column, spaces: String::new(), word: String::new(), escape: false }
     }
 
+    /// The window changed size: lines from here on fit the new width.
+    pub fn set_width(&mut self, width: usize) {
+        self.width = width;
+    }
+
     /// Takes the next piece of text and returns what can be printed now.
     pub fn push(&mut self, text: &str) -> String {
         let mut out = String::new();
@@ -121,6 +126,16 @@ mod tests {
         assert_eq!(wrapped(16, 7, "one two three four\nfive"), "one two\n       three\n       four\n       five");
         // Blank lines stay blank.
         assert_eq!(wrapped(30, 7, "a\n\nb"), "a\n\n       b");
+    }
+
+    #[test]
+    fn follows_a_new_width() {
+        let mut wrap = Wrap::new(20, 0, 0);
+        let mut out = wrap.push("one two three ");
+        wrap.set_width(10);
+        out += &wrap.push("four five six");
+        out += &wrap.finish();
+        assert_eq!(out, "one two three\nfour five\nsix");
     }
 
     #[test]

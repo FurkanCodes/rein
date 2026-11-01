@@ -33,6 +33,9 @@ pub enum Key {
     CtrlO,
     Esc,
     Paste(String),
+    /// Not a key: the terminal saying where the cursor is (row, column),
+    /// when rein asked.
+    CursorAt(usize, usize),
 }
 
 #[derive(Default)]
@@ -175,6 +178,13 @@ fn escape(bytes: &[u8]) -> Decoded {
                 (b"5", b'~') => key(Key::PageUp, used),
                 (b"6", b'~') => key(Key::PageDown, used),
                 (b"200", b'~') => Decoded::PasteStart(used),
+                (_, b'R') => match std::str::from_utf8(params).ok().and_then(|p| p.split_once(';')) {
+                    Some((row, column)) => match (row.parse(), column.parse()) {
+                        (Ok(row), Ok(column)) => key(Key::CursorAt(row, column), used),
+                        _ => Decoded::Skip(used),
+                    },
+                    None => Decoded::Skip(used),
+                },
                 _ => Decoded::Skip(used),
             }
         }
@@ -202,7 +212,7 @@ mod tests {
         assert_eq!(keys(b"\x1b[A\x1b[D\x1b[3~\x1b[H\x1bOF"), [Key::Up, Key::Left, Key::Delete, Key::Home, Key::End]);
         assert_eq!(keys(b"\x1b"), [Key::Esc]);
         assert_eq!(keys(b"\x1b[99Zx"), [Key::Char('x')], "unknown sequences are skipped");
-        assert_eq!(keys(b"\x1b[4;1Rx"), [Key::Char('x')], "a late cursor report isn't typing");
+        assert_eq!(keys(b"\x1b[4;12Rx"), [Key::CursorAt(4, 12), Key::Char('x')], "a cursor report isn't typing");
     }
 
     #[test]

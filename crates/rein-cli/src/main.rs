@@ -424,6 +424,7 @@ fn compact_limit(window: Option<u64>, compact_at: Option<&str>) -> CliResult<u64
 /// Compacts the conversation now, keeping `focus` in mind. Ctrl-C stops it
 /// and leaves the conversation as it was.
 async fn compact_now(agent: &mut Agent<OpenAi>, focus: Option<&str>, terminal: &mut Terminal) -> CliResult {
+    terminal.turn.started = Some(std::time::Instant::now());
     let interrupted = terminal.interrupted.clone();
     let done = tokio::select! {
         done = agent.compact(focus, true, terminal) => Some(done),
@@ -447,18 +448,20 @@ async fn pick(folder: &Path, terminal: &mut Terminal) -> CliResult<Option<PathBu
     if saved.is_empty() {
         return Err("no saved conversations in this folder yet".into());
     }
+    // Under the gutter, like everything else rein says.
+    let pad = " ".repeat(GUTTER);
     for (i, conversation) in saved.iter().enumerate() {
         let when = local_time(conversation.modified);
         let first = conversation.first.as_deref().map(|text| shorten(text, 50)).unwrap_or_default();
         let messages = format!("{} message{}", conversation.messages, if conversation.messages == 1 { "" } else { "s" });
-        say!("{:>2}  {} {:02}:{:02}  {messages:<12}  {first}", i + 1, when.date(), when.hour, when.minute);
+        say!("{pad}{:>2}  {} {:02}:{:02}  {messages:<12}  {first}", i + 1, when.date(), when.hour, when.minute);
     }
     loop {
         match terminal.input.read("Continue which one? (number, or Enter to cancel) ", false).await {
             Read::Line(line) if line.trim().is_empty() => return Ok(None),
             Read::Line(line) => match line.trim().parse::<usize>() {
                 Ok(n) if (1..=saved.len()).contains(&n) => return Ok(Some(saved[n - 1].path.clone())),
-                _ => say!("Type a number from 1 to {}.", saved.len()),
+                _ => say!("{pad}Type a number from 1 to {}.", saved.len()),
             },
             Read::Interrupted | Read::Eof => return Ok(None),
         }
@@ -840,6 +843,18 @@ struct Boxed {
 }
 
 impl Boxed {
+    /// The viewer, if it's open, or the box, at the window's new size.
+    fn redraw(&mut self) {
+        match &mut self.viewer {
+            Some(viewer) => {
+                let (rows, cols) = screen::size();
+                let shown = viewer.render(rows, cols, Style::stderr());
+                self.pinned.show_viewer(&shown);
+            }
+            None => self.draw(),
+        }
+    }
+
     fn draw(&mut self) {
         let (lines, cursor) = self.editor.layout(self.pinned.text_width());
         let placeholder = match self.waiting {
@@ -872,6 +887,11 @@ impl Boxed {
     }
 
     fn key(&mut self, key: Key) {
+        if let Key::CursorAt(row, column) = key {
+            self.pinned.cursor_at(row, column);
+            self.draw();
+            return;
+        }
         if let Some(viewer) = &mut self.viewer {
             let (rows, cols) = screen::size();
             if viewer.key(&key) {
@@ -946,6 +966,16 @@ impl Input {
                 replies: tx,
                 interrupted,
             }));
+            // A window that changes size gets the box drawn again right
+            // away, not only at the next key.
+            if let Ok(mut resized) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
+                let boxed = boxed.clone();
+                tokio::spawn(async move {
+                    while resized.recv().await.is_some() {
+                        boxed.lock().unwrap_or_else(|p| p.into_inner()).redraw();
+                    }
+                });
+            }
             let keyboard = boxed.clone();
             std::thread::spawn(move || {
                 let mut keys = Keys::default();
@@ -1100,6 +1130,8 @@ struct TurnStats {
     cached: u64,
     last_input: u64,
     started: Option<std::time::Instant>,
+    /// How long it took, once it's over.
+    took: Option<Duration>,
 }
 
 impl Terminal {
@@ -1180,6 +1212,7 @@ impl Terminal {
     /// ```
     fn end_turn(&mut self) {
         self.end_line();
+        self.turn.took = self.turn.started.map(|t| t.elapsed());
         if !self.fancy {
             return;
         }
@@ -1202,15 +1235,15 @@ impl Terminal {
         let cells = if self.turn.last_input == 0 { 0 } else { pct.div_ceil(10).clamp(1, 10) as usize };
         let gauge = s.blue(&"▰".repeat(cells)) + &s.dim(&"▱".repeat(10 - cells));
         let cache = (self.turn.cached * 100).checked_div(self.turn.input).unwrap_or(0);
-        let seconds = self.turn.started.map_or(0.0, |t| t.elapsed().as_secs_f32());
         let dot = s.dim("  ·  ");
+        // The time only once the turn is over; the spinner counts until then.
+        let took = self.turn.took.map(|t| format!("{dot}{}", s.dim(&format!("{:.1}s", t.as_secs_f32())))).unwrap_or_default();
         format!(
-            " {}{dot}{}{dot}{} {gauge} {pct}%{dot}{} {cache}%{dot}{}",
+            " {}{dot}{}{dot}{} {gauge} {pct}%{dot}{} {cache}%{took}",
             s.bold(&self.model),
             self.mode,
             s.dim("context"),
             s.dim("cache"),
-            s.dim(&format!("{seconds:.1}s")),
         )
     }
 
@@ -1287,6 +1320,9 @@ impl Ui for Terminal {
             None => delta.to_owned(),
         };
         if let Some(wrap) = &mut answer.wrap {
+            if let Some(width) = terminal_width() {
+                wrap.set_width(width);
+            }
             text = wrap.push(&text);
         }
         out!("{text}");
