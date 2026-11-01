@@ -47,6 +47,8 @@ enum Line {
     /// Tool outputs replaced to save space (see `compact`). The originals
     /// stay in the file, earlier.
     Retired { outputs: Vec<RetiredOutput> },
+    /// The conversation switched to another model from here on.
+    Model { model: String },
     /// The conversation was compacted: from here on it's the first message,
     /// this summary, and `kept`, its latest part word for word.
     Compaction { summary: String, kept: Vec<Line> },
@@ -72,7 +74,7 @@ impl Line {
     /// The conversation item this line holds; `None` for the header.
     fn into_item(self) -> Option<Item> {
         Some(match self {
-            Line::Session(_) | Line::Retired { .. } | Line::Compaction { .. } => return None,
+            Line::Session(_) | Line::Model { .. } | Line::Retired { .. } | Line::Compaction { .. } => return None,
             Line::Context { text } | Line::User { text } => Item::User(text),
             Line::Assistant { text } => Item::Assistant(text),
             Line::ToolCall { call_id, name, arguments } => Item::ToolCall(ToolCall { call_id, name, arguments }),
@@ -115,12 +117,14 @@ impl Session {
     pub fn load(path: &Path) -> Result<Loaded> {
         let text = fs::read_to_string(path)?;
         let mut lines = text.lines().filter_map(|line| serde_json::from_str::<Line>(line).ok());
-        let Some(Line::Session(header)) = lines.next() else {
+        let Some(Line::Session(mut header)) = lines.next() else {
             return Err(std::io::Error::other(format!("{} isn't a rein conversation", path.display())).into());
         };
         let (mut history, mut full) = (Vec::new(), Vec::new());
         for line in lines {
             match line {
+                // The header then says the model in use now.
+                Line::Model { model } => header.model = model,
                 Line::Retired { outputs } => {
                     let outputs: Vec<(String, String)> = outputs.into_iter().map(|o| (o.call_id, o.output)).collect();
                     crate::compact::retire(&mut history, &outputs);
@@ -155,6 +159,13 @@ impl Session {
 
     pub fn append_context(&mut self, text: &str) -> Result<()> {
         self.write(&Line::Context { text: text.to_owned() })
+    }
+
+    /// Records a switch to `model`, which a continued conversation keeps.
+    pub fn append_model(&mut self, model: &str) -> Result<()> {
+        self.write(&Line::Model { model: model.to_owned() })?;
+        self.header.model = model.to_owned();
+        Ok(())
     }
 
     pub fn append_retired(&mut self, outputs: &[(String, String)]) -> Result<()> {
@@ -315,6 +326,18 @@ mod tests {
         reopened.append(&Item::User("two".into())).unwrap();
         let history = Session::load(reopened.path()).unwrap().history;
         assert_eq!(history, vec![Item::User("one".into()), Item::User("two".into())]);
+    }
+
+    #[test]
+    fn a_model_switch_is_kept() {
+        let dir = dir("model");
+        let mut session = Session::new(&dir, "s", header("id"));
+        session.append(&Item::User("one".into())).unwrap();
+        session.append_model("other").unwrap();
+        session.append(&Item::User("two".into())).unwrap();
+        let loaded = Session::load(session.path()).unwrap();
+        assert_eq!(loaded.session.header().model, "other");
+        assert_eq!(loaded.history, vec![Item::User("one".into()), Item::User("two".into())]);
     }
 
     #[test]

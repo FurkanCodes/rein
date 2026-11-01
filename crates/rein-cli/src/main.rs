@@ -280,8 +280,13 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
         return Err("-s can't change a saved conversation's system prompt; start a new one instead".into());
     }
     let (loaded, context) = setup.open(saved, &args.model)?;
+    let mut loaded = loaded;
+    // A continued conversation keeps its model unless -m says otherwise,
+    // and then it's saved with it.
+    if args.resume != Resume::New && args.model_given && loaded.session.header().model != args.model {
+        loaded.session.append_model(&args.model).map_err(describe)?;
+    }
     let header = loaded.session.header().clone();
-    // A continued conversation keeps its model unless -m says otherwise.
     let model_name = if args.model_given || args.resume == Resume::New { args.model } else { header.model };
     setup.models = match tokio::time::timeout(Duration::from_secs(5), models).await {
         Ok(Ok(Ok(models))) => models,
@@ -598,6 +603,9 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             }
             agent.window.limit = compact_limit(setup.window(&id))?;
             terminal.context_limit = agent.window.limit;
+            if let Some(session) = &mut agent.session {
+                session.append_model(&id).map_err(describe)?;
+            }
             agent.model_name = id.clone();
             terminal.model = id.clone();
             say!("{pad}{} now using {id}", s.green("✓"));
