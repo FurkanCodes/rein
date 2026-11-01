@@ -115,6 +115,12 @@ impl Permissions {
         Ok(Permissions { mode, rules: parsed, ..Default::default() })
     }
 
+    /// Forgets what you said "always" to: that was for one conversation.
+    pub fn forget_approvals(&mut self) {
+        self.approved.clear();
+        self.approved_edits = false;
+    }
+
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }

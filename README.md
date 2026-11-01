@@ -53,6 +53,10 @@ framed diff before you approve them. Answers are rendered from Markdown.
 |---|---|
 | ↑ / ↓ | your earlier messages |
 | `\` at the end of a line, or Ctrl-J | a new line in your message |
+| `/` | the commands, as you type; Tab completes one. `/help` lists them |
+| `/mode [ask\|edits\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
+| `/model [id]`, `/effort [level]` | list or switch the model; show or change reasoning effort |
+| `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | Ctrl-O | see every step's full output: ↑↓ scroll, ←→ other steps, `/` search, Esc back |
 | Ctrl-C while rein works | stop that turn; the conversation goes on |
 | Ctrl-C at the prompt | clear the line; press again within two seconds to leave |

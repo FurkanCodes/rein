@@ -8,6 +8,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
     Char(char),
+    Tab,
     Enter,
     /// A newline in the message: Ctrl-J, or Alt-Enter.
     Newline,
@@ -121,7 +122,7 @@ fn decode(bytes: &[u8]) -> Decoded {
         0x10 => key(Key::Up, 1),
         0x15 => key(Key::DeleteToStart, 1),
         0x17 => key(Key::DeleteWord, 1),
-        0x09 => key(Key::Char(' '), 1),
+        0x09 => key(Key::Tab, 1),
         b if b < 0x20 => Decoded::Skip(1),
         b => {
             let len = match b {

@@ -34,6 +34,12 @@ impl Editor {
         self.text.is_empty()
     }
 
+    /// Replaces the text, cursor at the end.
+    pub fn replace(&mut self, text: &str) {
+        self.set(text);
+        self.browsing = None;
+    }
+
     /// Takes the text out, leaving the box empty.
     pub fn take(&mut self) -> String {
         let text = self.text();

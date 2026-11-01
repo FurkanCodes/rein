@@ -29,7 +29,9 @@ macro_rules! out {
     ($($arg:tt)*) => { $crate::ui::screen::write_out(&format!($($arg)*)) };
 }
 
+mod commands;
 mod ui;
+use commands::Slash;
 use ui::editor::{Action, Editor};
 use ui::keys::{Key, Keys};
 use ui::markdown::Markdown;
@@ -255,56 +257,37 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
     let permissions = load_permissions(&root, args.mode)?;
     let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none());
     let dir = config_dir()?;
-    let folder = session::folder(&dir.join("sessions"), &root);
+    let mut setup = Setup {
+        folder: session::folder(&dir.join("sessions"), &root),
+        personal: dir.join("AGENTS.md"),
+        root: root.clone(),
+        system: args.system.clone(),
+        models: Vec::new(),
+    };
 
     let saved = match args.resume {
         Resume::New => None,
-        Resume::Latest => match session::list(&folder, 1).into_iter().next() {
+        Resume::Latest => match session::list(&setup.folder, 1).into_iter().next() {
             Some(latest) => Some(latest.path),
             None => return Err("no saved conversation in this folder yet".into()),
         },
-        Resume::Pick => match pick(&folder, &mut terminal).await? {
+        Resume::Pick => match pick(&setup.folder, &mut terminal).await? {
             Some(path) => Some(path),
             None => return Ok(()),
         },
     };
-    let (loaded, context) = match saved {
-        Some(path) => {
-            if args.system.is_some() {
-                return Err("-s can't change a saved conversation's system prompt; start a new one instead".into());
-            }
-            let loaded = Session::load(&path).map_err(describe)?;
-            say_where_we_were(loaded.session.header(), &loaded.full);
-            (loaded, None)
-        }
-        None => {
-            let now = local_time(SystemTime::now());
-            let header = Header {
-                id: rein_llm::openai::new_session_id().map_err(describe)?,
-                cwd: root.clone(),
-                started: format!("{} {:02}:{:02}", now.date(), now.hour, now.minute),
-                model: args.model.clone(),
-                instructions: Some(prompt::system(args.system.as_deref())),
-            };
-            let stamp = format!("{}T{:02}-{:02}-{:02}", now.date(), now.hour, now.minute, now.second);
-            let files = context::find(&root, Some(&dir.join("AGENTS.md")));
-            if !files.is_empty() {
-                let names: Vec<String> = files.iter().map(|f| shown_path(&f.path, &root)).collect();
-                say!("Instructions: {}", names.join(", "));
-            }
-            let context = context::message(&root, std::env::consts::OS, &now.date(), &files);
-            let session = Session::new(&folder, &stamp, header);
-            (Loaded { session, history: Vec::new(), full: Vec::new() }, Some(context))
-        }
-    };
+    if saved.is_some() && args.system.is_some() {
+        return Err("-s can't change a saved conversation's system prompt; start a new one instead".into());
+    }
+    let (loaded, context) = setup.open(saved, &args.model)?;
     let header = loaded.session.header().clone();
     // A continued conversation keeps its model unless -m says otherwise.
     let model_name = if args.model_given || args.resume == Resume::New { args.model } else { header.model };
-    let window = match tokio::time::timeout(Duration::from_secs(5), models).await {
-        Ok(Ok(Ok(models))) => models.into_iter().find(|m| m.id == model_name).and_then(|m| m.context_window),
-        _ => None,
+    setup.models = match tokio::time::timeout(Duration::from_secs(5), models).await {
+        Ok(Ok(Ok(models))) => models,
+        _ => Vec::new(),
     };
-    let limit = compact_limit(window)?;
+    let limit = compact_limit(setup.window(&model_name))?;
     terminal.context_limit = limit;
     terminal.model = model_name.clone();
     terminal.input.set_bar(terminal.bar());
@@ -326,7 +309,55 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs) -> CliResult {
             terminal.start_turn(Some(&prompt));
             turn(&mut agent, prompt, &mut terminal).await
         }
-        None => conversation(&mut agent, &mut terminal).await,
+        None => conversation(&mut agent, &mut terminal, &mut setup).await,
+    }
+}
+
+/// What it takes to start or reopen a conversation in this folder, kept
+/// for `/new`, `/resume` and `/model`.
+struct Setup {
+    root: PathBuf,
+    /// Where this folder's conversations are saved.
+    folder: PathBuf,
+    /// Your own AGENTS.md, for every project.
+    personal: PathBuf,
+    /// `-s`: standing instructions added to the system prompt.
+    system: Option<String>,
+    /// The models you can use, with their context windows.
+    models: Vec<rein_llm::openai::ModelInfo>,
+}
+
+impl Setup {
+    /// A saved conversation (`saved`), or a new one: a header, the system
+    /// prompt, and the first message with the project's instructions.
+    fn open(&self, saved: Option<PathBuf>, model: &str) -> CliResult<(Loaded, Option<String>)> {
+        if let Some(path) = saved {
+            let loaded = Session::load(&path).map_err(describe)?;
+            say_where_we_were(loaded.session.header(), &loaded.full);
+            return Ok((loaded, None));
+        }
+        let now = local_time(SystemTime::now());
+        let header = Header {
+            id: rein_llm::openai::new_session_id().map_err(describe)?,
+            cwd: self.root.clone(),
+            started: format!("{} {:02}:{:02}", now.date(), now.hour, now.minute),
+            model: model.to_owned(),
+            instructions: Some(prompt::system(self.system.as_deref())),
+        };
+        let stamp = format!("{}T{:02}-{:02}-{:02}", now.date(), now.hour, now.minute, now.second);
+        let files = context::find(&self.root, Some(&self.personal));
+        if !files.is_empty() {
+            let names: Vec<String> = files.iter().map(|f| shown_path(&f.path, &self.root)).collect();
+            say!("Instructions: {}", names.join(", "));
+        }
+        let context = context::message(&self.root, std::env::consts::OS, &now.date(), &files);
+        let session = Session::new(&self.folder, &stamp, header);
+        Ok((Loaded { session, history: Vec::new(), full: Vec::new() }, Some(context)))
+    }
+
+    /// `model`'s context window, if the model list says.
+    fn window(&self, model: &str) -> Option<u64> {
+        self.models.iter().find(|m| m.id == model).and_then(|m| m.context_window)
     }
 }
 
@@ -485,10 +516,10 @@ fn local_time(time: SystemTime) -> LocalTime {
 /// Message after message with the same agent, so it remembers the whole
 /// conversation, until /exit or Ctrl-D. A failed turn is reported and the
 /// conversation goes on.
-async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> CliResult {
+async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
     if !terminal.input.pinned() {
-        say!("Type a message. End a line with \\ to keep typing on the next.");
-        say!("Ctrl-C stops an answer; /compact makes room; /exit or Ctrl-D leaves.");
+        say!("Type a message, or /help for commands. End a line with \\ to keep typing on the next.");
+        say!("Ctrl-C stops an answer; /exit or Ctrl-D leaves.");
     }
     let mut last_interrupt: Option<std::time::Instant> = None;
     loop {
@@ -499,24 +530,154 @@ async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal) -> Cli
         let Some(line) = message(terminal, &mut last_interrupt).await else {
             return Ok(());
         };
-        match line.trim() {
-            "" => continue,
-            "/exit" | "/quit" => return Ok(()),
-            message if message == "/compact" || message.starts_with("/compact ") => {
-                let focus = message["/compact".len()..].trim();
-                if let Err(e) = compact_now(agent, (!focus.is_empty()).then_some(focus), terminal).await {
-                    say!("rein: {e}");
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match commands::parse(line) {
+            Some(Ok(Slash::Exit)) => return Ok(()),
+            Some(Ok(command)) => {
+                if terminal.input.pinned() {
+                    say!("\n{}{line}", terminal.err.label("you"));
                 }
+                if let Err(e) = run_command(command, agent, terminal, setup).await {
+                    say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&e));
+                }
+                terminal.input.set_bar(terminal.bar());
             }
-            message => {
+            Some(Err(e)) => {
+                if terminal.input.pinned() {
+                    say!("\n{}{line}", terminal.err.label("you"));
+                }
+                say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&e));
+            }
+            None => {
                 // A plain terminal already shows what was typed; the box doesn't.
-                let echo = terminal.input.pinned().then_some(message);
+                let echo = terminal.input.pinned().then_some(line);
                 terminal.start_turn(echo);
-                if let Err(e) = turn(agent, message.to_owned(), terminal).await {
+                if let Err(e) = turn(agent, line.to_owned(), terminal).await {
                     say!("rein: {e}");
                 }
             }
         }
+    }
+}
+
+/// Does what a slash command asks. What it says goes under the gutter,
+/// like a step's result.
+async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
+    let pad = " ".repeat(GUTTER);
+    let s = terminal.err;
+    match command {
+        Slash::Help => {
+            for line in commands::help() {
+                say!("{pad}{line}");
+            }
+            say!("{pad}{}", s.dim("Ctrl-O shows a step's full output; \\ or Ctrl-J starts a new line."));
+        }
+        Slash::Mode(None) => say!("{pad}{}", mode_description(agent.permissions.mode)),
+        Slash::Mode(Some(mode)) => {
+            agent.permissions.mode = mode;
+            terminal.mode = mode_name(mode);
+            say!("{pad}{} {}", s.green("✓"), mode_description(mode));
+        }
+        Slash::Model(None) => {
+            if setup.models.is_empty() {
+                say!("{pad}{} (the model list couldn't be fetched)", agent.model_name);
+            }
+            for model in &setup.models {
+                let current = model.id == agent.model_name;
+                let window = model.context_window.map(|w| format!("  {} tokens", thousands(w))).unwrap_or_default();
+                let line = format!("{} {}{}", if current { "›" } else { " " }, model.id, s.dim(&window));
+                say!("{pad}{}", if current { s.bold(&line) } else { line });
+            }
+        }
+        Slash::Model(Some(id)) => {
+            if !setup.models.is_empty() && !setup.models.iter().any(|m| m.id == id) {
+                return Err(format!("no model called {id}; /model lists them"));
+            }
+            agent.window.limit = compact_limit(setup.window(&id))?;
+            terminal.context_limit = agent.window.limit;
+            agent.model_name = id.clone();
+            terminal.model = id.clone();
+            say!("{pad}{} now using {id}", s.green("✓"));
+            say!("{pad}{}", s.dim("The prompt cache starts over: it's kept per model."));
+        }
+        Slash::Effort(None) => {
+            say!("{pad}reasoning effort: {}", agent.reasoning_effort.as_deref().unwrap_or("the model's default"));
+        }
+        Slash::Effort(Some(level)) => {
+            agent.reasoning_effort = level;
+            say!("{pad}{} reasoning effort: {}", s.green("✓"), agent.reasoning_effort.as_deref().unwrap_or("the model's default"));
+        }
+        Slash::Status => {
+            let header = agent.session.as_ref().map(|session| session.header().clone());
+            let messages = agent.window.full.iter().skip(1).filter(|item| matches!(item, Item::User(_))).count();
+            let rows = [
+                ("model", agent.model_name.clone()),
+                ("effort", agent.reasoning_effort.clone().unwrap_or_else(|| "the model's default".into())),
+                ("mode", mode_description(agent.permissions.mode).to_owned()),
+                ("rules", format!("{} from .rein/permissions", agent.permissions.rule_count())),
+                ("context", format!("about {} of {} tokens before compacting", thousands(agent.estimated()), thousands(agent.window.limit))),
+                ("started", header.map(|h| format!("{} · {messages} message{} so far", h.started, if messages == 1 { "" } else { "s" })).unwrap_or_default()),
+                ("folder", setup.root.display().to_string()),
+            ];
+            for (name, value) in rows {
+                say!("{pad}{}  {value}", s.dim(&format!("{name:<8}")));
+            }
+        }
+        Slash::Compact(focus) => compact_now(agent, focus.as_deref(), terminal).await?,
+        Slash::New => {
+            let (loaded, context) = setup.open(None, &agent.model_name)?;
+            switch(agent, loaded, context);
+            say!("{pad}{} a fresh conversation; the last one is saved, /resume brings it back", s.green("✓"));
+        }
+        Slash::Resume => {
+            let Some(path) = pick(&setup.folder, terminal).await? else { return Ok(()) };
+            let (loaded, context) = setup.open(Some(path), &agent.model_name)?;
+            let model = loaded.session.header().model.clone();
+            switch(agent, loaded, context);
+            if model != agent.model_name {
+                agent.window.limit = compact_limit(setup.window(&model))?;
+                terminal.context_limit = agent.window.limit;
+                agent.model_name = model.clone();
+                terminal.model = model;
+            }
+        }
+        Slash::Exit => {}
+    }
+    Ok(())
+}
+
+/// Moves the agent to another conversation. The mode, the rules and the
+/// model stay; what you said "always" to was for the old one.
+fn switch(agent: &mut Agent<OpenAi>, loaded: Loaded, context: Option<String>) {
+    let header = loaded.session.header().clone();
+    agent.session_id = Some(header.id);
+    agent.instructions = header.instructions;
+    agent.history = loaded.history;
+    agent.session = Some(loaded.session);
+    agent.context = context;
+    agent.window.full = loaded.full;
+    agent.window.measured = None;
+    agent.permissions.forget_approvals();
+}
+
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Ask => "ask",
+        Mode::Edits => "edits",
+        Mode::ReadOnly => "read-only",
+        Mode::Trust => "trust",
+    }
+}
+
+fn mode_description(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Ask => "ask: file changes and commands ask first",
+        Mode::Edits => "edits: file changes in this folder don't ask; commands do",
+        Mode::ReadOnly => "read-only: nothing runs or changes",
+        Mode::Trust => "trust: everything runs without asking; only deny rules stop it",
     }
 }
 
@@ -645,11 +806,31 @@ impl Boxed {
     fn draw(&mut self) {
         let (lines, cursor) = self.editor.layout(self.pinned.text_width());
         let placeholder = match self.waiting {
-            Waiting::Message => "type a message · \\ or ctrl-j for a new line · /compact · /exit",
+            Waiting::Message => "type a message · / for commands · \\ or ctrl-j for a new line",
             Waiting::Answer => self.question.as_str(),
             Waiting::Nothing => "type ahead while rein works · ctrl-c stops it · ctrl-o shows output",
         };
-        let bottom = Bottom { focused: self.waiting != Waiting::Nothing, lines, cursor, placeholder: placeholder.into(), bar: self.bar.clone() };
+        // While a command's name is being typed, the bar shows the
+        // commands it could be.
+        let typed = self.editor.text();
+        let hints = if self.waiting == Waiting::Message { commands::matching(&typed) } else { Vec::new() };
+        let bar = if hints.is_empty() {
+            self.bar.clone()
+        } else {
+            let s = Style::stderr();
+            let (_, cols) = screen::size();
+            let tab = if commands::completion(&typed).is_some() { s.dim("  · tab completes") } else { String::new() };
+            // With what each does, if that fits; otherwise just the names.
+            let long: Vec<String> = hints.iter().map(|(name, _, what)| format!("{} {}", s.bold(name), s.dim(what))).collect();
+            let long = format!(" {}{tab}", long.join(&s.dim("  ·  ")));
+            if ui::style::width(&long) < cols {
+                long
+            } else {
+                let names: Vec<String> = hints.iter().map(|(name, _, _)| s.bold(name)).collect();
+                format!(" {}{tab}", names.join("  "))
+            }
+        };
+        let bottom = Bottom { focused: self.waiting != Waiting::Nothing, lines, cursor, placeholder: placeholder.into(), bar };
         self.pinned.draw(&bottom);
     }
 
@@ -684,6 +865,12 @@ impl Boxed {
             (Waiting::Message, Key::CtrlD) if self.editor.is_empty() => self.reply(Read::Eof),
             // What you type ahead is sent once rein is done and you press Enter.
             (Waiting::Nothing, Key::Enter) => {}
+            // Tab completes a command's name, when only one fits.
+            (Waiting::Message, Key::Tab) => {
+                if let Some((name, args, _)) = commands::completion(&self.editor.text()) {
+                    self.editor.replace(&format!("{name}{}", if args.is_empty() { "" } else { " " }));
+                }
+            }
             _ => {
                 if self.editor.key(&key) == Action::Submit {
                     let text = self.editor.take();
@@ -869,12 +1056,7 @@ struct TurnStats {
 
 impl Terminal {
     fn new(root: PathBuf, mode: Mode, pinned: bool) -> Terminal {
-        let mode = match mode {
-            Mode::Ask => "ask",
-            Mode::Edits => "edits",
-            Mode::ReadOnly => "read-only",
-            Mode::Trust => "trust",
-        };
+        let mode = mode_name(mode);
         let interrupted: std::sync::Arc<tokio::sync::Notify> = Default::default();
         Terminal {
             out: Style::stdout(),
