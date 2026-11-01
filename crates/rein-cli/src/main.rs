@@ -655,6 +655,15 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             }
         }
         Slash::Compact(focus) => compact_now(agent, focus.as_deref(), terminal).await?,
+        Slash::Undo => {
+            let undone = agent.undo().map_err(describe)?;
+            if undone.is_empty() {
+                say!("{pad}nothing to undo: rein hasn't changed any files in this session");
+            } else {
+                say!("{pad}{} put back {}", s.green("✓"), undone.join(", "));
+                say!("{pad}{}", s.dim("Commands rein ran aren't undone; the model has been told."));
+            }
+        }
         Slash::New => {
             let (loaded, context) = setup.open(None, &agent.model_name)?;
             switch(agent, loaded, context);

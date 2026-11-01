@@ -127,6 +127,7 @@ impl<M: Model> Agent<M> {
     /// the history valid again, and `send` calls it first anyway.
     pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
         self.repair();
+        self.tools.checkpoint();
         if let Some(context) = self.context.take() {
             if let Some(session) = &mut self.session {
                 session.append_context(&context)?;
@@ -335,6 +336,21 @@ impl<M> Agent<M> {
         self.window.full.push(item.clone());
         self.history.push(item);
         Ok(())
+    }
+
+    /// Undoes the file changes of the latest turn that made any, and tells
+    /// the model, so it doesn't go on as if they were still there. Returns
+    /// the files put back.
+    pub fn undo(&mut self) -> Result<Vec<String>> {
+        let undone = self.tools.undo().map_err(std::io::Error::other)?;
+        if !undone.is_empty() {
+            self.record(Item::User(format!(
+                "[rein: the user undid your file changes from your last turn: {}. Those files are back as they were \
+                 before it. Commands you ran then were not undone.]",
+                undone.join(", ")
+            )))?;
+        }
+        Ok(undone)
     }
 
     /// Gives every tool call that never got a result one now. A turn cut
@@ -615,6 +631,46 @@ mod tests {
         let loaded = Session::load(agent.session.as_ref().unwrap().path()).unwrap();
         assert_eq!(loaded.history, agent.history);
         assert_eq!(loaded.full, agent.window.full);
+    }
+
+    /// A server that answers 503 twice, then a real saved response.
+    #[tokio::test]
+    async fn retries_a_busy_server() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hello = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../rein-llm/tests/fixtures/real-hello.sse")).unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 65536];
+                let _ = socket.read(&mut request);
+                let reply = if attempt < 2 {
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()
+                } else {
+                    let mut ok = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", hello.len()).into_bytes();
+                    ok.extend_from_slice(&hello);
+                    ok
+                };
+                socket.write_all(&reply).unwrap();
+            }
+        });
+        let client = Client::new(rein_llm::reqwest::Client::new(), "test").with_base_url(format!("http://127.0.0.1:{port}"));
+        let model = OpenAi { client, record: None };
+        let request = Request {
+            model: "m".into(),
+            instructions: None,
+            input: vec![Item::User("hi".into())],
+            tools: Vec::new(),
+            reasoning_effort: None,
+            reasoning_summary: false,
+            session_id: None,
+        };
+        let started = std::time::Instant::now();
+        let (items, _) = model.respond(&request, &mut |_| {}).await.unwrap();
+        assert!(items.iter().any(|item| matches!(item, Item::Assistant(_))));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3), "waited 1 s, then 2 s");
+        server.join().unwrap();
     }
 
     #[tokio::test]

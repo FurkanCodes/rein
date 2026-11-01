@@ -56,6 +56,7 @@ framed diff before you approve them. Answers are rendered from Markdown.
 | `/` | the commands, as you type; Tab completes one. `/help` lists them |
 | `/mode [ask\|edits\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
 | `/model [id]`, `/effort [level]` | list or switch the model; show or change reasoning effort |
+| `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | Ctrl-O | see every step's full output: ↑↓ scroll, ←→ other steps, `/` search, Esc back |
 | Ctrl-C while rein works | stop that turn; the conversation goes on |
@@ -88,6 +89,29 @@ rein makes room, cheapest first:
 
 Nothing is lost: the session file keeps everything, and the model's `recall`
 tool searches the whole conversation, including what was compacted away.
+
+## Settings
+
+Defaults go in `~/.config/rein/config`, one per line:
+
+```text
+model = "gpt-6.1-sol"
+effort = "medium"
+mode = "edits"
+compact_at = 120000
+```
+
+A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE` and
+`$REIN_COMPACT_AT`, which win over the file.
+
+## Small things that matter
+
+- A request that fails before anything streams (network trouble, a busy
+  server, a rate limit) is retried, 1, 2 and 4 seconds apart.
+- Commands are stopped after 60 seconds; the model can ask for up to 10
+  minutes for a slow build or test suite.
+- For work with several steps the model keeps a plan, shown as a checklist.
+- What the model thought about shows as one dim line: `✻ Checking the tests`.
 
 ## What rein tells the model
 

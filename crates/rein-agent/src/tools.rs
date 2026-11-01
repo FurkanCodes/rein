@@ -20,7 +20,14 @@ pub struct Tools {
     root: PathBuf,
     /// How long a command may run before it's stopped.
     timeout: Duration,
+    /// What files looked like before rein changed them, one list per turn,
+    /// for `undo`.
+    checkpoints: std::sync::Mutex<Vec<Checkpoint>>,
 }
+
+/// Each file a turn changed, as it was before: its bytes, or `None` if the
+/// turn created it.
+type Checkpoint = Vec<(PathBuf, Option<Vec<u8>>)>;
 
 #[derive(Deserialize)]
 struct ReadArgs {
@@ -67,7 +74,50 @@ struct EditArgs {
 
 impl Tools {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Tools { root: root.into(), timeout: Duration::from_secs(60) }
+        Tools { root: root.into(), timeout: Duration::from_secs(60), checkpoints: Default::default() }
+    }
+
+    /// Starts a new turn: file changes from now on are undone together.
+    pub fn checkpoint(&self) {
+        self.saved().push(Vec::new());
+    }
+
+    /// Puts back the files the latest turn that changed any wrote or edited,
+    /// and returns their paths. Commands it ran aren't undone: rein can't
+    /// know what they did.
+    pub fn undo(&self) -> Result<Vec<String>, String> {
+        let mut saved = self.saved();
+        while saved.last().is_some_and(Vec::is_empty) {
+            saved.pop();
+        }
+        let Some(checkpoint) = saved.pop() else { return Ok(Vec::new()) };
+        // The paths were resolved, symlinks and all; so is the root here.
+        let root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+        let mut undone = Vec::new();
+        // Newest first, so a file changed twice ends up as it was at first.
+        for (path, before) in checkpoint.into_iter().rev() {
+            match &before {
+                Some(bytes) => std::fs::write(&path, bytes),
+                None => std::fs::remove_file(&path),
+            }
+            .map_err(|e| format!("can't put back {}: {e}", path.display()))?;
+            undone.push(path.strip_prefix(&root).unwrap_or(&path).display().to_string());
+        }
+        undone.sort();
+        undone.dedup();
+        Ok(undone)
+    }
+
+    fn saved(&self) -> std::sync::MutexGuard<'_, Vec<Checkpoint>> {
+        self.checkpoints.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Keeps `path` as it is now, before it changes.
+    fn remember(&self, path: &Path) {
+        let before = std::fs::read(path).ok();
+        if let Some(checkpoint) = self.saved().last_mut() {
+            checkpoint.push((path.to_owned(), before));
+        }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -212,6 +262,7 @@ impl Tools {
             tokio::fs::create_dir_all(dir).await.map_err(|e| format!("can't create the folders for {}: {e}", args.path))?;
         }
         let existed = path.exists();
+        self.remember(&path);
         tokio::fs::write(&path, &args.content).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
         let verb = if existed { "replaced" } else { "created" };
         let lines = args.content.lines().count();
@@ -224,6 +275,7 @@ impl Tools {
         let bytes = tokio::fs::read(&path).await.map_err(|e| format!("can't read {}: {e}", args.path))?;
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
         let edited = replace(&text, &args.old_text, &args.new_text, args.replace_all).map_err(|e| format!("{e} in {}", args.path))?;
+        self.remember(&path);
         tokio::fs::write(&path, edited.text).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
         let times = if edited.count == 1 { "1 place".to_owned() } else { format!("{} places", edited.count) };
         Ok(format!("edited {}: replaced {times}", args.path))
@@ -416,6 +468,26 @@ mod tests {
             let answer = tools.run(&call("read", json!({ "path": path }))).await;
             assert_eq!(answer, format!("error: {path} is outside the project"));
         }
+    }
+
+    #[tokio::test]
+    async fn undo_puts_back_the_last_turns_changes() {
+        let dir = project("undo", &[("a.txt", "one\n")]);
+        let tools = Tools::new(&dir);
+        tools.checkpoint();
+        tools.run(&call("edit", json!({"path": "a.txt", "old_text": "one", "new_text": "two", "replace_all": false}))).await;
+        tools.checkpoint();
+        tools.run(&call("edit", json!({"path": "a.txt", "old_text": "two", "new_text": "three", "replace_all": false}))).await;
+        tools.run(&call("edit", json!({"path": "a.txt", "old_text": "three", "new_text": "four", "replace_all": false}))).await;
+        tools.run(&call("write", json!({"path": "new/b.txt", "content": "made"}))).await;
+        tools.checkpoint(); // a turn that changed nothing
+
+        assert_eq!(tools.undo().unwrap(), ["a.txt", "new/b.txt"]);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "two\n", "back to before that turn");
+        assert!(!dir.join("new/b.txt").exists(), "a created file goes away");
+        assert_eq!(tools.undo().unwrap(), ["a.txt"]);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        assert!(tools.undo().unwrap().is_empty());
     }
 
     #[tokio::test]
