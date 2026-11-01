@@ -81,6 +81,41 @@ pub fn width(text: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(strip(text).as_str())
 }
 
+/// `text` cut to `max` columns, colour codes kept, with `…` if anything
+/// was cut. A line that fits can't wrap, which a line redrawn in place
+/// (like a spinner) depends on.
+pub fn fit(text: &str, max: usize) -> String {
+    if width(text) <= max {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            for c in chars.by_ref() {
+                out.push(c);
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    if text.contains('\x1b') {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
 /// `text` without its colour codes.
 pub fn strip(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -108,6 +143,16 @@ mod tests {
     fn labels_fill_the_gutter() {
         assert_eq!(Style::plain().label("run"), "run    ");
         assert_eq!(width(&Style::colored().label("recall")), GUTTER);
+    }
+
+    #[test]
+    fn fits_coloured_text_to_a_width() {
+        let s = Style::colored();
+        let line = format!("{} {}", s.bold("Run"), "a very long command line");
+        let cut = fit(&line, 12);
+        assert_eq!(strip(&cut), "Run a very …");
+        assert_eq!(width(&cut), 12);
+        assert_eq!(fit("short", 12), "short");
     }
 
     #[test]

@@ -1035,6 +1035,8 @@ struct Terminal {
     step: Option<Step>,
     /// A step was shown last, so an answer starts after a blank line.
     after_step: bool,
+    /// rein's label has been shown this turn; what follows lines up under it.
+    labeled: bool,
     /// The model is writing a summary, not an answer.
     compacting: bool,
     turn: TurnStats,
@@ -1047,7 +1049,9 @@ struct Answer {
 
 struct Step {
     call_id: String,
-    /// Its label line is on screen already, from the question.
+    /// What starts its line: rein's label, or room for it.
+    lead: String,
+    /// Its line is on screen already, from the question.
     header_shown: bool,
     /// Its result is on screen already (it was blocked).
     done: bool,
@@ -1081,6 +1085,7 @@ impl Terminal {
             spinner: None,
             step: None,
             after_step: false,
+            labeled: false,
             compacting: false,
             turn: TurnStats::default(),
         }
@@ -1117,6 +1122,7 @@ impl Terminal {
     fn start_turn(&mut self, echo: Option<&str>) {
         self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
         self.after_step = false;
+        self.labeled = false;
         if self.fancy {
             if let Some(message) = echo {
                 let mut wrap = Wrap::new(terminal_width().unwrap_or(80), GUTTER, GUTTER);
@@ -1169,17 +1175,35 @@ impl Terminal {
         )
     }
 
-    /// Prints a step's label line, unless its question already did.
+    /// What starts rein's next line: its label the first time in a turn,
+    /// then room for it, so everything rein does lines up under one name.
+    fn lead(&mut self) -> String {
+        if std::mem::replace(&mut self.labeled, true) { " ".repeat(GUTTER) } else { self.err.label("rein") }
+    }
+
+    /// The same, without using up the label: for a spinner, whose line
+    /// goes away again.
+    fn peek_lead(&self) -> String {
+        if self.labeled { " ".repeat(GUTTER) } else { self.err.label("rein") }
+    }
+
+    fn columns(&self) -> usize {
+        terminal_width().unwrap_or(80)
+    }
+
+    /// Prints a step's line before its question, with the change it would
+    /// make, unless it's on screen already.
     fn show_header(&mut self, call: &ToolCall) {
         let shown = self.step.as_ref().is_some_and(|step| step.call_id == call.call_id && step.header_shown);
         if !shown {
-            say!("{}", steps::header(call, self.err));
+            let lead = self.lead();
+            say!("{}", steps::line(call, &lead, &self.err.dim("○"), "", self.err, self.columns()));
             if matches!(call.name.as_str(), "edit" | "write") {
-                for line in steps::diff_box(call, &self.root, self.err, terminal_width().unwrap_or(80)) {
+                for line in steps::diff_box(call, &self.root, self.err, self.columns(), false) {
                     say!("{line}");
                 }
             }
-            self.step = Some(Step { call_id: call.call_id.clone(), header_shown: true, done: false });
+            self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: false });
         }
     }
 }
@@ -1195,7 +1219,10 @@ impl Ui for Terminal {
                     self.after_step = false;
                 }
                 // A summary has no label: it isn't an answer to you.
-                out!("{}", if self.compacting { " ".repeat(GUTTER) } else { self.out.label("rein") });
+                let lead = if self.compacting { " ".repeat(GUTTER) } else { self.lead() };
+                // The label came from stderr's style; stdout may differ.
+                let lead = if self.out.on() { lead } else { strip(&lead) };
+                out!("{lead}");
             }
             self.answer = Some(Answer {
                 markdown: width.map(|_| Markdown::new(self.out.on())),
@@ -1220,8 +1247,9 @@ impl Ui for Terminal {
         self.end_line();
         if self.fancy {
             let s = self.err;
+            let lead = self.peek_lead();
             self.spinner = Some(Spinner::start(move |frame, seconds| {
-                format!("{}{} Thinking… {}", s.label("rein"), s.yellow(&frame.to_string()), s.dim(&format!("({seconds}s · ctrl-c to stop)")))
+                format!("{lead}{} Thinking… {}", s.yellow(&frame.to_string()), s.dim(&format!("({seconds}s · ctrl-c to stop)")))
             }));
         }
     }
@@ -1236,7 +1264,7 @@ impl Ui for Terminal {
             "write" => "Allow writing this file?",
             _ => "Allow this?",
         };
-        let prompt = format!("{}{question}  [y]es  [n]o  [a]lways › ", " ".repeat(GUTTER));
+        let prompt = format!("{}{question}  [y]es  [n]o  [a]lways › ", " ".repeat(steps::INDENT));
         match self.input.read(&prompt, false).await {
             Read::Line(answer) => {
                 // The box keeps nothing; the conversation keeps the answer.
@@ -1259,20 +1287,25 @@ impl Ui for Terminal {
         self.end_line();
         let asked = self.step.as_ref().is_some_and(|step| step.call_id == call.call_id);
         if !asked {
-            self.step = None;
-        }
-        if matches!(call.name.as_str(), "edit" | "write") {
-            self.show_header(call);
+            // Not asked about: the step's own line spins, then says how it went.
+            let lead = self.lead();
+            self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: false, done: false });
         }
         if self.fancy {
             let s = self.err;
-            let lead = if self.step.as_ref().is_some_and(|step| step.call_id == call.call_id) {
-                " ".repeat(GUTTER)
-            } else {
-                format!("{}  ", steps::header(call, s))
-            };
+            let step = self.step.as_ref().expect("set above");
+            // A step already on screen spins under itself; otherwise its
+            // own line spins, and turns into its result when it's done.
+            let (call, lead, own_line) = (call.clone(), step.lead.clone(), !step.header_shown);
             self.spinner = Some(Spinner::start(move |frame, seconds| {
-                format!("{lead}{} {}", s.yellow(&frame.to_string()), s.dim(&format!("running · {seconds}s")))
+                let (_, columns) = ui::screen::size();
+                let time = s.dim(&format!("{seconds}s"));
+                let line = if own_line {
+                    steps::line(&call, &lead, &s.yellow(&frame.to_string()), &time, s, columns)
+                } else {
+                    format!("{}{} {}", " ".repeat(steps::INDENT), s.yellow(&frame.to_string()), s.dim(&format!("running · {seconds}s")))
+                };
+                ui::style::fit(&line, columns.saturating_sub(1))
             }));
         }
     }
@@ -1280,8 +1313,10 @@ impl Ui for Terminal {
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
         self.end_line();
         self.step = None;
-        say!("{}  {}", steps::header(call, self.err), self.err.red(&format!("✗ blocked: {reason}")));
-        self.step = Some(Step { call_id: call.call_id.clone(), header_shown: true, done: true });
+        let lead = self.lead();
+        let s = self.err;
+        say!("{}", steps::line(call, &lead, &s.red("●"), &s.red(&format!("blocked: {reason}")), s, self.columns()));
+        self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: true });
         self.after_step = true;
     }
 
@@ -1291,18 +1326,35 @@ impl Ui for Terminal {
         if step.as_ref().is_some_and(|step| step.done) {
             return;
         }
-        let outcome = steps::outcome(call, output, self.err);
+        let s = self.err;
+        let asked = step.as_ref().is_some_and(|step| step.header_shown);
+        let outcome = steps::outcome(call, output, s);
         if self.input.pinned() {
-            let (label, target) = steps::describe(call);
-            self.input.keep_output(format!("{label}  {target} · {}", strip(&outcome.status)), output);
+            let (name, target) = steps::describe(call);
+            self.input.keep_output(format!("{name}  {target} · {}", strip(&outcome.status)), output);
         }
-        if step.is_some_and(|step| step.header_shown) {
-            say!("{}{}", " ".repeat(GUTTER), outcome.status);
-        } else {
-            say!("{}  {}", steps::header(call, self.err), outcome.status);
+        let dot = match outcome.ok {
+            Some(true) => s.green("●"),
+            Some(false) => s.red("●"),
+            None => s.dim("●"),
+        };
+        match step {
+            // Asked about first: its line is up there; the result goes under it.
+            Some(step) if step.header_shown => say!("{}{dot} {}", " ".repeat(steps::INDENT), outcome.status),
+            step => {
+                let lead = step.map_or_else(|| self.lead(), |step| step.lead);
+                say!("{}", steps::line(call, &lead, &dot, &outcome.status, s, self.columns()));
+            }
         }
-        for line in steps::detail_lines(&outcome, self.err, terminal_width().unwrap_or(80), self.input.pinned()) {
+        for line in steps::detail_lines(&outcome, s, self.columns(), self.input.pinned()) {
             say!("{line}");
+        }
+        // An edit made without asking shows what it changed; a question
+        // showed it already. A new file's whole text is Ctrl-O away.
+        if !asked && call.name == "edit" && outcome.ok == Some(true) {
+            for line in steps::diff_box(call, &self.root, s, self.columns(), true) {
+                say!("{line}");
+            }
         }
         self.after_step = true;
     }
@@ -1319,7 +1371,8 @@ impl Ui for Terminal {
 
     fn compacting(&mut self) {
         self.end_line();
-        say!("{}{}", self.err.label("rein"), self.err.dim("compacting the conversation…"));
+        let lead = self.lead();
+        say!("{lead}{}", self.err.dim("compacting the conversation…"));
         self.compacting = true;
     }
 
