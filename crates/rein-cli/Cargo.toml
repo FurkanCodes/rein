@@ -14,3 +14,7 @@ tokio = { version = "1.54.1", features = ["rt", "macros", "time", "signal", "syn
 [[bin]]
 name = "rein"
 path = "src/main.rs"
+
+[dev-dependencies]
+# A terminal on screen in memory, for the tests that run rein in one.
+vt100 = "0.16.2"

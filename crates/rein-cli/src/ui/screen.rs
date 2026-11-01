@@ -213,8 +213,8 @@ fn selected_text(state: &mut State, from: (usize, usize), to: (usize, usize)) ->
     let (closed, open) = state.transcript.rows(size().1);
     let rows: Vec<&Row> = closed.iter().chain(open.iter()).collect();
     let mut out = String::new();
-    for i in from.0..=to.0.min(rows.len().saturating_sub(1)) {
-        let row = rows[i];
+    let last = to.0.min(rows.len().saturating_sub(1));
+    for (i, row) in rows.iter().enumerate().take(last + 1).skip(from.0) {
         let plain: Vec<char> = strip(&row.text).chars().collect();
         let start = if i == from.0 { from.1 } else { 0 };
         let end = if i == to.0 { (to.1 + 1).min(plain.len()) } else { plain.len() };

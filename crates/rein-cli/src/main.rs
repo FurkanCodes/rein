@@ -97,7 +97,8 @@ Defaults go in ~/.config/rein/config, one per line: model, effort, mode and
 compact_at, like `mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT,
 $REIN_MODE and $REIN_COMPACT_AT, which win over the file.
 
-Without `rein login`, rein uses $OPENAI_API_KEY, billed to your API account.";
+Without `rein login`, rein uses $OPENAI_API_KEY, billed to your API account,
+and $OPENAI_BASE_URL if set, for another server that speaks the Responses API.";
 
 type CliResult<T = ()> = Result<T, String>;
 
@@ -1496,8 +1497,19 @@ async fn client(http: &rein_llm::reqwest::Client) -> CliResult<Client> {
     }
     match std::env::var("OPENAI_API_KEY") {
         Ok(key) if !key.is_empty() => {
-            say!("Using OPENAI_API_KEY (billed to your API account)");
-            Ok(Client::new(http.clone(), key))
+            let client = Client::new(http.clone(), key);
+            // Another server that speaks the Responses API, like a proxy:
+            // the same variable OpenAI's own libraries read.
+            match std::env::var("OPENAI_BASE_URL") {
+                Ok(base) if !base.is_empty() => {
+                    say!("Using OPENAI_API_KEY with {base}");
+                    Ok(client.with_base_url(base.trim_end_matches('/')))
+                }
+                _ => {
+                    say!("Using OPENAI_API_KEY (billed to your API account)");
+                    Ok(client)
+                }
+            }
         }
         _ => Err("not signed in. Run `rein login` to continue with ChatGPT, or set OPENAI_API_KEY.".into()),
     }

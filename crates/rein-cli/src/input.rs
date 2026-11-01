@@ -195,12 +195,13 @@ impl Boxed {
                     lines.extend(shown);
                     lines.push(String::new());
                 }
+                // The key first, so a narrow box cuts the words, not the key.
                 for (i, (key, text)) in asking.question.answers.iter().enumerate() {
-                    let shortcut = s.dim(&format!("({key})"));
+                    let key = format!("{key:<3}");
                     lines.push(if i == asking.picked {
-                        format!("  {} {} {shortcut}", s.yellow("›"), s.bold(text))
+                        format!("  {} {}  {}", s.yellow("›"), s.bold(&s.yellow(&key)), s.bold(text))
                     } else {
-                        format!("    {text} {shortcut}")
+                        format!("    {}  {text}", s.dim(&key))
                     });
                 }
                 Bottom {

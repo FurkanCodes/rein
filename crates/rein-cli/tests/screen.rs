@@ -1,0 +1,403 @@
+//! rein as you see it: the real binary, in a terminal kept in memory
+//! (`vt100`), talking to a model that follows a script. These tests type
+//! keys, change the window's size and read the screen, with no network and
+//! no tokens spent.
+
+use std::fs::File;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use rein_llm::serde_json::{self, Value, json};
+
+/// What the model does in one turn, after waiting `delay`.
+struct Turn {
+    out: Vec<Out>,
+    delay: Duration,
+}
+
+enum Out {
+    Text(String),
+    /// A `bash` call.
+    Run(String),
+}
+
+fn says(text: &str) -> Turn {
+    Turn { out: vec![Out::Text(text.to_owned())], delay: Duration::ZERO }
+}
+
+fn runs(command: &str) -> Turn {
+    Turn { out: vec![Out::Run(command.to_owned())], delay: Duration::ZERO }
+}
+
+impl Turn {
+    fn after(mut self, millis: u64) -> Turn {
+        self.delay = Duration::from_millis(millis);
+        self
+    }
+}
+
+/// A model server: each request gets the next turn of the script, and
+/// every request is kept, to check what rein sent.
+struct Model {
+    base: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl Model {
+    fn start(turns: Vec<Turn>) -> Model {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            let mut turns = turns.into_iter();
+            for socket in listener.incoming() {
+                let Ok(mut socket) = socket else { break };
+                let Some((head, body)) = read_request(&mut socket) else { continue };
+                let reply = if head.starts_with("GET") {
+                    http("application/json", json!({ "data": [{ "id": "test-model" }] }).to_string().as_bytes())
+                } else {
+                    seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    let turn = turns.next().unwrap_or_else(|| says("(the script has no more turns)"));
+                    std::thread::sleep(turn.delay);
+                    http("text/event-stream", sse(&turn).as_bytes())
+                };
+                let _ = socket.write_all(&reply);
+            }
+        });
+        Model { base, requests }
+    }
+
+    fn requests(&self) -> Vec<Value> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn read_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 8192];
+    let head_end = loop {
+        let n = socket.read(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if let Some(i) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&data[..head_end]).into_owned();
+    let length = head
+        .lines()
+        .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|n| n.trim().parse::<usize>().unwrap_or(0)))
+        .unwrap_or(0);
+    while data.len() < head_end + length {
+        let n = socket.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+    }
+    Some((head, data[head_end..].to_vec()))
+}
+
+fn http(kind: &str, body: &[u8]) -> Vec<u8> {
+    let mut reply = format!("HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).into_bytes();
+    reply.extend_from_slice(body);
+    reply
+}
+
+/// A turn as the Responses API streams it.
+fn sse(turn: &Turn) -> String {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let mut out = String::new();
+    let mut event = |v: Value| out += &format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap());
+    for item in &turn.out {
+        match item {
+            Out::Text(text) => {
+                for piece in text.split_inclusive(' ') {
+                    event(json!({ "type": "response.output_text.delta", "delta": piece }));
+                }
+                let message = json!({ "type": "message", "content": [{ "type": "output_text", "text": text }] });
+                event(json!({ "type": "response.output_item.done", "item": message }));
+            }
+            Out::Run(command) => {
+                let call_id = format!("call_{}", CALLS.fetch_add(1, Ordering::Relaxed));
+                let arguments = json!({ "command": command }).to_string();
+                let call = json!({ "type": "function_call", "call_id": call_id, "namespace": "rein", "name": "bash", "arguments": arguments });
+                event(json!({ "type": "response.output_item.done", "item": call }));
+            }
+        }
+    }
+    let usage = json!({ "input_tokens": 1200, "input_tokens_details": { "cached_tokens": 1000 }, "output_tokens": 20, "output_tokens_details": { "reasoning_tokens": 0 } });
+    event(json!({ "type": "response.completed", "response": { "usage": usage } }));
+    out
+}
+
+/// rein running in a pseudo-terminal, read through a terminal emulator.
+struct Term {
+    screen: Arc<Mutex<vt100::Parser>>,
+    keyboard: File,
+    child: Child,
+    dir: PathBuf,
+}
+
+impl Term {
+    fn start(model: &Model, name: &str, rows: u16, cols: u16) -> Term {
+        let dir = std::env::temp_dir().join(format!("rein-screen-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (project, home) = (dir.join("project"), dir.join("home"));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let (mut master, mut slave) = (0, 0);
+        let mut size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: openpty writes two descriptors into the ints we pass.
+        let opened = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
+        assert_eq!(opened, 0, "can't open a pseudo-terminal");
+        // SAFETY: openpty just gave us these, and nothing else owns them.
+        let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rein"));
+        command
+            .current_dir(&project)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("REIN_HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env("OPENAI_API_KEY", "test")
+            .env("OPENAI_BASE_URL", &model.base)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        // SAFETY: only calls that are safe between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                // Its own session, with this terminal as its own: so it gets
+                // SIGWINCH when the window changes size.
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(command);
+
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
+        let shown = screen.clone();
+        let mut output = File::from(master.try_clone().unwrap());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 16384];
+            while let Ok(n @ 1..) = output.read(&mut buf) {
+                shown.lock().unwrap().process(&buf[..n]);
+            }
+        });
+        Term { screen, keyboard: File::from(master), child, dir }
+    }
+
+    fn keys(&mut self, keys: &str) {
+        self.keyboard.write_all(keys.as_bytes()).unwrap();
+    }
+
+    /// The window changes size: the terminal first, then rein hears of it.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.screen.lock().unwrap().screen_mut().set_size(rows, cols);
+        let size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: TIOCSWINSZ reads the winsize we pass.
+        unsafe { libc::ioctl(self.keyboard.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    }
+
+    /// The screen's rows as text.
+    fn rows(&self) -> Vec<String> {
+        let parser = self.screen.lock().unwrap();
+        let (_, cols) = parser.screen().size();
+        parser.screen().rows(0, cols).collect()
+    }
+
+    fn text(&self) -> String {
+        self.rows().join("\n")
+    }
+
+    /// Waits until the screen shows `text`; fails with the screen if it doesn't.
+    fn wait_for(&self, text: &str) {
+        self.wait_until(&format!("the screen to show {text:?}"), |screen| screen.contains(text));
+    }
+
+    fn wait_until(&self, what: &str, done: impl Fn(&str) -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if done(&self.text()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for {what}. The screen:\n{}", self.text());
+    }
+
+    /// Waits for rein to exit.
+    fn wait_exit(&mut self) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if self.child.try_wait().unwrap().is_some() {
+                // Whatever it printed last is still on its way.
+                std::thread::sleep(Duration::from_millis(100));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("rein didn't exit. The screen:\n{}", self.text());
+    }
+}
+
+impl Drop for Term {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+const IDLE: &str = "type a message";
+
+/// Long enough to wrap at any width these tests use.
+const PARAGRAPH: &str = "A harness is everything around the model: the conversation, the tools, the checks before anything runs, and the screen you read it all on, laid out again whenever the window changes size.";
+
+#[test]
+fn an_answer_appears_above_the_box() {
+    let model = Model::start(vec![says("Hello there, how can I help?")]);
+    let mut term = Term::start(&model, "answer", 24, 80);
+    term.wait_for(IDLE);
+    term.keys("hi\r");
+    term.wait_for("how can I help?");
+    term.wait_for(IDLE);
+    let screen = term.text();
+    assert!(screen.contains("you    hi"), "{screen}");
+    assert!(screen.contains("rein   Hello there, how can I help?"), "{screen}");
+    assert!(screen.contains("context"), "the status bar is under the box:\n{screen}");
+    assert!(model.requests()[0].to_string().contains("\"hi\""), "the model was sent the message");
+}
+
+#[test]
+fn a_command_is_asked_about_whole_and_runs_once_allowed() {
+    let command = "echo one && echo two && echo three-four-five-six-seven-eight-nine-ten";
+    let model = Model::start(vec![runs(command), says("All three lines printed.")]);
+    let mut term = Term::start(&model, "approve", 24, 50);
+    term.wait_for(IDLE);
+    term.keys("go\r");
+    term.wait_for("Allow this command?");
+    // The whole command is there to judge, though it's wider than the box.
+    let screen = term.text();
+    for word in command.split(' ') {
+        assert!(screen.contains(word), "{word:?} isn't on screen:\n{screen}");
+    }
+    let command_rows = screen.lines().filter(|row| row.contains("echo") || row.contains("three-four"));
+    assert!(command_rows.clone().all(|row| !row.contains('…')), "nothing of it is cut short:\n{screen}");
+    // Each answer's key comes first, so a narrow box can't cut it off.
+    for key in ["› y", "a    Yes, and", "n    No", "esc  No, and"] {
+        assert!(screen.contains(key), "{key:?} isn't on screen:\n{screen}");
+    }
+    // Keys too soon after a question still go to the box.
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("All three lines printed.");
+    let screen = term.text();
+    assert!(screen.contains("● Run") && screen.contains("exit 0"), "{screen}");
+    let sent = model.requests()[1].to_string();
+    assert!(sent.contains("three-four-five-six-seven-eight-nine-ten"), "the output went back to the model: {sent}");
+}
+
+#[test]
+fn a_narrower_window_rewraps_whole_words() {
+    let model = Model::start(vec![says(PARAGRAPH)]);
+    let mut term = Term::start(&model, "resize", 24, 100);
+    term.wait_for(IDLE);
+    term.keys("explain\r");
+    term.wait_until("the whole answer", |screen| screen.contains("size.") && screen.contains(IDLE));
+    for cols in [40, 63, 100, 31] {
+        term.resize(24, cols);
+        term.wait_until(&format!("the box at {cols} columns"), |screen| {
+            // Drawn again whole: the old box, cut at the new edge, has no corner there.
+            screen.lines().any(|row| row.starts_with('╭') && row.ends_with('╮') && row.chars().count() == usize::from(cols))
+        });
+        let rows = term.rows();
+        let start = rows.iter().position(|row| row.starts_with("rein   ")).expect("the answer");
+        let answer: Vec<&str> = rows[start..].iter().take_while(|row| !row.trim().is_empty()).map(|row| row.get(7..).unwrap_or("").trim()).collect();
+        assert_eq!(answer.join(" "), PARAGRAPH, "at {cols} columns, every word is whole:\n{}", rows.join("\n"));
+        assert!(answer.len() > 1 || cols == 100, "it wraps at {cols} columns");
+        let boxes = rows.iter().filter(|row| row.contains('╭')).count();
+        assert_eq!(boxes, 1, "one box, nothing left of an old one:\n{}", rows.join("\n"));
+    }
+}
+
+#[test]
+fn the_wheel_scrolls_back_and_pgdn_returns() {
+    let lines: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+    let model = Model::start(vec![says(&lines)]);
+    let mut term = Term::start(&model, "scroll", 16, 60);
+    term.wait_for(IDLE);
+    term.keys("count\r");
+    term.wait_for("line 40");
+    assert!(!term.text().contains("line 20"));
+    for _ in 0..5 {
+        term.keys("\x1b[<64;10;5M");
+    }
+    // Five notches, three rows each.
+    term.wait_for("15 more lines");
+    let screen = term.text();
+    assert!(screen.contains("line 20") && !screen.contains("line 40"), "scrolled back:\n{screen}");
+    for _ in 0..3 {
+        term.keys("\x1b[6~");
+    }
+    term.wait_until("the end of the conversation again", |screen| screen.contains("line 40") && !screen.contains("more lines"));
+}
+
+#[test]
+fn a_message_typed_while_rein_works_waits_its_turn() {
+    let model = Model::start(vec![says("First answer.").after(1500), says("Second answer.")]);
+    let mut term = Term::start(&model, "queue", 24, 80);
+    term.wait_for(IDLE);
+    term.keys("first\r");
+    term.wait_for("Thinking");
+    term.keys("second\r");
+    term.wait_for("queued: second");
+    term.wait_for("Second answer.");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].to_string().contains("\"second\""), "sent once the first turn was over");
+}
+
+#[test]
+fn typing_a_slash_lists_the_commands() {
+    let model = Model::start(Vec::new());
+    let mut term = Term::start(&model, "slash", 24, 80);
+    term.wait_for(IDLE);
+    term.keys("/mo");
+    term.wait_for("list the models");
+    let screen = term.text();
+    assert!(screen.contains("/mode") && screen.contains("/model"), "{screen}");
+    assert!(!screen.contains("/status"), "only the ones that match:\n{screen}");
+}
+
+#[test]
+fn leaving_leaves_the_conversation_in_the_terminal() {
+    let model = Model::start(vec![says("Bye for now.")]);
+    let mut term = Term::start(&model, "leave", 30, 80);
+    term.wait_for(IDLE);
+    term.keys("hello\r");
+    term.wait_for("Bye for now.");
+    term.wait_for(IDLE);
+    term.keys("\x04");
+    term.wait_exit();
+    let screen = term.text();
+    assert!(!screen.contains('╭'), "the box is gone:\n{screen}");
+    assert!(screen.contains("you    hello") && screen.contains("rein   Bye for now."), "{screen}");
+    assert!(screen.contains("rein -c continues this conversation"), "{screen}");
+}

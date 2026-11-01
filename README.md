@@ -24,7 +24,8 @@ rein uses OpenAI's Responses API and can pay for it in two ways:
   five-hour limit is shared with every other app that uses your plan. Manage it at
   [ChatGPT settings → Usage](https://chatgpt.com/settings/usage).
 - **An API key.** If you haven't signed in, rein uses `OPENAI_API_KEY`, billed
-  to your API account.
+  to your API account. `OPENAI_BASE_URL` points it at another server that
+  speaks the Responses API, like a proxy.
 
 rein prints which one it's using on every run.
 
@@ -194,7 +195,11 @@ cargo test
 ```
 
 The tests replay saved response streams from `crates/rein-llm/tests/fixtures`,
-so they need no network and spend no tokens. Record a real stream with
+so they need no network and spend no tokens. `crates/rein-cli/tests/screen.rs`
+runs the real `rein` in a pseudo-terminal, against a model that follows a
+script, and reads the screen through a terminal emulator kept in memory: it
+types, scrolls, approves commands and resizes the window, and checks what you
+would see. Record a real stream with
 `rein --record crates/rein-llm/tests/fixtures/<name>.sse "<prompt>"`. Recordings
 contain your account's `safety_identifier`; change it to `user-REDACTED` before
 committing. A test fails if you forget.
