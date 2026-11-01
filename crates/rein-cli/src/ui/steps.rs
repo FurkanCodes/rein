@@ -140,6 +140,10 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
     if output.starts_with("The user interrupted") {
         return plain(None, style.dim("interrupted"));
     }
+    // You wrote before it started.
+    if output.starts_with("Not run: the user sent a message") {
+        return plain(None, style.dim("skipped"));
+    }
     match call.name.as_str() {
         "bash" => {
             let mut lines: Vec<&str> = output.lines().collect();
@@ -414,6 +418,7 @@ mod tests {
         assert_eq!(details, ["test b ... FAILED"]);
         assert_eq!(more, 5);
         assert_eq!(status("bash", json!({}), "The user declined to run this command.").0, "declined");
+        assert_eq!(status("bash", json!({}), rein_agent::agent::SKIPPED).0, "skipped");
         assert_eq!(status("bash", json!({}), "error: the command took longer than 60s and was stopped").0, "the command took longer than 60s and was stopped");
         assert_eq!(outcome(&call("bash", json!({})), "x\n[exit code 2]", Style::plain()).ok, Some(false));
     }

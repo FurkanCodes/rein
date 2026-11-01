@@ -71,7 +71,8 @@ message, so typing ahead can't answer it by accident.
 | Shift-Enter, Ctrl-J, or `\` at the end of a line | a new line in your message (Shift-Enter where the terminal tells it apart from Enter) |
 | `/` | the commands that match, as you type: ↑↓ pick one, Tab completes it, Enter runs it. `/help` lists them |
 | Shift-Tab | the next mode: ask → edits → read-only |
-| Enter while rein works | queue your message; it's sent when rein is done. Esc puts it back in the box |
+| Enter while rein works | steer it: your message goes into the turn at its next step, and steps rein had planned but not started are skipped. Commands wait for the end of the turn |
+| Tab while rein works | send your message after the turn instead. Esc puts what's waiting back in the box |
 | Esc or Ctrl-C while rein works | stop that turn; the conversation goes on |
 | Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
 | Alt-← / Alt-→ | a word left or right |

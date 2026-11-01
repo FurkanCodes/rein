@@ -4,7 +4,8 @@
 //!
 //! ```text
 //!        ◐ Running cargo test… (4s · esc to stop)
-//!        ↳ and then commit it                          ← queued
+//!        ↳ steering: use the helper · goes in at the next step   ← enter
+//!        ↳ after this turn: and then commit it                    ← tab
 //! ╭──────────────────────────────────────────────╮
 //! │ › Now add a test                              │
 //! ╰──────────────────────────────────────────────╯
@@ -122,7 +123,10 @@ struct Boxed {
     asking: Option<Asking>,
     /// What rein is doing, and since when its turn started.
     busy: Option<(String, Instant)>,
-    /// Messages typed while rein worked, to be sent when it's done.
+    /// Messages typed while rein worked, sent with Enter: they steer the
+    /// turn, going in at its next step.
+    steering: Vec<String>,
+    /// And those sent with Tab, or commands: sent when it's done.
     queued: Vec<String>,
     /// Messages sent with big pastes in them, and how the box showed them,
     /// for the conversation to show the same.
@@ -205,9 +209,13 @@ impl Boxed {
             let what = fit(what, room.max(10));
             above.push(format!("{pad}{} {what}… {}", s.yellow(&frame.to_string()), s.dim(&hint)));
         }
+        for message in &self.steering {
+            let first = message.lines().next().unwrap_or_default();
+            above.push(format!("{pad}{} {first} {}", s.dim("↳ steering:"), s.dim("· goes in at the next step")));
+        }
         for message in &self.queued {
             let first = message.lines().next().unwrap_or_default();
-            above.push(format!("{pad}{} {first}", s.dim("↳ queued:")));
+            above.push(format!("{pad}{} {first}", s.dim("↳ after this turn:")));
         }
 
         let bottom = match &self.asking {
@@ -282,7 +290,7 @@ impl Boxed {
             let placeholder = match self.waiting {
                 Waiting::Message => "type a message · / for commands · shift-enter or ctrl-j for a new line",
                 Waiting::Answer => self.prompt.as_str(),
-                Waiting::Nothing => "type your next message · enter queues it for when rein is done",
+                Waiting::Nothing => "type to steer rein · enter sends it at the next step · tab after this turn",
             };
             lines = vec![s.dim(placeholder)];
         }
@@ -519,9 +527,11 @@ impl Boxed {
         let mut edited = true;
         match (waiting, &key) {
             (Waiting::Nothing, Key::CtrlC | Key::Esc) => {
-                // What was queued comes back to the box, to change or send.
-                if !self.queued.is_empty() {
-                    let mut text = std::mem::take(&mut self.queued).join("\n");
+                // What was waiting comes back to the box, to change or send.
+                let mut waiting: Vec<String> = std::mem::take(&mut self.steering);
+                waiting.append(&mut self.queued);
+                if !waiting.is_empty() {
+                    let mut text = waiting.join("\n");
                     if !self.editor.is_empty() {
                         text = format!("{text}\n{}", self.editor.text());
                     }
@@ -549,6 +559,8 @@ impl Boxed {
                 self.picked = (self.picked + 1) % menu.len();
                 edited = false;
             }
+            // Tab while rein works: after this turn, not into it.
+            (Waiting::Nothing, Key::Tab) if menu.is_empty() && !self.editor.is_empty() => self.submit_later(),
             // Tab completes the picked command's name.
             (_, Key::Tab) if !menu.is_empty() => {
                 let (name, args, _) = menu[self.picked.min(menu.len() - 1)];
@@ -595,8 +607,30 @@ impl Boxed {
         }
     }
 
-    /// Enter: the message goes, or, while rein works, waits its turn.
+    /// Tab while rein works: the message waits for the end of the turn.
+    fn submit_later(&mut self) {
+        let text = self.take_message(Waiting::Nothing);
+        if !text.trim().is_empty() {
+            self.queued.push(text);
+        }
+    }
+
+    /// Enter: the message goes; while rein works, into the turn, at its
+    /// next step. A command is for rein, not the model, so it waits for
+    /// the end of the turn instead.
     fn submit(&mut self, waiting: Waiting) {
+        let text = self.take_message(waiting);
+        match waiting {
+            Waiting::Nothing if text.trim().is_empty() => {}
+            Waiting::Nothing if commands::parse(&text).is_some() => self.queued.push(text),
+            Waiting::Nothing => self.steering.push(text),
+            _ => self.reply(Read::Line(text)),
+        }
+    }
+
+    /// Takes the message out of the box: kept for ↑, and how the box showed
+    /// it kept for the conversation.
+    fn take_message(&mut self, waiting: Waiting) -> String {
         screen::follow();
         let entry = self.editor.entry();
         let shown = entry.shown();
@@ -607,11 +641,7 @@ impl Boxed {
         if waiting != Waiting::Answer {
             self.editor.remember(entry);
         }
-        match waiting {
-            Waiting::Nothing if !text.trim().is_empty() => self.queued.push(text),
-            Waiting::Nothing => {}
-            _ => self.reply(Read::Line(text)),
-        }
+        text
     }
 
     /// A key while a question waits for its answer.
@@ -805,6 +835,7 @@ impl Input {
                 prompt: String::new(),
                 asking: None,
                 busy: None,
+                steering: Vec::new(),
                 queued: Vec::new(),
                 shown: Vec::new(),
                 notice: None,
@@ -898,10 +929,20 @@ impl Input {
             match &self.boxed {
                 Some(boxed) => {
                     let mut boxed = locked(boxed);
-                    if message && !boxed.queued.is_empty() {
-                        let next = boxed.queued.remove(0);
-                        boxed.draw();
-                        return Read::Line(next);
+                    // Steering the turn missed, if it ended first, then what
+                    // was meant for after it.
+                    if message {
+                        let next = if !boxed.steering.is_empty() {
+                            Some(boxed.steering.remove(0))
+                        } else if !boxed.queued.is_empty() {
+                            Some(boxed.queued.remove(0))
+                        } else {
+                            None
+                        };
+                        if let Some(next) = next {
+                            boxed.draw();
+                            return Read::Line(next);
+                        }
                     }
                     // Done, and nothing more to do: it's your turn.
                     if message && std::mem::take(&mut boxed.worked) {
@@ -948,6 +989,17 @@ impl Input {
             boxed.worked |= what.is_some();
             boxed.busy = what.map(|what| (what, since));
         });
+    }
+
+    /// The messages sent to steer the turn, taken out, oldest first.
+    pub fn steering(&self) -> Vec<String> {
+        let Some(boxed) = &self.boxed else { return Vec::new() };
+        let mut boxed = locked(boxed);
+        let taken = std::mem::take(&mut boxed.steering);
+        if !taken.is_empty() {
+            boxed.draw();
+        }
+        taken
     }
 
     /// A short note under the box for a moment, in place of the bar.

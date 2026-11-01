@@ -674,7 +674,8 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             for keys in [
                 "shift-enter, ctrl-j or \\ at the end starts a new line · shift-tab changes the mode",
                 "↑ brings back what you sent before, from this folder · ctrl-r finds it by its words",
-                "enter while rein works queues your message · esc or ctrl-c stops the turn",
+                "enter while rein works steers it: your message goes in at its next step",
+                "tab while rein works sends it after the turn instead · esc or ctrl-c stops the turn",
                 "wheel, pgup/pgdn or shift-↑↓ scroll · drag over text to copy it",
                 "ctrl-o shows every step's full output · ctrl-l draws the window again",
             ] {
@@ -1465,6 +1466,25 @@ impl Ui for Terminal {
         if self.input.pinned() {
             self.input.set_bar(self.bar());
         }
+    }
+
+    fn steering(&mut self) -> Vec<String> {
+        self.input.steering()
+    }
+
+    /// Your message, where it went into the turn: between the steps it came
+    /// between, so the screen reads as the model saw it.
+    fn steered(&mut self, message: &str) {
+        self.end_line();
+        if self.fancy {
+            let shown = self.input.shown(message);
+            say!("\n{}", you_said(&shown, self.err, self.wrap_width().unwrap_or(80)));
+        }
+        // What rein does next starts under its label again, after a gap.
+        self.labeled = false;
+        self.after_you = true;
+        self.after_step = false;
+        self.after_text = false;
     }
 
     fn compacting(&mut self) {

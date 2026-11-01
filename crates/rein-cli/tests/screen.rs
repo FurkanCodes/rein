@@ -16,10 +16,9 @@ use std::time::{Duration, Instant};
 
 use rein_llm::serde_json::{self, Value, json};
 
-/// What the model does in one turn, after waiting `delay`.
+/// What the model does in one turn.
 struct Turn {
     out: Vec<Out>,
-    delay: Duration,
 }
 
 enum Out {
@@ -29,7 +28,7 @@ enum Out {
 }
 
 fn says(text: &str) -> Turn {
-    Turn { out: vec![Out::Text(text.to_owned())], delay: Duration::ZERO }
+    Turn { out: vec![Out::Text(text.to_owned())] }
 }
 
 fn runs(command: &str) -> Turn {
@@ -37,14 +36,7 @@ fn runs(command: &str) -> Turn {
 }
 
 fn calls(tool: &'static str, arguments: Value) -> Turn {
-    Turn { out: vec![Out::Call(tool, arguments)], delay: Duration::ZERO }
-}
-
-impl Turn {
-    fn after(mut self, millis: u64) -> Turn {
-        self.delay = Duration::from_millis(millis);
-        self
-    }
+    Turn { out: vec![Out::Call(tool, arguments)] }
 }
 
 /// A model server: each request gets the next turn of the script, and
@@ -88,7 +80,6 @@ impl Model {
                         let body = if gzip { gunzip(&body) } else { body };
                         seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or(Value::Null));
                         let turn = turns.next().unwrap_or_else(|| says("(the script has no more turns)"));
-                        std::thread::sleep(turn.delay);
                         http(200, "text/event-stream", sse(&turn).as_bytes())
                     }
                 };
@@ -219,8 +210,18 @@ struct Term {
 
 impl Term {
     fn start(model: &Model, name: &str, rows: u16, cols: u16) -> Term {
+        Term::start_with(model, name, rows, cols, &[])
+    }
+
+    /// rein in a project that has `files` in it from the start.
+    fn start_with(model: &Model, name: &str, rows: u16, cols: u16, files: &[(&str, &str)]) -> Term {
         let dir = std::env::temp_dir().join(format!("rein-screen-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let path = dir.join("project").join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
         Term::spawn(model, dir, rows, cols)
     }
 
@@ -490,19 +491,58 @@ fn the_wheel_scrolls_back_and_pgdn_returns() {
     term.wait_until("the end of the conversation again", |screen| screen.contains("line 40") && !screen.contains("more lines"));
 }
 
+/// A turn with two steps planned at once: a slow one, then one that leaves a mark.
+fn two_steps() -> Turn {
+    Turn {
+        out: vec![
+            Out::Call("bash", json!({ "command": "sleep 1", "timeout_seconds": null })),
+            Out::Call("bash", json!({ "command": "touch planned.txt", "timeout_seconds": null })),
+        ],
+    }
+}
+
+const ALLOWED: (&str, &str) = (".rein/permissions", "allow sleep\nallow touch\n");
+
 #[test]
-fn a_message_typed_while_rein_works_waits_its_turn() {
-    let model = Model::start(vec![says("First answer.").after(1500), says("Second answer.")]);
-    let mut term = Term::start(&model, "queue", 24, 80);
+fn enter_while_rein_works_steers_it() {
+    let model = Model::start(vec![two_steps(), says("Switching to the helper.")]);
+    let mut term = Term::start_with(&model, "steer", 30, 90, &[ALLOWED]);
     term.wait_for(IDLE);
-    term.keys("first\r");
-    term.wait_for("Thinking");
-    term.keys("second\r");
-    term.wait_for("queued: second");
-    term.wait_for("Second answer.");
+    term.keys("make the file\r");
+    term.wait_for("Running sleep 1");
+    term.keys("use the helper instead\r");
+    term.wait_for("steering: use the helper instead · goes in at the next step");
+    term.wait_for("Switching to the helper.");
+    assert!(!term.dir.join("project/planned.txt").exists(), "the step planned before you wrote didn't run");
+    // On screen as the model saw it: the step that ran, the one skipped,
+    // your message, then what rein did about it.
+    let screen = term.text();
+    let at = |text: &str| screen.find(text).unwrap_or_else(|| panic!("{text:?} isn't on screen:\n{screen}"));
+    assert!(at("sleep 1  exit 0") < at("touch planned.txt  skipped"), "{screen}");
+    assert!(at("touch planned.txt  skipped") < at("you    use the helper instead"), "{screen}");
+    assert!(at("you    use the helper instead") < at("rein   Switching to the helper."), "{screen}");
     let requests = model.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].to_string().contains("\"second\""), "sent once the first turn was over");
+    assert_eq!(requests.len(), 2, "one turn, steered");
+    let input = requests[1]["input"].as_array().unwrap();
+    assert_eq!(input.last().unwrap()["content"], "use the helper instead", "it went in last, after both results");
+    assert!(input.iter().any(|item| item["output"].as_str().is_some_and(|out| out.starts_with("Not run: the user sent a message"))));
+}
+
+#[test]
+fn tab_while_rein_works_waits_for_the_end_of_the_turn() {
+    let model = Model::start(vec![two_steps(), says("Made it."), says("Committed.")]);
+    let mut term = Term::start_with(&model, "queue", 30, 90, &[ALLOWED]);
+    term.wait_for(IDLE);
+    term.keys("make the file\r");
+    term.wait_for("Running sleep 1");
+    term.keys("and then commit it\t");
+    term.wait_for("after this turn: and then commit it");
+    term.wait_for("Committed.");
+    assert!(term.dir.join("project/planned.txt").exists(), "every step ran");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3, "the turn finished, then the message went as the next");
+    assert!(!requests[1].to_string().contains("commit it"));
+    assert_eq!(requests[2]["input"].as_array().unwrap().last().unwrap()["content"], "and then commit it");
 }
 
 #[test]

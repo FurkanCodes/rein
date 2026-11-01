@@ -63,7 +63,18 @@ pub trait Ui {
     /// through `text`.
     fn compacting(&mut self) {}
     fn compacted(&mut self, _report: &Compacted) {}
+    /// Messages the user sent while the turn went on, to steer it: taken
+    /// out, oldest first. Asked between steps.
+    fn steering(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// A steering message has gone into the conversation, here.
+    fn steered(&mut self, _message: &str) {}
 }
+
+/// What a step the model asked for gets instead of running, when the user
+/// wrote before it started: what it was for may no longer hold.
+pub const SKIPPED: &str = "Not run: the user sent a message before this step started. It follows; act on it.";
 
 /// What a compaction did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,10 +189,27 @@ impl<M: Model> Agent<M> {
                 self.record(item)?;
             }
             if calls.is_empty() {
-                return Ok(Outcome::Done);
+                // Done, unless the user wrote meanwhile: then that's next.
+                if !self.steer(ui.steering(), ui)? {
+                    return Ok(Outcome::Done);
+                }
+                continue;
             }
 
-            for call in calls {
+            let mut calls = calls.into_iter();
+            while let Some(call) = calls.next() {
+                // The user wrote: what's left was planned before that, so
+                // it doesn't run. Every call still gets a result, as the
+                // conversation needs one for each.
+                let steering = ui.steering();
+                if !steering.is_empty() {
+                    for skipped in std::iter::once(call).chain(calls.by_ref()) {
+                        ui.tool_finished(&skipped, SKIPPED);
+                        self.record(Item::ToolResult { call_id: skipped.call_id, output: SKIPPED.to_owned() })?;
+                    }
+                    self.steer(steering, ui)?;
+                    break;
+                }
                 // Searching the conversation is rein's own business: no
                 // permission needed, nothing outside is touched.
                 if call.name == "recall" {
@@ -225,8 +253,21 @@ impl<M: Model> Agent<M> {
                 ui.tool_finished(&call, &output);
                 self.record(Item::ToolResult { call_id: call.call_id, output })?;
             }
+            // What the user wrote during the last step goes with its result.
+            self.steer(ui.steering(), ui)?;
         }
         Ok(Outcome::TurnLimit)
+    }
+
+    /// Adds the messages the user sent to steer the turn, where it is now.
+    /// Says whether there were any.
+    fn steer(&mut self, messages: Vec<String>, ui: &mut impl Ui) -> Result<bool> {
+        let any = !messages.is_empty();
+        for message in messages {
+            ui.steered(&message);
+            self.record(Item::User(message))?;
+        }
+        Ok(any)
     }
 
     /// Makes room in the conversation. If retiring stale tool output is
@@ -498,6 +539,79 @@ mod tests {
             self.log.push(format!("result {output}"));
         }
         fn usage(&mut self, _: &Usage) {}
+    }
+
+    /// Approves everything, and writes `message` once `after` steps are done.
+    struct Steerer {
+        message: Option<String>,
+        after: usize,
+        finished: usize,
+        log: Vec<String>,
+    }
+
+    impl Ui for Steerer {
+        fn text(&mut self, _: &str) {}
+        async fn approve(&mut self, _: &ToolCall) -> Approval {
+            Approval::Yes
+        }
+        fn tool_started(&mut self, call: &ToolCall) {
+            self.log.push(format!("ran {}", call.arguments));
+        }
+        fn tool_blocked(&mut self, _: &ToolCall, _: &str) {}
+        fn tool_finished(&mut self, call: &ToolCall, output: &str) {
+            self.finished += 1;
+            self.log.push(format!("result of {}: {output}", call.call_id));
+        }
+        fn usage(&mut self, _: &Usage) {}
+        fn steering(&mut self) -> Vec<String> {
+            if self.finished < self.after { Vec::new() } else { self.message.take().into_iter().collect() }
+        }
+        fn steered(&mut self, message: &str) {
+            self.log.push(format!("steered {message}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_sent_mid_turn_skips_the_steps_not_started() {
+        let mut agent = agent(
+            "steer",
+            vec![vec![bash("c1", "touch one"), bash("c2", "touch two")], vec![Item::Assistant("Using the helper.".into())]],
+        );
+        let root = std::env::temp_dir().join(format!("rein-agent-{}-steer", std::process::id()));
+        let mut steerer = Steerer { message: Some("stop, use the helper".into()), after: 1, finished: 0, log: Vec::new() };
+        assert_eq!(agent.send("make two files".into(), &mut steerer).await.unwrap(), Outcome::Done);
+        assert!(root.join("one").exists() && !root.join("two").exists(), "the second step never ran");
+        assert_eq!(steerer.log, [
+            r#"ran {"command":"touch one"}"#.to_owned(),
+            "result of c1: [exit code 0]".to_owned(),
+            format!("result of c2: {SKIPPED}"),
+            "steered stop, use the helper".to_owned(),
+        ]);
+        // The model next sees every call answered, then the message, last:
+        // the start of the conversation is unchanged, for the cache.
+        let requests = agent.model.requests.borrow();
+        assert_eq!(
+            requests[1].input,
+            [
+                Item::User("make two files".into()),
+                bash("c1", "touch one"),
+                bash("c2", "touch two"),
+                Item::ToolResult { call_id: "c1".into(), output: "[exit code 0]".into() },
+                Item::ToolResult { call_id: "c2".into(), output: SKIPPED.into() },
+                Item::User("stop, use the helper".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_sent_as_the_model_finishes_keeps_the_turn_going() {
+        let mut agent = agent("steer-end", vec![vec![Item::Assistant("Done.".into())], vec![Item::Assistant("Also renamed it.".into())]]);
+        let mut steerer = Steerer { message: Some("and rename it".into()), after: 0, finished: 0, log: Vec::new() };
+        assert_eq!(agent.send("fix it".into(), &mut steerer).await.unwrap(), Outcome::Done);
+        let requests = agent.model.requests.borrow();
+        assert_eq!(requests.len(), 2, "one turn, carried on");
+        assert_eq!(requests[1].input.last(), Some(&Item::User("and rename it".into())));
+        assert_eq!(agent.history.last(), Some(&Item::Assistant("Also renamed it.".into())));
     }
 
     fn bash(id: &str, command: &str) -> Item {
