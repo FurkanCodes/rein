@@ -184,6 +184,9 @@ pub struct Pinned {
     answers: bool,
     /// Asked, after a resize, and waiting for the answer.
     asked: bool,
+    /// Where the cursor sits in the box: which of its text lines, and the
+    /// screen column.
+    box_cursor: (usize, usize),
 }
 
 /// The most text lines the box grows to.
@@ -194,7 +197,7 @@ impl Pinned {
     pub fn start(style: Style) -> Pinned {
         let (rows, cols) = size();
         let row = cursor_row();
-        let mut pinned = Pinned { style, rows, cols, height: 4, in_box: false, answers: row.is_some(), asked: false };
+        let mut pinned = Pinned { style, rows, cols, height: 4, in_box: false, answers: row.is_some(), asked: false, box_cursor: (0, 1) };
         let _guard = lock();
         let mut out = String::from("\x1b[?2004h"); // pasted text comes marked
         out += &pinned.make_room(row.unwrap_or(rows), 1);
@@ -226,16 +229,33 @@ impl Pinned {
         out
     }
 
-    /// The terminal's answer after a resize: the conversation's cursor is
-    /// on `row`, at `column`. Everything below it is the old box, which the
-    /// terminal rewrapped; it goes, and the conversation goes on from there.
+    /// The terminal's answer after a resize: the cursor is on `row`, at
+    /// `column`. Everything from the old box down goes, and the
+    /// conversation goes on from where it was.
     pub fn cursor_at(&mut self, row: usize, column: usize) {
         if !std::mem::take(&mut self.asked) {
             return;
         }
         let _guard = lock();
-        (self.rows, self.cols) = size();
-        write_raw(&format!("\x1b[r\x1b[{row};{column}H\x1b[J{}", self.make_room(row, column)));
+        let (rows, cols) = size();
+        let (clear, row, column) = if self.in_box {
+            // The cursor is in the box. A narrower terminal rewrapped each
+            // of the box's lines, all as wide as the old window, onto
+            // `wrapped` rows, so its top is that much further up.
+            let (line, at) = self.box_cursor;
+            let wrapped = self.cols.div_ceil(cols.max(1)).max(1);
+            let top = row.saturating_sub((at - 1) / cols.max(1) + (line + 1) * wrapped).max(1);
+            // The conversation's cursor waits at the start of the line
+            // just above the box.
+            (top, top.saturating_sub(1).max(1), 1)
+        } else {
+            // Text is coming in: the old box is everything below it.
+            (row, row, column)
+        };
+        (self.rows, self.cols) = (rows, cols);
+        self.in_box = false;
+        let at = if clear == row { format!("\x1b[{row};{column}H") } else { format!("\x1b[{clear};1H") };
+        write_raw(&format!("\x1b[r{at}\x1b[J{}", self.make_room(row, column)));
     }
 
     /// Opens the viewer's screen (the terminal's alternate screen, as `less`
@@ -280,6 +300,13 @@ impl Pinned {
         let lines = bottom.lines.len().clamp(1, MAX_LINES);
         let height = lines + 3;
         let resized = (rows, cols) != (self.rows, self.cols);
+        if resized && self.answers {
+            // Ask where the terminal moved the cursor when it rewrapped
+            // the screen; `cursor_at` goes on from there.
+            self.asked = true;
+            write_raw("\x1b[6n");
+            return;
+        }
         if height != self.height || resized {
             // Back to the conversation's cursor, then make the new room.
             if self.in_box {
@@ -287,13 +314,7 @@ impl Pinned {
                 self.in_box = false;
             }
             let grow = height.saturating_sub(self.height);
-            if resized && !self.in_box && self.answers {
-                // Text is coming in: ask where the terminal moved the
-                // cursor, so it can go on from there (`cursor_at`).
-                self.asked = true;
-                write_raw("\x1b[6n");
-                return;
-            } else if resized {
+            if resized {
                 // The terminal rewrapped everything: clear where the old
                 // bottom was, and start over at the bottom.
                 let old_top = (self.rows + 1).saturating_sub(self.height).min(rows);
@@ -352,6 +373,7 @@ impl Pinned {
             let (line, column) = bottom.cursor;
             let line = line.saturating_sub(skip).min(lines - 1);
             out += &format!("\x1b[{};{}H\x1b[?25h", top + 1 + line, column + 5);
+            self.box_cursor = (line, column + 5);
             self.in_box = true;
         } else {
             out += "\x1b8";

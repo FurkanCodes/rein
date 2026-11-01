@@ -972,6 +972,9 @@ impl Input {
                 let boxed = boxed.clone();
                 tokio::spawn(async move {
                     while resized.recv().await.is_some() {
+                        // Dragging the window's edge sends many; draw once
+                        // it has stopped.
+                        while let Ok(Some(())) = tokio::time::timeout(Duration::from_millis(150), resized.recv()).await {}
                         boxed.lock().unwrap_or_else(|p| p.into_inner()).redraw();
                     }
                 });
