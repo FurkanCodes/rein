@@ -4,8 +4,10 @@
 //! A big paste shows as one piece, `[pasted 40 lines]`, which the cursor
 //! steps over and Backspace takes out whole; what's sent is the text.
 
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
+use super::history::History;
 use super::keys::Key;
 
 #[derive(Default)]
@@ -13,13 +15,52 @@ pub struct Editor {
     text: Vec<char>,
     /// The cursor, as an index into `text`.
     cursor: usize,
-    /// Messages sent before, oldest first, for ↑ and ↓.
-    history: Vec<String>,
+    /// Messages sent before, for ↑ and ↓.
+    history: History,
     /// Where ↑ has got to in `history`, and what was typed before it.
-    browsing: Option<(usize, String)>,
+    browsing: Option<(usize, Entry)>,
     /// Big pastes, each standing in `text` as one character of its own:
     /// [`PASTED`] plus its index here.
     pastes: Vec<String>,
+}
+
+/// What the box held, as kept for ↑ and Ctrl-R: the text, with each big
+/// paste standing in it as one character, and the pastes, so it comes back
+/// looking as it did.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pastes: Vec<String>,
+}
+
+impl Entry {
+    /// The text, with pastes in full: what's sent.
+    pub fn full(&self) -> String {
+        self.text.chars().map(|c| paste(c, &self.pastes).map_or_else(|| c.to_string(), str::to_owned)).collect()
+    }
+
+    /// The text as the box shows it, pastes as their labels.
+    pub fn shown(&self) -> String {
+        self.text.chars().map(|c| paste(c, &self.pastes).map_or_else(|| c.to_string(), label)).collect()
+    }
+}
+
+/// The paste `c` stands for among `pastes`, if it stands for one.
+fn paste(c: char, pastes: &[String]) -> Option<&str> {
+    let index = (c as u32).checked_sub(PASTED)? as usize;
+    pastes.get(index).map(String::as_str)
+}
+
+/// How a paste shows in the box: `[pasted 40 lines]`.
+fn label(paste: &str) -> String {
+    let lines = paste.lines().count();
+    if lines > 1 { format!("[pasted {lines} lines]") } else { format!("[pasted {} characters]", paste.chars().count()) }
+}
+
+/// The character that stands for the `index`th paste.
+fn stand_in(index: usize) -> char {
+    char::from_u32(PASTED + index as u32).unwrap_or('?')
 }
 
 /// Where the characters that stand for pastes start: a private-use plane
@@ -40,34 +81,48 @@ pub enum Action {
 }
 
 impl Editor {
+    /// An empty box, with the messages in `history` for ↑ and ↓.
+    pub fn with_history(history: History) -> Editor {
+        Editor { history, ..Editor::default() }
+    }
+
     /// The text, with pastes in full.
     pub fn text(&self) -> String {
-        let mut out = String::new();
-        for &c in &self.text {
-            match self.paste(c) {
-                Some(paste) => out.push_str(paste),
-                None => out.push(c),
-            }
-        }
-        out
+        self.entry().full()
     }
 
-    /// The text as the box shows it, pastes as their labels.
-    pub fn shown_text(&self) -> String {
-        self.text.iter().map(|&c| self.shown(c).unwrap_or_else(|| c.to_string())).collect()
+    /// What the box holds, with only the pastes still in it.
+    pub fn entry(&self) -> Entry {
+        let mut pastes = Vec::new();
+        let text = self
+            .text
+            .iter()
+            .map(|&c| match paste(c, &self.pastes) {
+                Some(paste) => {
+                    pastes.push(paste.to_owned());
+                    stand_in(pastes.len() - 1)
+                }
+                None => c,
+            })
+            .collect();
+        Entry { text, pastes }
     }
 
-    /// The paste `c` stands for, if it stands for one.
-    fn paste(&self, c: char) -> Option<&str> {
-        let index = (c as u32).checked_sub(PASTED)? as usize;
-        self.pastes.get(index).map(String::as_str)
+    /// Puts `entry` in the box, cursor at the end.
+    pub fn restore(&mut self, entry: &Entry) {
+        self.load(entry);
+        self.browsing = None;
+    }
+
+    fn load(&mut self, entry: &Entry) {
+        self.text = entry.text.chars().collect();
+        self.pastes = entry.pastes.clone();
+        self.cursor = self.text.len();
     }
 
     /// How a character looks in the box: a paste as its label.
     fn shown(&self, c: char) -> Option<String> {
-        let paste = self.paste(c)?;
-        let lines = paste.lines().count();
-        Some(if lines > 1 { format!("[pasted {lines} lines]") } else { format!("[pasted {} characters]", paste.chars().count()) })
+        paste(c, &self.pastes).map(label)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -90,10 +145,13 @@ impl Editor {
         text
     }
 
-    pub fn remember(&mut self, message: &str) {
-        if !message.trim().is_empty() && self.history.last().map(String::as_str) != Some(message) {
-            self.history.push(message.to_owned());
-        }
+    /// Keeps a message sent, as the newest for ↑.
+    pub fn remember(&mut self, entry: Entry) {
+        self.history.add(entry);
+    }
+
+    pub fn history(&self) -> &History {
+        &self.history
     }
 
     pub fn key(&mut self, key: &Key) -> Action {
@@ -111,9 +169,9 @@ impl Editor {
             Key::Newline => self.insert("\n"),
             Key::Char(c) => self.insert(&c.to_string()),
             Key::Paste(text) if text.lines().count() > BIG_PASTE_LINES || text.chars().count() > BIG_PASTE_CHARS => {
-                let stand_in = char::from_u32(PASTED + self.pastes.len() as u32).unwrap_or('?');
+                let c = stand_in(self.pastes.len());
                 self.pastes.push(text.clone());
-                self.insert(&stand_in.to_string());
+                self.insert(&c.to_string());
             }
             Key::Paste(text) => self.insert(text),
             Key::Backspace if self.cursor > 0 => {
@@ -224,19 +282,21 @@ impl Editor {
         };
         let draft = match self.browsing.take() {
             Some((_, draft)) => draft,
-            None => self.text(),
+            None => self.entry(),
         };
-        self.set(&self.history[next].clone());
+        let entry = self.history.get(next).clone();
+        self.load(&entry);
         self.browsing = Some((next, draft));
     }
 
     fn newer(&mut self) {
         match self.browsing.take() {
             Some((at, draft)) if at + 1 < self.history.len() => {
-                self.set(&self.history[at + 1].clone());
+                let entry = self.history.get(at + 1).clone();
+                self.load(&entry);
                 self.browsing = Some((at + 1, draft));
             }
-            Some((_, draft)) => self.set(&draft),
+            Some((_, draft)) => self.load(&draft),
             None => {}
         }
     }
@@ -343,11 +403,15 @@ mod tests {
         assert_eq!(e.text(), "one>\ntwo\nthree");
     }
 
+    fn entry(text: &str) -> Entry {
+        Entry { text: text.to_owned(), pastes: Vec::new() }
+    }
+
     #[test]
     fn up_and_down_walk_the_history() {
         let mut e = Editor::default();
-        e.remember("first");
-        e.remember("second");
+        e.remember(entry("first"));
+        e.remember(entry("second"));
         typed(&mut e, "draft");
         e.key(&Key::Up);
         assert_eq!(e.text(), "second");
@@ -368,7 +432,7 @@ mod tests {
         typed(&mut e, " why?");
         assert_eq!(e.layout(80).0, ["look: [pasted 40 lines] why?"]);
         assert_eq!(e.text(), format!("look: {log} why?"), "what's sent is the whole paste");
-        assert_eq!(e.shown_text(), "look: [pasted 40 lines] why?");
+        assert_eq!(e.entry().shown(), "look: [pasted 40 lines] why?");
         // Backspace over it takes it out whole.
         for _ in 0..6 {
             e.key(&Key::Backspace);
@@ -377,6 +441,28 @@ mod tests {
         // A short paste is just text.
         e.key(&Key::Paste("two\nlines".into()));
         assert_eq!(e.layout(80).0, ["look: two", "lines"]);
+    }
+
+    #[test]
+    fn a_message_with_a_paste_comes_back_as_it_looked() {
+        let mut e = Editor::default();
+        e.key(&Key::Paste("dropped\n".repeat(10)));
+        e.key(&Key::Backspace);
+        typed(&mut e, "see: ");
+        let log = "line\n".repeat(40);
+        e.key(&Key::Paste(log.clone()));
+        let sent = e.entry();
+        assert_eq!(sent.pastes, std::slice::from_ref(&log), "only the paste still in the box is kept");
+        assert_eq!(sent.full(), format!("see: {log}"));
+        e.remember(sent);
+        e.take();
+        typed(&mut e, "draft ");
+        e.key(&Key::Paste("x\n".repeat(9)));
+        e.key(&Key::Up);
+        assert_eq!(e.entry().shown(), "see: [pasted 40 lines]");
+        assert_eq!(e.text(), format!("see: {log}"));
+        e.key(&Key::Down);
+        assert_eq!(e.entry().shown(), "draft [pasted 9 lines]", "the draft, paste and all");
     }
 
     #[test]

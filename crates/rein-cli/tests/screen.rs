@@ -141,9 +141,44 @@ fn sse(turn: &Turn) -> String {
     out
 }
 
+/// What the terminal was asked to do besides drawing.
+#[derive(Default)]
+struct Seen {
+    bells: usize,
+    /// What was put on the clipboard (OSC 52), decoded.
+    copied: Vec<String>,
+}
+
+impl vt100::Callbacks for Seen {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
+        self.bells += 1;
+    }
+
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _: &[u8], data: &[u8]) {
+        self.copied.push(String::from_utf8(unbase64(data)).unwrap());
+    }
+}
+
+fn unbase64(data: &[u8]) -> Vec<u8> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        _ => 63,
+    };
+    let digits: Vec<u8> = data.iter().copied().filter(|&c| c != b'=').map(value).collect();
+    let mut out = Vec::new();
+    for chunk in digits.chunks(4) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &d)| n | u32::from(d) << (18 - 6 * i));
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    out
+}
+
 /// rein running in a pseudo-terminal, read through a terminal emulator.
 struct Term {
-    screen: Arc<Mutex<vt100::Parser>>,
+    screen: Arc<Mutex<vt100::Parser<Seen>>>,
     keyboard: File,
     child: Child,
     dir: PathBuf,
@@ -153,6 +188,19 @@ impl Term {
     fn start(model: &Model, name: &str, rows: u16, cols: u16) -> Term {
         let dir = std::env::temp_dir().join(format!("rein-screen-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        Term::spawn(model, dir, rows, cols)
+    }
+
+    /// rein again, in the same folder and with the same home, once this one
+    /// has left.
+    fn again(mut self, model: &Model) -> Term {
+        self.wait_exit();
+        let dir = std::mem::take(&mut self.dir);
+        let (rows, cols) = self.screen.lock().unwrap().screen().size();
+        Term::spawn(model, dir, rows, cols)
+    }
+
+    fn spawn(model: &Model, dir: PathBuf, rows: u16, cols: u16) -> Term {
         let (project, home) = (dir.join("project"), dir.join("home"));
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&home).unwrap();
@@ -175,6 +223,8 @@ impl Term {
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "test")
             .env("OPENAI_BASE_URL", &model.base)
+            // Copies go to the terminal (OSC 52), never this computer's clipboard.
+            .env("SSH_CONNECTION", "screen-test")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -191,7 +241,7 @@ impl Term {
         let child = command.spawn().unwrap();
         drop(command);
 
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
+        let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(rows, cols, 1000, Seen::default())));
         let shown = screen.clone();
         let mut output = File::from(master.try_clone().unwrap());
         std::thread::spawn(move || {
@@ -242,6 +292,25 @@ impl Term {
         panic!("timed out waiting for {what}. The screen:\n{}", self.text());
     }
 
+    fn bells(&self) -> usize {
+        self.screen.lock().unwrap().callbacks().bells
+    }
+
+    fn wait_bells(&self, bells: usize) {
+        let start = Instant::now();
+        while self.bells() < bells && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(self.bells(), bells, "the bell rang {} times, not {bells}. The screen:\n{}", self.bells(), self.text());
+    }
+
+    /// The text in the input box's first line.
+    fn in_box(&self) -> String {
+        let rows = self.rows();
+        let line = rows.iter().find(|row| row.starts_with("│ ")).cloned().unwrap_or_default();
+        line.trim_start_matches("│ ").trim_end_matches('│').trim().trim_start_matches('›').trim().to_owned()
+    }
+
     /// Waits for rein to exit.
     fn wait_exit(&mut self) {
         let start = Instant::now();
@@ -261,7 +330,9 @@ impl Drop for Term {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.dir.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -283,6 +354,7 @@ fn an_answer_appears_above_the_box() {
     assert!(screen.contains("rein   Hello there, how can I help?"), "{screen}");
     assert!(screen.contains("context"), "the status bar is under the box:\n{screen}");
     assert!(model.requests()[0].to_string().contains("\"hi\""), "the model was sent the message");
+    assert_eq!(term.bells(), 0, "you were there: no bell");
 }
 
 #[test]
@@ -400,4 +472,78 @@ fn leaving_leaves_the_conversation_in_the_terminal() {
     assert!(!screen.contains('╭'), "the box is gone:\n{screen}");
     assert!(screen.contains("you    hello") && screen.contains("rein   Bye for now."), "{screen}");
     assert!(screen.contains("rein -c continues this conversation"), "{screen}");
+}
+
+#[test]
+fn what_you_sent_comes_back_in_the_next_run() {
+    let model = Model::start(vec![says("On it."), says("Running them."), says("Fixed.")]);
+    let mut term = Term::start(&model, "history", 24, 80);
+    term.wait_for(IDLE);
+    term.keys("fix the parser please\r");
+    term.wait_for("On it.");
+    term.wait_for(IDLE);
+    term.keys("run the tests\r");
+    term.wait_for("Running them.");
+    term.wait_for(IDLE);
+    term.keys("\x04");
+
+    let mut term = term.again(&model);
+    term.wait_for(IDLE);
+    term.keys("\x1b[A");
+    term.wait_until("the last message in the box", |_| term.in_box() == "run the tests");
+    term.keys("\x1b[A");
+    term.wait_until("the one before", |_| term.in_box() == "fix the parser please");
+    term.keys("\x15");
+    term.wait_for(IDLE);
+
+    // Ctrl-R finds it by a word, wherever it is in the message.
+    term.keys("\x12");
+    term.wait_for("finding a message you sent");
+    term.keys("pars");
+    term.wait_until("only the message with the word", |screen| screen.contains("› fix the parser please") && !screen.contains("run the tests"));
+    term.keys("\r");
+    term.wait_until("it in the box", |screen| term.in_box() == "fix the parser please" && !screen.contains("finding"));
+    assert_eq!(model.requests().len(), 2, "picked, not sent: nothing goes without you seeing it");
+    term.keys("\r");
+    term.wait_for("Fixed.");
+    assert!(model.requests()[2].to_string().contains("fix the parser please"));
+}
+
+#[test]
+fn copy_puts_the_last_answer_on_the_clipboard() {
+    let model = Model::start(vec![says("It's a Rust workspace."), says("Run `cargo test --all`, then **commit**.")]);
+    let mut term = Term::start(&model, "copy", 24, 80);
+    term.wait_for(IDLE);
+    term.keys("what is this\r");
+    term.wait_for("Rust workspace.");
+    term.wait_for(IDLE);
+    term.keys("how do I check it\r");
+    term.wait_for("then commit.");
+    term.wait_for(IDLE);
+    term.keys("/copy\r");
+    term.wait_for("copied rein's last answer (1 line)");
+    let copied = term.screen.lock().unwrap().callbacks().copied.clone();
+    assert_eq!(copied, ["Run `cargo test --all`, then **commit**."], "as the model wrote it, Markdown and all");
+}
+
+#[test]
+fn the_bell_rings_when_rein_needs_you_and_youre_away() {
+    let model = Model::start(vec![runs("echo hi"), says("Done.")]);
+    let mut term = Term::start(&model, "bell", 24, 80);
+    term.wait_for(IDLE);
+    // The window is in front: a question doesn't ring.
+    term.keys("\x1b[I");
+    term.keys("go\r");
+    term.wait_for("Allow this command?");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(term.bells(), 0, "you were looking");
+    // You go to another window while it waits: it rings, once.
+    term.keys("\x1b[O");
+    term.wait_bells(1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(term.bells(), 1);
+    term.keys("y");
+    term.wait_for("Done.");
+    // Done, and you're still away: your turn.
+    term.wait_bells(2);
 }

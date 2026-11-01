@@ -66,7 +66,8 @@ message, so typing ahead can't answer it by accident.
 
 | Key | What it does |
 |---|---|
-| ↑ / ↓ | your earlier messages |
+| ↑ / ↓ | what you sent before from this folder, this run or an earlier one |
+| Ctrl-R | find something you sent before by its words: ↑↓ or Ctrl-R pick, Enter puts it in the box to change or send, Esc goes back |
 | Shift-Enter, Ctrl-J, or `\` at the end of a line | a new line in your message (Shift-Enter where the terminal tells it apart from Enter) |
 | `/` | the commands that match, as you type: ↑↓ pick one, Tab completes it, Enter runs it. `/help` lists them |
 | Shift-Tab | the next mode: ask → edits → read-only |
@@ -83,6 +84,7 @@ message, so typing ahead can't answer it by accident.
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
+| `/copy` | copy rein's last answer as it wrote it, Markdown and all |
 | Ctrl-D or `/exit` | leave |
 
 A big paste shows in the box as one piece, `[pasted 40 lines]`, which
@@ -92,6 +94,17 @@ Every conversation is saved as it goes, one JSON line per message, tool call
 and result, in `~/.config/rein/sessions/<this folder>/`. The files are readable
 only by you. `rein -c` picks up the latest one in the folder you're in, with
 the same history, system prompt and cache key, so it usually starts warm.
+
+What you send is also kept on its own, for ↑ and Ctrl-R: the last 1,000
+messages from each folder, each once, in `~/.config/rein/history/`, readable
+only by you. A big paste comes back as the piece it was.
+
+rein rings the terminal's bell when it needs you and you're away: it's asking
+something, or it's done. Away means its window isn't in front, which most
+terminals report when asked (tmux does with `set -g focus-events on`), or,
+where the terminal doesn't say, that you haven't touched a key for 10
+seconds. What a bell does is the terminal's to decide: a sound, a flash, or a
+mark on the tab or dock icon. `bell = off` in the settings turns it off.
 
 ## When the conversation gets long
 
@@ -123,10 +136,11 @@ model = "gpt-6.1-sol"
 effort = "medium"
 mode = "edits"
 compact_at = 120000
+bell = off
 ```
 
-A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE` and
-`$REIN_COMPACT_AT`, which win over the file.
+A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
+`$REIN_COMPACT_AT` and `$REIN_BELL`, which win over the file.
 
 ## Small things that matter
 
@@ -198,8 +212,9 @@ The tests replay saved response streams from `crates/rein-llm/tests/fixtures`,
 so they need no network and spend no tokens. `crates/rein-cli/tests/screen.rs`
 runs the real `rein` in a pseudo-terminal, against a model that follows a
 script, and reads the screen through a terminal emulator kept in memory: it
-types, scrolls, approves commands and resizes the window, and checks what you
-would see. Record a real stream with
+types, scrolls, approves commands, resizes the window, leaves and comes back,
+and checks what you would see, and when the bell rang and what was copied.
+Record a real stream with
 `rein --record crates/rein-llm/tests/fixtures/<name>.sse "<prompt>"`. Recordings
 contain your account's `safety_identifier`; change it to `user-REDACTED` before
 committing. A test fails if you forget.

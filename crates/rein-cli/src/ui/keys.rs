@@ -47,6 +47,11 @@ pub enum Key {
     CtrlC,
     CtrlD,
     CtrlO,
+    /// Ctrl-R: find a message sent before.
+    CtrlR,
+    /// The window came to the front (`true`) or went behind another, as
+    /// terminals that are asked report it.
+    Focus(bool),
     /// Ctrl-L: draw the screen again.
     Redraw,
     Esc,
@@ -139,6 +144,7 @@ fn decode(bytes: &[u8]) -> Decoded {
         0x0e => key(Key::Down, 1),
         0x0f => key(Key::CtrlO, 1),
         0x10 => key(Key::Up, 1),
+        0x12 => key(Key::CtrlR, 1),
         0x15 => key(Key::DeleteToStart, 1),
         0x17 => key(Key::DeleteWord, 1),
         0x09 => key(Key::Tab, 1),
@@ -193,6 +199,8 @@ fn escape(bytes: &[u8]) -> Decoded {
                 (_, b'C') => key(if by_word { Key::WordRight } else { Key::Right }, used),
                 (_, b'D') => key(if by_word { Key::WordLeft } else { Key::Left }, used),
                 (_, b'Z') => key(Key::BackTab, used),
+                (b"", b'I') => key(Key::Focus(true), used),
+                (b"", b'O') => key(Key::Focus(false), used),
                 (_, b'u') => spelled(params).map_or(Decoded::Skip(used), |k| key(k, used)),
                 (_, b'H') => key(Key::Home, used),
                 (_, b'F') => key(Key::End, used),
@@ -269,6 +277,7 @@ fn spelled(params: &[u8]) -> Option<Key> {
                 (true, false, 'n') => Key::Down,
                 (true, false, 'o') => Key::CtrlO,
                 (true, false, 'p') => Key::Up,
+                (true, false, 'r') => Key::CtrlR,
                 (true, false, 'u') => Key::DeleteToStart,
                 (true, false, 'w') => Key::DeleteWord,
                 (false, true, 'b') => Key::WordLeft,
@@ -311,6 +320,13 @@ mod tests {
         assert_eq!(keys(b"\x1b[27;2;13~"), [Key::Newline], "xterm spells Shift-Enter this way");
         assert_eq!(keys(b"\x1b[1;3D\x1b[1;5C\x1bb\x1b[1;2D"), [Key::WordLeft, Key::WordRight, Key::WordLeft, Key::Left]);
         assert_eq!(keys(b"\x1b[Z"), [Key::BackTab]);
+        assert_eq!(keys(b"\x12\x1b[114;5u"), [Key::CtrlR, Key::CtrlR]);
+    }
+
+    #[test]
+    fn reads_the_window_coming_and_going() {
+        assert_eq!(keys(b"\x1b[O\x1b[Ix"), [Key::Focus(false), Key::Focus(true), Key::Char('x')]);
+        assert_eq!(keys(b"\x1bOH"), [Key::Home], "not to be mistaken for the Home key's spelling");
     }
 
     #[test]

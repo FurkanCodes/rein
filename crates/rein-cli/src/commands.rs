@@ -11,6 +11,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/effort", "[low|medium|high|default]", "show or change how hard the model thinks"),
     ("/status", "", "the model, mode, context and conversation"),
     ("/compact", "[focus]", "make room in the conversation now"),
+    ("/copy", "", "copy rein's last answer, as it wrote it"),
     ("/undo", "", "put back the files rein changed in its last turn"),
     ("/new", "", "start a fresh conversation (also /clear)"),
     ("/resume", "", "continue a saved conversation from this folder"),
@@ -30,6 +31,7 @@ pub enum Slash {
     Effort(Option<Option<String>>),
     Status,
     Compact(Option<String>),
+    Copy,
     Undo,
     New,
     Resume,
@@ -65,6 +67,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
         },
         "/status" => Ok(Slash::Status),
         "/compact" => Ok(Slash::Compact(arg)),
+        "/copy" => Ok(Slash::Copy),
         "/undo" => Ok(Slash::Undo),
         "/new" => Ok(Slash::New),
         "/resume" => Ok(Slash::Resume),
@@ -126,6 +129,7 @@ mod tests {
     fn suggests_while_the_name_is_typed() {
         let names = |typed| matching(typed).into_iter().map(|(name, _, _)| name).collect::<Vec<_>>();
         assert_eq!(names("/mo"), ["/mode", "/model"]);
+        assert_eq!(names("/co"), ["/compact", "/copy"]);
         assert_eq!(names("/"), COMMANDS.iter().map(|c| c.0).collect::<Vec<_>>());
         assert!(names("/mode ").is_empty());
         assert!(names("hello").is_empty());

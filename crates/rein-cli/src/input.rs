@@ -20,11 +20,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::commands;
-use crate::ui::editor::{Action, Editor};
+use crate::ui::editor::{Action, Editor, Entry};
+use crate::ui::history::{self, History};
 use crate::ui::keys::{Key, Keys};
 use crate::ui::screen::{self, Bottom, Drag, Pinned, Raw, Tone};
 use crate::ui::style::{GUTTER, Style, fit, width};
-use crate::ui::viewer::{Entry, Viewer};
+use crate::ui::viewer::Viewer;
 use crate::ui::wrap::Wrap;
 
 /// What reading a line produced.
@@ -80,8 +81,22 @@ const NOTICE: Duration = Duration::from_secs(2);
 /// The most of your message the box shows at once; it scrolls for more.
 const BOX_LINES: usize = 8;
 
-/// The most commands listed under the box at once.
+/// The most commands, or messages found, listed under the box at once.
 const MENU_LINES: usize = 6;
+
+/// Where the terminal doesn't say whether its window is in front, you're
+/// taken to be away once you haven't touched a key for this long.
+const QUIET: Duration = Duration::from_secs(10);
+
+/// Ctrl-R: finding a message you sent before.
+struct Search {
+    /// The words to find, typed and edited like a message.
+    query: Editor,
+    /// Which of the messages found is picked: 0 is the newest.
+    picked: usize,
+    /// What was in the box before, put back if you change your mind.
+    draft: Entry,
+}
 
 const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
 
@@ -121,8 +136,22 @@ struct Boxed {
     /// When the last key came.
     last_key: Instant,
     /// Every step's full output, for the viewer (Ctrl-O).
-    outputs: Vec<Entry>,
+    outputs: Vec<crate::ui::viewer::Entry>,
     viewer: Option<Viewer>,
+    /// Ctrl-R, while it's finding a message.
+    search: Option<Search>,
+    /// Whether the window is in front, once the terminal has said.
+    focused: Option<bool>,
+    /// When you last pressed a key, scrolled or clicked.
+    touched: Instant,
+    /// The bell rings when rein needs you and you're away.
+    bell: bool,
+    /// A question is waiting that the bell hasn't rung for yet: you were
+    /// there when it came.
+    ring: bool,
+    /// rein has worked since it last waited for a message: when it's done,
+    /// it's waiting for you.
+    worked: bool,
     bar: String,
     replies: tokio::sync::mpsc::UnboundedSender<Read>,
     interrupted: Arc<tokio::sync::Notify>,
@@ -148,7 +177,7 @@ impl Boxed {
     /// The commands that match what's typed, while a command's name is
     /// being typed.
     fn menu(&self) -> Vec<(&'static str, &'static str, &'static str)> {
-        if self.waiting == Waiting::Answer {
+        if self.waiting == Waiting::Answer || self.search.is_some() {
             return Vec::new();
         }
         commands::matching(&self.editor.text())
@@ -223,9 +252,16 @@ impl Boxed {
         self.pinned.draw(&bottom);
     }
 
-    /// The box with your message in it.
+    /// The box with your message in it, or what you're looking for.
     fn composer(&mut self, above: Vec<String>) -> Bottom {
         let s = Style::stderr();
+        if let Some(search) = &self.search {
+            let (lines, caret) = search.query.layout(self.pinned.text_width());
+            let lines = if search.query.is_empty() { vec![s.dim("type words from a message you sent in this folder")] } else { lines };
+            let (tone, mark) = if self.waiting == Waiting::Message { (Tone::Typing, s.bold(&s.blue("›"))) } else { (Tone::Busy, s.dim("›")) };
+            let notes = ("finding a message you sent".to_owned(), "enter picks · esc goes back".to_owned());
+            return Bottom { above, tone, mark, lines, caret: Some(caret), notes, below: self.below(), compact: String::new() };
+        }
         let (mut lines, (line, column)) = self.editor.layout(self.pinned.text_width());
         // Keep the line with the cursor in view.
         if line < self.scroll {
@@ -259,9 +295,13 @@ impl Boxed {
         Bottom { above, tone, mark, lines, caret: Some((line - self.scroll, column)), notes, below: self.below(), compact: String::new() }
     }
 
-    /// Under the box: a note, the commands that match, or the bar.
+    /// Under the box: the messages found, a note, the commands that match,
+    /// or the bar.
     fn below(&self) -> Vec<String> {
         let s = Style::stderr();
+        if let Some(search) = &self.search {
+            return self.found(search);
+        }
         if let Some((note, _)) = &self.notice {
             return vec![format!(" {}", s.yellow(note))];
         }
@@ -293,7 +333,116 @@ impl Boxed {
         lines
     }
 
+    /// Under the box while finding a message: the ones that match, newest
+    /// first, with the words found picked out and how long ago each was sent.
+    ///
+    /// ```text
+    ///  › run the tests and fix what fails                 2h
+    ///    add a test for the parser (+3 lines)             1d
+    /// ```
+    fn found(&self, search: &Search) -> Vec<String> {
+        let s = Style::stderr();
+        let history = self.editor.history();
+        let query = search.query.text();
+        if history.is_empty() {
+            return vec![s.dim("   nothing sent from this folder yet")];
+        }
+        let found = history.search(&query);
+        if found.is_empty() {
+            return vec![s.dim(&format!("   nothing you sent here has “{}” in it", query.trim()))];
+        }
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let cols = screen::size().1;
+        let first = (search.picked + 1).saturating_sub(MENU_LINES);
+        let mut lines: Vec<String> = found
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(MENU_LINES)
+            .map(|(n, &i)| {
+                let shown = history.get(i).shown().replace('\t', " ");
+                let mut rows = shown.trim().lines();
+                let top = rows.next().unwrap_or_default();
+                let more = match rows.count() {
+                    0 => String::new(),
+                    1 => " (+1 line)".to_owned(),
+                    n => format!(" (+{n} lines)"),
+                };
+                let age = history::ago(history.sent(i));
+                let room = cols.saturating_sub(3 + width(&more) + 2 + width(&age) + 1);
+                let text = fit(top, room);
+                let pad = " ".repeat(room.saturating_sub(width(&text)));
+                let picked = n == search.picked;
+                let text = marked(&text, &words, s, picked);
+                let lead = if picked { format!(" {} ", s.blue("›")) } else { "   ".to_owned() };
+                format!("{lead}{text}{}{pad}  {}", s.dim(&more), s.dim(&age))
+            })
+            .collect();
+        let hidden = found.len().saturating_sub(first + MENU_LINES);
+        if hidden > 0 {
+            lines.push(s.dim(&format!("   … {hidden} more")));
+        }
+        lines
+    }
+
+    /// A key while finding a message: the words to find, or picking one.
+    fn search_key(&mut self, key: Key) {
+        let Some(search) = &mut self.search else { return };
+        let found = self.editor.history().search(&search.query.text());
+        match key {
+            Key::Esc | Key::CtrlC => {
+                let draft = std::mem::take(&mut search.draft);
+                self.search = None;
+                self.editor.restore(&draft);
+            }
+            // It goes in the box, to change or send: nothing is sent
+            // that you haven't seen there.
+            Key::Enter | Key::Tab => {
+                let entry = match found.get(search.picked) {
+                    Some(&i) => self.editor.history().get(i).clone(),
+                    None => std::mem::take(&mut search.draft),
+                };
+                self.search = None;
+                self.editor.restore(&entry);
+            }
+            Key::Up | Key::BackTab => search.picked = search.picked.saturating_sub(1),
+            Key::Down | Key::CtrlR => search.picked = (search.picked + 1).min(found.len().saturating_sub(1)),
+            Key::Newline => {}
+            Key::Paste(text) => {
+                search.query.key(&Key::Paste(text.replace(['\n', '\r'], " ")));
+                search.picked = 0;
+            }
+            key => {
+                search.query.key(&key);
+                search.picked = 0;
+            }
+        }
+    }
+
+    /// You're not looking: the terminal says its window is behind another,
+    /// or, where it doesn't say, you haven't touched a key for a while.
+    fn away(&self) -> bool {
+        match self.focused {
+            Some(focused) => !focused,
+            None => self.touched.elapsed() >= QUIET,
+        }
+    }
+
+    /// rein needs you: the bell rings if you're away. Says whether it rang.
+    fn call(&mut self) -> bool {
+        let ring = self.bell && self.away();
+        if ring {
+            screen::bell();
+        }
+        ring
+    }
+
     fn key(&mut self, key: Key) {
+        if let Key::Focus(focused) = key {
+            self.focused = Some(focused);
+            return;
+        }
+        self.touched = Instant::now();
         // The wheel scrolls the viewer's text, when it's open.
         let key = match key {
             Key::Mouse { button, .. } if self.viewer.is_some() && button & 64 != 0 => {
@@ -349,6 +498,18 @@ impl Boxed {
             && self.asking.as_ref().is_some_and(|asking| (paused && asking.since.elapsed() >= GRACE) || matches!(key, Key::Esc | Key::CtrlC));
         if answering {
             self.answer(&key);
+            self.draw();
+            return;
+        }
+        if self.search.is_some() {
+            self.search_key(key);
+            self.pick_default();
+            self.draw();
+            return;
+        }
+        if key == Key::CtrlR && self.asking.is_none() && self.waiting != Waiting::Answer {
+            self.search = Some(Search { query: Editor::default(), picked: 0, draft: self.editor.entry() });
+            self.notice = None;
             self.draw();
             return;
         }
@@ -437,13 +598,14 @@ impl Boxed {
     /// Enter: the message goes, or, while rein works, waits its turn.
     fn submit(&mut self, waiting: Waiting) {
         screen::follow();
-        let shown = self.editor.shown_text();
+        let entry = self.editor.entry();
+        let shown = entry.shown();
         let text = self.editor.take();
         if shown != text {
             self.shown.push((text.clone(), shown));
         }
         if waiting != Waiting::Answer {
-            self.editor.remember(&text);
+            self.editor.remember(entry);
         }
         match waiting {
             Waiting::Nothing if !text.trim().is_empty() => self.queued.push(text),
@@ -477,6 +639,7 @@ impl Boxed {
         if let Some(i) = chosen {
             let key = asking.question.answers[i].0.to_owned();
             self.asking = None;
+            self.ring = false;
             self.reply(Read::Line(key));
         }
     }
@@ -486,8 +649,12 @@ impl Boxed {
         let _ = self.replies.send(read);
     }
 
-    /// The clock's tick: the spinner moves, and old notes go.
+    /// The clock's tick: the spinner moves, old notes go, and the bell rings
+    /// for a question that's still waiting once you're away.
     fn tick(&mut self) {
+        if self.ring && self.asking.is_some() && self.call() {
+            self.ring = false;
+        }
         let expired = self.notice.as_ref().is_some_and(|(_, since)| since.elapsed() > NOTICE);
         if expired {
             self.notice = None;
@@ -535,7 +702,7 @@ fn hard_wrap(line: &str, width: usize) -> Vec<String> {
 /// Puts `text` on the clipboard: with the system's own command where there
 /// is one, and otherwise by asking the terminal (OSC 52), which works over
 /// ssh too, in terminals that allow it.
-fn copy(text: &str) -> bool {
+pub fn copy(text: &str) -> bool {
     use std::io::Write as _;
     let commands: &[&[&str]] = if cfg!(target_os = "macos") {
         &[&["pbcopy"]]
@@ -574,6 +741,38 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// `text` with each of `words` (lowercase) in it picked out: in blue, and
+/// the rest dim unless it's the `picked` line.
+fn marked(text: &str, words: &[String], s: Style, picked: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = chars.iter().map(|c| c.to_lowercase().next().unwrap_or(*c)).collect();
+    let mut found = vec![false; chars.len()];
+    for word in words {
+        let word: Vec<char> = word.chars().collect();
+        if word.is_empty() || word.len() > lower.len() {
+            continue;
+        }
+        for start in 0..=lower.len() - word.len() {
+            if lower[start..start + word.len()] == word[..] {
+                found[start..start + word.len()].fill(true);
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let end = (at..chars.len()).find(|&i| found[i] != found[at]).unwrap_or(chars.len());
+        let run: String = chars[at..end].iter().collect();
+        out += &match (found[at], picked) {
+            (true, _) => s.bold(&s.blue(&run)),
+            (false, true) => run,
+            (false, false) => s.dim(&run),
+        };
+        at = end;
+    }
+    out
+}
+
 /// `↑ 3 more lines`, or nothing for none.
 fn more(count: usize, arrow: &str) -> String {
     match count {
@@ -591,7 +790,9 @@ fn seconds(elapsed: Duration) -> String {
 
 impl Input {
     /// `pinned` asks for the input box, which needs a terminal all round.
-    pub fn start(pinned: bool, interrupted: Arc<tokio::sync::Notify>) -> Self {
+    /// `history` is what you sent before, for ↑ and Ctrl-R, and `bell`
+    /// says whether to ring when rein needs you and you're away.
+    pub fn start(pinned: bool, interrupted: Arc<tokio::sync::Notify>, history: History, bell: bool) -> Self {
         let (requests, asked) = std::sync::mpsc::channel::<String>();
         let (tx, replies) = tokio::sync::mpsc::unbounded_channel();
         let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
@@ -599,7 +800,7 @@ impl Input {
             screen::restore_on_panic();
             let boxed = Arc::new(Mutex::new(Boxed {
                 pinned: Pinned::start(Style::stderr()),
-                editor: Editor::default(),
+                editor: Editor::with_history(history),
                 waiting: Waiting::Nothing,
                 prompt: String::new(),
                 asking: None,
@@ -612,6 +813,12 @@ impl Input {
                 last_key: Instant::now(),
                 outputs: Vec::new(),
                 viewer: None,
+                search: None,
+                focused: None,
+                touched: Instant::now(),
+                bell,
+                ring: false,
+                worked: false,
                 bar: String::new(),
                 replies: tx,
                 interrupted,
@@ -696,6 +903,10 @@ impl Input {
                         boxed.draw();
                         return Read::Line(next);
                     }
+                    // Done, and nothing more to do: it's your turn.
+                    if message && std::mem::take(&mut boxed.worked) {
+                        boxed.call();
+                    }
                     boxed.waiting = if message { Waiting::Message } else { Waiting::Answer };
                     boxed.prompt = prompt.trim().to_owned();
                     boxed.pick_default();
@@ -720,6 +931,8 @@ impl Input {
             self.with(|boxed| {
                 boxed.waiting = Waiting::Answer;
                 boxed.asking = Some(Asking { question, picked: 0, since: Instant::now() });
+                // Or later, if you go away while it waits.
+                boxed.ring = boxed.bell && !boxed.call();
             });
             self.pending = true;
         }
@@ -731,7 +944,10 @@ impl Input {
     /// Says what rein is doing, over the box, with a spinner and the time
     /// since `since`; `None` once it's done.
     pub fn busy(&self, what: Option<String>, since: Instant) {
-        self.with(|boxed| boxed.busy = what.map(|what| (what, since)));
+        self.with(|boxed| {
+            boxed.worked |= what.is_some();
+            boxed.busy = what.map(|what| (what, since));
+        });
     }
 
     /// A short note under the box for a moment, in place of the bar.
@@ -752,7 +968,7 @@ impl Input {
     /// Keeps a step's full output for the viewer.
     pub fn keep_output(&self, title: String, output: &str) {
         if let Some(boxed) = &self.boxed {
-            locked(boxed).outputs.push(Entry::new(title, output));
+            locked(boxed).outputs.push(crate::ui::viewer::Entry::new(title, output));
         }
     }
 

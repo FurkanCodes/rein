@@ -166,6 +166,15 @@ pub fn clipboard(encoded: &str) {
     write_raw(&format!("\x1b]52;c;{encoded}\x07"));
 }
 
+/// Rings the terminal's bell, which it turns into a sound, a flash, or a
+/// mark on its window, tab or dock icon, as it's set up to.
+pub fn bell() {
+    let _guard = lock();
+    let mut stderr = std::io::stderr();
+    let _ = stderr.write_all(b"\x07");
+    let _ = stderr.flush();
+}
+
 /// What the mouse is doing to a selection.
 pub enum Drag {
     Start,
@@ -360,12 +369,13 @@ impl Drop for Raw {
 static RESTORE: Mutex<Option<libc::termios>> = Mutex::new(None);
 
 /// What starts the full screen: the terminal's other screen, the mouse
-/// reported (the wheel and drags, as `ESC [ < …`), pasted text marked, and
+/// reported (the wheel and drags, as `ESC [ < …`), pasted text marked,
 /// keys with Shift, Alt or Ctrl spelled out where the terminal knows how
-/// (the "kitty keyboard protocol", so Shift-Enter isn't just Enter).
-const START: &str = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[?25l";
+/// (the "kitty keyboard protocol", so Shift-Enter isn't just Enter), and
+/// the window coming to the front or going behind (`ESC [ I`, `ESC [ O`).
+const START: &str = "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[>1u\x1b[?25l";
 /// And what undoes it.
-const END: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[<u\x1b[?7h\x1b[?25h\x1b[?1049l";
+const END: &str = "\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[<u\x1b[?7h\x1b[?25h\x1b[?1049l";
 
 /// Makes a panic leave the terminal usable: normal keyboard, the normal
 /// screen, the mouse let go, cursor shown.

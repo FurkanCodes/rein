@@ -36,6 +36,7 @@ use settings::Settings;
 mod ui;
 use commands::Slash;
 use input::{Input, Question, Read};
+use ui::history::{self, History};
 use ui::markdown::Markdown;
 use ui::spinner::Spinner;
 use ui::steps;
@@ -62,7 +63,12 @@ Usage:
 
 rein can read, write and edit files in this folder and run commands. In a
 conversation, type /exit or press Ctrl-D to leave. Conversations are saved in
-~/.config/rein/sessions, readable only by you.
+~/.config/rein/sessions, and what you send from each folder, for ↑ and
+Ctrl-R, in ~/.config/rein/history, both readable only by you.
+
+rein rings the terminal's bell when it needs you and you're away: it asks
+something, or it's done. Away means its window isn't in front, or, where the
+terminal doesn't say, that you haven't touched a key for 10 seconds.
 
 A long conversation is compacted when it nears $REIN_COMPACT_AT tokens
 (default 150000): stale tool output goes first, then the model summarizes.
@@ -93,9 +99,10 @@ Rules in .rein/permissions refine the mode for commands, one per line:
 Deny beats ask beats allow, and a command only runs without asking if every
 part of it is allowed. Rules decide when rein asks; they aren't a sandbox.
 
-Defaults go in ~/.config/rein/config, one per line: model, effort, mode and
-compact_at, like `mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT,
-$REIN_MODE and $REIN_COMPACT_AT, which win over the file.
+Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
+compact_at and bell (on or off), like `mode = edits`. Flags win over
+$REIN_MODEL, $REIN_EFFORT, $REIN_MODE, $REIN_COMPACT_AT and $REIN_BELL, which
+win over the file.
 
 Without `rein login`, rein uses $OPENAI_API_KEY, billed to your API account,
 and $OPENAI_BASE_URL if set, for another server that speaks the Responses API.";
@@ -208,6 +215,8 @@ struct AskArgs {
     system: Option<String>,
     mode: Mode,
     record: Option<PathBuf>,
+    /// Ring the bell when rein needs you and you're away.
+    bell: bool,
     /// `None` starts a conversation instead of doing one task.
     prompt: Option<String>,
 }
@@ -221,6 +230,11 @@ impl AskArgs {
         let mut mode = match settings.get("mode", "REIN_MODE") {
             Some(name) => Mode::parse(&name).ok_or(format!("unknown mode {name} in the settings; use ask, edits, read-only or trust"))?,
             None => Mode::Ask,
+        };
+        let bell = match settings.get("bell", "REIN_BELL").as_deref() {
+            None | Some("on") => true,
+            Some("off") => false,
+            Some(other) => return Err(format!("bell should be on or off, not {other}")),
         };
         let (mut model_given, mut resume) = (false, Resume::New);
         let mut args = args.into_iter();
@@ -247,7 +261,7 @@ impl AskArgs {
             }
         }
         let prompt = if words.is_empty() { None } else { Some(words.join(" ")) };
-        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, prompt })
+        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, prompt })
     }
 }
 
@@ -269,12 +283,15 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
     };
     let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
     let permissions = load_permissions(&root, args.mode)?;
-    let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none());
+    let dir = config_dir()?;
+    // What you sent from this folder before, for ↑ and Ctrl-R: only a
+    // conversation has a box to bring it back in.
+    let sent = if args.prompt.is_none() { History::load(history::file(&dir, &root)) } else { History::default() };
+    let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none(), sent, args.bell);
     // The box goes up now, so typing can start while the model list loads.
     terminal.model = args.model.clone();
     terminal.effort = args.effort.clone();
     terminal.input.set_bar(terminal.bar());
-    let dir = config_dir()?;
     let mut setup = Setup {
         folder: session::folder(&dir.join("sessions"), &root),
         personal: dir.join("AGENTS.md"),
@@ -641,6 +658,7 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             }
             for keys in [
                 "shift-enter, ctrl-j or \\ at the end starts a new line · shift-tab changes the mode",
+                "↑ brings back what you sent before, from this folder · ctrl-r finds it by its words",
                 "enter while rein works queues your message · esc or ctrl-c stops the turn",
                 "wheel, pgup/pgdn or shift-↑↓ scroll · drag over text to copy it",
                 "ctrl-o shows every step's full output · ctrl-l draws the window again",
@@ -704,6 +722,18 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             }
         }
         Slash::Compact(focus) => compact_now(agent, focus.as_deref(), terminal).await?,
+        Slash::Copy => {
+            let last = agent.window.full.iter().rev().find_map(|item| match item {
+                Item::Assistant(text) if !text.trim().is_empty() => Some(text.trim()),
+                _ => None,
+            });
+            let Some(text) = last else { return Err("nothing to copy yet: rein hasn't answered in this conversation".into()) };
+            if !input::copy(text) {
+                return Err("couldn't copy: no clipboard".into());
+            }
+            let lines = text.lines().count();
+            say!("{pad}{} copied rein's last answer ({lines} line{})", s.green("✓"), if lines == 1 { "" } else { "s" });
+        }
         Slash::Undo => {
             let undone = agent.undo().map_err(describe)?;
             if undone.is_empty() {
@@ -950,7 +980,7 @@ struct TurnStats {
 const ECHO_LINES: usize = 12;
 
 impl Terminal {
-    fn new(root: PathBuf, mode: Mode, pinned: bool) -> Terminal {
+    fn new(root: PathBuf, mode: Mode, pinned: bool, history: History, bell: bool) -> Terminal {
         let mode = mode_name(mode);
         let interrupted: std::sync::Arc<tokio::sync::Notify> = Default::default();
         Terminal {
@@ -961,7 +991,7 @@ impl Terminal {
             model: String::new(),
             effort: None,
             mode,
-            input: Input::start(pinned, interrupted.clone()),
+            input: Input::start(pinned, interrupted.clone(), history, bell),
             interrupted,
             context_limit: compact::DEFAULT_LIMIT,
             context_used: 0,
