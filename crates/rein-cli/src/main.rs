@@ -36,7 +36,8 @@ use ui::markdown::Markdown;
 use ui::screen::{self, Bottom, Pinned, Raw};
 use ui::spinner::Spinner;
 use ui::steps;
-use ui::style::{GUTTER, Style};
+use ui::style::{GUTTER, Style, strip};
+use ui::viewer::{Entry, Viewer};
 use ui::wrap::Wrap;
 
 /// The name OpenAI shows for rein when someone signs in.
@@ -632,6 +633,9 @@ struct Boxed {
     waiting: Waiting,
     /// The question being answered, shown in the empty box.
     question: String,
+    /// Every step's full output, for the viewer (Ctrl-O).
+    outputs: Vec<Entry>,
+    viewer: Option<Viewer>,
     bar: String,
     replies: tokio::sync::mpsc::UnboundedSender<Read>,
     interrupted: std::sync::Arc<tokio::sync::Notify>,
@@ -643,13 +647,33 @@ impl Boxed {
         let placeholder = match self.waiting {
             Waiting::Message => "type a message · \\ or ctrl-j for a new line · /compact · /exit",
             Waiting::Answer => self.question.as_str(),
-            Waiting::Nothing => "type ahead while rein works · ctrl-c stops it",
+            Waiting::Nothing => "type ahead while rein works · ctrl-c stops it · ctrl-o shows output",
         };
         let bottom = Bottom { focused: self.waiting != Waiting::Nothing, lines, cursor, placeholder: placeholder.into(), bar: self.bar.clone() };
         self.pinned.draw(&bottom);
     }
 
     fn key(&mut self, key: Key) {
+        if let Some(viewer) = &mut self.viewer {
+            let (rows, cols) = screen::size();
+            if viewer.key(&key) {
+                let shown = viewer.render(rows, cols, Style::stderr());
+                self.pinned.show_viewer(&shown);
+            } else {
+                self.viewer = None;
+                self.pinned.close_viewer();
+                self.draw();
+            }
+            return;
+        }
+        if key == Key::CtrlO && !self.outputs.is_empty() {
+            let mut viewer = Viewer::new(self.outputs.clone());
+            let (rows, cols) = screen::size();
+            let shown = viewer.render(rows, cols, Style::stderr());
+            self.pinned.open_viewer(&shown);
+            self.viewer = Some(viewer);
+            return;
+        }
         match (self.waiting, &key) {
             (Waiting::Nothing, Key::CtrlC | Key::Esc) => self.interrupted.notify_one(),
             // Ctrl-C clears what you typed; on an empty box it's for leaving.
@@ -692,6 +716,8 @@ impl Input {
                 editor: Editor::default(),
                 waiting: Waiting::Nothing,
                 question: String::new(),
+                outputs: Vec::new(),
+                viewer: None,
                 bar: String::new(),
                 replies: tx,
                 interrupted,
@@ -751,6 +777,13 @@ impl Input {
         let read = self.replies.recv().await.unwrap_or(Read::Eof);
         self.pending = false;
         read
+    }
+
+    /// Keeps a step's full output for the viewer.
+    fn keep_output(&self, title: String, output: &str) {
+        if let Some(boxed) = &self.boxed {
+            boxed.lock().unwrap_or_else(|p| p.into_inner()).outputs.push(Entry::new(title, output));
+        }
     }
 
     /// Shows `bar` under the box.
@@ -1069,12 +1102,16 @@ impl Ui for Terminal {
             return;
         }
         let outcome = steps::outcome(call, output, self.err);
+        if self.input.pinned() {
+            let (label, target) = steps::describe(call);
+            self.input.keep_output(format!("{label}  {target} · {}", strip(&outcome.status)), output);
+        }
         if step.is_some_and(|step| step.header_shown) {
             say!("{}{}", " ".repeat(GUTTER), outcome.status);
         } else {
             say!("{}  {}", steps::header(call, self.err), outcome.status);
         }
-        for line in steps::detail_lines(&outcome, self.err, terminal_width().unwrap_or(80)) {
+        for line in steps::detail_lines(&outcome, self.err, terminal_width().unwrap_or(80), self.input.pinned()) {
             say!("{line}");
         }
         self.after_step = true;

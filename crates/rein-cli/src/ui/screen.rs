@@ -30,9 +30,26 @@ pub fn lock() -> MutexGuard<'static, ()> {
     SCREEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// While the viewer is open, what rein prints waits here, to be shown
+/// when it closes.
+static HELD: Mutex<Option<String>> = Mutex::new(None);
+
+fn held() -> MutexGuard<'static, Option<String>> {
+    HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The viewer is open: nothing else may draw.
+pub fn viewing() -> bool {
+    held().is_some()
+}
+
 /// Writes `text` to stderr in one piece, under the lock.
 pub fn write(text: &str) {
     let _guard = lock();
+    if let Some(held) = held().as_mut() {
+        held.push_str(text);
+        return;
+    }
     let mut stderr = std::io::stderr();
     let _ = stderr.write_all(text.as_bytes());
     let _ = stderr.flush();
@@ -41,6 +58,10 @@ pub fn write(text: &str) {
 /// Writes `text` to stdout in one piece, under the lock.
 pub fn write_out(text: &str) {
     let _guard = lock();
+    if let Some(held) = held().as_mut() {
+        held.push_str(text);
+        return;
+    }
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(text.as_bytes());
     let _ = stdout.flush();
@@ -201,9 +222,43 @@ impl Pinned {
         out
     }
 
+    /// Opens the viewer's screen (the terminal's alternate screen, as `less`
+    /// uses) and draws `screen` on it. From now until `close_viewer`,
+    /// whatever rein prints is held back.
+    pub fn open_viewer(&mut self, screen: &str) {
+        let _guard = lock();
+        let mut out = String::new();
+        if self.in_box {
+            // Back to the conversation first: the alternate screen keeps
+            // the cursor, and the box's isn't the one to come back to.
+            out += "\x1b8";
+            self.in_box = false;
+        }
+        out += "\x1b[?1049h";
+        out += screen;
+        write_raw(&out);
+        held().replace(String::new());
+    }
+
+    /// Draws the viewer again.
+    pub fn show_viewer(&self, screen: &str) {
+        let _guard = lock();
+        write_raw(screen);
+    }
+
+    /// Back to the conversation, with what was printed meanwhile.
+    pub fn close_viewer(&mut self) {
+        let _guard = lock();
+        let waiting = held().take().unwrap_or_default();
+        write_raw(&format!("\x1b[?1049l{waiting}"));
+    }
+
     /// Draws the bottom: the box, then the bar. Takes the lock itself.
     pub fn draw(&mut self, bottom: &Bottom) {
         let _guard = lock();
+        if viewing() {
+            return;
+        }
         let mut out = String::new();
         let (rows, cols) = size();
         let lines = bottom.lines.len().clamp(1, MAX_LINES);

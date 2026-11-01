@@ -120,7 +120,8 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
 }
 
 /// The lines under a step: `└` before the first, then a count of the rest.
-pub fn detail_lines(outcome: &Outcome, style: Style, columns: usize) -> Vec<String> {
+/// `viewer` adds how to see the rest: Ctrl-O.
+pub fn detail_lines(outcome: &Outcome, style: Style, columns: usize, viewer: bool) -> Vec<String> {
     let pad = " ".repeat(GUTTER);
     let room = columns.saturating_sub(GUTTER + 2).max(20);
     let mut lines: Vec<String> = outcome
@@ -131,7 +132,8 @@ pub fn detail_lines(outcome: &Outcome, style: Style, columns: usize) -> Vec<Stri
         .collect();
     if outcome.more > 0 {
         let s = if outcome.more == 1 { "" } else { "s" };
-        lines.push(format!("{pad}{}", style.dim(&format!("… {} more line{s}", outcome.more))));
+        let hint = if viewer { " · ctrl-o to see all" } else { "" };
+        lines.push(format!("{pad}{}", style.dim(&format!("… {} more line{s}{hint}", outcome.more))));
     }
     lines
 }
@@ -275,6 +277,7 @@ mod tests {
     #[test]
     fn shows_details_under_the_step() {
         let o = Outcome { status: String::new(), details: vec!["first".into(), "second".into()], more: 1 };
-        assert_eq!(detail_lines(&o, Style::plain(), 80), ["       └ first", "         second", "       … 1 more line"]);
+        assert_eq!(detail_lines(&o, Style::plain(), 80, false), ["       └ first", "         second", "       … 1 more line"]);
+        assert_eq!(detail_lines(&o, Style::plain(), 80, true)[2], "       … 1 more line · ctrl-o to see all");
     }
 }

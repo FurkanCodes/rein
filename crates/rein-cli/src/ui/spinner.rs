@@ -31,15 +31,16 @@ impl Spinner {
                     break;
                 }
                 {
+                    // Checked under the lock, so the viewer can't open in between.
                     let _guard = super::screen::lock();
-                    let _ = write!(stderr, "\r\x1b[2K{}", line(FRAMES[i % FRAMES.len()], started.elapsed().as_secs()));
-                    let _ = stderr.flush();
+                    if !super::screen::viewing() {
+                        let _ = write!(stderr, "\r\x1b[2K{}", line(FRAMES[i % FRAMES.len()], started.elapsed().as_secs()));
+                        let _ = stderr.flush();
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            let _guard = super::screen::lock();
-            let _ = write!(stderr, "\r\x1b[2K");
-            let _ = stderr.flush();
+            super::screen::write("\r\x1b[2K");
         });
         Spinner { stop, thread: Some(thread) }
     }

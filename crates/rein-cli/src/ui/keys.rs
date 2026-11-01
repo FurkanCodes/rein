@@ -19,6 +19,8 @@ pub enum Key {
     Down,
     Home,
     End,
+    PageUp,
+    PageDown,
     /// Delete the word before the cursor.
     DeleteWord,
     /// Delete everything before the cursor.
@@ -169,6 +171,8 @@ fn escape(bytes: &[u8]) -> Decoded {
                 (b"1" | b"7", b'~') => key(Key::Home, used),
                 (b"4" | b"8", b'~') => key(Key::End, used),
                 (b"3", b'~') => key(Key::Delete, used),
+                (b"5", b'~') => key(Key::PageUp, used),
+                (b"6", b'~') => key(Key::PageDown, used),
                 (b"200", b'~') => Decoded::PasteStart(used),
                 _ => Decoded::Skip(used),
             }
