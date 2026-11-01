@@ -44,6 +44,8 @@ pub trait Ui {
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str);
     fn tool_finished(&mut self, call: &ToolCall, output: &str);
     fn usage(&mut self, usage: &Usage);
+    /// A request is on its way to the model; nothing to show yet.
+    fn thinking(&mut self) {}
     /// Compaction is starting. A summary, if one is written, streams
     /// through `text`.
     fn compacting(&mut self) {}
@@ -132,6 +134,7 @@ impl<M: Model> Agent<M> {
             }
             let request = self.request(self.history.clone());
             let sent = self.history.len();
+            ui.thinking();
             let (items, usage) = match self.model.respond(&request, &mut |text| ui.text(text)).await {
                 // The provider says it's too long after all: make room and
                 // try again, once.
@@ -241,6 +244,7 @@ impl<M: Model> Agent<M> {
         // lose the cache from there.)
         let mut input = self.history.clone();
         input.push(Item::User(compact::prompt(focus)));
+        ui.thinking();
         let (items, usage) = self.model.respond(&self.request(input), &mut |text| ui.text(text)).await?;
         ui.usage(&usage);
         let summary: Vec<&str> = items

@@ -1,0 +1,8 @@
+//! How rein looks in a terminal: each step under a label, answers rendered
+//! from Markdown and wrapped, and a status bar after each turn.
+
+pub mod markdown;
+pub mod spinner;
+pub mod steps;
+pub mod style;
+pub mod wrap;
