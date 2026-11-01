@@ -271,6 +271,9 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
     let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
     let permissions = load_permissions(&root, args.mode)?;
     let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none());
+    // The box goes up now, so typing can start while the model list loads.
+    terminal.model = args.model.clone();
+    terminal.input.set_bar(terminal.bar());
     let dir = config_dir()?;
     let mut setup = Setup {
         folder: session::folder(&dir.join("sessions"), &root),

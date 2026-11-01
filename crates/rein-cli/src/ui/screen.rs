@@ -396,8 +396,10 @@ impl Pinned {
     }
 }
 
+/// Writes one frame. Terminals that know synchronized output (mode 2026)
+/// show it all at once, never half drawn; others ignore the markers.
 fn write_raw(text: &str) {
     let mut stderr = std::io::stderr();
-    let _ = stderr.write_all(text.as_bytes());
+    let _ = stderr.write_all(format!("\x1b[?2026h{text}\x1b[?2026l").as_bytes());
     let _ = stderr.flush();
 }
