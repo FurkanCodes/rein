@@ -173,8 +173,13 @@ fn messages(request: &Request<'_>, omitted: &[&str], quirks: Quirks) -> Vec<Valu
             // came with. Only this format's own.
             Item::Opaque(opaque) if opaque.api == Api::Chat && !omitted.contains(&"replay") => {
                 let message = turn.get_or_insert_with(assistant);
-                if let Some(fields) = opaque.value.as_object() {
-                    message.extend(fields.clone());
+                // Only the fields rein keeps: the item may come from a file
+                // on disk, and anything else there (a `tool_calls` that
+                // isn't a list, say) mustn't reach the message.
+                for field in ["reasoning_content", "reasoning_details"] {
+                    if let Some(value) = opaque.value.get(field) {
+                        message.insert(field.into(), value.clone());
+                    }
                 }
             }
             Item::Opaque(_) => {}
@@ -411,6 +416,15 @@ mod tests {
         assert_eq!(body["stream_options"], json!({ "include_usage": true }));
         assert_eq!(body["reasoning_effort"], "high", "max is beyond the format: its highest");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
+    }
+
+    #[test]
+    fn a_tampered_reasoning_item_cant_break_the_message() {
+        let tampered = Item::Opaque(Opaque::new(Api::Chat, json!({ "tool_calls": {}, "role": "system", "reasoning_content": "hm" })));
+        let body = request_body(&request(&[Item::User("hi".into()), tampered, call("c1"), result("c1")]), &[], Quirks::default());
+        let assistant = &body["messages"][2];
+        assert_eq!((assistant["role"].as_str(), assistant["reasoning_content"].as_str()), (Some("assistant"), Some("hm")));
+        assert_eq!(assistant["tool_calls"][0]["id"], "c1");
     }
 
     #[test]

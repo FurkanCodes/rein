@@ -404,6 +404,8 @@ fn read_secret(prompt: &str) -> CliResult<String> {
     // SAFETY: an all-zero termios is a valid value, and tcgetattr fills it.
     let mut shown: libc::termios = unsafe { std::mem::zeroed() };
     let quiet = tty && unsafe { libc::tcgetattr(0, &mut shown) } == 0;
+    // Whatever handled Ctrl-C before, to put back after.
+    let mut before = libc::SIG_DFL;
     if quiet {
         let _ = SHOWN.set(shown);
         let mut hidden = shown;
@@ -411,7 +413,7 @@ fn read_secret(prompt: &str) -> CliResult<String> {
         // SAFETY: the handler only uses async-signal-safe calls; the
         // termios is one tcgetattr gave, with echo off.
         unsafe {
-            libc::signal(libc::SIGINT, interrupted as extern "C" fn(libc::c_int) as libc::sighandler_t);
+            before = libc::signal(libc::SIGINT, interrupted as extern "C" fn(libc::c_int) as libc::sighandler_t);
             libc::tcsetattr(0, libc::TCSANOW, &hidden);
         }
     }
@@ -421,7 +423,7 @@ fn read_secret(prompt: &str) -> CliResult<String> {
         // SAFETY: putting back what tcgetattr gave, and Ctrl-C as it was.
         unsafe {
             libc::tcsetattr(0, libc::TCSANOW, &shown);
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGINT, before);
         }
         eprintln!();
     }

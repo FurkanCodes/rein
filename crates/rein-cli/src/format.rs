@@ -49,7 +49,11 @@ pub(crate) fn local_time(time: SystemTime) -> LocalTime {
     // SAFETY: an all-zero `tm` is a valid value, and localtime_r only
     // writes into the one we pass.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&seconds, &mut tm) };
+    // SAFETY: as above; gmtime_r is the same, in UTC, for when the local
+    // time zone can't be had.
+    if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
+        unsafe { libc::gmtime_r(&seconds, &mut tm) };
+    }
     LocalTime { year: tm.tm_year + 1900, month: (tm.tm_mon + 1) as u32, day: tm.tm_mday as u32, hour: tm.tm_hour as u32, minute: tm.tm_min as u32, second: tm.tm_sec as u32 }
 }
 
