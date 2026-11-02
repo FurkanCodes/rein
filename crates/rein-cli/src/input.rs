@@ -64,6 +64,44 @@ pub struct Question {
     pub answers: Vec<(&'static str, String)>,
 }
 
+/// A list to choose one from: ↑↓ move, typing narrows it, Enter picks,
+/// Esc cancels. Every command that shows choices shows them this way.
+pub struct Menu {
+    /// What it's for, on the box's edge: `choose a model`.
+    pub title: String,
+    /// Each choice: its name, and a few dim words about it.
+    pub items: Vec<(String, String)>,
+    /// The one in use: marked, and where the list starts.
+    pub current: Option<usize>,
+}
+
+/// A menu on screen: what's typed to narrow it, and which of the matching
+/// items is picked.
+struct Picking {
+    menu: Menu,
+    filter: Editor,
+    picked: usize,
+}
+
+impl Picking {
+    /// The items that match what's typed, best first: the letters in
+    /// order, as `@` finds files. All of them, in order, before anything is.
+    fn matching(&self) -> Vec<usize> {
+        let query = self.filter.text();
+        let query = query.trim();
+        if query.is_empty() {
+            return (0..self.menu.items.len()).collect();
+        }
+        let mut scored: Vec<(i64, usize)> =
+            self.menu.items.iter().enumerate().filter_map(|(i, (name, about))| Some((fuzzy::score(query, name).or_else(|| Some(fuzzy::score(query, &format!("{name} {about}"))? - 1000))?, i))).collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, i)| i).collect()
+    }
+}
+
+/// The most of a menu shown at once; it scrolls for more.
+const PICK_LINES: usize = 10;
+
 /// The question on screen, which answer is picked, and since when it's
 /// been asked.
 struct Asking {
@@ -124,6 +162,11 @@ struct Boxed {
     waiting: Waiting,
     /// What the empty box says while waiting for a typed answer.
     prompt: String,
+    /// The answer being typed is a secret, like a key: it shows as dots,
+    /// and is never kept.
+    secret: bool,
+    /// A menu to choose from.
+    picking: Option<Picking>,
     asking: Option<Asking>,
     /// What rein is doing, and since when its turn started.
     busy: Option<(String, Instant)>,
@@ -276,7 +319,10 @@ impl Boxed {
                     },
                 }
             }
-            _ => self.composer(above),
+            _ => match &self.picking {
+                Some(picking) => self.picker(picking, above),
+                None => self.composer(above),
+            },
         };
         self.pinned.draw(&bottom);
     }
@@ -290,6 +336,12 @@ impl Boxed {
             let (tone, mark) = if self.waiting == Waiting::Message { (Tone::Typing, s.bold(&s.blue("›"))) } else { (Tone::Busy, s.dim("›")) };
             let notes = ("finding a message you sent".to_owned(), "enter picks · esc goes back".to_owned());
             return Bottom { above, tone, mark, lines, caret: Some(caret), notes, below: self.below(), compact: String::new() };
+        }
+        if self.secret && !self.editor.is_empty() {
+            let width = self.pinned.text_width().max(2);
+            let dots = self.editor.text().chars().count().min(width - 1);
+            let notes = (String::new(), "enter saves it · esc cancels".to_owned());
+            return Bottom { above, tone: Tone::Asking, mark: s.bold(&s.yellow("?")), lines: vec!["•".repeat(dots)], caret: Some((0, dots)), notes, below: self.below(), compact: String::new() };
         }
         let (mut lines, (line, column)) = self.editor.layout(self.pinned.text_width());
         // Keep the line with the cursor in view.
@@ -464,6 +516,85 @@ impl Boxed {
         }
     }
 
+    /// A key while a menu waits for a choice.
+    fn pick_key(&mut self, key: Key) {
+        let Some(picking) = &mut self.picking else { return };
+        let matching = picking.matching();
+        let last = matching.len().saturating_sub(1);
+        let chosen = match key {
+            Key::Esc | Key::CtrlC => Some(Read::Interrupted),
+            // Nothing matches: Enter waits for typing that does.
+            Key::Enter => matching.get(picking.picked).map(|i| Read::Line(i.to_string())),
+            Key::Up | Key::BackTab => {
+                picking.picked = if picking.picked == 0 { last } else { picking.picked - 1 };
+                None
+            }
+            Key::Down | Key::Tab => {
+                picking.picked = if picking.picked >= last { 0 } else { picking.picked + 1 };
+                None
+            }
+            Key::PageUp => {
+                picking.picked = picking.picked.saturating_sub(PICK_LINES);
+                None
+            }
+            Key::PageDown => {
+                picking.picked = (picking.picked + PICK_LINES).min(last);
+                None
+            }
+            Key::Newline => None,
+            Key::Paste(text) => {
+                picking.filter.key(&Key::Paste(text.replace(['\n', '\r'], " ")));
+                picking.picked = 0;
+                None
+            }
+            key => {
+                picking.filter.key(&key);
+                picking.picked = 0;
+                None
+            }
+        };
+        if let Some(read) = chosen {
+            self.picking = None;
+            self.reply(read);
+        }
+    }
+
+    /// The box with a menu: what's typed to narrow it in the box, the
+    /// matching items under it.
+    fn picker(&self, picking: &Picking, above: Vec<String>) -> Bottom {
+        let s = Style::stderr();
+        let (lines, caret) = picking.filter.layout(self.pinned.text_width());
+        let lines = if picking.filter.is_empty() { vec![s.dim("type to narrow the list · ↑↓ to move")] } else { lines };
+        let matching = picking.matching();
+        let mut below = Vec::new();
+        if matching.is_empty() {
+            below.push(s.dim(&format!("   nothing matches “{}”", picking.filter.text().trim())));
+        }
+        let first = (picking.picked + 1).saturating_sub(PICK_LINES);
+        if first > 0 {
+            below.push(s.dim(&format!("   … {first} more above")));
+        }
+        let names = matching.iter().skip(first).take(PICK_LINES).map(|&i| width(&picking.menu.items[i].0)).max().unwrap_or(0).min(64);
+        let cols = screen::size().1;
+        for (n, &i) in matching.iter().enumerate().skip(first).take(PICK_LINES) {
+            let (name, about) = &picking.menu.items[i];
+            let mark = if picking.menu.current == Some(i) { "•" } else { " " };
+            let pad = " ".repeat(names.saturating_sub(width(name)));
+            let line = if n == picking.picked {
+                format!(" {} {}{mark} {pad} {}", s.blue("›"), s.bold(&s.blue(name)), about)
+            } else {
+                format!("   {name}{mark} {pad} {}", s.dim(about))
+            };
+            below.push(fit(&line, cols.saturating_sub(1)));
+        }
+        let hidden = matching.len().saturating_sub(first + PICK_LINES);
+        if hidden > 0 {
+            below.push(s.dim(&format!("   … {hidden} more")));
+        }
+        let notes = (picking.menu.title.clone(), "enter picks · esc cancels".to_owned());
+        Bottom { above, tone: Tone::Typing, mark: s.bold(&s.blue("›")), lines, caret: Some(caret), notes, below, compact: picking.menu.title.clone() }
+    }
+
     /// You're not looking: the terminal says its window is behind another,
     /// or, where it doesn't say, you haven't touched a key for a while.
     fn away(&self) -> bool {
@@ -514,6 +645,12 @@ impl Boxed {
             let shown = viewer.render(rows, cols, Style::stderr());
             self.pinned.open_viewer(&shown);
             self.viewer = Some(viewer);
+            return;
+        }
+        // A menu takes the keys, but the wheel still scrolls the conversation.
+        if self.picking.is_some() && !matches!(key, Key::Mouse { .. } | Key::ScrollUp | Key::ScrollDown | Key::Redraw) {
+            self.pick_key(key);
+            self.draw();
             return;
         }
         // The conversation scrolls; a drag selects and copies.
@@ -605,6 +742,7 @@ impl Boxed {
                 self.editor.take();
             }
             (_, Key::CtrlC) => self.reply(Read::Interrupted),
+            (Waiting::Answer, Key::Esc) if self.secret => self.reply(Read::Interrupted),
             (Waiting::Message, Key::CtrlD) if self.editor.is_empty() => self.reply(Read::Eof),
             (Waiting::Message, Key::BackTab) if menu.is_empty() => self.reply(Read::NextMode),
             // The arrows pick among the matching commands.
@@ -693,7 +831,7 @@ impl Boxed {
         let entry = self.editor.entry();
         let shown = entry.shown();
         let text = self.editor.take();
-        if shown != text {
+        if shown != text && !self.secret {
             self.shown.push((text.clone(), shown));
         }
         if waiting != Waiting::Answer {
@@ -903,6 +1041,8 @@ impl Input {
                 editor: Editor::with_history(history),
                 waiting: Waiting::Nothing,
                 prompt: String::new(),
+            secret: false,
+            picking: None,
                 asking: None,
                 busy: None,
                 steering: Vec::new(),
@@ -1045,6 +1185,59 @@ impl Input {
         let read = self.replies.recv().await.unwrap_or(Read::Eof);
         self.pending = false;
         read
+    }
+
+    /// Reads a secret, like an API key, in the box: it shows as dots and
+    /// isn't kept, and Esc cancels. `None` without a box, where it would
+    /// show as it's typed.
+    pub async fn read_secret(&mut self, prompt: &str) -> Option<Read> {
+        self.boxed.as_ref()?;
+        self.with(|boxed| boxed.secret = true);
+        let read = self.read(prompt, false).await;
+        self.with(|boxed| {
+            boxed.secret = false;
+            // A cancelled one mustn't stay in the box, half typed.
+            boxed.editor.take();
+        });
+        Some(read)
+    }
+
+    /// Shows `menu` and waits for a choice: the index of the item picked,
+    /// or `None` if you change your mind. Without a box, the items are
+    /// numbered and a number is typed.
+    pub async fn choose(&mut self, menu: Menu) -> Option<usize> {
+        if menu.items.is_empty() {
+            return None;
+        }
+        if self.boxed.is_none() {
+            let pad = " ".repeat(GUTTER);
+            for (n, (name, about)) in menu.items.iter().enumerate() {
+                let mark = if menu.current == Some(n) { "•" } else { " " };
+                say!("{pad}{:>3}  {name}{mark} {about}", n + 1);
+            }
+            loop {
+                match self.read(&format!("{} (number, or Enter to cancel) ", menu.title), false).await {
+                    Read::Line(line) if line.trim().is_empty() => return None,
+                    Read::Line(line) => match line.trim().parse::<usize>() {
+                        Ok(n) if (1..=menu.items.len()).contains(&n) => return Some(n - 1),
+                        _ => say!("{pad}Type a number from 1 to {}.", menu.items.len()),
+                    },
+                    _ => return None,
+                }
+            }
+        }
+        let picked = menu.current.unwrap_or(0);
+        self.with(|boxed| {
+            boxed.waiting = Waiting::Answer;
+            boxed.picking = Some(Picking { menu, filter: Editor::default(), picked });
+        });
+        self.pending = true;
+        let read = self.replies.recv().await.unwrap_or(Read::Eof);
+        self.pending = false;
+        match read {
+            Read::Line(i) => i.parse().ok(),
+            _ => None,
+        }
     }
 
     /// Asks `question` in the box and waits for the key of the answer.

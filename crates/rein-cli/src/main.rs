@@ -36,7 +36,7 @@ mod settings;
 use settings::Settings;
 mod ui;
 use commands::Slash;
-use input::{Input, Question, Read};
+use input::{Input, Menu, Question, Read};
 use ui::history::{self, History};
 use ui::markdown::Markdown;
 use ui::spinner::Spinner;
@@ -148,10 +148,10 @@ async fn run(args: Vec<String>) -> CliResult {
             println!("{HELP}");
             Ok(())
         }
-        ["login"] | ["login", "chatgpt"] => login(&http).await,
+        ["login"] | ["login", "chatgpt"] => login(&http, &|line| say!("{line}")).await,
         ["login", provider] => connect::login(&http, provider, false).await,
         ["login", provider, "--key"] => connect::login(&http, provider, true).await,
-        ["logout", provider] => connect::logout(provider),
+        ["logout", provider] => connect::logout(provider, &|line| say!("{line}")),
         ["providers"] => connect::list(),
         ["models"] => connect::models(&http, None).await,
         ["models", provider] => connect::models(&http, Some(provider)).await,
@@ -163,16 +163,17 @@ async fn run(args: Vec<String>) -> CliResult {
     }
 }
 
-async fn login(http: &rein_llm::reqwest::Client) -> CliResult {
+/// Signs in with ChatGPT, saying how it goes with `tell`.
+async fn login(http: &rein_llm::reqwest::Client, tell: &dyn Fn(&str)) -> CliResult {
     let dir = config_dir()?;
     let host_id = host_id(&dir)?;
     let path = dir.join(CREDENTIALS_FILE);
     let previous: Option<Credentials> = store::read_json(&path).map_err(describe)?;
 
     let pending = signin::begin(&host_id, AGENT_NAME, previous.as_ref()).await.map_err(describe)?;
-    say!("Continue with ChatGPT: finish signing in in your browser...");
+    tell("Continue with ChatGPT: finish signing in in your browser...");
     if !open_browser(&pending.url) {
-        say!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url);
+        tell(&format!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url));
     }
     let credentials = tokio::time::timeout(Duration::from_secs(600), pending.finish(http))
         .await
@@ -187,19 +188,19 @@ async fn login(http: &rein_llm::reqwest::Client) -> CliResult {
 
     let who = credentials.email.as_deref().map_or_else(|| "your ChatGPT account".to_owned(), mask_email);
     if !credentials.plan_enabled() {
-        say!(
+        tell(&format!(
             "Signed in as {who}, but rein wasn't allowed to use your ChatGPT plan. \
              Run `rein login` again and allow it, or set OPENAI_API_KEY to pay with an API key."
-        );
+        ));
         return Ok(());
     }
     if previous.is_none() {
-        say!(
+        tell(&format!(
             "\nYou're using your ChatGPT plan.\n\
              Eligible requests in rein use your ChatGPT plan. Manage usage: {USAGE_URL}\n"
-        );
+        ));
     }
-    say!("Signed in as {who}.");
+    tell(&format!("Signed in as {who}."));
     Ok(())
 }
 
@@ -362,6 +363,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
         root: root.clone(),
         system: args.system.clone(),
         models,
+        others: None,
         compact_at,
         http: http.clone(),
         provider,
@@ -416,6 +418,9 @@ struct Setup {
     system: Option<String>,
     /// The models the provider in use offers, with their context windows.
     models: Vec<ModelInfo>,
+    /// The other providers you can use, and their models, once /model has
+    /// looked them up.
+    others: Option<Vec<(Provider, Vec<ModelInfo>)>>,
     /// `compact_at` from the settings or the environment.
     compact_at: Option<String>,
     /// For connecting to another provider, when `/model` names one.
@@ -550,29 +555,21 @@ async fn compact_now(agent: &mut Agent<Llm>, focus: Option<&str>, terminal: &mut
 /// Lists this folder's recent conversations and asks which to continue.
 /// `None` if the user changes their mind.
 async fn pick(folder: &Path, terminal: &mut Terminal) -> CliResult<Option<PathBuf>> {
-    let saved = session::list(folder, 10);
+    let saved = session::list(folder, 30);
     if saved.is_empty() {
         return Err("no saved conversations in this folder yet".into());
     }
-    // Under the gutter, like everything else rein says.
-    let pad = " ".repeat(GUTTER);
-    for (i, conversation) in saved.iter().enumerate() {
-        let when = local_time(conversation.modified);
-        let first = conversation.first.as_deref().map(|text| shorten(text, 50)).unwrap_or_default();
-        let messages = format!("{} message{}", conversation.messages, if conversation.messages == 1 { "" } else { "s" });
-        say!("{pad}{:>2}  {} {:02}:{:02}  {messages:<12}  {first}", i + 1, when.date(), when.hour, when.minute);
-    }
-    loop {
-        match terminal.input.read("Continue which one? (number, or Enter to cancel) ", false).await {
-            Read::Line(line) if line.trim().is_empty() => return Ok(None),
-            Read::Line(line) => match line.trim().parse::<usize>() {
-                Ok(n) if (1..=saved.len()).contains(&n) => return Ok(Some(saved[n - 1].path.clone())),
-                _ => say!("{pad}Type a number from 1 to {}.", saved.len()),
-            },
-            Read::Interrupted | Read::Eof => return Ok(None),
-            Read::NextMode => {}
-        }
-    }
+    let items = saved
+        .iter()
+        .map(|conversation| {
+            let when = local_time(conversation.modified);
+            let first = conversation.first.as_deref().map(|text| shorten(text, 44)).unwrap_or_default();
+            let messages = format!("{} message{}", conversation.messages, if conversation.messages == 1 { "" } else { "s" });
+            (format!("{} {:02}:{:02}  {first}", when.date(), when.hour, when.minute), messages)
+        })
+        .collect();
+    let menu = Menu { title: "continue which conversation".to_owned(), items, current: None };
+    Ok(terminal.input.choose(menu).await.map(|i| saved[i].path.clone()))
 }
 
 /// A reminder of where a continued conversation left off.
@@ -727,6 +724,8 @@ fn next_mode(mode: Mode) -> Mode {
 async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
     let pad = " ".repeat(GUTTER);
     let s = terminal.err;
+    // A command that takes a choice and was given none shows the choices.
+    let Some(command) = choose(command, agent, terminal, setup).await? else { return Ok(()) };
     match command {
         Slash::Help => {
             for line in commands::help() {
@@ -744,27 +743,12 @@ async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Term
                 say!("{pad}{}", s.dim(keys));
             }
         }
-        Slash::Mode(None) => say!("{pad}{}", mode_description(agent.permissions.mode)),
+        // Chosen above.
+        Slash::Mode(None) | Slash::Model(None) | Slash::Login(None) | Slash::Logout(None) | Slash::Effort(None) => {}
         Slash::Mode(Some(mode)) => {
             agent.permissions.mode = mode;
             terminal.mode = mode_name(mode);
             say!("{pad}{} {}", s.green("✓"), mode_description(mode));
-        }
-        Slash::Model(None) => {
-            if setup.models.is_empty() {
-                say!("{pad}{} (the model list couldn't be fetched)", terminal.model);
-            }
-            for model in &setup.models {
-                let current = model.id == agent.model_name;
-                let window = model.context_window.map(|w| format!("  {} tokens", thousands(w))).unwrap_or_default();
-                let line = format!("{} {}{}", if current { "›" } else { " " }, provider::shown(&setup.provider, &model.id), s.dim(&window));
-                say!("{pad}{}", if current { s.bold(&line) } else { line });
-            }
-            let others: Vec<&str> =
-                setup.providers.iter().filter(|p| p.name != setup.provider.name && connect::usable(p, &setup.keys)).map(|p| p.name.as_str()).collect();
-            if !others.is_empty() {
-                say!("{pad}{}", s.dim(&format!("You also have {}: /model <provider>/<model> switches", others.join(", "))));
-            }
         }
         Slash::Model(Some(spec)) => {
             let shown = use_model(&spec, agent, terminal, setup).await?;
@@ -775,8 +759,11 @@ async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Term
             say!("{pad}{} now using {shown}", s.green("✓"));
             say!("{pad}{}", s.dim("The prompt cache starts over: it's kept per model."));
         }
-        Slash::Effort(None) => {
-            say!("{pad}reasoning effort: {}", agent.reasoning_effort.as_deref().unwrap_or("the model's default"));
+        Slash::Login(Some(name)) => login_here(&name, agent, terminal, setup).await?,
+        Slash::Logout(Some(name)) => {
+            connect::logout(&name, &|line| say!("{pad}{line}"))?;
+            setup.keys = connect::load_keys(&config_dir()?)?;
+            setup.others = None;
         }
         Slash::Effort(Some(level)) => {
             agent.reasoning_effort = level;
@@ -846,6 +833,194 @@ async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Term
     Ok(())
 }
 
+/// What `command` is, once its choice is made: a command given no choice
+/// (`/model`, `/login`, `/mode`...) shows what there is to choose from.
+/// `None` when you change your mind.
+async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult<Option<Slash>> {
+    let menu = |title: &str, items: Vec<(String, String)>, current: Option<usize>| Menu { title: title.to_owned(), items, current };
+    Ok(match command {
+        Slash::Mode(None) => {
+            let modes = [Mode::Ask, Mode::Edits, Mode::ReadOnly, Mode::Trust];
+            // "edits: file changes ...": the name is the item's already.
+            let about = |m: Mode| mode_description(m).split_once(": ").map_or(mode_description(m), |(_, about)| about).to_owned();
+            let items = modes.iter().map(|&m| (mode_name(m).to_owned(), about(m))).collect();
+            let current = modes.iter().position(|&m| m == agent.permissions.mode);
+            terminal.input.choose(menu("what runs without asking", items, current)).await.map(|i| Slash::Mode(Some(modes[i])))
+        }
+        Slash::Effort(None) => {
+            let levels = [
+                (None, "the model's own"),
+                (Some("minimal"), "as little thinking as there can be"),
+                (Some("low"), "quick: for simple work"),
+                (Some("medium"), "a balance"),
+                (Some("high"), "thorough"),
+                (Some("xhigh"), "more thorough, where the model has it"),
+                (Some("max"), "the most thinking, where the model has it"),
+            ];
+            let items = levels.iter().map(|(level, about)| (level.unwrap_or("default").to_owned(), (*about).to_owned())).collect();
+            let current = levels.iter().position(|(level, _)| level.map(str::to_owned) == agent.reasoning_effort);
+            let chosen = terminal.input.choose(menu("how hard the model thinks", items, current)).await;
+            chosen.map(|i| Slash::Effort(Some(levels[i].0.map(str::to_owned))))
+        }
+        Slash::Model(None) => {
+            let mut specs = Vec::new();
+            let mut items = Vec::new();
+            let mut add = |provider: &Provider, models: &[ModelInfo]| {
+                for model in models {
+                    let window = model.context_window.map(|w| format!(" · {} tokens", thousands(w))).unwrap_or_default();
+                    specs.push(provider::spec(provider, &model.id));
+                    items.push((provider::shown(provider, &model.id), format!("{}{window}", provider.title)));
+                }
+            };
+            if setup.models.is_empty() {
+                // The list couldn't be had: the one in use, at least.
+                add(&setup.provider, &[ModelInfo { id: agent.model_name.clone(), name: agent.model_name.clone(), context_window: None, max_output: None }]);
+            } else {
+                add(&setup.provider, &setup.models);
+            }
+            for (provider, models) in other_models(setup, terminal).await {
+                add(&provider, &models);
+            }
+            let current = specs.iter().position(|spec| *spec == setup.current(agent));
+            terminal.input.choose(menu("choose a model", items, current)).await.map(|i| Slash::Model(Some(specs[i].clone())))
+        }
+        Slash::Login(None) => {
+            // Keys may have come or gone in another terminal since.
+            setup.keys = connect::load_keys(&config_dir()?)?;
+            let signed_in = config_dir()?.join(CREDENTIALS_FILE).exists();
+            let mut names = vec!["chatgpt".to_owned()];
+            let mut items = vec![("chatgpt".to_owned(), if signed_in { "signed in: your ChatGPT plan pays for OpenAI's models" } else { "your ChatGPT plan, for OpenAI's models" }.to_owned())];
+            for provider in setup.providers.iter().filter(|p| p.needs_key) {
+                names.push(provider.name.clone());
+                let how = if provider.sign_in_url.is_some() { ", signs in in the browser" } else { "" };
+                items.push((provider.name.clone(), format!("{}{how}", connect::pays(provider, &setup.keys, false))));
+            }
+            let current = names.iter().position(|name| *name == setup.provider.name);
+            terminal.input.choose(menu("sign in to a provider", items, current)).await.map(|i| Slash::Login(Some(names[i].clone())))
+        }
+        Slash::Logout(None) => {
+            setup.keys = connect::load_keys(&config_dir()?)?;
+            let mut names: Vec<String> = Vec::new();
+            if config_dir()?.join(CREDENTIALS_FILE).exists() {
+                names.push("chatgpt".into());
+            }
+            names.extend(setup.keys.keys().cloned());
+            if names.is_empty() {
+                return Err("nothing to forget: no saved keys, and not signed in with ChatGPT".into());
+            }
+            let items = names.iter().map(|name| (name.clone(), if name == "chatgpt" { "sign out of ChatGPT" } else { "forget the saved key" }.to_owned())).collect();
+            terminal.input.choose(menu("forget which", items, None)).await.map(|i| Slash::Logout(Some(names[i].clone())))
+        }
+        command => Some(command),
+    })
+}
+
+/// The other providers you can use and their models, looked up all at
+/// once the first time, a few seconds at most.
+async fn other_models(setup: &mut Setup, terminal: &mut Terminal) -> Vec<(Provider, Vec<ModelInfo>)> {
+    if let Some(others) = &setup.others {
+        return others.clone();
+    }
+    let others: Vec<Provider> = setup.providers.iter().filter(|p| p.name != setup.provider.name && connect::usable(p, &setup.keys)).cloned().collect();
+    if others.is_empty() {
+        return Vec::new();
+    }
+    terminal.doing("Looking up the other providers' models");
+    let lookups: Vec<_> = others
+        .into_iter()
+        .map(|provider| {
+            let (http, keys) = (setup.http.clone(), setup.keys.clone());
+            tokio::spawn(async move {
+                let (client, _) = connect::client_for(&http, &provider, &keys).await.ok()?;
+                let models = tokio::time::timeout(Duration::from_secs(5), client.list_models()).await.ok()?.ok()?;
+                Some((provider, models))
+            })
+        })
+        .collect();
+    let mut found = Vec::new();
+    for lookup in lookups {
+        if let Ok(Some(other)) = lookup.await {
+            found.push(other);
+        }
+    }
+    terminal.quiet();
+    terminal.input.busy(None, std::time::Instant::now());
+    setup.others = Some(found.clone());
+    found
+}
+
+/// `/login <name>`: signs in without leaving the conversation. A key is
+/// pasted in the box, where it shows as dots; a provider with a browser
+/// sign-in, and ChatGPT, sign in there. Once done, it's ready for /model,
+/// and if it's the provider in use, its next request pays the new way.
+async fn login_here(name: &str, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
+    let pad = " ".repeat(GUTTER);
+    let s = terminal.err;
+    let tell = |text: &str| {
+        for line in text.trim_matches('\n').lines() {
+            say!("{pad}{line}");
+        }
+    };
+    let cancelled = || say!("{pad}{}", s.dim("(cancelled; nothing was saved)"));
+    let signed_in = if name == "chatgpt" {
+        if waiting(terminal, "Waiting for you to sign in to ChatGPT in the browser", login(&setup.http, &tell)).await?.is_none() {
+            cancelled();
+            return Ok(());
+        }
+        "openai"
+    } else {
+        let provider = connect::find(&setup.providers, name)?.clone();
+        let made = connect::sign_in(&provider, false)?;
+        let key = match made {
+            Some(auth_url) => {
+                let what = format!("Waiting for you to sign in to {} in the browser", provider.title);
+                waiting(terminal, &what, connect::key_from_browser(&setup.http, &provider, auth_url, &tell)).await?
+            }
+            None => match terminal.input.read_secret(&connect::paste_prompt(&provider)).await {
+                Some(Read::Line(key)) => Some(key),
+                Some(_) => None,
+                None => return Err(format!("a key typed here would show; run `rein login {name}` in a terminal instead")),
+            },
+        };
+        let Some(key) = key else {
+            cancelled();
+            return Ok(());
+        };
+        connect::save_key(&setup.http, &provider, key, made.is_some(), &tell).await?;
+        name
+    };
+    setup.keys = connect::load_keys(&config_dir()?)?;
+    setup.others = None;
+    if setup.provider.name == signed_in {
+        let connected = connect::connect(&setup.http, &setup.providers, &setup.keys, &setup.current(agent), setup.compress).await?;
+        say!("{pad}{}", s.dim(&connected.pays));
+        let (client, models) = connected.models().await;
+        agent.model.client = client;
+        if !models.is_empty() {
+            setup.models = models;
+        }
+    } else {
+        say!("{pad}{}", s.dim(&format!("/model {signed_in}/<model> switches to it; `rein models {signed_in}` lists them")));
+    }
+    Ok(())
+}
+
+/// Runs `work`, saying `what` over the box, until it's done or you stop it
+/// with Esc or Ctrl-C (`None`).
+async fn waiting<T>(terminal: &mut Terminal, what: &str, work: impl std::future::Future<Output = CliResult<T>>) -> CliResult<Option<T>> {
+    terminal.turn.started = Some(std::time::Instant::now());
+    terminal.doing(what);
+    let interrupted = terminal.interrupted.clone();
+    let done = tokio::select! {
+        done = work => Some(done),
+        _ = tokio::signal::ctrl_c() => None,
+        _ = interrupted.notified() => None,
+    };
+    terminal.quiet();
+    terminal.input.busy(None, std::time::Instant::now());
+    done.transpose()
+}
+
 /// Switches to the model `spec`, connecting to its provider if that's
 /// another one. Returns the model as shown.
 async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult<String> {
@@ -861,6 +1036,8 @@ async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut Terminal, 
         }
         agent.model.client = client;
         (setup.provider, setup.models) = (provider, models);
+        // The others are others now.
+        setup.others = None;
     } else if missing(&setup.models) {
         return Err(format!("no model called {model}; /model lists them"));
     }

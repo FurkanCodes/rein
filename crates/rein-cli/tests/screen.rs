@@ -1047,9 +1047,14 @@ fn a_conversation_moves_between_providers_and_continues_where_it_was() {
     term.keys("hi\r");
     term.wait_for("From GPT.");
     term.wait_for(IDLE);
+    // Every provider's models in one menu: narrowed by typing, picked with Enter.
     term.keys("/model\r");
-    term.wait_for("You also have anthropic");
-    term.keys("/model claude-opus-5-5\r");
+    term.wait_for("choose a model");
+    term.wait_for("claude-opus-5-5");
+    assert!(term.text().contains("gpt-6.1-sol"), "{}", term.text());
+    term.keys("opus");
+    term.wait_until("only Claude left", |screen| !screen.contains("test-model") && screen.contains("claude-opus-5-5"));
+    term.keys("\r");
     term.wait_for("now using claude-opus-5-5");
     term.keys("and you?\r");
     term.wait_for("From Claude.");
@@ -1278,4 +1283,89 @@ fn openrouter_sign_in_happens_in_the_browser_and_rein_keeps_the_key_it_makes() {
     let (ok, said) = run(&model, &home, &["logout", "openrouter"], "");
     assert!(ok && said.contains("still works there until you delete it"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn signing_in_from_the_conversation_makes_a_provider_ready_to_switch_to() {
+    let claude = Model::claude(vec![says("Hello from Claude.")]);
+    let gpt = Model::start(vec![says("From GPT.")]).with_env("ANTHROPIC_BASE_URL", &claude.base);
+    let mut term = Term::start(&gpt, "login-here", 40, 100);
+    term.wait_for(IDLE);
+    // /login alone: a menu of who to sign in to, and what pays for each now.
+    term.keys("/login\r");
+    term.wait_for("sign in to a provider");
+    let screen = term.text();
+    let row = |name: &str| screen.lines().find(|l| l.trim_start().trim_start_matches('›').trim_start().starts_with(name)).unwrap_or_default().to_owned();
+    assert!(row("openai").contains("$OPENAI_API_KEY") && row("openai").trim_start().starts_with('›'), "it starts on the one in use:\n{screen}");
+    assert!(row("anthropic").contains("no key yet") && row("chatgpt").contains("ChatGPT plan"), "{screen}");
+    assert!(!screen.contains("ollama"), "nothing to sign in to there:\n{screen}");
+
+    // Picked from the menu; a key typed in the box shows as dots, and Esc
+    // leaves without one.
+    term.keys("anthr\r");
+    term.wait_for("Paste your Anthropic API key");
+    term.keys("sk-ant-half");
+    term.wait_for("•••••••••••");
+    assert!(!term.text().contains("sk-ant-half"), "{}", term.text());
+    term.keys("\x1b");
+    term.wait_for("(cancelled; nothing was saved)");
+    term.wait_for(IDLE);
+    assert!(!term.dir.join("home/keys.json").exists());
+    assert!(!term.text().contains("sk-ant-half"));
+
+    term.keys("/login anthropic\r");
+    term.wait_for("Paste your Anthropic API key");
+    term.keys("sk-ant-test\r");
+    term.wait_for("Saved. Your Anthropic key works");
+    term.wait_for("/model anthropic/<model> switches to it");
+    assert!(!term.text().contains("sk-ant-test"), "{}", term.text());
+    assert!(std::fs::read_to_string(term.dir.join("home/keys.json")).unwrap().contains("sk-ant-test"));
+
+    // Ready at once: no restart.
+    term.keys("/model claude-opus-5-5\r");
+    term.wait_for("now using claude-opus-5-5");
+    term.keys("hi\r");
+    term.wait_for("Hello from Claude.");
+    assert!(claude.heads()[0].to_lowercase().contains("x-api-key: sk-ant-test"), "{}", claude.heads()[0]);
+
+    term.keys("/logout\r");
+    term.wait_for("forget which");
+    term.keys("\r");
+    term.wait_for("Forgot your anthropic key.");
+    assert!(!std::fs::read_to_string(term.dir.join("home/keys.json")).unwrap().contains("sk-ant-test"));
+}
+
+#[test]
+fn a_menu_is_chosen_from_with_the_arrows_and_enter() {
+    let model = Model::start(vec![]);
+    let mut term = Term::start(&model, "menu", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("/mode\r");
+    term.wait_for("what runs without asking");
+    let screen = term.text();
+    assert!(screen.contains("› ask•"), "it starts on the mode in use, marked:\n{screen}");
+    assert!(!screen.contains("edits: file"), "each says what it is once:\n{screen}");
+    // Down, and down again from the last comes back to the first.
+    term.keys("\x1b[B");
+    term.wait_for("› edits");
+    term.keys("\x1b[B\x1b[B\x1b[B");
+    term.wait_for("› ask•");
+    term.keys("\x1b[A\x1b[A\x1b[A");
+    term.wait_for("› edits");
+    term.keys("\r");
+    term.wait_for("✓ edits: file changes in this folder don't ask");
+    term.wait_until("the bar says edits", |screen| screen.lines().last().is_some_and(|bar| bar.contains("edits")));
+
+    // Esc changes nothing; what's typed narrows the list.
+    term.keys("/effort\r");
+    term.wait_for("how hard the model thinks");
+    term.keys("\x1b");
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("reasoning effort:"), "{}", term.text());
+    term.keys("/effort\r");
+    term.wait_for("how hard the model thinks");
+    term.keys("xh");
+    term.wait_until("only xhigh", |screen| screen.contains("› xhigh") && !screen.contains("minimal"));
+    term.keys("\r");
+    term.wait_for("✓ reasoning effort: xhigh");
 }

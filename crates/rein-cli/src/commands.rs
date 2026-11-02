@@ -8,6 +8,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/help", "", "list these commands"),
     ("/mode", "[ask|edits|read-only|trust]", "show or change what runs without asking"),
     ("/model", "[id]", "list the models, or switch to one"),
+    ("/login", "[provider]", "sign in to a provider, or see what pays for each"),
+    ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
     ("/effort", "[low|medium|high|default]", "show or change how hard the model thinks"),
     ("/status", "", "the model, mode, context and conversation"),
     ("/compact", "[focus]", "make room in the conversation now"),
@@ -27,6 +29,10 @@ pub enum Slash {
     /// `None` shows the mode.
     Mode(Option<Mode>),
     Model(Option<String>),
+    /// `None` lists the providers and what pays for each.
+    Login(Option<String>),
+    /// `None` asks which.
+    Logout(Option<String>),
     /// `Some(None)` goes back to the model's default.
     Effort(Option<Option<String>>),
     Status,
@@ -59,6 +65,8 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
             Some(name) => Mode::parse(name).map(|m| Slash::Mode(Some(m))).ok_or_else(|| format!("no mode called {name}; use ask, edits, read-only or trust")),
         },
         "/model" => Ok(Slash::Model(arg)),
+        "/login" => Ok(Slash::Login(arg)),
+        "/logout" => Ok(Slash::Logout(arg)),
         "/effort" => match arg.as_deref() {
             None => Ok(Slash::Effort(None)),
             Some("default") => Ok(Slash::Effort(Some(None))),
@@ -110,6 +118,10 @@ mod tests {
         assert_eq!(parse("/compact keep the test output"), Some(Ok(Slash::Compact(Some("keep the test output".into())))));
         assert_eq!(parse("/clear"), Some(Ok(Slash::New)));
         assert_eq!(parse("/quit"), Some(Ok(Slash::Exit)));
+        assert_eq!(parse("/login"), Some(Ok(Slash::Login(None))));
+        assert_eq!(parse("/login anthropic"), Some(Ok(Slash::Login(Some("anthropic".into())))));
+        assert_eq!(parse("/logout openrouter"), Some(Ok(Slash::Logout(Some("openrouter".into())))));
+        assert_eq!(parse("/logout"), Some(Ok(Slash::Logout(None))));
     }
 
     #[test]
@@ -129,6 +141,7 @@ mod tests {
     fn suggests_while_the_name_is_typed() {
         let names = |typed| matching(typed).into_iter().map(|(name, _, _)| name).collect::<Vec<_>>();
         assert_eq!(names("/mo"), ["/mode", "/model"]);
+        assert_eq!(names("/lo"), ["/login", "/logout"]);
         assert_eq!(names("/co"), ["/compact", "/copy"]);
         assert_eq!(names("/"), COMMANDS.iter().map(|c| c.0).collect::<Vec<_>>());
         assert!(names("/mode ").is_empty());

@@ -206,29 +206,51 @@ pub async fn connect(http: &rein_llm::reqwest::Client, providers: &[Provider], k
     Ok(Connected { provider: provider.clone(), pays, model, client, models })
 }
 
-/// `rein login <provider>`: saves a key for it, after checking it works.
-/// A provider with an official browser sign-in makes one that way, unless
-/// `paste` says you'd rather paste one.
+/// The provider called `name`, or what to say when there's none.
+pub fn find<'a>(providers: &'a [Provider], name: &str) -> CliResult<&'a Provider> {
+    providers.iter().find(|p| p.name == name).ok_or_else(|| {
+        let names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
+        format!("no provider called {name}; rein knows chatgpt, {}", names.join(", "))
+    })
+}
+
+/// How a key for `provider` is had: from its browser sign-in, or pasted.
+/// `None` when it needs none.
+pub fn sign_in(provider: &Provider, paste: bool) -> CliResult<Option<&str>> {
+    if !provider.needs_key {
+        return Err(format!("{} needs no key: use a model of it, like {}/<model>", provider.title, provider.name));
+    }
+    Ok(provider.sign_in_url.as_deref().filter(|_| !paste))
+}
+
+/// What to ask for when a key is pasted.
+pub fn paste_prompt(provider: &Provider) -> String {
+    let get = provider.keys_url.as_deref().map(|url| format!(" (from {url})")).unwrap_or_default();
+    format!("Paste your {} API key{get}", provider.title)
+}
+
+/// `rein login <provider>`: a key for it, made in the browser where the
+/// provider has an official sign-in (unless `paste`), or pasted; checked,
+/// then saved.
 pub async fn login(http: &rein_llm::reqwest::Client, name: &str, paste: bool) -> CliResult {
     let providers = providers(&config_dir()?)?;
-    let Some(provider) = providers.iter().find(|p| p.name == name) else {
-        let names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
-        return Err(format!("no provider called {name}; rein knows {}", names.join(", ")));
+    let provider = find(&providers, name)?;
+    let tell = |line: &str| say!("{line}");
+    let made = sign_in(provider, paste)?;
+    let key = match made {
+        Some(auth_url) => key_from_browser(http, provider, auth_url, &tell).await?,
+        None => read_secret(&format!("{}: ", paste_prompt(provider)))?,
     };
-    if !provider.needs_key {
-        return Err(format!("{} needs no key: use a model of it, like {name}/<model>", provider.title));
-    }
-    let signed_in = provider.sign_in_url.as_deref().filter(|_| !paste);
-    let key = match signed_in {
-        Some(auth_url) => key_from_browser(http, provider, auth_url).await?,
-        None => {
-            let get = provider.keys_url.as_deref().map(|url| format!(" (from {url})")).unwrap_or_default();
-            read_secret(&format!("Paste your {} API key{get}: ", provider.title))?
-        }
-    };
-    if key.is_empty() {
+    save_key(http, provider, key, made.is_some(), &tell).await
+}
+
+/// Checks `key` with `provider` and saves it, saying how that went.
+/// `made`: the provider made it for rein, in the browser.
+pub async fn save_key(http: &rein_llm::reqwest::Client, provider: &Provider, key: String, made: bool, tell: &dyn Fn(&str)) -> CliResult {
+    if key.trim().is_empty() {
         return Err("no key given; nothing was saved".into());
     }
+    let key = key.trim().to_owned();
     let client = Client::new(http.clone(), provider.api, base_url(provider).0, auth(provider, key.clone())).with_quirks(provider.quirks);
     let didnt = |e| format!("that key didn't work ({}); nothing was saved", describe(e));
     client.check_key(&provider.key_check).await.map_err(didnt)?;
@@ -238,27 +260,27 @@ pub async fn login(http: &rein_llm::reqwest::Client, name: &str, paste: bool) ->
     keys.insert(provider.name.clone(), key);
     store::write_json_private(&dir.join(KEYS_FILE), &keys).map_err(describe)?;
     let count = if models.len() == 1 { "1 model".to_owned() } else { format!("{} models", models.len()) };
-    if signed_in.is_some() {
+    if made {
         let manage = provider.keys_url.as_deref().map(|url| format!("; see or delete it at {url}")).unwrap_or_default();
-        say!("Signed in. {} made rein a key of its own, billed to your account{manage}.", provider.title);
-        say!("It works: {count}. `rein models {name}` lists them.");
+        tell(&format!("Signed in. {} made rein a key of its own, billed to your account{manage}.", provider.title));
+        tell(&format!("It works: {count}. `rein models {}` lists them.", provider.name));
     } else {
-        say!("Saved. Your {} key works: {count}. `rein models {name}` lists them.", provider.title);
+        tell(&format!("Saved. Your {} key works: {count}. `rein models {}` lists them.", provider.title, provider.name));
     }
     match payment(provider, &keys) {
-        Some(Payment::Plan) => say!("You're signed in with ChatGPT, which comes first; `rein logout chatgpt` to use this key instead."),
-        Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => say!("While ${var} is set, rein uses that instead."),
+        Some(Payment::Plan) => tell("You're signed in with ChatGPT, which comes first; `rein logout chatgpt` to use this key instead."),
+        Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => tell(&format!("While ${var} is set, rein uses that instead.")),
         _ => {}
     }
     Ok(())
 }
 
 /// A key `provider` makes for rein when you sign in in the browser.
-async fn key_from_browser(http: &rein_llm::reqwest::Client, provider: &Provider, auth_url: &str) -> CliResult<String> {
+pub async fn key_from_browser(http: &rein_llm::reqwest::Client, provider: &Provider, auth_url: &str, tell: &dyn Fn(&str)) -> CliResult<String> {
     let pending = rein_llm::openrouter::begin(auth_url, "rein").await.map_err(describe)?;
-    say!("Sign in to {} in your browser, and rein gets a key of its own...", provider.title);
+    tell(&format!("Sign in to {} in your browser, and rein gets a key of its own...", provider.title));
     if !crate::open_browser(&pending.url) {
-        say!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url);
+        tell(&format!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url));
     }
     let (base, _) = base_url(provider);
     tokio::time::timeout(Duration::from_secs(600), pending.finish(http, &base))
@@ -268,12 +290,12 @@ async fn key_from_browser(http: &rein_llm::reqwest::Client, provider: &Provider,
 }
 
 /// `rein logout <provider>`: forgets its saved key, or your ChatGPT sign-in.
-pub fn logout(name: &str) -> CliResult {
+pub fn logout(name: &str, tell: &dyn Fn(&str)) -> CliResult {
     let dir = config_dir()?;
     if name == "chatgpt" {
         return match std::fs::remove_file(dir.join(CREDENTIALS_FILE)) {
             Ok(()) => {
-                say!("Signed out of ChatGPT.");
+                tell("Signed out of ChatGPT.");
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("you weren't signed in with ChatGPT".into()),
@@ -285,11 +307,11 @@ pub fn logout(name: &str) -> CliResult {
         return Err(format!("there's no saved key for {name}"));
     }
     store::write_json_private(&dir.join(KEYS_FILE), &keys).map_err(describe)?;
-    say!("Forgot your {name} key.");
+    tell(&format!("Forgot your {name} key."));
     let providers = providers(&dir)?;
     if let Some(provider) = providers.iter().find(|p| p.name == name && p.sign_in_url.is_some()) {
         let at = provider.keys_url.as_deref().map(|url| format!(": delete it at {url}")).unwrap_or_default();
-        say!("If {} made it for rein, it still works there until you delete it{at}.", provider.title);
+        tell(&format!("If {} made it for rein, it still works there until you delete it{at}.", provider.title));
     }
     Ok(())
 }
@@ -328,19 +350,36 @@ pub async fn models(http: &rein_llm::reqwest::Client, name: Option<&str>) -> Cli
     Ok(())
 }
 
+/// What pays for `provider`, in a few words; `how` adds how to get a key
+/// when there's none.
+pub fn pays(provider: &Provider, keys: &Keys, how: bool) -> String {
+    match payment(provider, keys) {
+        Some(Payment::Plan) => "your ChatGPT plan".to_owned(),
+        Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => format!("${var}"),
+        Some(Payment::Saved(_)) => "your saved key".to_owned(),
+        Some(Payment::Free) => "nothing: no key needed".to_owned(),
+        None if how => format!("no key yet: ${} or `rein login {}`", provider.key_env.join(" or $"), provider.name),
+        None => "no key yet".to_owned(),
+    }
+}
+
+/// Each provider: its name, its API, where its requests go, and what pays.
+pub fn rows(providers: &[Provider], keys: &Keys) -> Vec<[String; 4]> {
+    providers.iter().map(|provider| [provider.name.clone(), provider.api.name().to_owned(), base_url(provider).0, pays(provider, keys, true)]).collect()
+}
+
+/// `rows`, lined up in columns as wide as what's in them.
+pub fn table(rows: &[[String; 4]]) -> Vec<String> {
+    let width = |i: usize| rows.iter().map(|row| row[i].chars().count()).max().unwrap_or(0);
+    let (a, b, c) = (width(0), width(1), width(2));
+    rows.iter().map(|[name, api, url, pays]| format!("{name:<a$}  {api:<b$}  {url:<c$}  {pays}")).collect()
+}
+
 /// `rein providers`: who rein can reach, how, and what pays.
 pub fn list() -> CliResult {
     let dir = config_dir()?;
-    let (providers, keys) = (providers(&dir)?, load_keys(&dir)?);
-    for provider in &providers {
-        let pays = match payment(provider, &keys) {
-            Some(Payment::Plan) => "your ChatGPT plan".to_owned(),
-            Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => format!("${var}"),
-            Some(Payment::Saved(_)) => "your saved key".to_owned(),
-            Some(Payment::Free) => "nothing: no key needed".to_owned(),
-            None => format!("no key yet: ${} or `rein login {}`", provider.key_env.join(" or $"), provider.name),
-        };
-        println!("{:<11} {:<10} {:<42} {pays}", provider.name, provider.api.name(), base_url(provider).0);
+    for line in table(&rows(&providers(&dir)?, &load_keys(&dir)?)) {
+        println!("{line}");
     }
     Ok(())
 }

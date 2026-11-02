@@ -157,12 +157,19 @@ message, so typing ahead can't answer it by accident.
 | Drag over text | select it and copy it to the clipboard |
 | Ctrl-L | draw the window again |
 | `/mode [ask\|edits\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
-| `/model [id]`, `/effort [level]` | list or switch the model, from any provider; show or change reasoning effort |
+| `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort |
+| `/login [provider]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
 | `/copy` | copy rein's last answer as it wrote it, Markdown and all |
 | Ctrl-D or `/exit` | leave |
+
+A command given no choice shows what there is to choose from: `/model`
+lists every provider's models, `/login` the providers, and `/mode`,
+`/effort`, `/logout` and `/resume` theirs. ↑↓ move (PgUp/PgDn a page at a
+time), typing narrows the list, as `@` finds files, Enter picks and Esc
+changes nothing. The one in use is marked •.
 
 A big paste shows in the box as one piece, `[pasted 40 lines]`, which
 Backspace takes out whole; the model gets all of it.
