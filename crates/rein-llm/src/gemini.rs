@@ -67,8 +67,8 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
         .collect()
 }
 
-pub(crate) fn request_body(request: &Request, omitted: &[&str]) -> Value {
-    let mut body = json!({ "contents": contents(&request.input) });
+pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str]) -> Value {
+    let mut body = json!({ "contents": contents(request.input) });
     if let Some(instructions) = &request.instructions {
         body["systemInstruction"] = json!({ "parts": [{ "text": instructions }] });
     }
@@ -324,12 +324,16 @@ mod tests {
     use super::*;
     use crate::Tool;
 
-    fn request(input: Vec<Item>) -> Request {
+    /// The tool every test request offers.
+    static TOOLS: std::sync::LazyLock<Vec<Tool>> =
+        std::sync::LazyLock::new(|| vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]);
+
+    fn request(input: &[Item]) -> Request<'_> {
         Request {
-            model: "gemini-3.8-flash".into(),
-            instructions: Some("be brief".into()),
+            model: "gemini-3.8-flash",
+            instructions: Some("be brief"),
             input,
-            tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
+            tools: &TOOLS,
             reasoning_effort: Some(Effort::XHigh),
             reasoning_summary: true,
             session_id: None,
@@ -361,7 +365,7 @@ mod tests {
             Item::Assistant("Both read.".into()),
             signature("s2"),
         ];
-        let body = request_body(&request(input), &[]);
+        let body = request_body(&request(&input), &[]);
         assert_eq!(body["systemInstruction"], json!({ "parts": [{ "text": "be brief" }] }));
         assert_eq!(body["generationConfig"], json!({ "thinkingConfig": { "includeThoughts": true, "thinkingLevel": "HIGH" } }));
         assert_eq!(body["tools"][0]["functionDeclarations"][0]["parametersJsonSchema"], json!({ "type": "object" }));
@@ -378,19 +382,19 @@ mod tests {
     fn calls_gemini_didnt_make_say_so() {
         // A call rein made for `@`, and one from another provider's turn.
         let input = vec![Item::User("look at @a.rs".into()), call("mention_1"), result("mention_1"), Item::Assistant("ok".into())];
-        let contents = request_body(&request(input), &[])["contents"].clone();
+        let contents = request_body(&request(&input), &[])["contents"].clone();
         assert_eq!(contents[1]["parts"][0]["thoughtSignature"], UNSIGNED);
         assert_eq!(contents[3]["parts"][0].get("thoughtSignature"), None, "text needs none");
         let claude = Item::Opaque(Opaque::new(Api::Anthropic, json!({ "type": "thinking", "signature": "x" })));
-        let contents = request_body(&request(vec![Item::User("hi".into()), claude, Item::Assistant("hello".into())]), &[])["contents"].clone();
+        let contents = request_body(&request(&[Item::User("hi".into()), claude, Item::Assistant("hello".into())]), &[])["contents"].clone();
         assert_eq!(contents[1]["parts"], json!([{ "text": "hello" }]), "another provider's thinking stays out");
     }
 
     #[test]
     fn leaves_out_what_the_model_doesnt_take() {
-        let body = request_body(&request(vec![Item::User("hi".into())]), &["level"]);
+        let body = request_body(&request(&[Item::User("hi".into())]), &["level"]);
         assert_eq!(body["generationConfig"]["thinkingConfig"], json!({ "includeThoughts": true }));
-        let body = request_body(&request(vec![Item::User("hi".into())]), &["level", "thoughts"]);
+        let body = request_body(&request(&[Item::User("hi".into())]), &["level", "thoughts"]);
         assert_eq!(body.get("generationConfig"), None);
     }
 
@@ -450,7 +454,7 @@ mod tests {
         let thought = Item::Opaque(Opaque::new(Api::Gemini, json!({ "text": "**Planning**", "thought": true, "thoughtSignature": "sigTh" })));
         let items: Vec<Item> = events.iter().filter_map(|e| if let Event::Item(item) = e { Some(item.clone()) } else { None }).collect();
         assert_eq!(items, [thought.clone(), Item::Assistant("Done.".into())]);
-        let contents = request_body(&request([vec![Item::User("hi".into())], items].concat()), &[])["contents"].clone();
+        let contents = request_body(&request(&[vec![Item::User("hi".into())], items].concat()), &[])["contents"].clone();
         assert_eq!(contents[1]["parts"], json!([{ "text": "**Planning**", "thought": true, "thoughtSignature": "sigTh" }, { "text": "Done." }]), "on the part it came on");
     }
 

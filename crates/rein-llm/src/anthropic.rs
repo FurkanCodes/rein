@@ -52,7 +52,7 @@ pub(crate) const OPTIONAL: Optional = &[
     ("cache_control", "cache_control", "cache_control"),
 ];
 
-pub(crate) fn headers(request: Option<(&Request, &Value)>) -> Vec<(&'static str, String)> {
+pub(crate) fn headers(request: Option<(&Request<'_>, &Value)>) -> Vec<(&'static str, String)> {
     let mut headers = vec![("anthropic-version", VERSION.to_owned())];
     if request.is_some_and(|(_, body)| body.get("fallbacks").is_some()) {
         headers.push(("anthropic-beta", FALLBACK_BETA.to_owned()));
@@ -128,13 +128,13 @@ fn tool_id(id: &str) -> String {
     if id.is_empty() { "call".to_owned() } else { id }
 }
 
-pub(crate) fn request_body(request: &Request, omitted: &[&str], base_url: &str) -> Value {
-    let mut messages = messages(&request.input);
+pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], base_url: &str) -> Value {
+    let mut messages = messages(request.input);
     let cache = !omitted.contains(&"cache_control");
     if cache {
         mark_last(&mut messages);
     }
-    let legacy = legacy(&request.model);
+    let legacy = legacy(request.model);
     let mut max_tokens = request.max_output_tokens.map_or(MAX_TOKENS, |m| m.min(MAX_TOKENS_CAP));
     let mut body = json!({ "model": request.model, "messages": messages, "stream": true });
     if let Some(instructions) = &request.instructions {
@@ -173,7 +173,7 @@ pub(crate) fn request_body(request: &Request, omitted: &[&str], base_url: &str) 
     }
     // A refusal by mistake (security work looks risky to a classifier)
     // goes to another model instead of ending the turn.
-    if base_url == API_BASE && FALLBACKS.contains(&request.model.as_str()) && !omitted.contains(&"fallbacks") {
+    if base_url == API_BASE && FALLBACKS.contains(&request.model) && !omitted.contains(&"fallbacks") {
         body["fallbacks"] = json!("default");
     }
     body["max_tokens"] = json!(max_tokens);
@@ -420,15 +420,19 @@ mod tests {
     use super::*;
     use crate::Tool;
 
-    fn request(model: &str, input: Vec<Item>) -> Request {
+    /// The tool every test request offers.
+    static TOOLS: std::sync::LazyLock<Vec<Tool>> =
+        std::sync::LazyLock::new(|| vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]);
+
+    fn request<'a>(model: &'a str, input: &'a [Item]) -> Request<'a> {
         Request {
-            model: model.into(),
-            instructions: Some("be brief".into()),
+            model,
+            instructions: Some("be brief"),
             input,
-            tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
+            tools: &TOOLS,
             reasoning_effort: Some(Effort::High),
             reasoning_summary: true,
-            session_id: Some("s".into()),
+            session_id: Some("s"),
             max_output_tokens: None,
         }
     }
@@ -461,7 +465,7 @@ mod tests {
             Item::Opaque(Opaque::new(Api::Responses, json!({ "type": "reasoning", "encrypted_content": "x" }))),
             Item::Assistant("Done.".into()),
         ];
-        let body = request_body(&request("claude-opus-5-5", input), &[], API_BASE);
+        let body = request_body(&request("claude-opus-5-5", &input), &[], API_BASE);
         let messages = body["messages"].as_array().unwrap();
         let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
@@ -478,50 +482,51 @@ mod tests {
 
     #[test]
     fn caches_the_system_prompt_and_the_conversation_so_far() {
-        let body = request_body(&request("claude-opus-5-5", vec![Item::User("hi".into())]), &[], API_BASE);
+        let body = request_body(&request("claude-opus-5-5", &[Item::User("hi".into())]), &[], API_BASE);
         assert_eq!(body["system"], json!([{ "type": "text", "text": "be brief", "cache_control": { "type": "ephemeral" } }]));
         assert_eq!(body["messages"][0]["content"][0]["cache_control"], json!({ "type": "ephemeral" }));
         assert_eq!(body["tools"][0], json!({ "name": "read", "description": "Read a file.", "input_schema": { "type": "object" } }));
         // A gateway that won't take the marks gets none.
-        let plain = request_body(&request("claude-opus-5-5", vec![Item::User("hi".into())]), &["cache_control"], API_BASE);
+        let plain = request_body(&request("claude-opus-5-5", &[Item::User("hi".into())]), &["cache_control"], API_BASE);
         assert!(!plain.to_string().contains("cache_control"));
     }
 
     #[test]
     fn thinks_adaptively_with_effort_or_with_a_budget_on_older_models() {
-        let body = request_body(&request("claude-opus-5-5", vec![Item::User("hi".into())]), &[], API_BASE);
+        let body = request_body(&request("claude-opus-5-5", &[Item::User("hi".into())]), &[], API_BASE);
         assert_eq!(body["thinking"], json!({ "type": "adaptive", "display": "summarized" }));
         assert_eq!(body["output_config"], json!({ "effort": "high" }));
         assert_eq!((body["max_tokens"].as_u64(), body["stream"].as_bool()), (Some(MAX_TOKENS), Some(true)));
         assert_eq!(body.get("temperature"), None);
 
-        let old = request_body(&request("claude-haiku-4-5", vec![Item::User("hi".into())]), &[], API_BASE);
+        let old = request_body(&request("claude-haiku-4-5", &[Item::User("hi".into())]), &[], API_BASE);
         assert_eq!(old["thinking"], json!({ "type": "enabled", "budget_tokens": 24_000 }));
         assert_eq!(old.get("output_config"), None);
         assert!(old["max_tokens"].as_u64().unwrap() > 24_000);
-        let mut quiet = request("claude-sonnet-4-5", vec![Item::User("hi".into())]);
+        let hi = [Item::User("hi".into())];
+        let mut quiet = request("claude-sonnet-4-5", &hi);
         quiet.reasoning_effort = None;
         assert_eq!(request_body(&quiet, &[], API_BASE).get("thinking"), None);
 
-        let mut big = request("claude-opus-5-5", vec![Item::User("hi".into())]);
+        let mut big = request("claude-opus-5-5", &hi);
         big.max_output_tokens = Some(128_000);
         assert_eq!(request_body(&big, &[], API_BASE)["max_tokens"], MAX_TOKENS_CAP);
-        let left_out = request_body(&request("claude-opus-5-5", vec![Item::User("hi".into())]), &["thinking.display", "output_config"], API_BASE);
+        let left_out = request_body(&request("claude-opus-5-5", &[Item::User("hi".into())]), &["thinking.display", "output_config"], API_BASE);
         assert_eq!((left_out["thinking"].clone(), left_out.get("output_config")), (json!({ "type": "adaptive" }), None));
     }
 
     #[test]
     fn asks_for_fallbacks_only_on_anthropics_own_api_for_models_that_have_them() {
-        let body = |model: &str, base: &str| request_body(&request(model, vec![Item::User("hi".into())]), &[], base);
+        let body = |model: &str, base: &str| request_body(&request(model, &[Item::User("hi".into())]), &[], base);
         assert_eq!(body("claude-opus-5-5", API_BASE)["fallbacks"], "default");
         assert_eq!(body("claude-haiku-5-5", API_BASE).get("fallbacks"), None);
         assert_eq!(body("claude-opus-5-5", "https://gateway.example/v1").get("fallbacks"), None);
         let with = body("claude-opus-5-5", API_BASE);
-        let headers = headers(Some((&request("claude-opus-5-5", vec![]), &with)));
+        let headers = headers(Some((&request("claude-opus-5-5", &[]), &with)));
         assert!(headers.contains(&("anthropic-beta", FALLBACK_BETA.to_owned())));
         assert!(headers.contains(&("anthropic-version", VERSION.to_owned())));
         let without = body("claude-haiku-5-5", API_BASE);
-        assert_eq!(super::headers(Some((&request("claude-haiku-5-5", vec![]), &without))).len(), 1);
+        assert_eq!(super::headers(Some((&request("claude-haiku-5-5", &[]), &without))).len(), 1);
     }
 
     #[test]

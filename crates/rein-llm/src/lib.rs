@@ -150,17 +150,19 @@ pub struct Usage {
 }
 
 /// One request to the model, in rein's terms; each [`Api`] has its own
-/// way of saying it.
-#[derive(Debug, Clone)]
-pub struct Request {
-    pub model: String,
+/// way of saying it. It borrows what it carries: the conversation can be
+/// hundreds of kilobytes, and nothing that reads a request needs its own
+/// copy of it.
+#[derive(Debug, Clone, Copy)]
+pub struct Request<'a> {
+    pub model: &'a str,
     /// The system prompt.
-    pub instructions: Option<String>,
+    pub instructions: Option<&'a str>,
     /// The whole conversation so far. Nothing is kept on the server, so
     /// every request carries it all.
-    pub input: Vec<Item>,
+    pub input: &'a [Item],
     /// The tools the model may call.
-    pub tools: Vec<Tool>,
+    pub tools: &'a [Tool],
     /// How hard the model thinks. `None` uses the model's default.
     pub reasoning_effort: Option<Effort>,
     /// Ask for short summaries of the model's reasoning as it thinks
@@ -169,7 +171,7 @@ pub struct Request {
     /// The same ID on every request of one conversation. Sign in with ChatGPT
     /// routes requests to its prompt cache by the `session-id` header, so
     /// without it nothing is ever cached; see [`new_session_id`].
-    pub session_id: Option<String>,
+    pub session_id: Option<&'a str>,
     /// The most the answer may take, where the format needs a number
     /// (Anthropic's does). `None` lets rein pick.
     pub max_output_tokens: Option<u64>,

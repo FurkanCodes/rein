@@ -15,7 +15,7 @@ use crate::compact;
 use crate::context;
 use crate::mentions;
 use crate::permissions::{Decision, Permissions};
-use crate::session::Session;
+use crate::session::{Loaded, Session};
 use crate::tools::{ToolName, Tools};
 
 /// After this many model turns in a row, stop and give the user control back.
@@ -37,7 +37,7 @@ pub enum Streamed<'a> {
 pub trait Model {
     /// Sends one request, passing what streams in to `on` as it arrives,
     /// and returns the finished items and the token counts.
-    fn respond(&self, request: &Request, on: &mut dyn FnMut(Streamed)) -> impl Future<Output = Result<(Vec<Item>, Usage)>>;
+    fn respond(&self, request: &Request<'_>, on: &mut dyn FnMut(Streamed)) -> impl Future<Output = Result<(Vec<Item>, Usage)>>;
 }
 
 /// The answer to "may this run?".
@@ -150,15 +150,15 @@ pub struct Compacted {
 }
 
 /// How full the conversation is, and what compaction needs to know.
-pub struct Window {
+struct Window {
     /// Compact once a request would carry more than this many tokens.
-    pub limit: u64,
+    limit: u64,
     /// The provider's token count for the last request, and how many
     /// history items that request carried.
-    pub measured: Option<(u64, usize)>,
+    measured: Option<(u64, usize)>,
     /// Everything said so far, compacted away or not: rein's record and
     /// `recall` work from it. It's never sent as is.
-    pub full: Vec<Item>,
+    full: Vec<Item>,
 }
 
 impl Default for Window {
@@ -178,26 +178,33 @@ pub enum Outcome {
     Stopped,
 }
 
+/// The agent: settings anyone may change (the public fields), and the
+/// conversation it's working in, which only its methods change, so what has
+/// to stay together does: the history, everything said, the session file,
+/// and what the window was last measured at.
 pub struct Agent<M> {
     pub model: M,
     pub tools: Tools,
     /// What may run without asking.
     pub permissions: Permissions,
     pub model_name: String,
-    pub instructions: Option<String>,
     pub reasoning_effort: Option<rein_llm::Effort>,
     /// The most one answer may take, when the model list says.
     pub max_output: Option<u64>,
+    /// The tools offered: the same in every request, so built once.
+    specs: Vec<Tool>,
+    /// The system prompt, the same for the whole conversation.
+    instructions: Option<String>,
     /// One ID for the whole conversation, so its requests share a prompt cache.
-    pub session_id: Option<String>,
+    session_id: Option<String>,
     /// The whole conversation. Every request sends all of it.
-    pub history: Vec<Item>,
+    history: Vec<Item>,
     /// Where the conversation is saved as it grows, if anywhere.
-    pub session: Option<Session>,
+    session: Option<Session>,
     /// What the model is told before the first message (see
     /// [`crate::context`]); it goes in when the first message does.
-    pub context: Option<String>,
-    pub window: Window,
+    context: Option<String>,
+    window: Window,
 }
 
 impl<M: Model> Agent<M> {
@@ -225,7 +232,7 @@ impl<M: Model> Agent<M> {
                 self.compact(None, false, ui).await?;
                 compacted = true;
             }
-            let request = self.request(self.history.clone());
+            let request = self.request(&self.history);
             let sent = self.history.len();
             ui.thinking();
             let (items, usage) = match self.model.respond(&request, &mut |streamed| stream_to(ui, streamed)).await {
@@ -492,7 +499,7 @@ impl<M: Model> Agent<M> {
             let mut input = self.history.clone();
             input.push(Item::User(compact::prompt(focus)));
             ui.thinking();
-            match self.model.respond(&self.request(input), &mut |streamed| stream_to(ui, streamed)).await {
+            match self.model.respond(&self.request(&input), &mut |streamed| stream_to(ui, streamed)).await {
                 Err(e) if tries == 0 && e.kind() == Some(ErrorKind::StaleThinking) => {
                     self.unbind()?;
                     tries += 1;
@@ -536,24 +543,94 @@ impl<M: Model> Agent<M> {
 }
 
 impl<M> Agent<M> {
+    /// An agent working in `conversation` (saved or new), compacting once a
+    /// request would carry `limit` tokens. `context` is what a new one tells
+    /// the model first.
+    pub fn new(model: M, tools: Tools, permissions: Permissions, model_name: String, limit: u64, conversation: Loaded, context: Option<String>) -> Self {
+        let header = conversation.session.header().clone();
+        Agent {
+            specs: tool_specs(&tools),
+            model,
+            tools,
+            permissions,
+            model_name,
+            reasoning_effort: None,
+            max_output: None,
+            instructions: header.instructions,
+            session_id: Some(header.id),
+            history: conversation.history,
+            session: Some(conversation.session),
+            context,
+            window: Window { limit, measured: None, full: conversation.full },
+        }
+    }
+
+    /// Moves to another conversation. The settings stay; what was only
+    /// true of the last one goes with it: what you said "always" to, and
+    /// the file changes there are to undo.
+    pub fn resume(&mut self, conversation: Loaded, context: Option<String>) {
+        let header = conversation.session.header().clone();
+        self.session_id = Some(header.id);
+        self.instructions = header.instructions;
+        self.history = conversation.history;
+        self.session = Some(conversation.session);
+        self.context = context;
+        self.window.full = conversation.full;
+        self.window.measured = None;
+        self.permissions.forget_approvals();
+        self.tools.forget_changes();
+    }
+
+    /// The same agent, in the same conversation, answered by `model`.
+    pub fn with_model<N>(self, model: N) -> Agent<N> {
+        let Agent { model: _, tools, permissions, model_name, reasoning_effort, max_output, specs, instructions, session_id, history, session, context, window } = self;
+        Agent { model, tools, permissions, model_name, reasoning_effort, max_output, specs, instructions, session_id, history, session, context, window }
+    }
+
+    /// Compact once a request would carry more than this many tokens.
+    pub fn limit(&self) -> u64 {
+        self.window.limit
+    }
+
+    pub fn set_limit(&mut self, limit: u64) {
+        self.window.limit = limit;
+    }
+
+    /// Everything said in the conversation, compacted away or not.
+    pub fn full(&self) -> &[Item] {
+        &self.window.full
+    }
+
+    /// The conversation's file, if it's saved.
+    pub fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
+    }
+
+    /// Saves that the conversation uses `model` from here on.
+    pub fn save_model(&mut self, model: &str) -> Result<()> {
+        match &mut self.session {
+            Some(session) => session.append_model(model),
+            None => Ok(()),
+        }
+    }
+
     /// The tools offered. `recall` is there from the start, though it only
     /// matters after a compaction: the tool list comes before everything
     /// else in a request, so changing it would lose the whole cache.
-    fn specs(&self) -> Vec<Tool> {
-        let mut specs = self.tools.specs();
-        specs.push(compact::recall_spec());
-        specs
+    fn specs(&self) -> &[Tool] {
+        &self.specs
     }
 
-    fn request(&self, input: Vec<Item>) -> Request {
+    /// A request carrying `input`, borrowed: nothing is copied.
+    fn request<'a>(&'a self, input: &'a [Item]) -> Request<'a> {
         Request {
-            model: self.model_name.clone(),
-            instructions: self.instructions.clone(),
+            model: &self.model_name,
+            instructions: self.instructions.as_deref(),
             input,
-            tools: self.specs(),
+            tools: &self.specs,
             reasoning_effort: self.reasoning_effort,
             reasoning_summary: true,
-            session_id: self.session_id.clone(),
+            session_id: self.session_id.as_deref(),
             max_output_tokens: self.max_output,
         }
     }
@@ -638,6 +715,15 @@ impl<M> Agent<M> {
     }
 }
 
+/// The tools offered. `recall` is there from the start, though it only
+/// matters after a compaction: the tool list comes before everything else
+/// in a request, so changing it would lose the whole cache.
+fn tool_specs(tools: &Tools) -> Vec<Tool> {
+    let mut specs = tools.specs();
+    specs.push(compact::recall_spec());
+    specs
+}
+
 /// A provider's API as a [`Model`], optionally saving every raw response
 /// stream to `record` for replay tests.
 pub struct Llm {
@@ -657,7 +743,7 @@ fn stream_to(ui: &mut impl Ui, streamed: Streamed) {
 const RETRY_WAITS: [u64; 3] = [1, 2, 4];
 
 impl Model for Llm {
-    async fn respond(&self, request: &Request, on: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
+    async fn respond(&self, request: &Request<'_>, on: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
         // Only the request itself is retried: once the answer has started,
         // trying again would show it twice.
         let mut waits = RETRY_WAITS.iter();
@@ -697,10 +783,25 @@ mod tests {
     use super::*;
     use crate::permissions::Mode;
 
+    /// What a test model kept of a request it was sent: requests borrow,
+    /// so it keeps its own copy.
+    #[derive(Clone)]
+    struct Seen {
+        input: Vec<Item>,
+        tools: Vec<Tool>,
+        session_id: Option<String>,
+    }
+
+    impl From<&Request<'_>> for Seen {
+        fn from(request: &Request<'_>) -> Self {
+            Seen { input: request.input.to_vec(), tools: request.tools.to_vec(), session_id: request.session_id.map(str::to_owned) }
+        }
+    }
+
     /// Plays back scripted turns and remembers every request it was sent.
     struct Scripted {
         turns: RefCell<VecDeque<Vec<Item>>>,
-        requests: RefCell<Vec<Request>>,
+        requests: RefCell<Vec<Seen>>,
     }
 
     impl Scripted {
@@ -710,8 +811,8 @@ mod tests {
     }
 
     impl Model for Scripted {
-        async fn respond(&self, request: &Request, on: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
-            self.requests.borrow_mut().push(request.clone());
+        async fn respond(&self, request: &Request<'_>, on: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
+            self.requests.borrow_mut().push(request.into());
             let items = self.turns.borrow_mut().pop_front().expect("the loop asked for more turns than scripted");
             for item in &items {
                 if let Item::Assistant(text) = item {
@@ -725,12 +826,12 @@ mod tests {
     /// Turns away any request carrying Claude thinking, as Anthropic does
     /// once the conversation before it has changed; answers the rest.
     struct Picky {
-        requests: RefCell<Vec<Request>>,
+        requests: RefCell<Vec<Seen>>,
     }
 
     impl Model for Picky {
-        async fn respond(&self, request: &Request, _: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
-            self.requests.borrow_mut().push(request.clone());
+        async fn respond(&self, request: &Request<'_>, _: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
+            self.requests.borrow_mut().push(request.into());
             if request.input.iter().any(|item| matches!(item, Item::Opaque(o) if o.bound())) {
                 let message = "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.";
                 return Err(Error::api(Some(400), Some("invalid_request_error".into()), message.into(), None));
@@ -742,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn thinking_the_provider_turns_away_is_dropped_and_the_turn_goes_on() {
         let thinking = Item::Opaque(rein_llm::Opaque::new(rein_llm::Api::Anthropic, json!({"type": "thinking", "thinking": "", "signature": "old"})));
-        let mut agent = base_with(agent("unbind", vec![]));
+        let mut agent = agent("unbind", vec![]).with_model(Picky { requests: RefCell::new(Vec::new()) });
         agent.history = vec![Item::User("first".into()), thinking.clone(), Item::Assistant("answer".into())];
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         assert_eq!(agent.send("next".into(), &mut person).await.unwrap(), Outcome::Done);
@@ -751,12 +852,6 @@ mod tests {
         assert!(requests[1].input.iter().all(|item| !matches!(item, Item::Opaque(o) if o.bound())));
         assert!(!agent.history.contains(&thinking));
         assert_eq!(agent.history.last(), Some(&Item::Assistant("ok".into())));
-    }
-
-    /// `agent`'s parts, for an agent with another model.
-    fn base_with(agent: Agent<Scripted>) -> Agent<Picky> {
-        let Agent { model: _, tools, permissions, model_name, instructions, reasoning_effort, max_output, session_id, history, session, context, window } = agent;
-        Agent { model: Picky { requests: RefCell::new(Vec::new()) }, tools, permissions, model_name, instructions, reasoning_effort, max_output, session_id, history, session, context, window }
     }
 
     /// Gives the same answer every time and keeps a log of what it saw.
@@ -961,9 +1056,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rein-agent-{}-{dir}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let tools = Tools::new(root);
         Agent {
             model: Scripted::new(turns),
-            tools: Tools::new(root),
+            specs: tool_specs(&tools),
+            tools,
             permissions: Permissions::default(),
             model_name: "m".into(),
             instructions: None,
@@ -1122,11 +1219,12 @@ mod tests {
         });
         let client = Client::new(rein_llm::reqwest::Client::new(), rein_llm::Api::Responses, format!("http://127.0.0.1:{port}"), rein_llm::Auth::Bearer("test".into()));
         let model = Llm { client, record: None };
+        let input = [Item::User("hi".into())];
         let request = Request {
-            model: "m".into(),
+            model: "m",
             instructions: None,
-            input: vec![Item::User("hi".into())],
-            tools: Vec::new(),
+            input: &input,
+            tools: &[],
             reasoning_effort: None,
             reasoning_summary: false,
             session_id: None,

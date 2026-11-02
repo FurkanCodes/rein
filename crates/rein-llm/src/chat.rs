@@ -82,7 +82,7 @@ fn tool_id(id: &str, quirks: Quirks) -> String {
         .collect()
 }
 
-pub(crate) fn request_body(request: &Request, omitted: &[&str], quirks: Quirks) -> Value {
+pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], quirks: Quirks) -> Value {
     let mut body = json!({ "model": request.model, "messages": messages(request, omitted, quirks), "stream": true });
     if !omitted.contains(&"stream_options") {
         // Without it, most servers don't say what the answer cost.
@@ -118,7 +118,7 @@ pub(crate) fn request_body(request: &Request, omitted: &[&str], quirks: Quirks) 
 /// rein's items as chat messages. What the model said, the reasoning it
 /// came with and the tools it called are one assistant message; each
 /// tool's result is a message of its own, right after.
-fn messages(request: &Request, omitted: &[&str], quirks: Quirks) -> Vec<Value> {
+fn messages(request: &Request<'_>, omitted: &[&str], quirks: Quirks) -> Vec<Value> {
     let mut messages = Vec::new();
     if let Some(instructions) = &request.instructions {
         messages.push(json!({ "role": "system", "content": instructions }));
@@ -142,7 +142,7 @@ fn messages(request: &Request, omitted: &[&str], quirks: Quirks) -> Vec<Value> {
             messages.push(Value::Object(message));
         }
     };
-    for item in &request.input {
+    for item in request.input {
         match item {
             Item::User(text) => {
                 end(&mut turn, &mut messages);
@@ -357,12 +357,16 @@ mod tests {
     use super::*;
     use crate::Tool;
 
-    fn request(input: Vec<Item>) -> Request {
+    /// The tool every test request offers.
+    static TOOLS: std::sync::LazyLock<Vec<Tool>> =
+        std::sync::LazyLock::new(|| vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]);
+
+    fn request(input: &[Item]) -> Request<'_> {
         Request {
-            model: "qwen3-coder".into(),
-            instructions: Some("be brief".into()),
+            model: "qwen3-coder",
+            instructions: Some("be brief"),
             input,
-            tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
+            tools: &TOOLS,
             reasoning_effort: Some(Effort::Max),
             reasoning_summary: true,
             session_id: None,
@@ -383,7 +387,7 @@ mod tests {
         let reasoning = Item::Opaque(Opaque::new(Api::Chat, json!({ "reasoning_content": "Let me look." })));
         let claude = Item::Opaque(Opaque::new(Api::Anthropic, json!({ "type": "thinking", "thinking": "", "signature": "s" })));
         let input = vec![Item::User("read a.rs".into()), claude, reasoning, Item::Assistant("Reading.".into()), call("c1"), call("c2"), result("c1"), result("c2"), Item::Assistant("Done.".into())];
-        let body = request_body(&request(input), &[], Quirks::default());
+        let body = request_body(&request(&input), &[], Quirks::default());
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[0], json!({ "role": "system", "content": "be brief" }));
         assert_eq!(messages[1], json!({ "role": "user", "content": "read a.rs" }));
@@ -405,23 +409,23 @@ mod tests {
     #[test]
     fn leaves_out_what_the_server_turned_away() {
         let reasoning = Item::Opaque(Opaque::new(Api::Chat, json!({ "reasoning_content": "hm" })));
-        let body = request_body(&request(vec![Item::User("hi".into()), reasoning, Item::Assistant("a".into())]), &["stream_options", "effort", "replay"], Quirks::default());
+        let body = request_body(&request(&[Item::User("hi".into()), reasoning, Item::Assistant("a".into())]), &["stream_options", "effort", "replay"], Quirks::default());
         let text = body.to_string();
         assert!(!text.contains("stream_options") && !text.contains("reasoning"), "{text}");
         // An assistant message of reasoning alone isn't sent.
         let lone = Item::Opaque(Opaque::new(Api::Chat, json!({ "reasoning_content": "hm" })));
-        let body = request_body(&request(vec![Item::User("hi".into()), lone, Item::User("again".into())]), &[], Quirks::default());
+        let body = request_body(&request(&[Item::User("hi".into()), lone, Item::User("again".into())]), &[], Quirks::default());
         assert_eq!(body["messages"].as_array().unwrap().len(), 3);
     }
 
     #[test]
     fn says_it_the_way_each_provider_needs() {
         let openrouter = Quirks { effort_object: true, ..Quirks::default() };
-        let body = request_body(&request(vec![Item::User("hi".into())]), &[], openrouter);
+        let body = request_body(&request(&[Item::User("hi".into())]), &[], openrouter);
         assert_eq!((body["reasoning"].clone(), body.get("reasoning_effort")), (json!({ "effort": "high" }), None));
 
         let mistral = Quirks { short_ids: true, tool_names: true, ..Quirks::default() };
-        let body = request_body(&request(vec![Item::User("hi".into()), call("toolu_01A09q90qw90lq917835lq9"), result("toolu_01A09q90qw90lq917835lq9")]), &[], mistral);
+        let body = request_body(&request(&[Item::User("hi".into()), call("toolu_01A09q90qw90lq917835lq9"), result("toolu_01A09q90qw90lq917835lq9")]), &[], mistral);
         let id = body["messages"][2]["tool_calls"][0]["id"].as_str().unwrap().to_owned();
         assert!(id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
         assert_eq!(body["messages"][3]["tool_call_id"], id.as_str(), "the result pairs with its call");

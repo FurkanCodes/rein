@@ -190,7 +190,7 @@ impl Client {
     }
 
     /// The format's own headers, for `body` when it's a request.
-    fn headers(&self, request: Option<(&Request, &Value)>) -> Vec<(&'static str, String)> {
+    fn headers(&self, request: Option<(&Request<'_>, &Value)>) -> Vec<(&'static str, String)> {
         match self.api {
             Api::Responses => openai::headers(request),
             Api::Anthropic => anthropic::headers(request),
@@ -198,7 +198,7 @@ impl Client {
         }
     }
 
-    fn body(&self, request: &Request, omitted: &[&str]) -> Value {
+    fn body(&self, request: &Request<'_>, omitted: &[&str]) -> Value {
         match self.api {
             Api::Responses => openai::request_body(request),
             Api::Anthropic => anthropic::request_body(request, omitted, &self.base_url),
@@ -216,26 +216,26 @@ impl Client {
         }
     }
 
-    fn decoder(&self, request: &Request) -> Box<dyn Decode> {
+    fn decoder(&self, request: &Request<'_>) -> Box<dyn Decode> {
         match self.api {
             Api::Responses => Box::new(openai::EventDecoder::default()),
-            Api::Anthropic => Box::new(anthropic::decoder(&request.model)),
+            Api::Anthropic => Box::new(anthropic::decoder(request.model)),
             Api::Chat => Box::new(chat::decoder()),
             Api::Gemini => Box::new(gemini::decoder()),
         }
     }
 
-    fn endpoint(&self, request: &Request) -> String {
+    fn endpoint(&self, request: &Request<'_>) -> String {
         match self.api {
             Api::Responses => format!("{}/responses", self.base_url),
             Api::Anthropic => format!("{}/messages", self.base_url),
             Api::Chat => format!("{}/chat/completions", self.base_url),
-            Api::Gemini => gemini::endpoint(&self.base_url, &request.model),
+            Api::Gemini => gemini::endpoint(&self.base_url, request.model),
         }
     }
 
     /// Sends the request and returns the answer as a stream of events.
-    pub async fn stream(&self, request: &Request) -> Result<ResponseStream> {
+    pub async fn stream(&self, request: &Request<'_>) -> Result<ResponseStream> {
         let mut omitted = self.omitted();
         loop {
             let body = self.body(request, &omitted);
@@ -255,7 +255,7 @@ impl Client {
     }
 
     /// Posts `body`, gzipped if it's worth it and the server takes it.
-    async fn send(&self, request: &Request, json: &Value, omitted: &[&str]) -> Result<reqwest::Response> {
+    async fn send(&self, request: &Request<'_>, json: &Value, omitted: &[&str]) -> Result<reqwest::Response> {
         let headers = self.headers(Some((request, json)));
         let body = serde_json::to_vec(json)?;
         let gzipped = (body.len() >= COMPRESS_FROM && !self.wire.off.load(Ordering::Relaxed)).then(|| gzip(&body)).flatten();
@@ -278,7 +278,7 @@ impl Client {
     }
 
     /// Posts `body`, or `gzipped` in its place when there is one.
-    async fn post(&self, request: &Request, headers: &[(&'static str, String)], body: &[u8], gzipped: Option<Vec<u8>>) -> Result<reqwest::Response> {
+    async fn post(&self, request: &Request<'_>, headers: &[(&'static str, String)], body: &[u8], gzipped: Option<Vec<u8>>) -> Result<reqwest::Response> {
         let mut builder = self
             .authorize(self.http.post(self.endpoint(request)))
             .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -421,7 +421,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None).with_idle_timeout(Duration::from_millis(300));
-        let request = Request { model: "m".into(), instructions: None, input: vec![], tools: vec![], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        let request = Request { model: "m", instructions: None, input: &[], tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
         let mut stream = client.stream(&request).await.unwrap();
         assert!(matches!(stream.next().await, Some(Ok(Event::TextDelta(_)))));
         let started = std::time::Instant::now();

@@ -19,10 +19,10 @@ pub const API_BASE: &str = "https://api.openai.com/v1";
 const NAMESPACE: &str = "rein";
 
 /// The headers a request needs besides the body.
-pub(crate) fn headers(request: Option<(&Request, &Value)>) -> Vec<(&'static str, String)> {
+pub(crate) fn headers(request: Option<(&Request<'_>, &Value)>) -> Vec<(&'static str, String)> {
     // The prompt cache follows this header, not `prompt_cache_key`: the
     // server replaces that with a random key on every request.
-    request.and_then(|(request, _)| request.session_id.clone()).map(|id| ("session-id", id)).into_iter().collect()
+    request.and_then(|(request, _)| request.session_id).map(|id| ("session-id", id.to_owned())).into_iter().collect()
 }
 
 /// The models this credential can use, in the server's order.
@@ -30,7 +30,7 @@ pub(crate) async fn models(client: &Client) -> Result<Vec<ModelInfo>> {
     Ok(parse_models(&client.get("models").await?))
 }
 
-pub(crate) fn request_body(request: &Request) -> Value {
+pub(crate) fn request_body(request: &Request<'_>) -> Value {
     // Only what the Responses API can read: another format's reasoning
     // means nothing here.
     let input: Vec<Value> = request.input.iter().filter(|item| !matches!(item, Item::Opaque(o) if o.api != Api::Responses)).map(item_json).collect();
@@ -181,11 +181,12 @@ mod tests {
 
     #[test]
     fn request_body_has_only_fields_both_billing_paths_accept() {
+        let input = [Item::User("hi".into()), Item::Assistant("hello".into()), Item::User("bye".into())];
         let request = Request {
-            model: "m".into(),
-            instructions: Some("be brief".into()),
-            input: vec![Item::User("hi".into()), Item::Assistant("hello".into()), Item::User("bye".into())],
-            tools: vec![],
+            model: "m",
+            instructions: Some("be brief"),
+            input: &input,
+            tools: &[],
             reasoning_effort: Some(crate::Effort::Low),
             reasoning_summary: false,
             session_id: None,
@@ -211,18 +212,20 @@ mod tests {
     #[test]
     fn tools_go_in_a_namespace_and_calls_round_trip() {
         let call = ToolCall { call_id: "call_1".into(), name: "read".into(), arguments: r#"{"path":"a.rs"}"#.into() };
-        let request = Request {
-            model: "m".into(),
-            instructions: None,
-            input: vec![
+        let tools = [Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }];
+        let input = [
                 Item::User("open a.rs".into()),
                 Item::Opaque(Opaque::new(Api::Responses, json!({"type": "reasoning", "encrypted_content": "xyz"}))),
                 // Claude's thinking means nothing to OpenAI: it stays out.
                 Item::Opaque(Opaque::new(Api::Anthropic, json!({"type": "thinking", "thinking": "", "signature": "s"}))),
                 Item::ToolCall(call.clone()),
                 Item::ToolResult { call_id: "call_1".into(), output: "fn main() {}".into() },
-            ],
-            tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
+        ];
+        let request = Request {
+            model: "m",
+            instructions: None,
+            input: &input,
+            tools: &tools,
             reasoning_effort: None,
             reasoning_summary: false,
             session_id: None,
