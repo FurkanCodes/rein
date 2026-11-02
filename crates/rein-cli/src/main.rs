@@ -674,6 +674,7 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             for keys in [
                 "shift-enter, ctrl-j or \\ at the end starts a new line · shift-tab changes the mode",
                 "↑ brings back what you sent before, from this folder · ctrl-r finds it by its words",
+                "@ points at a file or folder: it's read with your message · @file:10-20 for some lines",
                 "enter while rein works steers it: your message goes in at its next step",
                 "tab while rein works sends it after the turn instead · esc or ctrl-c stops the turn",
                 "wheel, pgup/pgdn or shift-↑↓ scroll · drag over text to copy it",
@@ -966,7 +967,32 @@ struct Terminal {
     compacting: bool,
     /// It's been said that requests go uncompressed.
     said_uncompressed: bool,
+    /// The reads on screen as one line, which the next joins if nothing
+    /// came between.
+    reads: Option<Reads>,
+    /// The key the next run of reads is shown under.
+    next_key: u64,
     turn: TurnStats,
+}
+
+/// A run of reads, shown as one line.
+struct Reads {
+    key: u64,
+    lead: String,
+    /// The first read: alone, the run looks like any step.
+    first: ToolCall,
+    paths: Vec<String>,
+    statuses: Vec<String>,
+}
+
+impl Reads {
+    fn draw(&self, s: Style) -> ui::transcript::Draw {
+        let (lead, first, paths, statuses) = (self.lead.clone(), self.first.clone(), self.paths.clone(), self.statuses.clone());
+        Box::new(move |width| {
+            let dot = s.green("●");
+            vec![if paths.len() == 1 { steps::line(&first, &lead, &dot, &statuses[0], s, width) } else { steps::reads_line(&paths, &statuses, &lead, &dot, s, width) }]
+        })
+    }
 }
 
 struct Answer {
@@ -1002,6 +1028,7 @@ impl Terminal {
     fn new(root: PathBuf, mode: Mode, pinned: bool, history: History, bell: bool) -> Terminal {
         let mode = mode_name(mode);
         let interrupted: std::sync::Arc<tokio::sync::Notify> = Default::default();
+        let input = Input::start(pinned, interrupted.clone(), history, bell, root.clone());
         Terminal {
             out: Style::stdout(),
             err: Style::stderr(),
@@ -1010,7 +1037,7 @@ impl Terminal {
             model: String::new(),
             effort: None,
             mode,
-            input: Input::start(pinned, interrupted.clone(), history, bell),
+            input,
             interrupted,
             context_limit: compact::DEFAULT_LIMIT,
             context_used: 0,
@@ -1029,6 +1056,8 @@ impl Terminal {
             plan: Vec::new(),
             compacting: false,
             said_uncompressed: false,
+            reads: None,
+            next_key: 0,
             turn: TurnStats::default(),
         }
     }
@@ -1120,6 +1149,7 @@ impl Terminal {
     fn end_turn(&mut self) {
         self.end_line();
         self.input.busy(None, std::time::Instant::now());
+        self.input.look_for_paths();
         self.turn.took = self.turn.started.map(|t| t.elapsed());
         if let Some(cache) = (self.turn.cached * 100).checked_div(self.turn.input) {
             self.last_cache = Some(cache);
@@ -1188,6 +1218,25 @@ impl Terminal {
     /// full screen they're laid out again whenever the width changes.
     fn show(&self, draw: impl Fn(usize) -> Vec<String> + Send + 'static) {
         ui::screen::show(Box::new(draw));
+    }
+
+    /// A read that went well: it joins the reads on screen just before it,
+    /// if nothing came between, or starts a run of its own.
+    fn show_read(&mut self, call: &ToolCall, status: String, lead: String) {
+        let s = self.err;
+        let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).unwrap_or_default();
+        let path = args["path"].as_str().unwrap_or_default().to_owned();
+        if let Some(reads) = &mut self.reads {
+            reads.paths.push(path.clone());
+            reads.statuses.push(status.clone());
+            if ui::screen::redraw(reads.key, reads.draw(s)) {
+                return;
+            }
+        }
+        self.next_key += 1;
+        let reads = Reads { key: self.next_key, lead, first: call.clone(), paths: vec![path], statuses: vec![status] };
+        ui::screen::show_as(reads.key, reads.draw(s));
+        self.reads = Some(reads);
     }
 
     /// Prints a step's line before its question, with the change it would
@@ -1441,6 +1490,12 @@ impl Ui for Terminal {
             }
         };
         let note = self.noted.take().map(|note| format!("{}{} {}", " ".repeat(steps::INDENT), s.green("✓"), s.dim(&note)));
+        // Reads in a row share a line.
+        if call.name == "read" && outcome.ok == Some(true) && note.is_none() && let Some(lead) = lead.clone() {
+            self.show_read(call, outcome.status, lead);
+            self.after_step = true;
+            return;
+        }
         // An edit made without asking shows what it changed; a question
         // showed it already. A new file's whole text is Ctrl-O away.
         let diff = if !asked && call.name == "edit" && outcome.ok == Some(true) { steps::diff_box(call, &self.root, s, WIDE, true) } else { Vec::new() };
@@ -1466,6 +1521,39 @@ impl Ui for Terminal {
         if self.input.pinned() {
             self.input.set_bar(self.bar());
         }
+    }
+
+    /// Lookups asked for together: one line over the box says so.
+    fn tools_started(&mut self, calls: &[ToolCall]) {
+        self.end_line();
+        self.gap_before_step();
+        self.step = None;
+        let reads = calls.iter().all(|call| call.name == "read");
+        self.doing(&if reads { format!("Reading {} files", calls.len()) } else { format!("Looking at {} things at once", calls.len()) });
+    }
+
+    /// What your message pointed at, under it: in rein's column, without
+    /// rein's label, as you're the one who asked.
+    fn attached(&mut self, call: &ToolCall, output: &str) {
+        self.end_line();
+        let s = self.err;
+        let outcome = steps::outcome(call, output, s);
+        if self.input.pinned() {
+            let (name, target) = steps::describe(call);
+            self.input.keep_output(format!("{name}  {target} · {}", strip(&outcome.status)), output);
+        }
+        let lead = " ".repeat(GUTTER);
+        if call.name == "read" && outcome.ok == Some(true) {
+            self.show_read(call, outcome.status, lead);
+            return;
+        }
+        let dot = if outcome.ok == Some(false) { s.red("●") } else { s.green("●") };
+        let (call_, viewer) = (call.clone(), self.input.pinned());
+        self.show(move |width| {
+            let mut lines = vec![steps::line(&call_, &lead, &dot, &outcome.status, s, width)];
+            lines.extend(steps::detail_lines(&outcome, s, width, viewer));
+            lines
+        });
     }
 
     fn steering(&mut self) -> Vec<String> {

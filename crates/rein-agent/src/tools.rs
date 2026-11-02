@@ -140,6 +140,11 @@ impl Tools {
         }
     }
 
+    /// The project folder.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self

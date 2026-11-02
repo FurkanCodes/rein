@@ -382,6 +382,16 @@ fn ignored(rules: &[Rule], path: &str, name: &str, folder: bool) -> bool {
     ignored
 }
 
+/// Every file and folder in the project the `.gitignore` files don't leave
+/// out, relative to `root`, folders ending in `/`: what `@` can point at.
+pub fn paths(root: &Path) -> Vec<String> {
+    let files = walk(root, root);
+    let mut folders: Vec<String> = files.iter().flat_map(|file| file.match_indices('/').map(|(i, _)| file[..=i].to_owned())).collect();
+    folders.sort();
+    folders.dedup();
+    files.into_iter().chain(folders).collect()
+}
+
 /// Every file under `start` that the `.gitignore` files don't leave out,
 /// relative to `root`, sorted. The rules of the folders above `start` count
 /// too, from the root down, and so does the repository's own
@@ -478,6 +488,12 @@ mod tests {
         assert_eq!(walk(&root, &root), [".github/ci.yml", ".gitignore", "docs/deep/page.html", "keep.log", "src/.gitignore", "src/main.rs", "sub/only-top.txt"]);
         // Starting further down, the rules above still count.
         assert_eq!(walk(&root, &root.join("src")), ["src/.gitignore", "src/main.rs"]);
+    }
+
+    #[test]
+    fn lists_what_can_be_pointed_at() {
+        let root = project("paths", &[("Cargo.toml", ""), ("src/ui/box.rs", ""), ("src/main.rs", ""), (".gitignore", "target/\n"), ("target/x", "")]);
+        assert_eq!(paths(&root), [".gitignore", "Cargo.toml", "src/main.rs", "src/ui/box.rs", "src/", "src/ui/"]);
     }
 
     #[test]

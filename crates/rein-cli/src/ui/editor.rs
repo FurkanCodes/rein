@@ -145,6 +145,27 @@ impl Editor {
         text
     }
 
+    /// The `@` word the cursor is at the end of, if it's at one: where it
+    /// starts, and what's typed after the `@`.
+    pub fn mention(&self) -> Option<(usize, String)> {
+        let start = self.text[..self.cursor].iter().rposition(|c| c.is_whitespace()).map_or(0, |i| i + 1);
+        let at_end = self.text.get(self.cursor).is_none_or(|c| c.is_whitespace());
+        (self.text.get(start) == Some(&'@') && at_end).then(|| (start, self.text[start + 1..self.cursor].iter().collect()))
+    }
+
+    /// Puts `@path` in place of the `@` word being typed: with a space
+    /// after a file, to go on with the message, and none after a folder,
+    /// to go on into it.
+    pub fn complete_mention(&mut self, path: &str) {
+        let Some((start, _)) = self.mention() else { return };
+        let space = if path.ends_with('/') { "" } else { " " };
+        let new: Vec<char> = format!("@{path}{space}").chars().collect();
+        let end = self.cursor;
+        self.cursor = start + new.len();
+        self.text.splice(start..end, new);
+        self.browsing = None;
+    }
+
     /// Keeps a message sent, as the newest for ↑.
     pub fn remember(&mut self, entry: Entry) {
         self.history.add(entry);
@@ -441,6 +462,23 @@ mod tests {
         // A short paste is just text.
         e.key(&Key::Paste("two\nlines".into()));
         assert_eq!(e.layout(80).0, ["look: two", "lines"]);
+    }
+
+    #[test]
+    fn completes_what_an_at_points_at() {
+        let mut e = Editor::default();
+        typed(&mut e, "why does @src/pa");
+        assert_eq!(e.mention(), Some((9, "src/pa".into())));
+        e.complete_mention("src/parser.rs");
+        assert_eq!(e.text(), "why does @src/parser.rs ");
+        assert_eq!(e.mention(), None, "the space ends it");
+        typed(&mut e, "and @s");
+        e.complete_mention("src/");
+        typed(&mut e, "ui");
+        assert_eq!(e.mention(), Some((28, "src/ui".into())), "a folder goes on");
+        let mut mail = Editor::default();
+        typed(&mut mail, "me@example");
+        assert_eq!(mail.mention(), None, "not at the start of a word");
     }
 
     #[test]

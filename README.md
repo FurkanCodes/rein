@@ -70,6 +70,7 @@ message, so typing ahead can't answer it by accident.
 | Ctrl-R | find something you sent before by its words: ↑↓ or Ctrl-R pick, Enter puts it in the box to change or send, Esc goes back |
 | Shift-Enter, Ctrl-J, or `\` at the end of a line | a new line in your message (Shift-Enter where the terminal tells it apart from Enter) |
 | `/` | the commands that match, as you type: ↑↓ pick one, Tab completes it, Enter runs it. `/help` lists them |
+| `@` | the project's files and folders that match, as you type, letters in order (`@prsr` finds `src/parser.rs`): ↑↓ pick, Tab puts the path in, Esc closes the list. What you point at goes with your message |
 | Shift-Tab | the next mode: ask → edits → read-only |
 | Enter while rein works | steer it: your message goes into the turn at its next step, and steps rein had planned but not started are skipped. Commands wait for the end of the turn |
 | Tab while rein works | send your message after the turn instead. Esc puts what's waiting back in the box |
@@ -158,7 +159,22 @@ file.
 
 Nothing is uploaded up front: no files, no folder listing. The model asks
 for what it needs with `read`, `grep` and `glob`, and gets it back as text,
-as part of the conversation. Each request carries the whole conversation,
+as part of the conversation, or you point at it with `@` in your message:
+
+```text
+why does @src/parser.rs panic?      the file, read with your message
+look at @src/parser.rs:120-180      those lines (or #L120-L180)
+what's in @src/ui/?                 the folder's files
+```
+
+What you point at is read for you, as a `read` step under your message, so
+the model starts with it instead of spending a round trip on it. A file the
+conversation already holds as it is now goes as a one-line note instead of a
+second copy, and a file in a folder with its own AGENTS.md brings that along,
+once. `@alice` is just a word unless there's a file called that; a path that
+isn't there says so. Reads the model asks for together run at once, and a
+run of reads shows as one line, names and all: `● Read  a.rs, b.rs +2  4
+files · 612 lines`. Each request carries the whole conversation,
 since the server keeps none of it, so a long one sends the same hundreds of
 kilobytes again and again.
 

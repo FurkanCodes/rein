@@ -129,6 +129,32 @@ pub fn show(draw: Draw) {
     render(&mut state);
 }
 
+/// Like [`show`], under `key`, so [`redraw`] can draw it again in place.
+pub fn show_as(key: u64, draw: Draw) {
+    let full = state().full;
+    if !full {
+        show(draw);
+        return;
+    }
+    let _guard = lock();
+    let mut state = state();
+    state.transcript.draw_as(Some(key), draw);
+    render(&mut state);
+}
+
+/// Draws what was shown under `key` again, in place, if nothing has been
+/// shown since: a run of steps becoming one line. Says whether it could;
+/// without the full screen, what's printed stays printed.
+pub fn redraw(key: u64, draw: Draw) -> bool {
+    let _guard = lock();
+    let mut state = state();
+    if !state.full || !state.transcript.redraw(key, draw) {
+        return false;
+    }
+    render(&mut state);
+    true
+}
+
 /// Scrolls the conversation by `rows`, back for negative.
 pub fn scroll(rows: isize) {
     let _guard = lock();

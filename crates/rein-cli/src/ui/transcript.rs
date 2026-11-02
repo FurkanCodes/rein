@@ -25,8 +25,9 @@ pub type Draw = Box<dyn Fn(usize) -> Vec<String> + Send>;
 enum Block {
     /// A line of text, wrapped at the width.
     Text(String),
-    /// Lines laid out by a function, like a step and its details.
-    Drawn(Draw),
+    /// Lines laid out by a function, like a step and its details. One
+    /// drawn under a key can be drawn again in place, while it's last.
+    Drawn(Draw, Option<u64>),
 }
 
 #[derive(Default)]
@@ -38,6 +39,8 @@ pub struct Transcript {
     rows: Vec<Row>,
     /// How many blocks `rows` holds.
     laid_out: usize,
+    /// How many of `rows` the last of them made.
+    last_rows: usize,
     width: usize,
 }
 
@@ -57,11 +60,34 @@ impl Transcript {
 
     /// Lines that lay themselves out, after whatever is being written.
     pub fn draw(&mut self, draw: Draw) {
+        self.draw_as(None, draw);
+    }
+
+    /// The same, under `key`, for [`Transcript::redraw`].
+    pub fn draw_as(&mut self, key: Option<u64>, draw: Draw) {
         if !self.open.is_empty() {
             let line = std::mem::take(&mut self.open);
             self.blocks.push(Block::Text(line));
         }
-        self.blocks.push(Block::Drawn(draw));
+        self.blocks.push(Block::Drawn(draw, key));
+    }
+
+    /// Draws the block under `key` again, with `draw`, if nothing has come
+    /// after it. Says whether it could.
+    pub fn redraw(&mut self, key: u64, draw: Draw) -> bool {
+        let last = matches!(self.blocks.last(), Some(Block::Drawn(_, Some(k))) if *k == key);
+        if !last || !self.open.is_empty() {
+            return false;
+        }
+        if let Some(block) = self.blocks.last_mut() {
+            *block = Block::Drawn(draw, Some(key));
+        }
+        // Its rows are laid out again, and only its.
+        if self.laid_out == self.blocks.len() {
+            self.rows.truncate(self.rows.len() - self.last_rows);
+            self.laid_out -= 1;
+        }
+        true
     }
 
     /// How many blocks there are, to show the ones after it later.
@@ -78,7 +104,9 @@ impl Transcript {
             self.laid_out = 0;
         }
         for block in &self.blocks[self.laid_out..] {
-            self.rows.extend(lay_out(block, width));
+            let rows = lay_out(block, width);
+            self.last_rows = rows.len();
+            self.rows.extend(rows);
         }
         self.laid_out = self.blocks.len();
         let open = if self.open.is_empty() { Vec::new() } else { text_rows(&self.open, width) };
@@ -106,7 +134,7 @@ impl Transcript {
 fn lay_out(block: &Block, width: usize) -> Vec<Row> {
     match block {
         Block::Text(line) => text_rows(line, width),
-        Block::Drawn(draw) => {
+        Block::Drawn(draw, _) => {
             draw(width).into_iter().flat_map(|line| line.split('\n').map(|l| fit(l, width)).collect::<Vec<_>>()).map(|text| Row { text, wrapped: false }).collect()
         }
     }
@@ -261,6 +289,19 @@ mod tests {
         let (rows, open) = t.rows(40);
         assert_eq!(shown(rows), ["rein   half a line", "step 40"]);
         assert!(open.is_empty());
+    }
+
+    #[test]
+    fn a_drawn_block_is_drawn_again_while_its_last() {
+        let mut t = Transcript::default();
+        t.draw_as(Some(7), Box::new(|_| vec!["read a.rs".into()]));
+        let _ = t.rows(40);
+        assert!(t.redraw(7, Box::new(|_| vec!["read a.rs, b.rs".into(), "two rows".into()])));
+        assert_eq!(shown(t.rows(40).0), ["read a.rs, b.rs", "two rows"], "its rows were laid out again, no others");
+        assert!(!t.redraw(8, Box::new(|_| Vec::new())), "another key");
+        t.write("rein   then words\n");
+        assert!(!t.redraw(7, Box::new(|_| vec!["read a.rs, b.rs, c.rs".into()])), "something came after it");
+        assert_eq!(shown(t.rows(40).0), ["read a.rs, b.rs", "two rows", "rein   then words"]);
     }
 
     #[test]

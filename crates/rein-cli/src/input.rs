@@ -17,11 +17,13 @@
 //! otherwise it reads plain lines, so piping into rein works.
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::commands;
 use crate::ui::editor::{Action, Editor, Entry};
+use crate::ui::fuzzy;
 use crate::ui::history::{self, History};
 use crate::ui::keys::{Key, Keys};
 use crate::ui::screen::{self, Bottom, Drag, Pinned, Raw, Tone};
@@ -111,6 +113,8 @@ pub struct Input {
     boxed: Option<Arc<Mutex<Boxed>>>,
     /// Puts the keyboard back when rein ends.
     _raw: Option<Raw>,
+    /// The project.
+    root: PathBuf,
 }
 
 /// The box, shared by the keyboard's thread, the clock's and the rest of rein.
@@ -144,6 +148,11 @@ struct Boxed {
     viewer: Option<Viewer>,
     /// Ctrl-R, while it's finding a message.
     search: Option<Search>,
+    /// What `@` can point at in the project, files and folders, as last
+    /// looked at.
+    paths: Vec<String>,
+    /// The `@` word Esc closed the list for.
+    dismissed: Option<String>,
     /// Whether the window is in front, once the terminal has said.
     focused: Option<bool>,
     /// When you last pressed a key, scrolled or clicked.
@@ -185,6 +194,18 @@ impl Boxed {
             return Vec::new();
         }
         commands::matching(&self.editor.text())
+    }
+
+    /// The paths that match the `@` word being typed, best first: none
+    /// without one, or once Esc closed the list for it.
+    fn mention_menu(&self) -> Vec<String> {
+        if self.waiting == Waiting::Answer || self.search.is_some() {
+            return Vec::new();
+        }
+        match self.editor.mention() {
+            Some((_, typed)) if self.dismissed.as_ref() != Some(&typed) => fuzzy::best(&typed, &self.paths, 50).into_iter().map(str::to_owned).collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// Picks the command named exactly, or else the first.
@@ -309,6 +330,22 @@ impl Boxed {
         let s = Style::stderr();
         if let Some(search) = &self.search {
             return self.found(search);
+        }
+        let found = self.mention_menu();
+        if !found.is_empty() {
+            let first = (self.picked + 1).saturating_sub(MENU_LINES);
+            let mut lines: Vec<String> = found
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(MENU_LINES)
+                .map(|(i, path)| if i == self.picked { format!(" {} {}", s.blue("›"), s.bold(&s.blue(path))) } else { format!("   {path}") })
+                .collect();
+            let hidden = found.len().saturating_sub(first + MENU_LINES);
+            if hidden > 0 {
+                lines.push(s.dim(&format!("   … {hidden} more")));
+            }
+            return lines;
         }
         if let Some((note, _)) = &self.notice {
             return vec![format!(" {}", s.yellow(note))];
@@ -524,8 +561,28 @@ impl Boxed {
         // A question too new to take keys: they go to the box, as typing ahead.
         let waiting = if self.waiting == Waiting::Answer && self.asking.is_some() { Waiting::Nothing } else { self.waiting };
         let menu = self.menu();
+        let found = self.mention_menu();
+        let pick = found.get(self.picked.min(found.len().saturating_sub(1))).cloned();
+        let typed = self.editor.mention().map(|(_, typed)| typed);
         let mut edited = true;
         match (waiting, &key) {
+            // The paths that match an `@` word: Esc closes the list, the
+            // arrows pick, Tab puts the path in; so does Enter, unless it's
+            // typed out already, and then Enter sends.
+            (_, Key::Esc) if !found.is_empty() => {
+                self.dismissed = typed;
+                edited = false;
+            }
+            (_, Key::Up | Key::BackTab) if !found.is_empty() => {
+                self.picked = (self.picked + found.len() - 1) % found.len();
+                edited = false;
+            }
+            (_, Key::Down) if !found.is_empty() => {
+                self.picked = (self.picked + 1) % found.len();
+                edited = false;
+            }
+            (_, Key::Tab) if !found.is_empty() => self.editor.complete_mention(&pick.unwrap_or_default()),
+            (_, Key::Enter) if !found.is_empty() && pick != typed => self.editor.complete_mention(&pick.unwrap_or_default()),
             (Waiting::Nothing, Key::CtrlC | Key::Esc) => {
                 // What was waiting comes back to the box, to change or send.
                 let mut waiting: Vec<String> = std::mem::take(&mut self.steering);
@@ -631,6 +688,7 @@ impl Boxed {
     /// Takes the message out of the box: kept for ↑, and how the box showed
     /// it kept for the conversation.
     fn take_message(&mut self, waiting: Waiting) -> String {
+        self.dismissed = None;
         screen::follow();
         let entry = self.editor.entry();
         let shown = entry.shown();
@@ -803,6 +861,17 @@ fn marked(text: &str, words: &[String], s: Style, picked: bool) -> String {
     out
 }
 
+/// Lists what `@` can point at in `root`, on a thread of its own, as a big
+/// project takes a moment.
+fn look_for_paths(boxed: std::sync::Weak<Mutex<Boxed>>, root: PathBuf) {
+    std::thread::spawn(move || {
+        let paths = rein_agent::search::paths(&root);
+        if let Some(boxed) = boxed.upgrade() {
+            locked(&boxed).paths = paths;
+        }
+    });
+}
+
 /// `↑ 3 more lines`, or nothing for none.
 fn more(count: usize, arrow: &str) -> String {
     match count {
@@ -820,9 +889,10 @@ fn seconds(elapsed: Duration) -> String {
 
 impl Input {
     /// `pinned` asks for the input box, which needs a terminal all round.
-    /// `history` is what you sent before, for ↑ and Ctrl-R, and `bell`
-    /// says whether to ring when rein needs you and you're away.
-    pub fn start(pinned: bool, interrupted: Arc<tokio::sync::Notify>, history: History, bell: bool) -> Self {
+    /// `history` is what you sent before, for ↑ and Ctrl-R, `bell` says
+    /// whether to ring when rein needs you and you're away, and `root` is
+    /// the project, whose files `@` points at.
+    pub fn start(pinned: bool, interrupted: Arc<tokio::sync::Notify>, history: History, bell: bool, root: PathBuf) -> Self {
         let (requests, asked) = std::sync::mpsc::channel::<String>();
         let (tx, replies) = tokio::sync::mpsc::unbounded_channel();
         let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
@@ -845,6 +915,8 @@ impl Input {
                 outputs: Vec::new(),
                 viewer: None,
                 search: None,
+                paths: Vec::new(),
+                dismissed: None,
                 focused: None,
                 touched: Instant::now(),
                 bell,
@@ -867,6 +939,7 @@ impl Input {
                     }
                 });
             }
+            look_for_paths(Arc::downgrade(&boxed), root.clone());
             let clock = Arc::downgrade(&boxed);
             std::thread::spawn(move || {
                 while let Some(boxed) = clock.upgrade() {
@@ -886,7 +959,7 @@ impl Input {
                     }
                 }
             });
-            return Input { requests, replies, pending: false, boxed: Some(boxed), _raw: Some(raw) };
+            return Input { requests, replies, pending: false, boxed: Some(boxed), _raw: Some(raw), root };
         }
         std::thread::spawn(move || {
             for prompt in asked {
@@ -901,7 +974,15 @@ impl Input {
                 }
             }
         });
-        Input { requests, replies, pending: false, boxed: None, _raw: None }
+        Input { requests, replies, pending: false, boxed: None, _raw: None, root }
+    }
+
+    /// Looks again at what `@` can point at: a turn may have made or
+    /// removed files.
+    pub fn look_for_paths(&self) {
+        if let Some(boxed) = &self.boxed {
+            look_for_paths(Arc::downgrade(boxed), self.root.clone());
+        }
     }
 
     pub fn pinned(&self) -> bool {

@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod compact;
 pub mod context;
+pub mod mentions;
 pub mod permissions;
 pub mod prompt;
 pub mod search;

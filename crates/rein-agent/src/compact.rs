@@ -34,7 +34,12 @@ pub const DEFAULT_LIMIT: u64 = 150_000;
 pub const KEEP_RECENT: u64 = 20_000;
 
 /// What retired tool output is replaced with starts with this.
-const RETIRED: &str = "[removed to save space:";
+pub const RETIRED: &str = "[removed to save space:";
+
+/// How a read starts when the file hadn't changed since an earlier one: it
+/// points at that copy, so retiring the copy would leave it pointing at
+/// nothing.
+pub const UNCHANGED: &str = "[unchanged:";
 
 /// What a summary message starts with.
 const SUMMARY: &str = "<summary>";
@@ -122,6 +127,13 @@ fn exit_code(output: &str) -> Option<&str> {
 /// as there's nothing to gain.
 pub fn stale(history: &[Item]) -> Vec<(String, String)> {
     let calls = calls(history);
+    let notes: std::collections::HashSet<&str> = history
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult { call_id, output } if output.starts_with(UNCHANGED) => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
     let typed: Vec<usize> = history.iter().enumerate().filter(|(_, item)| typed(item).is_some()).map(|(i, _)| i).collect();
     // Commands before the second-to-last message are old news.
     let recent = if typed.len() >= 2 { typed[typed.len() - 2] } else { 0 };
@@ -135,9 +147,9 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
         match (call.name.as_str(), &call.path, &call.command) {
             ("read", Some(path), _) => {
                 // Read again or changed: a search in it doesn't count.
-                let touched_later = calls
-                    .values()
-                    .any(|(j, later)| *j > i && later.path.as_ref() == Some(path) && matches!(later.name.as_str(), "read" | "write" | "edit"));
+                let touched_later = calls.iter().any(|(id, (j, later))| {
+                    *j > i && later.path.as_ref() == Some(path) && matches!(later.name.as_str(), "read" | "write" | "edit") && !notes.contains(id)
+                });
                 if touched_later {
                     retired.push((
                         call_id.clone(),
@@ -432,6 +444,19 @@ mod tests {
         let mut history = history;
         retire(&mut history, &retired);
         assert!(stale(&history).is_empty(), "retiring twice changes nothing");
+    }
+
+    #[test]
+    fn keeps_the_copy_a_later_note_points_to() {
+        let history = vec![
+            Item::User("look at @a.py".into()),
+            call("r1", "read", json!({"path": "a.py"})),
+            result("r1", &big("a")),
+            Item::User("again @a.py".into()),
+            call("r2", "read", json!({"path": "a.py"})),
+            result("r2", &format!("{UNCHANGED} a.py is as it was when it was last read in this conversation, so that copy is current.]")),
+        ];
+        assert!(stale(&history).is_empty(), "the note isn't a fresh copy, so the first read stays");
     }
 
     #[test]

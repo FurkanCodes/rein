@@ -668,3 +668,45 @@ fn a_search_runs_without_asking() {
     let sent = model.requests()[1].to_string();
     assert!(sent.contains(r"1 match in 1 file\nsrc/parser.rs\n2:fn parse_list() {}"), "the model got the line: {sent}");
 }
+
+fn read(path: &str) -> Out {
+    Out::Call("read", json!({ "path": path, "start_line": null, "line_count": null }))
+}
+
+#[test]
+fn an_at_points_at_a_file_which_goes_with_the_message() {
+    let model = Model::start(vec![says("It panics on an empty list.")]);
+    let files = [("src/parser.rs", "fn parse() {}\nfn parse_list() {}\n"), ("src/main.rs", "fn main() {}\n"), ("README.md", "# x\n")];
+    let mut term = Term::start_with(&model, "mention", 24, 80, &files);
+    term.wait_for(IDLE);
+    term.keys("why does @READ");
+    term.wait_for("› README.md");
+    term.keys("\x1b");
+    term.wait_until("the list closed", |screen| !screen.contains("› README.md"));
+    term.keys("\x15why does @pars");
+    term.wait_for("› src/parser.rs");
+    term.keys("\t");
+    term.wait_until("the path in the box", |_| term.in_box() == "why does @src/parser.rs");
+    term.keys("panic?\r");
+    term.wait_for("empty list.");
+    let screen = term.text();
+    // Under your message, as yours: no label of rein's on its line.
+    assert!(screen.contains("you    why does @src/parser.rs panic?\n       ● Read   src/parser.rs  2 lines"), "{screen}");
+    assert!(screen.contains("rein   It panics on an empty list."), "{screen}");
+    let input = model.requests()[0]["input"].to_string();
+    assert!(input.contains(r#"fn parse() {}\nfn parse_list() {}\n"#), "the model got the file with the message: {input}");
+}
+
+#[test]
+fn reads_in_a_row_share_a_line() {
+    let files = [("a.txt", "1\n"), ("b.txt", "1\n2\n"), ("c.txt", "1\n2\n3\n")];
+    let together = Turn { out: vec![read("a.txt"), read("b.txt")] };
+    let model = Model::start(vec![together, Turn { out: vec![read("c.txt")] }, says("All read.")]);
+    let mut term = Term::start_with(&model, "reads", 24, 90, &files);
+    term.wait_for(IDLE);
+    term.keys("read them\r");
+    term.wait_for("All read.");
+    let screen = term.text();
+    assert!(screen.contains("● Read   a.txt, b.txt, c.txt  3 files · 6 lines"), "{screen}");
+    assert_eq!(screen.matches("● Read").count(), 1, "one line for the three, asked for together or not:\n{screen}");
+}

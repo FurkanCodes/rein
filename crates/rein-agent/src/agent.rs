@@ -3,12 +3,18 @@
 
 use std::fs::File;
 use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::task::Poll;
+
+use serde_json::{Value, json};
 
 use rein_llm::openai::{Client, Request};
 use rein_llm::{Error, Event, Item, Result, Tool, ToolCall, Usage};
 
 use crate::compact;
 use crate::context;
+use crate::mentions;
 use crate::permissions::{Decision, Permissions};
 use crate::session::Session;
 use crate::tools::Tools;
@@ -53,6 +59,12 @@ pub trait Ui {
     /// interrupt can cancel the turn even while it waits for an answer.
     fn approve(&mut self, call: &ToolCall) -> impl Future<Output = Approval>;
     fn tool_started(&mut self, call: &ToolCall);
+    /// Steps that only look, asked for together, starting at once.
+    fn tools_started(&mut self, calls: &[ToolCall]) {
+        for call in calls {
+            self.tool_started(call);
+        }
+    }
     /// A call the permissions refused without asking, and why.
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str);
     fn tool_finished(&mut self, call: &ToolCall, output: &str);
@@ -70,6 +82,45 @@ pub trait Ui {
     }
     /// A steering message has gone into the conversation, here.
     fn steered(&mut self, _message: &str) {}
+    /// What the user's message pointed at with `@`, read for them.
+    fn attached(&mut self, call: &ToolCall, output: &str) {
+        self.tool_started(call);
+        self.tool_finished(call, output);
+    }
+}
+
+/// The tools that only look, and so may run at the same time.
+const LOOKS: [&str; 3] = ["read", "grep", "glob"];
+
+/// A read's path and lines, to tell whether two reads read the same.
+fn read_args(arguments: &str) -> Option<(String, Option<u64>, Option<u64>)> {
+    let args: Value = serde_json::from_str(arguments).ok()?;
+    let path = args["path"].as_str()?.trim_start_matches("./").to_owned();
+    Some((path, args["start_line"].as_u64().filter(|&start| start > 1), args["line_count"].as_u64()))
+}
+
+fn read_path(arguments: &str) -> Option<String> {
+    read_args(arguments).map(|(path, _, _)| path)
+}
+
+/// Runs `futures` at the same time; their outputs, in order.
+async fn all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut waiting = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(done) => *output = Some(done),
+                    Poll::Pending => waiting = true,
+                }
+            }
+        }
+        if waiting { Poll::Pending } else { Poll::Ready(()) }
+    })
+    .await;
+    outputs.into_iter().flatten().collect()
 }
 
 /// What a step the model asked for gets instead of running, when the user
@@ -151,7 +202,8 @@ impl<M: Model> Agent<M> {
             self.window.full.push(Item::User(context.clone()));
             self.history.push(Item::User(context));
         }
-        self.record(Item::User(prompt))?;
+        self.record(Item::User(prompt.clone()))?;
+        self.attach(&prompt, ui).await?;
         // Compact at most once per message, so a summary that is itself too
         // big can't start a loop of summaries.
         let mut compacted = false;
@@ -190,26 +242,44 @@ impl<M: Model> Agent<M> {
             }
             if calls.is_empty() {
                 // Done, unless the user wrote meanwhile: then that's next.
-                if !self.steer(ui.steering(), ui)? {
+                if !self.steer(ui.steering(), ui).await? {
                     return Ok(Outcome::Done);
                 }
                 continue;
             }
 
-            let mut calls = calls.into_iter();
-            while let Some(call) = calls.next() {
+            let mut next = 0;
+            while next < calls.len() {
                 // The user wrote: what's left was planned before that, so
                 // it doesn't run. Every call still gets a result, as the
                 // conversation needs one for each.
                 let steering = ui.steering();
                 if !steering.is_empty() {
-                    for skipped in std::iter::once(call).chain(calls.by_ref()) {
-                        ui.tool_finished(&skipped, SKIPPED);
-                        self.record(Item::ToolResult { call_id: skipped.call_id, output: SKIPPED.to_owned() })?;
+                    for skipped in &calls[next..] {
+                        ui.tool_finished(skipped, SKIPPED);
+                        self.record(Item::ToolResult { call_id: skipped.call_id.clone(), output: SKIPPED.to_owned() })?;
                     }
-                    self.steer(steering, ui)?;
+                    self.steer(steering, ui).await?;
                     break;
                 }
+                // Lookups asked for together run at once: they only look.
+                let together = calls[next..]
+                    .iter()
+                    .take_while(|call| LOOKS.contains(&call.name.as_str()) && self.permissions.decide(call) == Decision::Allow)
+                    .count();
+                if together > 1 {
+                    let batch = &calls[next..next + together];
+                    ui.tools_started(batch);
+                    let outputs = all(batch.iter().map(|call| self.tools.run(call)).collect()).await;
+                    for (call, output) in batch.iter().zip(outputs) {
+                        ui.tool_finished(call, &output);
+                        self.record(Item::ToolResult { call_id: call.call_id.clone(), output })?;
+                    }
+                    next += together;
+                    continue;
+                }
+                let call = calls[next].clone();
+                next += 1;
                 // Searching the conversation is rein's own business: no
                 // permission needed, nothing outside is touched.
                 if call.name == "recall" {
@@ -254,20 +324,110 @@ impl<M: Model> Agent<M> {
                 self.record(Item::ToolResult { call_id: call.call_id, output })?;
             }
             // What the user wrote during the last step goes with its result.
-            self.steer(ui.steering(), ui)?;
+            self.steer(ui.steering(), ui).await?;
         }
         Ok(Outcome::TurnLimit)
     }
 
-    /// Adds the messages the user sent to steer the turn, where it is now.
-    /// Says whether there were any.
-    fn steer(&mut self, messages: Vec<String>, ui: &mut impl Ui) -> Result<bool> {
+    /// Adds the messages the user sent to steer the turn, where it is now,
+    /// with what they point at. Says whether there were any.
+    async fn steer(&mut self, messages: Vec<String>, ui: &mut impl Ui) -> Result<bool> {
         let any = !messages.is_empty();
         for message in messages {
             ui.steered(&message);
-            self.record(Item::User(message))?;
+            self.record(Item::User(message.clone()))?;
+            self.attach(&message, ui).await?;
         }
         Ok(any)
+    }
+
+    /// Reads what `message` points at with `@`, as steps of the user's: a
+    /// file as `read` gives it, some lines of it, or a folder's files. A
+    /// file the conversation already holds as it is now gets a note that
+    /// says so instead of a second copy. A mention inside a folder with
+    /// its own AGENTS.md brings that along, once.
+    async fn attach(&mut self, message: &str, ui: &mut impl Ui) -> Result<()> {
+        for mention in mentions::find(message) {
+            let full = self.tools.root().join(&mention.path);
+            // `@alice` is a word, not a file; `@src/gone.rs` is worth a word.
+            if !full.exists() && !mention.looks_like_a_path() {
+                continue;
+            }
+            let folder = full.is_dir();
+            for instructions in self.instructions_for(&mention.path, folder) {
+                let call = self.mention_call("read", json!({ "path": instructions, "start_line": null, "line_count": null }));
+                let text = self.tools.run(&call).await;
+                let output = format!("Instructions for working in {}/, from {instructions}; follow them there:\n\n{text}", Path::new(&instructions).parent().map(|p| p.display().to_string()).unwrap_or_default());
+                self.attached(call, output, ui)?;
+            }
+            let call = if folder {
+                self.mention_call("glob", json!({ "pattern": "*", "path": mention.path.trim_end_matches('/') }))
+            } else {
+                let (start, count) = match mention.lines {
+                    Some((first, last)) => (json!(first), last.map_or(json!(null), |last| json!(last - first + 1))),
+                    None => (json!(null), json!(null)),
+                };
+                self.mention_call("read", json!({ "path": mention.path, "start_line": start, "line_count": count }))
+            };
+            let mut output = self.tools.run(&call).await;
+            if call.name == "read" && self.last_copy(&call.arguments) == Some(output.as_str()) {
+                output = format!("{} {} is as it was when it was last read in this conversation, so that copy is current.]", compact::UNCHANGED, mention.path);
+            }
+            self.attached(call, output, ui)?;
+        }
+        Ok(())
+    }
+
+    fn attached(&mut self, call: ToolCall, output: String, ui: &mut impl Ui) -> Result<()> {
+        ui.attached(&call, &output);
+        let call_id = call.call_id.clone();
+        self.record(Item::ToolCall(call))?;
+        self.record(Item::ToolResult { call_id, output })
+    }
+
+    /// A call of `tool` made for the user. Its ID is unique in the
+    /// conversation: it grows by at least one item for each.
+    fn mention_call(&self, tool: &str, arguments: Value) -> ToolCall {
+        ToolCall { call_id: format!("mention_{}", self.window.full.len()), name: tool.to_owned(), arguments: arguments.to_string() }
+    }
+
+    /// The AGENTS.md (or CLAUDE.md) files in the folders between the project
+    /// and `path`, outermost first, that the conversation doesn't hold yet:
+    /// the project's own came with the first message.
+    fn instructions_for(&self, path: &str, folder: bool) -> Vec<String> {
+        let path = Path::new(path.trim_end_matches('/'));
+        let deepest = if folder { Some(path) } else { path.parent() };
+        let mut folders: Vec<&Path> = deepest.into_iter().flat_map(Path::ancestors).filter(|dir| !dir.as_os_str().is_empty()).collect();
+        folders.reverse();
+        folders
+            .into_iter()
+            .filter_map(|dir| {
+                let file = ["AGENTS.md", "CLAUDE.md"].into_iter().map(|name| dir.join(name)).find(|file| self.tools.root().join(file).is_file())?;
+                let file = file.to_string_lossy().into_owned();
+                let held = self.history.iter().any(|item| matches!(item, Item::ToolCall(call) if call.name == "read" && read_path(&call.arguments) == Some(file.clone())));
+                (!held).then_some(file)
+            })
+            .collect()
+    }
+
+    /// What the latest read with these arguments gave, if the model can
+    /// still see it: not retired, and not itself a note pointing further back.
+    fn last_copy(&self, arguments: &str) -> Option<&str> {
+        let wanted = read_args(arguments);
+        let mut ids = std::collections::HashSet::new();
+        let mut latest = None;
+        for item in &self.history {
+            match item {
+                Item::ToolCall(call) if call.name == "read" && read_args(&call.arguments) == wanted => {
+                    ids.insert(call.call_id.as_str());
+                }
+                Item::ToolResult { call_id, output } if ids.contains(call_id.as_str()) && !output.starts_with(compact::UNCHANGED) => {
+                    latest = Some(output.as_str());
+                }
+                _ => {}
+            }
+        }
+        latest.filter(|output| !output.starts_with(compact::RETIRED))
     }
 
     /// Makes room in the conversation. If retiring stale tool output is
@@ -612,6 +772,101 @@ mod tests {
         assert_eq!(requests.len(), 2, "one turn, carried on");
         assert_eq!(requests[1].input.last(), Some(&Item::User("and rename it".into())));
         assert_eq!(agent.history.last(), Some(&Item::Assistant("Also renamed it.".into())));
+    }
+
+    fn root_of(dir: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rein-agent-{}-{dir}", std::process::id()))
+    }
+
+    fn read_call(id: &str, path: &str, start: Value, count: Value) -> Item {
+        Item::ToolCall(ToolCall { call_id: id.into(), name: "read".into(), arguments: json!({ "path": path, "start_line": start, "line_count": count }).to_string() })
+    }
+
+    fn result(id: &str, output: &str) -> Item {
+        Item::ToolResult { call_id: id.into(), output: output.into() }
+    }
+
+    #[tokio::test]
+    async fn what_a_message_points_at_is_read_with_it() {
+        let mut agent = agent("mention", vec![vec![Item::Assistant("Seen.".into())]]);
+        let root = root_of("mention");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("sub/AGENTS.md"), "Use tabs.\n").unwrap();
+        std::fs::write(root.join("sub/b.rs"), "one\ntwo\nthree\n").unwrap();
+        let message = "look at @src/a.rs and @sub/b.rs:2-2, ask @alice, and check @gone/x.rs";
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send(message.into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        let input = &requests[0].input;
+        assert_eq!(input[..7], [
+            Item::User(message.into()),
+            read_call("mention_1", "src/a.rs", Value::Null, Value::Null),
+            result("mention_1", "fn a() {}\n"),
+            read_call("mention_3", "sub/AGENTS.md", Value::Null, Value::Null),
+            result("mention_3", "Instructions for working in sub/, from sub/AGENTS.md; follow them there:\n\nUse tabs.\n"),
+            read_call("mention_5", "sub/b.rs", json!(2), json!(1)),
+            result("mention_5", "two\n[lines 2-2 of 3; read again with start_line 3 for more]"),
+        ]);
+        assert!(matches!(&input[8], Item::ToolResult { output, .. } if output.starts_with("error: can't read gone/x.rs")), "a path that isn't there is said so: {:?}", input[8]);
+        assert_eq!(input.len(), 9, "@alice is just a word");
+    }
+
+    #[tokio::test]
+    async fn a_file_already_in_the_conversation_isnt_sent_again() {
+        let turns = vec![vec![Item::Assistant("1".into())], vec![Item::Assistant("2".into())], vec![Item::Assistant("3".into())]];
+        let mut agent = agent("again", turns);
+        let root = root_of("again");
+        std::fs::write(root.join("a.txt"), "first\n").unwrap();
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("see @a.txt".into(), &mut person).await.unwrap();
+        agent.send("again @a.txt".into(), &mut person).await.unwrap();
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        agent.send("and now @a.txt".into(), &mut person).await.unwrap();
+        let results: Vec<&str> = agent
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results, [
+            "first\n",
+            "[unchanged: a.txt is as it was when it was last read in this conversation, so that copy is current.]",
+            "changed\n",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn lookups_asked_for_together_run_together() {
+        let grep = Item::ToolCall(ToolCall {
+            call_id: "g".into(),
+            name: "grep".into(),
+            arguments: json!({ "pattern": "two", "path": null, "glob": null, "ignore_case": false, "output": "files", "context": null }).to_string(),
+        });
+        let turns = vec![vec![read_call("r1", "a.txt", Value::Null, Value::Null), read_call("r2", "b.txt", Value::Null, Value::Null), grep, bash("c1", "echo after")], vec![Item::Assistant("Done.".into())]];
+        let mut agent = agent("together", turns);
+        let root = root_of("together");
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        std::fs::write(root.join("b.txt"), "two\n").unwrap();
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("look".into(), &mut person).await.unwrap();
+        // The three lookups start together and their results come in order;
+        // the command, which asks first, comes after them on its own.
+        assert_eq!(person.log, [
+            "ran read",
+            "ran read",
+            "ran grep",
+            "result one\n",
+            "result two\n",
+            "result 1 file with matches (1 matching line)\nb.txt (1 match)",
+            r#"asked {"command":"echo after"}"#,
+            "ran bash",
+            "result after\n[exit code 0]",
+            "text Done.",
+        ]);
     }
 
     fn bash(id: &str, command: &str) -> Item {

@@ -18,7 +18,7 @@ use std::path::Path;
 use rein_llm::ToolCall;
 use rein_llm::serde_json::{self, Value};
 
-use super::style::{GUTTER, Style, fit as fit_width, width};
+use super::style::{GUTTER, Style, fit as fit_width, strip, width};
 
 /// Where a step's details start: under its tool name.
 pub const INDENT: usize = GUTTER + 2;
@@ -115,6 +115,43 @@ pub fn line(call: &ToolCall, lead: &str, mark: &str, status: &str, style: Style,
     format!("{head}{}{tail}", fit_width(&target, room))
 }
 
+/// Reads in a row, on one line: their paths, as many as fit and then how
+/// many more, and what they came to. Ctrl-O shows each.
+///
+/// ```text
+/// rein   ● Read   src/parser.rs, src/lexer.rs +2  4 files · 612 lines
+/// ```
+pub fn reads_line(paths: &[String], statuses: &[String], lead: &str, mark: &str, style: Style, columns: usize) -> String {
+    let lines: Option<u64> = statuses
+        .iter()
+        .map(|status| {
+            let plain = strip(status);
+            plain.strip_suffix(" lines").or_else(|| plain.strip_suffix(" line")).and_then(|n| n.parse::<u64>().ok())
+        })
+        .sum();
+    let files = format!("{} files", paths.len());
+    let total = match lines {
+        Some(1) => format!("{files} · 1 line"),
+        Some(n) => format!("{files} · {n} lines"),
+        None => files,
+    };
+    let head = format!("{lead}{mark} {} ", style.bold(&format!("{:<6}", "Read")));
+    let tail = format!("  {}", style.dim(&total));
+    let room = columns.saturating_sub(width(&head) + width(&tail) + 1).max(8);
+    let mut shown = String::new();
+    for (i, path) in paths.iter().enumerate() {
+        let joined = if shown.is_empty() { path.clone() } else { format!("{shown}, {path}") };
+        let left = paths.len() - i - 1;
+        let more = if left > 0 { format!(" +{left}") } else { String::new() };
+        if i > 0 && width(&joined) + width(&more) > room {
+            shown = format!("{shown} +{}", paths.len() - i);
+            break;
+        }
+        shown = joined;
+    }
+    format!("{head}{}{tail}", fit_width(&shown, room))
+}
+
 /// What a step's output came to: a short result for its first line, the
 /// output lines worth showing under it, and how many more there are.
 #[derive(Clone)]
@@ -171,6 +208,7 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             }
             Outcome { ok: Some(!failed), status, more: body.len() - shown.len(), details: shown.into_iter().map(str::to_owned).collect(), unit: "line" }
         }
+        "read" if output.starts_with("[unchanged:") => plain(Some(true), style.dim("unchanged: already in the conversation")),
         "read" => {
             // A partial read ends with a note saying which lines it holds.
             let note = output.lines().last().filter(|line| line.starts_with("[lines "));
@@ -444,6 +482,19 @@ mod tests {
         let partial = "x\n[lines 1-100 of 164; read again with start_line 101 for more]";
         assert_eq!(status("read", json!({"path": "a", "start_line": 1, "line_count": 100}), partial).0, "of 164 lines");
         assert_eq!(status("recall", json!({}), "#3 tool result:\nx\n\n#9 user:\ny").0, "2 matches");
+    }
+
+    #[test]
+    fn a_run_of_reads_is_one_line() {
+        let paths: Vec<String> = ["src/parser.rs", "src/lexer.rs", "src/ast.rs", "src/main.rs"].map(str::to_owned).to_vec();
+        let statuses: Vec<String> = ["240 lines", "120 lines", "200 lines", "52 lines"].map(str::to_owned).to_vec();
+        let wide = reads_line(&paths, &statuses, "rein   ", "●", Style::plain(), 100);
+        assert_eq!(wide, "rein   ● Read   src/parser.rs, src/lexer.rs, src/ast.rs, src/main.rs  4 files · 612 lines");
+        let narrow = reads_line(&paths, &statuses, "rein   ", "●", Style::plain(), 70);
+        assert_eq!(narrow, "rein   ● Read   src/parser.rs, src/lexer.rs +2  4 files · 612 lines", "the names that fit, then how many more");
+        let parts: Vec<String> = ["240 lines", "lines 10-14 of 900"].map(str::to_owned).to_vec();
+        assert!(reads_line(&paths[..2], &parts, "", "●", Style::plain(), 100).ends_with("  2 files"), "parts of files don't add up to lines");
+        assert_eq!(status("read", json!({}), "[unchanged: a.rs is as it was…]").0, "unchanged: already in the conversation");
     }
 
     #[test]
