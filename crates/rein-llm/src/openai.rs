@@ -2,28 +2,15 @@
 //!
 //! An API key and a Sign in with ChatGPT access token both go in the same
 //! `Authorization: Bearer` header; only who pays differs.
-//!
-//! Every request carries the whole conversation, so a long one sends the
-//! same hundreds of kilobytes again and again. Bodies of any size are
-//! gzipped on the way (`Content-Encoding: gzip`), which `api.openai.com`
-//! takes, and which makes rein's JSON about three times smaller. The model
-//! reads the same text either way: the server unpacks it first. A server
-//! that turns a compressed request away, like many a local one behind
-//! `OPENAI_BASE_URL`, gets it again uncompressed, and nothing compressed
-//! after that.
 
 pub mod signin;
 
-use std::collections::VecDeque;
-use std::fs::File;
-use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
 use serde_json::{Value, json};
 
-use crate::sse::{SseEvent, SseParser};
-use crate::{Error, Event, Item, Result, Tool, ToolCall, Usage};
+use crate::client::Client;
+use crate::decode::{Decoder, Translate};
+use crate::sse::SseEvent;
+use crate::{Api, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
 
 pub const API_BASE: &str = "https://api.openai.com/v1";
 
@@ -31,172 +18,22 @@ pub const API_BASE: &str = "https://api.openai.com/v1";
 /// so all of rein's tools live in this one.
 const NAMESPACE: &str = "rein";
 
-#[derive(Debug, Clone)]
-pub struct Client {
-    http: reqwest::Client,
-    base_url: String,
-    bearer: String,
-    /// How requests went over the wire, shared by the client's clones.
-    wire: Arc<Wire>,
+/// The headers a request needs besides the body.
+pub(crate) fn headers(request: Option<(&Request, &Value)>) -> Vec<(&'static str, String)> {
+    // The prompt cache follows this header, not `prompt_cache_key`: the
+    // server replaces that with a random key on every request.
+    request.and_then(|(request, _)| request.session_id.clone()).map(|id| ("session-id", id)).into_iter().collect()
 }
 
-/// Bodies smaller than this go as they are: there'd be little to save.
-const COMPRESS_FROM: usize = 1024;
-
-#[derive(Debug, Default)]
-struct Wire {
-    /// Compression was turned off.
-    off: AtomicBool,
-    /// The server turned a compressed request away, so it's off.
-    refused: AtomicBool,
-    /// Request bodies' bytes as JSON, and as they were sent.
-    json: AtomicU64,
-    sent: AtomicU64,
+/// The models this credential can use, in the server's order.
+pub(crate) async fn models(client: &Client) -> Result<Vec<ModelInfo>> {
+    Ok(parse_models(&client.get("models").await?))
 }
 
-/// What requests have cost on the wire so far.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Traffic {
-    /// The request bodies' bytes, as JSON.
-    pub json: u64,
-    /// The bytes that went: fewer, once compressed.
-    pub sent: u64,
-    pub compression: Compression,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Compression {
-    Gzip,
-    /// Turned off by the user.
-    Off,
-    /// The server didn't take a compressed request.
-    Refused,
-}
-
-/// One request to the model.
-#[derive(Debug, Clone)]
-pub struct Request {
-    pub model: String,
-    /// The system prompt.
-    pub instructions: Option<String>,
-    /// The whole conversation so far. Sign in with ChatGPT keeps no
-    /// server-side history, so every request carries it all.
-    pub input: Vec<Item>,
-    /// The tools the model may call.
-    pub tools: Vec<Tool>,
-    /// For example "low", "medium" or "high". `None` uses the model default.
-    pub reasoning_effort: Option<String>,
-    /// Ask for short summaries of the model's reasoning as it thinks
-    /// ([`Event::Thought`]). Only for models that reason.
-    pub reasoning_summary: bool,
-    /// The same ID on every request of one conversation. Sign in with ChatGPT
-    /// routes requests to its prompt cache by the `session-id` header, so
-    /// without it nothing is ever cached; see [`new_session_id`].
-    pub session_id: Option<String>,
-}
-
-/// A fresh ID for one conversation, for [`Request::session_id`].
-pub fn new_session_id() -> Result<String> {
-    signin::new_uuid()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelInfo {
-    pub id: String,
-    pub name: String,
-    /// How many tokens one request may carry, when the list says.
-    pub context_window: Option<u64>,
-}
-
-impl Client {
-    /// `bearer` is an OpenAI API key or a Sign in with ChatGPT access token.
-    pub fn new(http: reqwest::Client, bearer: impl Into<String>) -> Self {
-        Client { http, base_url: API_BASE.to_owned(), bearer: bearer.into(), wire: Arc::default() }
-    }
-
-    /// Sends request bodies as they are, uncompressed.
-    pub fn without_compression(self) -> Self {
-        self.wire.off.store(true, Ordering::Relaxed);
-        self
-    }
-
-    pub fn traffic(&self) -> Traffic {
-        let compression = match (self.wire.refused.load(Ordering::Relaxed), self.wire.off.load(Ordering::Relaxed)) {
-            (true, _) => Compression::Refused,
-            (false, true) => Compression::Off,
-            (false, false) => Compression::Gzip,
-        };
-        Traffic { json: self.wire.json.load(Ordering::Relaxed), sent: self.wire.sent.load(Ordering::Relaxed), compression }
-    }
-
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
-    }
-
-    /// The models this credential can use, in the server's order.
-    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        let response = self.http.get(format!("{}/models", self.base_url)).bearer_auth(&self.bearer).send().await?;
-        let body: Value = check(response).await?.json().await?;
-        Ok(parse_models(&body))
-    }
-
-    /// Sends the request and returns the answer as a stream of events.
-    pub async fn stream(&self, request: &Request) -> Result<ResponseStream> {
-        let body = serde_json::to_vec(&request_body(request))?;
-        let gzipped = (body.len() >= COMPRESS_FROM && !self.wire.off.load(Ordering::Relaxed)).then(|| gzip(&body)).flatten();
-        let compressed = gzipped.is_some();
-        let response = match check(self.post(request, &body, gzipped).await?).await {
-            // A server that can't unpack the body can't read it: the same
-            // request again as it is. If that goes through, compression was
-            // the trouble, and it's off from now on; if not, it wasn't.
-            Err(Error::Api { status: Some(400 | 415 | 422), .. }) if compressed => {
-                let plain = check(self.post(request, &body, None).await?).await?;
-                self.wire.refused.store(true, Ordering::Relaxed);
-                self.wire.off.store(true, Ordering::Relaxed);
-                plain
-            }
-            other => other?,
-        };
-        Ok(ResponseStream { response, decoder: EventDecoder::default(), record: None })
-    }
-
-    /// Posts `body`, or `gzipped` in its place when there is one.
-    async fn post(&self, request: &Request, body: &[u8], gzipped: Option<Vec<u8>>) -> Result<reqwest::Response> {
-        let mut builder = self
-            .http
-            .post(format!("{}/responses", self.base_url))
-            .bearer_auth(&self.bearer)
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(reqwest::header::CONTENT_TYPE, "application/json");
-        if let Some(id) = &request.session_id {
-            // The prompt cache follows this header, not `prompt_cache_key`:
-            // the server replaces that with a random key on every request.
-            builder = builder.header("session-id", id);
-        }
-        let sent = match gzipped {
-            Some(gzipped) => {
-                builder = builder.header(reqwest::header::CONTENT_ENCODING, "gzip");
-                gzipped
-            }
-            None => body.to_vec(),
-        };
-        self.wire.json.fetch_add(body.len() as u64, Ordering::Relaxed);
-        self.wire.sent.fetch_add(sent.len() as u64, Ordering::Relaxed);
-        Ok(builder.body(sent).send().await?)
-    }
-}
-
-/// `bytes` gzipped. Level 6, zlib's own default: within a few percent of the
-/// smallest, at a fraction of the time.
-fn gzip(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut encoder = flate2::write::GzEncoder::new(Vec::with_capacity(bytes.len() / 3), flate2::Compression::new(6));
-    encoder.write_all(bytes).ok()?;
-    encoder.finish().ok()
-}
-
-fn request_body(request: &Request) -> Value {
-    let input: Vec<Value> = request.input.iter().map(item_json).collect();
+pub(crate) fn request_body(request: &Request) -> Value {
+    // Only what the Responses API can read: another format's reasoning
+    // means nothing here.
+    let input: Vec<Value> = request.input.iter().filter(|item| !matches!(item, Item::Opaque(o) if o.api != Api::Responses)).map(item_json).collect();
     // Sign in with ChatGPT requires `store: false` and `stream: true`, and
     // rejects fields like `temperature` and `max_output_tokens`. Sending only
     // what it accepts keeps one request shape for both ways of paying.
@@ -234,35 +71,8 @@ fn item_json(item: &Item) -> Value {
             "arguments": call.arguments,
         }),
         Item::ToolResult { call_id, output } => json!({ "type": "function_call_output", "call_id": call_id, "output": output }),
-        Item::Opaque(value) => value.clone(),
+        Item::Opaque(opaque) => opaque.value.clone(),
     }
-}
-
-/// Turns a non-2xx response into [`Error::Api`], keeping the request ID,
-/// which OpenAI support asks for.
-async fn check(response: reqwest::Response) -> Result<reqwest::Response> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-    let request_id = response.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let text = response.text().await.unwrap_or_default();
-    let (code, message) = parse_error_body(&text);
-    Err(Error::Api { status: Some(status.as_u16()), code, message, request_id })
-}
-
-fn parse_error_body(text: &str) -> (Option<String>, String) {
-    let v: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-    if v["error"].is_object() {
-        let message = str_field(&v["error"], "message").unwrap_or_else(|| v["error"].to_string());
-        return (str_field(&v["error"], "code"), message);
-    }
-    // Requests turned away before reaching the Responses API answer with
-    // {"detail": "..."} instead.
-    if let Some(detail) = v["detail"].as_str() {
-        return (None, detail.to_owned());
-    }
-    (None, text.chars().take(500).collect())
 }
 
 fn parse_models(body: &Value) -> Vec<ModelInfo> {
@@ -278,95 +88,25 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
                     id: id.to_owned(),
                     name: m["display_name"].as_str().unwrap_or(id).to_owned(),
                     context_window: m["context_window"].as_u64(),
+                    max_output: None,
                 })
             })
             .collect();
     }
     let ids = body["data"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str());
-    ids.map(|id| ModelInfo { id: id.to_owned(), name: id.to_owned(), context_window: None }).collect()
+    ids.map(|id| ModelInfo { id: id.to_owned(), name: id.to_owned(), context_window: None, max_output: None }).collect()
 }
 
-/// A streaming answer. Call [`ResponseStream::next`] until it returns `None`.
-/// Dropping it closes the connection, which cancels the request.
-pub struct ResponseStream {
-    response: reqwest::Response,
-    decoder: EventDecoder,
-    record: Option<File>,
-}
+/// Reads the Responses API's stream; see [`crate::decode`].
+pub type EventDecoder = Decoder<Responses>;
 
-impl ResponseStream {
-    /// Also writes the raw stream to `file`, so tests can replay it later.
-    pub fn record_to(&mut self, file: File) {
-        self.record = Some(file);
-    }
-
-    pub async fn next(&mut self) -> Option<Result<Event>> {
-        loop {
-            if let Some(item) = self.decoder.pop() {
-                return Some(item);
-            }
-            if self.decoder.is_finished() {
-                return None;
-            }
-            match self.response.chunk().await {
-                Ok(Some(bytes)) => {
-                    if let Some(file) = &mut self.record
-                        && let Err(e) = file.write_all(&bytes)
-                    {
-                        return Some(Err(e.into()));
-                    }
-                    self.decoder.push(&bytes);
-                }
-                Ok(None) => return self.decoder.finish(),
-                Err(e) => {
-                    self.decoder.finished = true;
-                    return Some(Err(e.into()));
-                }
-            }
-        }
-    }
-}
-
-/// Turns raw stream bytes into [`Event`]s. It's separate from the HTTP code
-/// so tests can feed it recorded streams without a network.
+/// The Responses API's events, as rein's.
 #[derive(Debug, Default)]
-pub struct EventDecoder {
-    parser: SseParser,
-    queue: VecDeque<Result<Event>>,
-    /// Set once the response has completed or failed.
-    finished: bool,
-}
+pub struct Responses;
 
-impl EventDecoder {
-    pub fn push(&mut self, bytes: &[u8]) {
-        for sse in self.parser.push(bytes) {
-            if self.finished {
-                break;
-            }
-            if let Some(item) = decode(&sse) {
-                // Completing and every kind of failure end the response.
-                self.finished = matches!(item, Ok(Event::Completed { .. }) | Err(_));
-                self.queue.push_back(item);
-            }
-        }
-    }
-
-    pub fn pop(&mut self) -> Option<Result<Event>> {
-        self.queue.pop_front()
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    /// Call when the stream ends. A stream that ends before the response
-    /// completed was cut off, and that's reported as [`Error::Interrupted`].
-    pub fn finish(&mut self) -> Option<Result<Event>> {
-        if self.finished {
-            return self.pop();
-        }
-        self.finished = true;
-        Some(Err(Error::Interrupted))
+impl Translate for Responses {
+    fn event(&mut self, sse: &SseEvent, out: &mut Vec<Result<Event>>) {
+        out.extend(decode(sse));
     }
 }
 
@@ -411,18 +151,13 @@ fn decode_item(item: &Value) -> Option<Item> {
             arguments: item["arguments"].as_str().unwrap_or("{}").to_owned(),
         })),
         // Encrypted reasoning: the next request must carry it back as is.
-        "reasoning" => Some(Item::Opaque(item.clone())),
+        "reasoning" => Some(Item::Opaque(Opaque::new(Api::Responses, item.clone()))),
         _ => None,
     }
 }
 
 fn api_error(error: &Value, fallback: &str) -> Error {
-    Error::Api {
-        status: None,
-        code: str_field(error, "code"),
-        message: str_field(error, "message").unwrap_or_else(|| fallback.to_owned()),
-        request_id: None,
-    }
+    Error::api(None, str_field(error, "code"), str_field(error, "message").unwrap_or_else(|| fallback.to_owned()), None)
 }
 
 fn parse_usage(usage: &Value) -> Usage {
@@ -442,6 +177,7 @@ fn str_field(v: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Tool;
 
     #[test]
     fn request_body_has_only_fields_both_billing_paths_accept() {
@@ -453,6 +189,7 @@ mod tests {
             reasoning_effort: Some("low".into()),
             reasoning_summary: false,
             session_id: None,
+            max_output_tokens: None,
         };
         assert_eq!(
             request_body(&request),
@@ -479,7 +216,9 @@ mod tests {
             instructions: None,
             input: vec![
                 Item::User("open a.rs".into()),
-                Item::Opaque(json!({"type": "reasoning", "encrypted_content": "xyz"})),
+                Item::Opaque(Opaque::new(Api::Responses, json!({"type": "reasoning", "encrypted_content": "xyz"}))),
+                // Claude's thinking means nothing to OpenAI: it stays out.
+                Item::Opaque(Opaque::new(Api::Anthropic, json!({"type": "thinking", "thinking": "", "signature": "s"}))),
                 Item::ToolCall(call.clone()),
                 Item::ToolResult { call_id: "call_1".into(), output: "fn main() {}".into() },
             ],
@@ -487,6 +226,7 @@ mod tests {
             reasoning_effort: None,
             reasoning_summary: false,
             session_id: None,
+            max_output_tokens: None,
         };
         let body = request_body(&request);
         assert_eq!(body["tools"][0]["type"], "namespace");
@@ -497,6 +237,7 @@ mod tests {
             json!({"type": "function_call", "call_id": "call_1", "namespace": "rein", "name": "read", "arguments": "{\"path\":\"a.rs\"}"})
         );
         assert_eq!(body["input"][3], json!({"type": "function_call_output", "call_id": "call_1", "output": "fn main() {}"}));
+        assert_eq!(body["input"].as_array().unwrap().len(), 4);
 
         // The model's call comes back as the same item.
         let done = json!({"type": "function_call", "call_id": "call_1", "namespace": "rein", "name": "read", "arguments": "{\"path\":\"a.rs\"}"});
@@ -505,7 +246,7 @@ mod tests {
 
     #[test]
     fn session_ids_are_fresh_v4_uuids() {
-        let (a, b) = (new_session_id().unwrap(), new_session_id().unwrap());
+        let (a, b) = (crate::new_session_id().unwrap(), crate::new_session_id().unwrap());
         assert_ne!(a, b);
         assert_eq!(a.len(), 36);
         assert_eq!(&a[14..15], "4", "version 4: {a}");
@@ -518,18 +259,8 @@ mod tests {
             {"slug": "a", "display_name": "Model A", "visibility": "list", "context_window": 500000},
             {"slug": "hidden", "display_name": "Hidden", "visibility": "hide"},
         ]});
-        assert_eq!(parse_models(&chatgpt), [ModelInfo { id: "a".into(), name: "Model A".into(), context_window: Some(500_000) }]);
+        assert_eq!(parse_models(&chatgpt), [ModelInfo { id: "a".into(), name: "Model A".into(), context_window: Some(500_000), max_output: None }]);
         let api_key = json!({"data": [{"id": "b"}]});
-        assert_eq!(parse_models(&api_key), [ModelInfo { id: "b".into(), name: "b".into(), context_window: None }]);
-    }
-
-    #[test]
-    fn parses_both_error_body_shapes() {
-        let structured = r#"{"error": {"code": "subscription_sharing_usage_limit_exceeded", "message": "limit"}}"#;
-        assert_eq!(
-            parse_error_body(structured),
-            (Some("subscription_sharing_usage_limit_exceeded".into()), "limit".into())
-        );
-        assert_eq!(parse_error_body(r#"{"detail": "not enabled"}"#), (None, "not enabled".into()));
+        assert_eq!(parse_models(&api_key), [ModelInfo { id: "b".into(), name: "b".into(), context_window: None, max_output: None }]);
     }
 }

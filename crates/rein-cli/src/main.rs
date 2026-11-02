@@ -7,15 +7,15 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rein_llm::openai::signin::{self, Credentials};
-use rein_agent::agent::{Agent, Approval, Compacted, MAX_TURNS, OpenAi, Outcome, Ui, Window};
+use rein_agent::agent::{Agent, Approval, Compacted, Llm, MAX_TURNS, Outcome, Ui, Window};
 use rein_agent::compact;
 use rein_agent::permissions::{Mode, Permissions};
 use rein_agent::session::{self, Header, Loaded, Session};
 use rein_agent::tools::Tools;
 use rein_agent::{context, prompt};
 use rein_llm::Item;
-use rein_llm::openai::Client;
-use rein_llm::{ToolCall, Usage, store};
+use rein_llm::provider::{self, Provider};
+use rein_llm::{ModelInfo, ToolCall, Usage, store};
 
 /// `eprintln!` that waits its turn: the spinner and the input box draw
 /// from other threads.
@@ -30,6 +30,7 @@ macro_rules! out {
 }
 
 mod commands;
+mod connect;
 mod input;
 mod settings;
 use settings::Settings;
@@ -59,7 +60,9 @@ Usage:
   rein -c [<prompt...>]          Continue the latest conversation in this folder
   rein -r [<prompt...>]          Choose a saved conversation to continue
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
-  rein models                    List the models you can use
+  rein login <provider>          Save an API key for a provider, like anthropic
+  rein logout <provider>         Forget it (rein logout chatgpt signs out)
+  rein models [<provider>]       List the models you can use
 
 rein can read, write and edit files in this folder and run commands. In a
 conversation, type /exit or press Ctrl-D to leave. Conversations are saved in
@@ -80,7 +83,9 @@ repository's root down to this folder (CLAUDE.md where a folder has no
 AGENTS.md), plus your own ~/.config/rein/AGENTS.md. 32 KB at most.
 
 Options:
-  -m, --model <id>      Model to use (default: $REIN_MODEL, or gpt-6.1-sol)
+  -m, --model <id>      Model to use, like claude-opus-5-5 or anthropic/claude-sonnet-5-5
+                        (default: $REIN_MODEL, or gpt-6.1-sol; claude-opus-5-5 when
+                        Anthropic is the only provider you have a key for)
       --effort <level>  Reasoning effort: low, medium, high, ...
   -c, --continue        Continue the latest conversation in this folder
   -r, --resume          Choose which saved conversation to continue
@@ -108,8 +113,14 @@ Each request carries the whole conversation, so rein gzips it on the way:
 about three times fewer bytes, and the same text for the model. A server that
 doesn't take compressed requests gets them uncompressed instead.
 
-Without `rein login`, rein uses $OPENAI_API_KEY, billed to your API account,
-and $OPENAI_BASE_URL if set, for another server that speaks the Responses API.";
+A model's name says who serves it: claude-* is Anthropic's, gpt-* OpenAI's.
+Or name the provider first, like anthropic/claude-opus-5-5; /model switches
+mid-conversation, even to another provider. Keys come from $OPENAI_API_KEY and
+$ANTHROPIC_API_KEY ($ANTHROPIC_AUTH_TOKEN for a gateway), or from
+`rein login <provider>`, which keeps them in ~/.config/rein/keys.json, readable
+only by you. $OPENAI_BASE_URL and $ANTHROPIC_BASE_URL point rein at another
+server that speaks the same API. Signed in with ChatGPT, OpenAI's models use
+your plan; otherwise $OPENAI_API_KEY, billed to your API account.";
 
 type CliResult<T = ()> = Result<T, String>;
 
@@ -137,8 +148,11 @@ async fn run(args: Vec<String>) -> CliResult {
             println!("{HELP}");
             Ok(())
         }
-        ["login"] => login(&http).await,
-        ["models"] => models(&http).await,
+        ["login"] | ["login", "chatgpt"] => login(&http).await,
+        ["login", provider] => connect::login(&http, provider).await,
+        ["logout", provider] => connect::logout(provider),
+        ["models"] => connect::models(&http, None).await,
+        ["models", provider] => connect::models(&http, Some(provider)).await,
         _ => {
             let settings = Settings::load(&config_dir()?.join(settings::FILE))?;
             let compact_at = settings.get("compact_at", "REIN_COMPACT_AT");
@@ -187,18 +201,6 @@ async fn login(http: &rein_llm::reqwest::Client) -> CliResult {
     Ok(())
 }
 
-async fn models(http: &rein_llm::reqwest::Client) -> CliResult {
-    let client = client(http).await?;
-    for model in client.list_models().await.map_err(describe)? {
-        if model.name == model.id {
-            println!("{}", model.id);
-        } else {
-            println!("{:<24} {}", model.id, model.name);
-        }
-    }
-    Ok(())
-}
-
 /// Which conversation to work in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Resume {
@@ -210,7 +212,8 @@ enum Resume {
 }
 
 struct AskArgs {
-    model: String,
+    /// From `-m`, the environment or the settings; `None` lets rein choose.
+    model: Option<String>,
     /// `-m` was given, so a continued conversation switches to `model`.
     model_given: bool,
     resume: Resume,
@@ -231,7 +234,7 @@ impl AskArgs {
     /// Flags first; what they don't say comes from `settings` (and the
     /// environment), then rein's defaults.
     fn parse(args: Vec<String>, settings: &Settings) -> CliResult<Self> {
-        let mut model = settings.get("model", "REIN_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+        let mut model = settings.get("model", "REIN_MODEL");
         let (mut effort, mut system, mut record, mut words) = (settings.get("effort", "REIN_EFFORT"), None, None, Vec::new());
         let mut mode = match settings.get("mode", "REIN_MODE") {
             Some(name) => Mode::parse(&name).ok_or(format!("unknown mode {name} in the settings; use ask, edits, read-only or trust"))?,
@@ -248,7 +251,7 @@ impl AskArgs {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-m" | "--model" => {
-                    model = value(&mut args, &arg)?;
+                    model = Some(value(&mut args, &arg)?);
                     model_given = true;
                 }
                 "-c" | "--continue" => resume = Resume::Latest,
@@ -277,46 +280,61 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> CliResult<Strin
 }
 
 async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option<String>) -> CliResult {
-    let mut client = client(http).await?;
-    if !args.compress {
-        client = client.without_compression();
-    }
-    // The model list says how big each model's context window is. Fetched
-    // while everything else gets ready.
-    let models = {
-        let client = client.clone();
-        tokio::spawn(async move { client.list_models().await })
+    let dir = config_dir()?;
+    let keys = connect::load_keys(&dir)?;
+    let providers = provider::builtin();
+    let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
+    let folder = session::folder(&dir.join("sessions"), &root);
+    let latest = match args.resume {
+        Resume::Latest => match session::list(&folder, 1).into_iter().next() {
+            Some(latest) => Some(latest.path),
+            None => return Err("no saved conversation in this folder yet".into()),
+        },
+        _ => None,
+    };
+    let wanted = args.model.clone().unwrap_or_else(|| connect::default_model(&providers, &keys));
+    // Whoever serves the model, as soon as that's known: the model list,
+    // which says how big each model's context window is, loads while
+    // everything else gets ready.
+    let early = if args.model_given || args.resume == Resume::New {
+        Some(wanted.clone())
+    } else {
+        latest.as_deref().and_then(session::peek).map(|header| header.model)
+    };
+    let mut connected = match &early {
+        Some(spec) => Some(connect::connect(http, &providers, &keys, spec, args.compress).await?),
+        None => None,
     };
     let record = match &args.record {
         Some(path) => Some(File::create(path).map_err(|e| format!("can't create {}: {e}", path.display()))?),
         None => None,
     };
-    let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
     let permissions = load_permissions(&root, args.mode)?;
-    let dir = config_dir()?;
     // What you sent from this folder before, for ↑ and Ctrl-R: only a
     // conversation has a box to bring it back in.
     let sent = if args.prompt.is_none() { History::load(history::file(&dir, &root)) } else { History::default() };
     let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none(), sent, args.bell);
     // The box goes up now, so typing can start while the model list loads.
-    terminal.model = args.model.clone();
+    terminal.model = connected.as_ref().map(|c| provider::shown(&c.provider, &c.model)).unwrap_or_default();
     terminal.effort = args.effort.clone();
     terminal.input.set_bar(terminal.bar());
     let mut setup = Setup {
-        folder: session::folder(&dir.join("sessions"), &root),
+        folder,
         personal: dir.join("AGENTS.md"),
         root: root.clone(),
         system: args.system.clone(),
         models: Vec::new(),
         compact_at,
+        http: http.clone(),
+        provider: providers[0].clone(),
+        providers,
+        keys,
+        compress: args.compress,
     };
 
     let saved = match args.resume {
         Resume::New => None,
-        Resume::Latest => match session::list(&setup.folder, 1).into_iter().next() {
-            Some(latest) => Some(latest.path),
-            None => return Err("no saved conversation in this folder yet".into()),
-        },
+        Resume::Latest => latest,
         Resume::Pick => match pick(&setup.folder, &mut terminal).await? {
             Some(path) => Some(path),
             None => return Ok(()),
@@ -325,27 +343,35 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
     if saved.is_some() && args.system.is_some() {
         return Err("-s can't change a saved conversation's system prompt; start a new one instead".into());
     }
-    let (loaded, context) = setup.open(saved, &args.model)?;
-    let mut loaded = loaded;
+    let wanted = setup.canonical(&wanted)?;
+    let (mut loaded, context) = setup.open(saved, &wanted)?;
     // A continued conversation keeps its model unless -m says otherwise,
     // and then it's saved with it.
-    if args.resume != Resume::New && args.model_given && loaded.session.header().model != args.model {
-        loaded.session.append_model(&args.model).map_err(describe)?;
+    let theirs = setup.canonical(&loaded.session.header().model)?;
+    let spec = if args.model_given || args.resume == Resume::New { wanted } else { theirs.clone() };
+    if args.resume != Resume::New && args.model_given && theirs != spec {
+        loaded.session.append_model(&spec).map_err(describe)?;
     }
-    let header = loaded.session.header().clone();
-    let model_name = if args.model_given || args.resume == Resume::New { args.model } else { header.model };
-    setup.models = match tokio::time::timeout(Duration::from_secs(5), models).await {
-        Ok(Ok(Ok(models))) => models,
-        _ => Vec::new(),
+    let (provider, model_name) = connect::resolve(&spec, &setup.providers)?;
+    let provider = provider.clone();
+    // Connected to another provider than the conversation's, or to none yet.
+    let connected = match connected.take() {
+        Some(connected) if connected.provider.name == provider.name => connected,
+        _ => connect::connect(http, &setup.providers, &setup.keys, &spec, args.compress).await?,
     };
+    let (client, models) = connected.models().await;
+    setup.provider = provider;
+    setup.models = models;
+    let header = loaded.session.header().clone();
     let limit = setup.limit(&model_name)?;
     terminal.context_limit = limit;
-    terminal.model = model_name.clone();
+    terminal.model = provider::shown(&setup.provider, &model_name);
     terminal.input.set_bar(terminal.bar());
     let mut agent = Agent {
-        model: OpenAi { client, record },
+        model: Llm { client, record },
         tools: Tools::new(root),
         permissions,
+        max_output: setup.max_output(&model_name),
         model_name,
         instructions: header.instructions,
         reasoning_effort: args.effort,
@@ -377,10 +403,18 @@ struct Setup {
     personal: PathBuf,
     /// `-s`: standing instructions added to the system prompt.
     system: Option<String>,
-    /// The models you can use, with their context windows.
-    models: Vec<rein_llm::openai::ModelInfo>,
+    /// The models the provider in use offers, with their context windows.
+    models: Vec<ModelInfo>,
     /// `compact_at` from the settings or the environment.
     compact_at: Option<String>,
+    /// For connecting to another provider, when `/model` names one.
+    http: rein_llm::reqwest::Client,
+    /// The provider in use.
+    provider: Provider,
+    providers: Vec<Provider>,
+    keys: connect::Keys,
+    /// Gzip request bodies.
+    compress: bool,
 }
 
 impl Setup {
@@ -394,7 +428,7 @@ impl Setup {
         }
         let now = local_time(SystemTime::now());
         let header = Header {
-            id: rein_llm::openai::new_session_id().map_err(describe)?,
+            id: rein_llm::new_session_id().map_err(describe)?,
             cwd: self.root.clone(),
             started: format!("{} {:02}:{:02}", now.date(), now.hour, now.minute),
             model: model.to_owned(),
@@ -416,13 +450,29 @@ impl Setup {
         let window = self.models.iter().find(|m| m.id == model).and_then(|m| m.context_window);
         compact_limit(window, self.compact_at.as_deref())
     }
+
+    /// The most one answer from `model` may take, when its provider says.
+    fn max_output(&self, model: &str) -> Option<u64> {
+        self.models.iter().find(|m| m.id == model).and_then(|m| m.max_output)
+    }
+
+    /// `spec` as saved: `provider/model`.
+    fn canonical(&self, spec: &str) -> CliResult<String> {
+        let (provider, model) = connect::resolve(spec, &self.providers)?;
+        Ok(provider::spec(provider, &model))
+    }
+
+    /// The model in use, as saved.
+    fn current(&self, agent: &Agent<Llm>) -> String {
+        provider::spec(&self.provider, &agent.model_name)
+    }
 }
 
 /// One message from you, worked on until the model is done, or until
 /// Ctrl-C. Interrupting drops the turn mid-flight: the request is closed,
 /// a running command is killed, and the history is repaired so the
 /// conversation can go on.
-async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal) -> CliResult {
+async fn turn(agent: &mut Agent<Llm>, prompt: String, terminal: &mut Terminal) -> CliResult {
     let interrupted = terminal.interrupted.clone();
     let outcome = tokio::select! {
         outcome = agent.send(prompt, terminal) => Some(outcome),
@@ -441,7 +491,7 @@ async fn turn(agent: &mut Agent<OpenAi>, prompt: String, terminal: &mut Terminal
     };
     terminal.end_turn();
     // Said once: rein's requests to this server go uncompressed.
-    let refused = agent.model.client.traffic().compression == rein_llm::openai::Compression::Refused;
+    let refused = agent.model.client.traffic().compression == rein_llm::Compression::Refused;
     if refused && !std::mem::replace(&mut terminal.said_uncompressed, true) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(this server doesn't take compressed requests, so they go uncompressed)"));
     }
@@ -468,7 +518,7 @@ fn compact_limit(window: Option<u64>, compact_at: Option<&str>) -> CliResult<u64
 
 /// Compacts the conversation now, keeping `focus` in mind. Ctrl-C stops it
 /// and leaves the conversation as it was.
-async fn compact_now(agent: &mut Agent<OpenAi>, focus: Option<&str>, terminal: &mut Terminal) -> CliResult {
+async fn compact_now(agent: &mut Agent<Llm>, focus: Option<&str>, terminal: &mut Terminal) -> CliResult {
     terminal.turn.started = Some(std::time::Instant::now());
     let interrupted = terminal.interrupted.clone();
     let done = tokio::select! {
@@ -590,7 +640,7 @@ fn local_time(time: SystemTime) -> LocalTime {
 /// Message after message with the same agent, so it remembers the whole
 /// conversation, until /exit or Ctrl-D. A failed turn is reported and the
 /// conversation goes on.
-async fn conversation(agent: &mut Agent<OpenAi>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
+async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
     if !terminal.input.pinned() {
         say!("Type a message, or /help for commands. End a line with \\ to keep typing on the next.");
         say!("Ctrl-C stops an answer; /exit or Ctrl-D leaves.");
@@ -663,7 +713,7 @@ fn next_mode(mode: Mode) -> Mode {
 
 /// Does what a slash command asks. What it says goes under the gutter,
 /// like a step's result.
-async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
+async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
     let pad = " ".repeat(GUTTER);
     let s = terminal.err;
     match command {
@@ -691,27 +741,27 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
         }
         Slash::Model(None) => {
             if setup.models.is_empty() {
-                say!("{pad}{} (the model list couldn't be fetched)", agent.model_name);
+                say!("{pad}{} (the model list couldn't be fetched)", terminal.model);
             }
             for model in &setup.models {
                 let current = model.id == agent.model_name;
                 let window = model.context_window.map(|w| format!("  {} tokens", thousands(w))).unwrap_or_default();
-                let line = format!("{} {}{}", if current { "›" } else { " " }, model.id, s.dim(&window));
+                let line = format!("{} {}{}", if current { "›" } else { " " }, provider::shown(&setup.provider, &model.id), s.dim(&window));
                 say!("{pad}{}", if current { s.bold(&line) } else { line });
             }
+            let others: Vec<&str> =
+                setup.providers.iter().filter(|p| p.name != setup.provider.name && connect::usable(p, &setup.keys)).map(|p| p.name.as_str()).collect();
+            if !others.is_empty() {
+                say!("{pad}{}", s.dim(&format!("You also have {}: /model <provider>/<model> switches", others.join(", "))));
+            }
         }
-        Slash::Model(Some(id)) => {
-            if !setup.models.is_empty() && !setup.models.iter().any(|m| m.id == id) {
-                return Err(format!("no model called {id}; /model lists them"));
-            }
-            agent.window.limit = setup.limit(&id)?;
-            terminal.context_limit = agent.window.limit;
+        Slash::Model(Some(spec)) => {
+            let shown = use_model(&spec, agent, terminal, setup).await?;
+            let current = setup.current(agent);
             if let Some(session) = &mut agent.session {
-                session.append_model(&id).map_err(describe)?;
+                session.append_model(&current).map_err(describe)?;
             }
-            agent.model_name = id.clone();
-            terminal.model = id.clone();
-            say!("{pad}{} now using {id}", s.green("✓"));
+            say!("{pad}{} now using {shown}", s.green("✓"));
             say!("{pad}{}", s.dim("The prompt cache starts over: it's kept per model."));
         }
         Slash::Effort(None) => {
@@ -726,7 +776,8 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             let header = agent.session.as_ref().map(|session| session.header().clone());
             let messages = agent.window.full.iter().skip(1).filter(|item| matches!(item, Item::User(_))).count();
             let rows = [
-                ("model", agent.model_name.clone()),
+                ("model", terminal.model.clone()),
+                ("provider", format!("{} · {}", setup.provider.title, agent.model.client.base_url())),
                 ("effort", agent.reasoning_effort.clone().unwrap_or_else(|| "the model's default".into())),
                 ("mode", mode_description(agent.permissions.mode).to_owned()),
                 ("rules", format!("{} from .rein/permissions", agent.permissions.rule_count())),
@@ -762,32 +813,55 @@ async fn run_command(command: Slash, agent: &mut Agent<OpenAi>, terminal: &mut T
             }
         }
         Slash::New => {
-            let (loaded, context) = setup.open(None, &agent.model_name)?;
+            let (loaded, context) = setup.open(None, &setup.current(agent))?;
             switch(agent, loaded, context);
             (terminal.context_used, terminal.last_cache) = (0, None);
             say!("{pad}{} a fresh conversation; the last one is saved, /resume brings it back", s.green("✓"));
         }
         Slash::Resume => {
             let Some(path) = pick(&setup.folder, terminal).await? else { return Ok(()) };
-            let (loaded, context) = setup.open(Some(path), &agent.model_name)?;
-            let model = loaded.session.header().model.clone();
+            let (loaded, context) = setup.open(Some(path), &setup.current(agent))?;
+            // Its own model, from whichever provider serves it: connected
+            // first, so a missing key leaves everything as it was.
+            let model = setup.canonical(&loaded.session.header().model)?;
+            if model != setup.current(agent) {
+                use_model(&model, agent, terminal, setup).await?;
+            }
             switch(agent, loaded, context);
             (terminal.context_used, terminal.last_cache) = (agent.estimated(), None);
-            if model != agent.model_name {
-                agent.window.limit = setup.limit(&model)?;
-                terminal.context_limit = agent.window.limit;
-                agent.model_name = model.clone();
-                terminal.model = model;
-            }
         }
         Slash::Exit => {}
     }
     Ok(())
 }
 
+/// Switches to the model `spec`, connecting to its provider if that's
+/// another one. Returns the model as shown.
+async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult<String> {
+    let (provider, model) = connect::resolve(spec, &setup.providers)?;
+    let provider = provider.clone();
+    let missing = |models: &[ModelInfo]| !models.is_empty() && !models.iter().any(|m| m.id == model);
+    if provider.name != setup.provider.name {
+        let (client, models) = connect::connect(&setup.http, &setup.providers, &setup.keys, spec, setup.compress).await?.models().await;
+        if missing(&models) {
+            return Err(format!("{} has no model called {model}; `rein models {}` lists them", provider.title, provider.name));
+        }
+        agent.model.client = client;
+        (setup.provider, setup.models) = (provider, models);
+    } else if missing(&setup.models) {
+        return Err(format!("no model called {model}; /model lists them"));
+    }
+    agent.window.limit = setup.limit(&model)?;
+    terminal.context_limit = agent.window.limit;
+    agent.max_output = setup.max_output(&model);
+    terminal.model = provider::shown(&setup.provider, &model);
+    agent.model_name = model;
+    Ok(terminal.model.clone())
+}
+
 /// Moves the agent to another conversation. The mode, the rules and the
 /// model stay; what you said "always" to was for the old one.
-fn switch(agent: &mut Agent<OpenAi>, loaded: Loaded, context: Option<String>) {
+fn switch(agent: &mut Agent<Llm>, loaded: Loaded, context: Option<String>) {
     let header = loaded.session.header().clone();
     agent.session_id = Some(header.id);
     agent.instructions = header.instructions;
@@ -1353,6 +1427,13 @@ impl Ui for Terminal {
         }
     }
 
+    fn note(&mut self, note: &str) {
+        self.quiet();
+        self.gap_before_step();
+        let lead = self.lead();
+        say!("{lead}{}", self.err.dim(&format!("↳ {note}")));
+    }
+
     async fn approve(&mut self, call: &ToolCall) -> Approval {
         self.end_line();
         self.input.busy(None, std::time::Instant::now());
@@ -1620,8 +1701,8 @@ fn headlines(thoughts: &str) -> Vec<String> {
 }
 
 /// What the requests cost on the wire: `412 KB as 128 KB (gzip, 3.2× fewer bytes)`.
-fn traffic(t: rein_llm::openai::Traffic) -> String {
-    use rein_llm::openai::Compression;
+fn traffic(t: rein_llm::Traffic) -> String {
+    use rein_llm::Compression;
     if t.json == 0 {
         return "nothing yet".to_owned();
     }
@@ -1658,43 +1739,6 @@ fn approval(answer: &str) -> Approval {
     }
 }
 
-/// A client using the saved ChatGPT sign-in, or else `OPENAI_API_KEY`.
-/// Prints which one, so it's always clear who pays.
-async fn client(http: &rein_llm::reqwest::Client) -> CliResult<Client> {
-    let path = config_dir()?.join(CREDENTIALS_FILE);
-    if let Some(mut credentials) = store::read_json::<Credentials>(&path).map_err(describe)? {
-        if !credentials.plan_enabled() {
-            return Err("your ChatGPT sign-in doesn't allow using your plan; run `rein login` and allow it".into());
-        }
-        if credentials.needs_refresh() {
-            credentials = signin::refresh(http, &credentials).await.map_err(|e| {
-                format!("couldn't renew your ChatGPT sign-in ({}); run `rein login` to sign in again", describe(e))
-            })?;
-            store::write_json_private(&path, &credentials).map_err(describe)?;
-        }
-        say!("Using ChatGPT plan (manage usage: {USAGE_URL})");
-        return Ok(Client::new(http.clone(), credentials.access_token));
-    }
-    match std::env::var("OPENAI_API_KEY") {
-        Ok(key) if !key.is_empty() => {
-            let client = Client::new(http.clone(), key);
-            // Another server that speaks the Responses API, like a proxy:
-            // the same variable OpenAI's own libraries read.
-            match std::env::var("OPENAI_BASE_URL") {
-                Ok(base) if !base.is_empty() => {
-                    say!("Using OPENAI_API_KEY with {base}");
-                    Ok(client.with_base_url(base.trim_end_matches('/')))
-                }
-                _ => {
-                    say!("Using OPENAI_API_KEY (billed to your API account)");
-                    Ok(client)
-                }
-            }
-        }
-        _ => Err("not signed in. Run `rein login` to continue with ChatGPT, or set OPENAI_API_KEY.".into()),
-    }
-}
-
 /// Error text with the next step, where there's an obvious one.
 fn describe(e: rein_llm::Error) -> String {
     match (e.code(), e.status()) {
@@ -1704,6 +1748,8 @@ fn describe(e: rein_llm::Error) -> String {
         (Some("subscription_sharing_user_not_eligible"), _) => {
             format!("ChatGPT plan usage isn't available for this account or workspace: {e}")
         }
+        (Some("refusal"), _) => format!("the model declined: {e}. Rephrase it, or try another model with /model"),
+        (Some("authentication_error"), _) => format!("{e}. Check $ANTHROPIC_API_KEY, or save another key with `rein login anthropic`"),
         // A bad API key's message already says what to do.
         (code, Some(401)) if code != Some("invalid_api_key") => format!("{e}. Run `rein login` to sign in again."),
         _ => e.to_string(),
@@ -1794,7 +1840,7 @@ mod tests {
         let parsed = AskArgs::parse(vec!["hi".into()], &settings).unwrap();
         assert_eq!((parsed.mode, parsed.effort.as_deref()), (Mode::Edits, Some("low")));
         let parsed = AskArgs::parse(["--mode", "trust", "-m", "flagged", "hi"].map(str::to_owned).to_vec(), &settings).unwrap();
-        assert_eq!((parsed.mode, parsed.model.as_str()), (Mode::Trust, "flagged"));
+        assert_eq!((parsed.mode, parsed.model.as_deref()), (Mode::Trust, Some("flagged")));
     }
 
     #[test]

@@ -14,31 +14,70 @@ cargo build --release
 ./target/release/rein --help
 ```
 
-## Paying for the model
+## Models and who pays for them
 
-rein uses OpenAI's Responses API and can pay for it in two ways:
+rein speaks to OpenAI and Anthropic, each in its own API: OpenAI's Responses
+API, and Anthropic's Messages API. A model's name says who serves it
+(`claude-*` is Anthropic's, `gpt-*` OpenAI's), or you name the provider
+first: `anthropic/claude-sonnet-5-5`.
 
-- **Your ChatGPT plan.** Run `rein login` to continue with ChatGPT. This uses
-  OpenAI's official [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
+- **Your ChatGPT plan, for OpenAI's models.** Run `rein login` to continue
+  with ChatGPT. This uses OpenAI's official [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
   for open-source apps. Usage counts toward your plan's limits; on Plus, the
   five-hour limit is shared with every other app that uses your plan. Manage it at
   [ChatGPT settings → Usage](https://chatgpt.com/settings/usage).
-- **An API key.** If you haven't signed in, rein uses `OPENAI_API_KEY`, billed
-  to your API account. `OPENAI_BASE_URL` points it at another server that
-  speaks the Responses API, like a proxy.
+- **An API key.** `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, billed to that API
+  account, or a key you save with `rein login <provider>`: it goes in
+  `~/.config/rein/keys.json`, readable only by you, once a call with it has
+  worked. The variable wins over the saved key. A gateway in front of Claude
+  takes `ANTHROPIC_AUTH_TOKEN` instead. `OPENAI_BASE_URL` and
+  `ANTHROPIC_BASE_URL` point rein at another server that speaks the same API,
+  like a proxy.
 
-rein prints which one it's using on every run.
+There's no signing in with a Claude plan: Anthropic doesn't allow other apps
+to use one. rein prints which key it's using on every run. With no model
+named, it uses `gpt-6.1-sol`, or `claude-opus-5-5` if Anthropic is the only
+provider you have a key for.
+
+`/model` lists the models of the provider in use, and switches to another,
+from any provider, in the middle of a conversation. The conversation goes on
+as it was: what was said and every tool call and result carry over, in the
+new provider's own format. Reasoning only one provider can read (OpenAI's
+encrypted reasoning, Claude's signed thinking) only goes back to that one.
+`rein -c` continues with the model the conversation was left with.
+
+### Claude, done properly
+
+- **Its cache is used.** Claude caches nothing unless asked, so rein marks
+  the end of the system prompt and the end of the conversation in every
+  request: each one reads the one before it from the cache, and the status
+  bar's cache figure says how much did.
+- **Its thinking stays valid.** Claude's thinking comes back signed together
+  with everything before it, and Anthropic turns it away if anything earlier
+  in the conversation has changed. Compaction does change it, so at that
+  moment rein drops exactly the thinking after the change and keeps the rest,
+  and records that in the session file. A test checks every request against
+  Anthropic's own rule. If Anthropic still turns some away (an older rein's
+  tools, say), rein drops it once and goes on.
+- **Effort is Claude's own.** `--effort` and `/effort` (`low` to `max`) set
+  how hard it thinks, and its thinking shows as it goes. Models from before
+  adaptive thinking get a thinking budget instead.
+- **A refusal by mistake isn't the end.** On Anthropic's own API, the models
+  that have one ask for its server-side fallback: if a classifier declines
+  (security work can look risky), another model answers, and rein says which.
 
 ## Usage
 
 ```sh
 rein login                      # continue with ChatGPT
-rein models                     # list the models you can use
+rein login anthropic            # save an API key, checked first
+rein models                     # list the models you can use, by provider
 rein                            # a conversation in this folder
 rein "explain what a harness is"   # one task, then exit
 rein -c                         # continue the latest conversation here
 rein -r                         # choose a saved conversation to continue
 rein --model gpt-6.1-sol --effort low "say hi"
+rein -m claude-opus-5-5 "explain this repository"
 ```
 
 In a conversation rein takes the whole window, as `less` and `vim` do: the
@@ -82,7 +121,7 @@ message, so typing ahead can't answer it by accident.
 | Drag over text | select it and copy it to the clipboard |
 | Ctrl-L | draw the window again |
 | `/mode [ask\|edits\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
-| `/model [id]`, `/effort [level]` | list or switch the model; show or change reasoning effort |
+| `/model [id]`, `/effort [level]` | list or switch the model, from any provider; show or change reasoning effort |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
@@ -128,6 +167,8 @@ rein makes room, cheapest first:
 
 Nothing is lost: the session file keeps everything, and the model's `recall`
 tool searches the whole conversation, including what was compacted away.
+With Claude, its thinking from after the point compaction changed goes with
+it (see above); the words stay.
 
 ## Settings
 
@@ -241,7 +282,7 @@ doesn't stop `/bin/rm`.
 
 | Crate | What it is |
 |---|---|
-| `crates/rein-llm` | Streaming LLM provider layer: SSE parsing, the Responses API, Sign in with ChatGPT |
+| `crates/rein-llm` | Streaming LLM provider layer: one client for every provider, the Responses and Messages APIs, the providers rein knows, Sign in with ChatGPT |
 | `crates/rein-agent` | The agent loop, the tools, the permission engine, saved conversations, and what the model is told first |
 | `crates/rein-cli` | The `rein` command |
 

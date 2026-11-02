@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rein_llm::{Item, Result, ToolCall};
+use rein_llm::{Api, Item, Opaque, Result, ToolCall};
 use serde::{Deserialize, Serialize};
 
 /// What a conversation file starts with.
@@ -43,7 +43,13 @@ enum Line {
     Assistant { text: String },
     ToolCall { call_id: String, name: String, arguments: String },
     ToolResult { call_id: String, output: String },
-    Opaque { value: serde_json::Value },
+    /// Provider data, with the format that can read it. Conversations
+    /// saved before rein spoke more than one say none: OpenAI's.
+    Opaque {
+        #[serde(default)]
+        api: Api,
+        value: serde_json::Value,
+    },
     /// Tool outputs replaced to save space (see `compact`). The originals
     /// stay in the file, earlier.
     Retired { outputs: Vec<RetiredOutput> },
@@ -52,6 +58,9 @@ enum Line {
     /// The conversation was compacted: from here on it's the first message,
     /// this summary, and `kept`, its latest part word for word.
     Compaction { summary: String, kept: Vec<Line> },
+    /// The provider turned the thinking in the conversation away (it no
+    /// longer matched what came before it), so it was dropped from here on.
+    Unbound,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,21 +76,35 @@ impl Line {
             Item::Assistant(text) => Line::Assistant { text: text.clone() },
             Item::ToolCall(call) => Line::ToolCall { call_id: call.call_id.clone(), name: call.name.clone(), arguments: call.arguments.clone() },
             Item::ToolResult { call_id, output } => Line::ToolResult { call_id: call_id.clone(), output: output.clone() },
-            Item::Opaque(value) => Line::Opaque { value: value.clone() },
+            Item::Opaque(opaque) => Line::Opaque { api: opaque.api, value: opaque.value.clone() },
         }
     }
 
     /// The conversation item this line holds; `None` for the header.
     fn into_item(self) -> Option<Item> {
         Some(match self {
-            Line::Session(_) | Line::Model { .. } | Line::Retired { .. } | Line::Compaction { .. } => return None,
+            Line::Session(_) | Line::Model { .. } | Line::Retired { .. } | Line::Compaction { .. } | Line::Unbound => return None,
             Line::Context { text } | Line::User { text } => Item::User(text),
             Line::Assistant { text } => Item::Assistant(text),
             Line::ToolCall { call_id, name, arguments } => Item::ToolCall(ToolCall { call_id, name, arguments }),
             Line::ToolResult { call_id, output } => Item::ToolResult { call_id, output },
-            Line::Opaque { value } => Item::Opaque(value),
+            Line::Opaque { api, value } => Item::Opaque(Opaque::new(api, value)),
         })
     }
+}
+
+/// A saved conversation's header and the model it uses now, read without
+/// the rest of it.
+pub fn peek(path: &Path) -> Option<Header> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines().filter_map(|line| serde_json::from_str::<Line>(line).ok());
+    let Some(Line::Session(mut header)) = lines.next() else { return None };
+    for line in lines {
+        if let Line::Model { model } = line {
+            header.model = model;
+        }
+    }
+    Some(header)
 }
 
 /// A saved conversation, read back.
@@ -129,6 +152,7 @@ impl Session {
                     let outputs: Vec<(String, String)> = outputs.into_iter().map(|o| (o.call_id, o.output)).collect();
                     crate::compact::retire(&mut history, &outputs);
                 }
+                Line::Unbound => crate::compact::unbind(&mut history),
                 Line::Compaction { summary, kept } => {
                     let pinned = history.first().filter(|item| crate::context::is_context(item)).cloned();
                     history = pinned.into_iter().chain([Item::User(summary)]).chain(kept.into_iter().filter_map(Line::into_item)).collect();
@@ -171,6 +195,11 @@ impl Session {
     pub fn append_retired(&mut self, outputs: &[(String, String)]) -> Result<()> {
         let outputs = outputs.iter().map(|(call_id, output)| RetiredOutput { call_id: call_id.clone(), output: output.clone() }).collect();
         self.write(&Line::Retired { outputs })
+    }
+
+    /// Records that the conversation's thinking was dropped ([`crate::compact::unbind`]).
+    pub fn append_unbound(&mut self) -> Result<()> {
+        self.write(&Line::Unbound)
     }
 
     pub fn append_compaction(&mut self, summary: &str, kept: &[Item]) -> Result<()> {
@@ -287,7 +316,8 @@ mod tests {
             Item::User("hi".into()),
             Item::ToolCall(ToolCall { call_id: "c1".into(), name: "read".into(), arguments: "{}".into() }),
             Item::ToolResult { call_id: "c1".into(), output: "text".into() },
-            Item::Opaque(serde_json::json!({ "type": "reasoning", "encrypted_content": "xyz" })),
+            Item::Opaque(Opaque::new(Api::Responses, serde_json::json!({ "type": "reasoning", "encrypted_content": "xyz" }))),
+            Item::Opaque(Opaque::new(Api::Anthropic, serde_json::json!({ "type": "thinking", "thinking": "", "signature": "s" }))),
             Item::Assistant("hello".into()),
         ];
         session.append_context("<environment>…</environment>").unwrap();
@@ -326,6 +356,31 @@ mod tests {
         reopened.append(&Item::User("two".into())).unwrap();
         let history = Session::load(reopened.path()).unwrap().history;
         assert_eq!(history, vec![Item::User("one".into()), Item::User("two".into())]);
+    }
+
+    #[test]
+    fn reads_reasoning_saved_before_rein_spoke_more_than_openai() {
+        let dir = dir("old-opaque");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.jsonl");
+        let header = serde_json::to_string(&Line::Session(header("id"))).unwrap();
+        fs::write(&path, format!("{header}\n{{\"type\":\"opaque\",\"value\":{{\"type\":\"reasoning\"}}}}\n")).unwrap();
+        let history = Session::load(&path).unwrap().history;
+        assert_eq!(history, [Item::Opaque(Opaque::new(Api::Responses, serde_json::json!({ "type": "reasoning" })))]);
+    }
+
+    #[test]
+    fn dropped_thinking_stays_dropped() {
+        let dir = dir("unbound");
+        let mut session = Session::new(&dir, "s", header("id"));
+        let thinking = Item::Opaque(Opaque::new(Api::Anthropic, serde_json::json!({ "type": "thinking", "thinking": "", "signature": "s" })));
+        for item in [Item::User("one".into()), thinking.clone(), Item::Assistant("a".into())] {
+            session.append(&item).unwrap();
+        }
+        session.append_unbound().unwrap();
+        session.append(&thinking).unwrap();
+        let history = Session::load(session.path()).unwrap().history;
+        assert_eq!(history, [Item::User("one".into()), Item::Assistant("a".into()), thinking], "only what came before the drop");
     }
 
     #[test]

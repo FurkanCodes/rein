@@ -44,33 +44,65 @@ fn calls(tool: &'static str, arguments: Value) -> Turn {
 struct Model {
     base: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    /// Each request's first line and headers, in the same order.
+    heads: Arc<Mutex<Vec<String>>>,
     /// Whether each request came gzipped, those turned away included.
     gzipped: Arc<Mutex<Vec<bool>>>,
+    /// What rein's environment says besides the defaults: the provider's
+    /// key and URL, and settings.
+    env: Vec<(String, String)>,
+}
+
+/// The wire format a model server speaks.
+#[derive(Clone, Copy, PartialEq)]
+enum Wire {
+    /// OpenAI's Responses API.
+    Responses,
+    /// Anthropic's Messages API, with signed thinking in every turn.
+    Messages,
 }
 
 impl Model {
     fn start(turns: Vec<Turn>) -> Model {
-        Model::serve(turns, true)
+        Model::serve(turns, true, Wire::Responses)
     }
 
     /// A server that, like many a local one, can't unpack a compressed
     /// body, and says it's a bad request.
     fn without_gzip(turns: Vec<Turn>) -> Model {
-        Model::serve(turns, false)
+        Model::serve(turns, false, Wire::Responses)
     }
 
-    fn serve(turns: Vec<Turn>, takes_gzip: bool) -> Model {
+    /// Claude, as Anthropic serves it, and rein set to use it.
+    fn claude(turns: Vec<Turn>) -> Model {
+        let mut model = Model::serve(turns, true, Wire::Messages);
+        let base = model.base.clone();
+        model.env.extend([("ANTHROPIC_API_KEY".into(), "test-key".into()), ("ANTHROPIC_BASE_URL".into(), base), ("REIN_MODEL".into(), "claude-opus-5-5".into())]);
+        model
+    }
+
+    /// Also sets `name` to `value` in rein's environment.
+    fn with_env(mut self, name: &str, value: &str) -> Model {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
+    fn serve(turns: Vec<Turn>, takes_gzip: bool, wire: Wire) -> Model {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
-        let (requests, gzipped) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
-        let (seen, how) = (requests.clone(), gzipped.clone());
+        let (requests, gzipped, heads) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let (seen, how, heard) = (requests.clone(), gzipped.clone(), heads.clone());
         std::thread::spawn(move || {
             let mut turns = turns.into_iter();
             for socket in listener.incoming() {
                 let Ok(mut socket) = socket else { break };
                 let Some((head, body)) = read_request(&mut socket) else { continue };
                 let reply = if head.starts_with("GET") {
-                    http(200, "application/json", json!({ "data": [{ "id": "test-model" }] }).to_string().as_bytes())
+                    let models = match wire {
+                        Wire::Responses => json!({ "data": [{ "id": "test-model" }, { "id": "gpt-6.1-sol" }] }),
+                        Wire::Messages => json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false }),
+                    };
+                    http(200, "application/json", models.to_string().as_bytes())
                 } else {
                     let gzip = head.lines().any(|line| line.to_ascii_lowercase().starts_with("content-encoding:") && line.contains("gzip"));
                     how.lock().unwrap().push(gzip);
@@ -78,15 +110,26 @@ impl Model {
                         http(400, "application/json", br#"{"detail":"Bad Request"}"#)
                     } else {
                         let body = if gzip { gunzip(&body) } else { body };
-                        seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                        heard.lock().unwrap().push(head.clone());
                         let turn = turns.next().unwrap_or_else(|| says("(the script has no more turns)"));
-                        http(200, "text/event-stream", sse(&turn).as_bytes())
+                        let stream = match wire {
+                            Wire::Responses => sse(&turn),
+                            // About what a tokenizer would count, mostly cached.
+                            Wire::Messages => messages_sse(&turn, seen.len() - 1, body.len() as u64 / 4),
+                        };
+                        http(200, "text/event-stream", stream.as_bytes())
                     }
                 };
                 let _ = socket.write_all(&reply);
             }
         });
-        Model { base, requests, gzipped }
+        Model { base, requests, heads, gzipped, env: Vec::new() }
+    }
+
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
     }
 
     fn requests(&self) -> Vec<Value> {
@@ -165,6 +208,48 @@ fn sse(turn: &Turn) -> String {
     out
 }
 
+/// A turn as the Messages API streams it: thinking first, signed
+/// `sig-<n>` for the `n`th request, so a test can tell which request's
+/// answer each thinking block came from.
+fn messages_sse(turn: &Turn, n: usize, tokens: u64) -> String {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let mut out = String::new();
+    let mut event = |v: Value| out += &format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap());
+    let usage = json!({ "input_tokens": tokens / 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": tokens - tokens / 10, "output_tokens": 1 });
+    event(json!({ "type": "message_start", "message": { "model": "claude-opus-5-5", "usage": usage } }));
+    event(json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "", "signature": "" } }));
+    event(json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "**Working it out**" } }));
+    event(json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": format!("sig-{n}") } }));
+    event(json!({ "type": "content_block_stop", "index": 0 }));
+    let mut called = false;
+    for (i, item) in turn.out.iter().enumerate() {
+        let index = i + 1;
+        match item {
+            Out::Text(text) => {
+                event(json!({ "type": "content_block_start", "index": index, "content_block": { "type": "text", "text": "" } }));
+                for piece in text.split_inclusive(' ') {
+                    event(json!({ "type": "content_block_delta", "index": index, "delta": { "type": "text_delta", "text": piece } }));
+                }
+            }
+            Out::Call(tool, arguments) => {
+                called = true;
+                let id = format!("toolu_{}", CALLS.fetch_add(1, Ordering::Relaxed));
+                event(json!({ "type": "content_block_start", "index": index, "content_block": { "type": "tool_use", "id": id, "name": tool, "input": {} } }));
+                let json = arguments.to_string();
+                let (a, b) = json.split_at(json.len() / 2);
+                for part in [a, b] {
+                    event(json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": part } }));
+                }
+            }
+        }
+        event(json!({ "type": "content_block_stop", "index": index }));
+    }
+    let reason = if called { "tool_use" } else { "end_turn" };
+    event(json!({ "type": "message_delta", "delta": { "stop_reason": reason }, "usage": { "output_tokens": 20 } }));
+    event(json!({ "type": "message_stop" }));
+    out
+}
+
 /// What the terminal was asked to do besides drawing.
 #[derive(Default)]
 struct Seen {
@@ -227,14 +312,23 @@ impl Term {
 
     /// rein again, in the same folder and with the same home, once this one
     /// has left.
-    fn again(mut self, model: &Model) -> Term {
+    fn again(self, model: &Model) -> Term {
+        self.again_with(model, &[])
+    }
+
+    /// rein again, as `again` does, started with `args`.
+    fn again_with(mut self, model: &Model, args: &[&str]) -> Term {
         self.wait_exit();
         let dir = std::mem::take(&mut self.dir);
         let (rows, cols) = self.screen.lock().unwrap().screen().size();
-        Term::spawn(model, dir, rows, cols)
+        Term::spawn_with(model, dir, rows, cols, args)
     }
 
     fn spawn(model: &Model, dir: PathBuf, rows: u16, cols: u16) -> Term {
+        Term::spawn_with(model, dir, rows, cols, &[])
+    }
+
+    fn spawn_with(model: &Model, dir: PathBuf, rows: u16, cols: u16, args: &[&str]) -> Term {
         let (project, home) = (dir.join("project"), dir.join("home"));
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&home).unwrap();
@@ -249,6 +343,7 @@ impl Term {
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_rein"));
         command
+            .args(args)
             .current_dir(&project)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -257,6 +352,7 @@ impl Term {
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "test")
             .env("OPENAI_BASE_URL", &model.base)
+            .envs(model.env.iter().map(|(name, value)| (name, value)))
             // Copies go to the terminal (OSC 52), never this computer's clipboard.
             .env("SSH_CONNECTION", "screen-test")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -709,4 +805,207 @@ fn reads_in_a_row_share_a_line() {
     let screen = term.text();
     assert!(screen.contains("● Read   a.txt, b.txt, c.txt  3 files · 6 lines"), "{screen}");
     assert_eq!(screen.matches("● Read").count(), 1, "one line for the three, asked for together or not:\n{screen}");
+}
+
+#[test]
+fn claude_answers_through_anthropics_own_api() {
+    let model = Model::claude(vec![says("Hello from Claude.")]);
+    let mut term = Term::start(&model, "claude", 24, 90);
+    term.wait_for(IDLE);
+    term.keys("hi\r");
+    term.wait_for("Hello from Claude.");
+    term.wait_for(IDLE);
+    let screen = term.text();
+    assert!(screen.contains("claude-opus-5-5"), "the bar names the model:\n{screen}");
+    assert!(screen.contains("✻ Working it out"), "its thinking shows:\n{screen}");
+    assert!(screen.contains("cache 90%"), "Claude's cache counts, made rein's:\n{screen}");
+    let head = model.heads()[0].to_lowercase();
+    assert!(head.starts_with("post /v1/messages "), "{head}");
+    assert!(head.contains("x-api-key: test-key") && head.contains("anthropic-version: 2026-10-21"), "{head}");
+    let request = &model.requests()[0];
+    assert_eq!(request["model"], "claude-opus-5-5");
+    assert_eq!(request["thinking"], json!({ "type": "adaptive", "display": "summarized" }));
+    assert_eq!(request["system"][0]["cache_control"], json!({ "type": "ephemeral" }), "the system prompt is cached");
+}
+
+/// `v` without its cache marks, which may move between requests: they
+/// aren't part of what thinking is signed with.
+fn unmarked(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(map.iter().filter(|(k, _)| *k != "cache_control").map(|(k, v)| (k.clone(), unmarked(v))).collect()),
+        Value::Array(items) => Value::Array(items.iter().map(unmarked).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The signatures of the thinking blocks a request sends back, in order.
+fn signatures(request: &Value) -> Vec<String> {
+    let messages = request["messages"].as_array().into_iter().flatten();
+    let blocks = messages.flat_map(|m| m["content"].as_array().into_iter().flatten());
+    blocks.filter(|b| b["type"] == "thinking").map(|b| b["signature"].as_str().unwrap().to_owned()).collect()
+}
+
+/// Anthropic's own check: Claude's thinking is signed with the system
+/// prompt, the tools and every message before it, and a request that
+/// sends it back after anything else is turned away. So each thinking
+/// block a request carries has to follow exactly the request it was the
+/// answer to.
+fn assert_thinking_follows_what_it_was_signed_with(requests: &[Value]) {
+    for (i, request) in requests.iter().enumerate() {
+        let messages = request["messages"].as_array().unwrap();
+        for (m, message) in messages.iter().enumerate() {
+            for (b, block) in message["content"].as_array().unwrap().iter().enumerate().filter(|(_, b)| b["type"] == "thinking") {
+                let signature = block["signature"].as_str().unwrap();
+                let j: usize = signature.strip_prefix("sig-").unwrap().parse().unwrap();
+                let signed = &requests[j];
+                assert!(j < i && b == 0, "request {i}: {signature} out of place");
+                assert_eq!(unmarked(&request["system"]), unmarked(&signed["system"]), "request {i}: {signature} after another system prompt");
+                assert_eq!(request["tools"], signed["tools"], "request {i}: {signature} after other tools");
+                let before: Vec<Value> = messages[..m].iter().map(unmarked).collect();
+                let then: Vec<Value> = signed["messages"].as_array().unwrap().iter().map(unmarked).collect();
+                assert_eq!(before, then, "request {i} sends {signature} after another conversation than request {j}'s");
+            }
+        }
+    }
+}
+
+#[test]
+fn claude_thinking_always_goes_back_after_what_it_was_signed_with() {
+    let line = "z".repeat(990);
+    let big: String = (1..=25).map(|i| format!("{i:03} {line}\n")).collect();
+    let read = |start: Value, count: Value| calls("read", json!({ "path": "big.txt", "start_line": start, "line_count": count }));
+    let model = Model::claude(vec![
+        read(json!(null), json!(null)),
+        says("It's big."),
+        read(json!(1), json!(6)),
+        says("Same start."),
+        says("Goal: read big.txt."),
+        says("You're welcome."),
+        says("Bye."),
+    ])
+    // Under the third request, over the second: see below.
+    .with_env("REIN_COMPACT_AT", "9000");
+    let mut term = Term::start_with(&model, "claude-compact", 30, 100, &[("big.txt", &big)]);
+    term.wait_for(IDLE);
+    term.keys("read big.txt\r");
+    term.wait_for("It's big.");
+    term.wait_for(IDLE);
+    // The second read makes the first stale, and the conversation too big:
+    // the first read's output is retired before the next request.
+    term.keys("read the start again\r");
+    term.wait_for("Same start.");
+    term.wait_for(IDLE);
+    assert!(term.text().contains("no summary needed, 1 stale tool output retired"), "{}", term.text());
+    term.keys("/compact\r");
+    term.wait_for("(summarized");
+    term.wait_for(IDLE);
+    term.keys("thanks\r");
+    term.wait_for("You're welcome.");
+    term.wait_for(IDLE);
+    term.keys("bye\r");
+    term.wait_for("Bye.");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 7);
+    assert_thinking_follows_what_it_was_signed_with(&requests);
+    // Thinking from before the retired output stays; after it, it goes.
+    assert_eq!(signatures(&requests[2]), ["sig-0", "sig-1"]);
+    assert_eq!(signatures(&requests[3]), ["sig-0"]);
+    assert_eq!(signatures(&requests[4]), ["sig-0", "sig-3"], "the summary request is the conversation as it was");
+    assert_eq!(signatures(&requests[5]), Vec::<String>::new(), "after a summary nothing before it holds");
+    assert_eq!(signatures(&requests[6]), ["sig-5"]);
+}
+
+#[test]
+fn a_conversation_moves_between_providers_and_continues_where_it_was() {
+    let claude = Model::claude(vec![says("From Claude."), says("Claude again.")]);
+    let gpt = Model::start(vec![says("From GPT."), says("GPT again.")])
+        .with_env("ANTHROPIC_API_KEY", "test-key")
+        .with_env("ANTHROPIC_BASE_URL", &claude.base);
+    let mut term = Term::start(&gpt, "switch", 24, 100);
+    term.wait_for(IDLE);
+    term.keys("hi\r");
+    term.wait_for("From GPT.");
+    term.wait_for(IDLE);
+    term.keys("/model\r");
+    term.wait_for("You also have anthropic");
+    term.keys("/model claude-opus-5-5\r");
+    term.wait_for("now using claude-opus-5-5");
+    term.keys("and you?\r");
+    term.wait_for("From Claude.");
+    term.wait_for(IDLE);
+    // Claude was told everything said so far, as Claude's messages.
+    let to_claude = &claude.requests()[0];
+    assert_eq!(to_claude["model"], "claude-opus-5-5");
+    let said: Vec<String> = to_claude["messages"].as_array().unwrap().iter().map(|m| format!("{} {}", m["role"].as_str().unwrap(), m["content"])).collect();
+    assert_eq!(said.len(), 3, "{said:?}");
+    assert!(said[0].starts_with("user ") && said[0].contains("\"hi\""), "{said:?}");
+    assert!(said[1].starts_with("assistant ") && said[1].contains("From GPT."), "{said:?}");
+    assert!(said[2].starts_with("user ") && said[2].contains("and you?"), "{said:?}");
+
+    term.keys("/model gpt-6.1-sol\r");
+    term.wait_for("now using gpt-6.1-sol");
+    term.keys("back to you\r");
+    term.wait_for("GPT again.");
+    term.wait_for(IDLE);
+    let to_gpt = gpt.requests()[1].to_string();
+    assert!(to_gpt.contains("From Claude.") && !to_gpt.contains("sig-0"), "Claude's words go to GPT, its signed thinking doesn't: {to_gpt}");
+
+    term.keys("/model claude-opus-5-5\r");
+    term.wait_for("now using claude-opus-5-5");
+    term.keys("/exit\r");
+    // -c goes on with the provider the conversation was left with.
+    let mut term = term.again_with(&gpt, &["-c"]);
+    term.wait_for(IDLE);
+    assert!(term.text().contains("claude-opus-5-5"), "{}", term.text());
+    term.keys("one more\r");
+    term.wait_for("Claude again.");
+    assert_eq!(claude.requests().len(), 2);
+    assert_eq!(signatures(&claude.requests()[1]), ["sig-0"], "its own thinking, after the same conversation");
+}
+
+/// rein run once, outside a terminal, with `input` piped in.
+fn run(model: &Model, home: &std::path::Path, args: &[&str], input: &str) -> (bool, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rein"))
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("REIN_HOME", home)
+        .env("ANTHROPIC_BASE_URL", &model.base)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+}
+
+#[test]
+fn a_saved_key_is_checked_kept_private_used_and_forgotten() {
+    let model = Model::claude(vec![]);
+    let home = std::env::temp_dir().join(format!("rein-login-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    let (ok, said) = run(&model, &home, &["login", "anthropic"], "sk-ant-test\n");
+    assert!(ok && said.contains("Saved. Your Anthropic key works: 1 model."), "{said}");
+    let keys = home.join("keys.json");
+    assert!(std::fs::read_to_string(&keys).unwrap().contains("sk-ant-test"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&keys).unwrap().permissions().mode() & 0o777, 0o600, "only you can read it");
+    assert!(model.requests().is_empty(), "checking the key lists models; it sends no message");
+
+    let (ok, said) = run(&model, &home, &["models", "anthropic"], "");
+    assert!(ok && said.contains("Using your saved Anthropic key with") && said.contains("claude-opus-5-5"), "{said}");
+
+    let (ok, said) = run(&model, &home, &["login", "nobody"], "key\n");
+    assert!(!ok && said.contains("no provider called nobody"), "{said}");
+    let (ok, said) = run(&model, &home, &["logout", "anthropic"], "");
+    assert!(ok && said.contains("Forgot your anthropic key."), "{said}");
+    let (ok, said) = run(&model, &home, &["models", "anthropic"], "");
+    assert!(!ok && said.contains("no key for Anthropic: set ANTHROPIC_API_KEY, or run `rein login anthropic`"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
 }

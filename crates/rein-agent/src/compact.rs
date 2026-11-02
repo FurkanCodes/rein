@@ -18,6 +18,12 @@
 //! Compacting loses the prompt cache once: the next request starts
 //! differently. The request for the summary itself doesn't: it's the
 //! conversation untouched, with the request added at the end.
+//!
+//! Claude's thinking is signed together with everything before it, so it
+//! only holds while that stays as it was. Where compaction changes the
+//! conversation, the thinking after that point goes (see [`unbind`]); the
+//! rest, and every word and tool call, stays. Requests then never carry
+//! thinking the provider would turn away.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -74,7 +80,7 @@ pub fn size(item: &Item) -> usize {
         Item::User(text) | Item::Assistant(text) => text.len(),
         Item::ToolCall(call) => call.name.len() + call.arguments.len(),
         Item::ToolResult { output, .. } => output.len(),
-        Item::Opaque(value) => value.to_string().len(),
+        Item::Opaque(opaque) => opaque.value.to_string().len(),
     }
 }
 
@@ -176,16 +182,36 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
     retired
 }
 
-/// Swaps in the replacements from [`stale`].
-pub fn retire(history: &mut [Item], retired: &[(String, String)]) {
+/// Swaps in the replacements from [`stale`]. Thinking after the first one
+/// was signed with what's been replaced, so it goes.
+pub fn retire(history: &mut Vec<Item>, retired: &[(String, String)]) {
     let by_id: HashMap<&str, &str> = retired.iter().map(|(id, text)| (id.as_str(), text.as_str())).collect();
-    for item in history {
+    let mut first = None;
+    for (i, item) in history.iter_mut().enumerate() {
         if let Item::ToolResult { call_id, output } = item
             && let Some(text) = by_id.get(call_id.as_str())
         {
             *output = (*text).to_owned();
+            first.get_or_insert(i);
         }
     }
+    if let Some(first) = first {
+        let mut i = 0;
+        history.retain(|item| {
+            i += 1;
+            i <= first || !bound(item)
+        });
+    }
+}
+
+/// Drops the thinking that only holds while the conversation before it
+/// stays as it was: Claude's. After a summary, nothing before is as it was.
+pub fn unbind(items: &mut Vec<Item>) {
+    items.retain(|item| !bound(item));
+}
+
+fn bound(item: &Item) -> bool {
+    matches!(item, Item::Opaque(opaque) if opaque.bound())
 }
 
 /// rein's own record of the conversation, from everything that happened
@@ -444,6 +470,42 @@ mod tests {
         let mut history = history;
         retire(&mut history, &retired);
         assert!(stale(&history).is_empty(), "retiring twice changes nothing");
+    }
+
+    #[test]
+    fn thinking_signed_before_a_retired_output_goes_and_the_rest_stays() {
+        let thinking = |sig: &str| Item::Opaque(rein_llm::Opaque::new(rein_llm::Api::Anthropic, json!({"type": "thinking", "thinking": "", "signature": sig})));
+        let reasoning = Item::Opaque(rein_llm::Opaque::new(rein_llm::Api::Responses, json!({"type": "reasoning", "encrypted_content": "x"})));
+        let mut history = vec![
+            Item::User("look at a.py".into()),
+            thinking("before"),
+            call("r1", "read", json!({"path": "a.py"})),
+            result("r1", &big("old a")),
+            thinking("after"),
+            reasoning.clone(),
+            call("e1", "edit", json!({"path": "a.py"})),
+            result("e1", "edited a.py"),
+            thinking("later"),
+            Item::Assistant("done".into()),
+        ];
+        let retired = stale(&history);
+        assert_eq!(retired.len(), 1);
+        retire(&mut history, &retired);
+        let signatures: Vec<&str> = history
+            .iter()
+            .filter_map(|item| match item {
+                Item::Opaque(o) if o.bound() => o.value["signature"].as_str(),
+                _ => None,
+            })
+            .collect();
+        // The thinking before the change still matches what came before it.
+        assert_eq!(signatures, ["before"]);
+        assert!(history.contains(&reasoning), "OpenAI's reasoning isn't signed with the conversation");
+        assert_eq!(history.len(), 8, "every word and call stays");
+
+        let mut kept = history.clone();
+        unbind(&mut kept);
+        assert!(kept.iter().all(|item| !bound(item)));
     }
 
     #[test]

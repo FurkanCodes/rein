@@ -62,8 +62,8 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
         "/effort" => match arg.as_deref() {
             None => Ok(Slash::Effort(None)),
             Some("default") => Ok(Slash::Effort(Some(None))),
-            Some(level @ ("minimal" | "low" | "medium" | "high" | "xhigh")) => Ok(Slash::Effort(Some(Some(level.to_owned())))),
-            Some(other) => Err(format!("no effort called {other}; use low, medium, high or default")),
+            Some(level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max")) => Ok(Slash::Effort(Some(Some(level.to_owned())))),
+            Some(other) => Err(format!("no effort called {other}; use low, medium, high, xhigh, max or default")),
         },
         "/status" => Ok(Slash::Status),
         "/compact" => Ok(Slash::Compact(arg)),

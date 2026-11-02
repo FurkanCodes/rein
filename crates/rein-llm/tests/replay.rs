@@ -1,16 +1,21 @@
 //! Replays saved response streams through the decoder: no network, no tokens.
 //!
-//! `synthetic-hello.sse` is hand-written in the documented event format.
-//! Record real ones with `rein --record tests/fixtures/<name>.sse "<prompt>"`.
+//! The `synthetic-*` streams are hand-written in each format's documented
+//! events. Record real ones with `rein --record tests/fixtures/<name>.sse "<prompt>"`.
 
+use rein_llm::decode::{Decoder, Translate};
 use rein_llm::openai::EventDecoder;
-use rein_llm::{Error, Event, Item, ToolCall, Usage};
+use rein_llm::serde_json;
+use rein_llm::{Api, Error, Event, Item, Opaque, ToolCall, Usage};
 
 const HELLO: &[u8] = include_bytes!("fixtures/synthetic-hello.sse");
 
 /// Feeds `stream` in `chunk`-byte pieces, the way a network might deliver it.
 fn replay(stream: &[u8], chunk: usize) -> Vec<rein_llm::Result<Event>> {
-    let mut decoder = EventDecoder::default();
+    replay_with(EventDecoder::default(), stream, chunk)
+}
+
+fn replay_with<T: Translate>(mut decoder: Decoder<T>, stream: &[u8], chunk: usize) -> Vec<rein_llm::Result<Event>> {
     let mut events = Vec::new();
     for piece in stream.chunks(chunk) {
         decoder.push(piece);
@@ -28,7 +33,7 @@ fn text_and_usage(events: Vec<rein_llm::Result<Event>>) -> (String, Option<Usage
     for event in events {
         match event.expect("no errors") {
             Event::TextDelta(delta) => text.push_str(&delta),
-            Event::Item(_) | Event::Thought(_) => {}
+            Event::Item(_) | Event::Thought(_) | Event::Note(_) => {}
             Event::Completed { usage: u } => usage = Some(u),
         }
     }
@@ -123,4 +128,27 @@ fn nothing_is_decoded_after_the_response_ends() {
     stream.extend_from_slice(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n");
     let (text, _) = text_and_usage(replay(&stream, 32));
     assert!(!text.contains("late"));
+}
+
+#[test]
+fn replays_claude_thinking_and_a_tool_call() {
+    let stream = include_bytes!("fixtures/synthetic-claude-tool-call.sse");
+    for chunk in [1, 5, 64, stream.len()] {
+        let events: Vec<Event> = replay_with(rein_llm::anthropic::decoder("claude-opus-5-5"), stream, chunk).into_iter().map(|e| e.expect("no errors")).collect();
+        let items: Vec<&Item> = events.iter().filter_map(|e| if let Event::Item(item) = e { Some(item) } else { None }).collect();
+        let thinking = serde_json::json!({ "type": "thinking", "thinking": "**Finding the manifest**\nThe user wants the crate's name.", "signature": "EqQBCkgIARABGAIiQL" });
+        assert_eq!(
+            items,
+            [
+                &Item::Opaque(Opaque::new(Api::Anthropic, thinking)),
+                &Item::Assistant("I'll read the manifest.".into()),
+                &Item::ToolCall(ToolCall { call_id: "toolu_01A09q90qw90lq917835lq9".into(), name: "read".into(), arguments: r#"{"path": "Cargo.toml"}"#.into() }),
+            ],
+            "chunk size {chunk}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Event::Completed { usage: Usage { input_tokens: 2_437, cached_input_tokens: 2_048, output_tokens: 89, reasoning_tokens: 41 } })
+        );
+    }
 }

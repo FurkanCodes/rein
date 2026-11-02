@@ -9,8 +9,7 @@ use std::task::Poll;
 
 use serde_json::{Value, json};
 
-use rein_llm::openai::{Client, Request};
-use rein_llm::{Error, Event, Item, Result, Tool, ToolCall, Usage};
+use rein_llm::{Client, Error, Event, Item, Request, Result, STALE_THINKING, Tool, ToolCall, Usage};
 
 use crate::compact;
 use crate::context;
@@ -28,9 +27,13 @@ pub enum Streamed<'a> {
     Text(&'a str),
     /// A piece of a short summary of what the model is thinking.
     Thought(&'a str),
+    /// Something to tell the user about the answer, like another model
+    /// having given it.
+    Note(&'a str),
 }
 
-/// Something that answers requests. The real one is OpenAI; tests script one.
+/// Something that answers requests. The real one is a provider's API
+/// ([`Llm`]); tests script one.
 pub trait Model {
     /// Sends one request, passing what streams in to `on` as it arrives,
     /// and returns the finished items and the token counts.
@@ -55,6 +58,8 @@ pub trait Ui {
     /// A piece of a summary of the model's thinking, like `**Checking the
     /// tests**`.
     fn thought(&mut self, _delta: &str) {}
+    /// Something to know about the answer: another model gave it, say.
+    fn note(&mut self, _note: &str) {}
     /// Asked when the permissions say to ask. It's async so that an
     /// interrupt can cancel the turn even while it waits for an answer.
     fn approve(&mut self, call: &ToolCall) -> impl Future<Output = Approval>;
@@ -176,6 +181,8 @@ pub struct Agent<M> {
     pub model_name: String,
     pub instructions: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// The most one answer may take, when the model list says.
+    pub max_output: Option<u64>,
     /// One ID for the whole conversation, so its requests share a prompt cache.
     pub session_id: Option<String>,
     /// The whole conversation. Every request sends all of it.
@@ -207,6 +214,7 @@ impl<M: Model> Agent<M> {
         // Compact at most once per message, so a summary that is itself too
         // big can't start a loop of summaries.
         let mut compacted = false;
+        let mut unbound = false;
         for _ in 0..MAX_TURNS {
             if !compacted && self.estimated() > self.window.limit {
                 self.compact(None, false, ui).await?;
@@ -218,9 +226,17 @@ impl<M: Model> Agent<M> {
             let (items, usage) = match self.model.respond(&request, &mut |streamed| stream_to(ui, streamed)).await {
                 // The provider says it's too long after all: make room and
                 // try again, once.
-                Err(e) if !compacted && e.code() == Some("context_length_exceeded") => {
+                Err(e) if !compacted && e.code() == Some(rein_llm::CONTEXT_FULL) => {
                     self.compact(None, true, ui).await?;
                     compacted = true;
+                    continue;
+                }
+                // The provider turned the conversation's thinking away (it
+                // was signed with a conversation that has changed since,
+                // say by an older rein's tools): without it, once.
+                Err(e) if !unbound && e.code() == Some(STALE_THINKING) => {
+                    self.unbind()?;
+                    unbound = true;
                     continue;
                 }
                 other => other?,
@@ -466,10 +482,19 @@ impl<M: Model> Agent<M> {
         // summary: it starts exactly like the last request, so the cache
         // serves most of it. (Retiring first would change it early on and
         // lose the cache from there.)
-        let mut input = self.history.clone();
-        input.push(Item::User(compact::prompt(focus)));
-        ui.thinking();
-        let (items, usage) = self.model.respond(&self.request(input), &mut |streamed| stream_to(ui, streamed)).await?;
+        let mut tries = 0;
+        let (items, usage) = loop {
+            let mut input = self.history.clone();
+            input.push(Item::User(compact::prompt(focus)));
+            ui.thinking();
+            match self.model.respond(&self.request(input), &mut |streamed| stream_to(ui, streamed)).await {
+                Err(e) if tries == 0 && e.code() == Some(STALE_THINKING) => {
+                    self.unbind()?;
+                    tries += 1;
+                }
+                answer => break answer?,
+            }
+        };
         ui.usage(&usage);
         let summary: Vec<&str> = items
             .iter()
@@ -489,6 +514,9 @@ impl<M: Model> Agent<M> {
         let start = compact::recent_start(&self.history, pinned, budget);
         let mut kept = self.history[start..].to_vec();
         compact::retire(&mut kept, &retired);
+        // The kept part follows the summary now, not what its thinking was
+        // signed with.
+        compact::unbind(&mut kept);
         if let Some(session) = &mut self.session {
             session.append_compaction(&message, &kept)?;
         }
@@ -521,7 +549,19 @@ impl<M> Agent<M> {
             reasoning_effort: self.reasoning_effort.clone(),
             reasoning_summary: true,
             session_id: self.session_id.clone(),
+            max_output_tokens: self.max_output,
         }
+    }
+
+    /// Drops the conversation's thinking that only held while what came
+    /// before it stayed the same ([`compact::unbind`]), and saves that.
+    fn unbind(&mut self) -> Result<()> {
+        compact::unbind(&mut self.history);
+        if let Some(session) = &mut self.session {
+            session.append_unbound()?;
+        }
+        self.window.measured = None;
+        Ok(())
     }
 
     /// About how many tokens the next request will carry: the provider's
@@ -593,9 +633,9 @@ impl<M> Agent<M> {
     }
 }
 
-/// OpenAI as a [`Model`], optionally saving every raw response stream to
-/// `record` for replay tests.
-pub struct OpenAi {
+/// A provider's API as a [`Model`], optionally saving every raw response
+/// stream to `record` for replay tests.
+pub struct Llm {
     pub client: Client,
     pub record: Option<File>,
 }
@@ -604,13 +644,14 @@ fn stream_to(ui: &mut impl Ui, streamed: Streamed) {
     match streamed {
         Streamed::Text(text) => ui.text(text),
         Streamed::Thought(text) => ui.thought(text),
+        Streamed::Note(note) => ui.note(note),
     }
 }
 
 /// How long to wait before each retry of a failed request.
 const RETRY_WAITS: [u64; 3] = [1, 2, 4];
 
-impl Model for OpenAi {
+impl Model for Llm {
     async fn respond(&self, request: &Request, on: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
         // Only the request itself is retried: once the answer has started,
         // trying again would show it twice.
@@ -631,6 +672,7 @@ impl Model for OpenAi {
             match event? {
                 Event::TextDelta(text) => on(Streamed::Text(&text)),
                 Event::Thought(text) => on(Streamed::Thought(&text)),
+                Event::Note(note) => on(Streamed::Note(&note)),
                 Event::Item(item) => items.push(item),
                 Event::Completed { usage } => return Ok((items, usage)),
             }
@@ -673,6 +715,43 @@ mod tests {
             }
             Ok((items, Usage::default()))
         }
+    }
+
+    /// Turns away any request carrying Claude thinking, as Anthropic does
+    /// once the conversation before it has changed; answers the rest.
+    struct Picky {
+        requests: RefCell<Vec<Request>>,
+    }
+
+    impl Model for Picky {
+        async fn respond(&self, request: &Request, _: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
+            self.requests.borrow_mut().push(request.clone());
+            if request.input.iter().any(|item| matches!(item, Item::Opaque(o) if o.bound())) {
+                let message = "messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.";
+                return Err(Error::api(Some(400), Some("invalid_request_error".into()), message.into(), None));
+            }
+            Ok((vec![Item::Assistant("ok".into())], Usage::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_the_provider_turns_away_is_dropped_and_the_turn_goes_on() {
+        let thinking = Item::Opaque(rein_llm::Opaque::new(rein_llm::Api::Anthropic, json!({"type": "thinking", "thinking": "", "signature": "old"})));
+        let mut agent = base_with(agent("unbind", vec![]));
+        agent.history = vec![Item::User("first".into()), thinking.clone(), Item::Assistant("answer".into())];
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        assert_eq!(agent.send("next".into(), &mut person).await.unwrap(), Outcome::Done);
+        let requests = agent.model.requests.borrow();
+        assert_eq!(requests.len(), 2, "turned away once, then answered");
+        assert!(requests[1].input.iter().all(|item| !matches!(item, Item::Opaque(o) if o.bound())));
+        assert!(!agent.history.contains(&thinking));
+        assert_eq!(agent.history.last(), Some(&Item::Assistant("ok".into())));
+    }
+
+    /// `agent`'s parts, for an agent with another model.
+    fn base_with(agent: Agent<Scripted>) -> Agent<Picky> {
+        let Agent { model: _, tools, permissions, model_name, instructions, reasoning_effort, max_output, session_id, history, session, context, window } = agent;
+        Agent { model: Picky { requests: RefCell::new(Vec::new()) }, tools, permissions, model_name, instructions, reasoning_effort, max_output, session_id, history, session, context, window }
     }
 
     /// Gives the same answer every time and keeps a log of what it saw.
@@ -884,6 +963,7 @@ mod tests {
             model_name: "m".into(),
             instructions: None,
             reasoning_effort: None,
+            max_output: None,
             session_id: Some("session-1".into()),
             history: Vec::new(),
             session: None,
@@ -897,7 +977,7 @@ mod tests {
         let mut agent = agent(
             "loop",
             vec![
-                vec![Item::Opaque(json!({"type": "reasoning"})), bash("c1", "echo hi")],
+                vec![Item::Opaque(rein_llm::Opaque::new(rein_llm::Api::Responses, json!({"type": "reasoning"}))), bash("c1", "echo hi")],
                 vec![Item::Assistant("It printed hi.".into())],
             ],
         );
@@ -912,7 +992,7 @@ mod tests {
             requests[1].input,
             [
                 Item::User("say hi".into()),
-                Item::Opaque(json!({"type": "reasoning"})),
+                Item::Opaque(rein_llm::Opaque::new(rein_llm::Api::Responses, json!({"type": "reasoning"}))),
                 bash("c1", "echo hi"),
                 Item::ToolResult { call_id: "c1".into(), output: "hi\n[exit code 0]".into() },
             ]
@@ -1035,8 +1115,8 @@ mod tests {
                 socket.write_all(&reply).unwrap();
             }
         });
-        let client = Client::new(rein_llm::reqwest::Client::new(), "test").with_base_url(format!("http://127.0.0.1:{port}"));
-        let model = OpenAi { client, record: None };
+        let client = Client::new(rein_llm::reqwest::Client::new(), rein_llm::Api::Responses, format!("http://127.0.0.1:{port}"), rein_llm::Auth::Bearer("test".into()));
+        let model = Llm { client, record: None };
         let request = Request {
             model: "m".into(),
             instructions: None,
@@ -1045,6 +1125,7 @@ mod tests {
             reasoning_effort: None,
             reasoning_summary: false,
             session_id: None,
+            max_output_tokens: None,
         };
         let started = std::time::Instant::now();
         let (items, _) = model.respond(&request, &mut |_| {}).await.unwrap();
