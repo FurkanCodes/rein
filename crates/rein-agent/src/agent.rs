@@ -380,7 +380,7 @@ impl<M: Model> Agent<M> {
                 self.mention_call("glob", json!({ "pattern": "*", "path": mention.path.trim_end_matches('/') }))
             } else {
                 let (start, count) = match mention.lines {
-                    Some((first, last)) => (json!(first), last.map_or(json!(null), |last| json!(last - first + 1))),
+                    Some((first, last)) => (json!(first), last.and_then(|last| last.checked_sub(first)).map_or(json!(null), |more| json!(more + 1))),
                     None => (json!(null), json!(null)),
                 };
                 self.mention_call("read", json!({ "path": mention.path, "start_line": start, "line_count": count }))

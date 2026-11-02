@@ -102,6 +102,12 @@ impl Tools {
         self.saved().push(Vec::new());
     }
 
+    /// Forgets the file changes there are to undo: they were another
+    /// conversation's.
+    pub fn forget_changes(&self) {
+        self.saved().clear();
+    }
+
     /// Puts back the files the latest turn that changed any wrote or edited,
     /// and returns their paths. Commands it ran aren't undone: rein can't
     /// know what they did.
@@ -377,29 +383,83 @@ impl Tools {
     async fn bash(&self, arguments: &str) -> Result<String, String> {
         let args: BashArgs = parse(arguments)?;
         let timeout = args.timeout_seconds.map_or(self.timeout, |s| Duration::from_secs(s).clamp(Duration::from_secs(1), MAX_TIMEOUT));
-        let child = tokio::process::Command::new("sh")
+        let mut command = tokio::process::Command::new("sh");
+        command
             .arg("-c")
             .arg(&args.command)
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // If we give up waiting, dropping the child stops it.
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("can't start sh: {e}"))?;
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(result) => result.map_err(|e| format!("the command failed to run: {e}"))?,
-            Err(_) => return Err(format!("the command took longer than {timeout:?} and was stopped")),
+            .kill_on_drop(true);
+        // A group of its own, so stopping it stops what it started too.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|e| format!("can't start sh: {e}"))?;
+        let group = Group(child.id());
+        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let run = async { tokio::join!(read_capped(stdout), read_capped(stderr), child.wait()) };
+        // Given up on, or the turn stopped: `group` is dropped, and with it
+        // everything the command started.
+        let Ok(((out, out_total), (err, err_total), status)) = tokio::time::timeout(timeout, run).await else {
+            return Err(format!("the command took longer than {timeout:?} and was stopped"));
         };
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        let status = match output.status.code() {
+        let status = status.map_err(|e| format!("the command failed to run: {e}"))?;
+        // Done: what it put in the background on purpose, like a server,
+        // is its own business.
+        group.disarm();
+        let mut text = String::from_utf8_lossy(&out).into_owned();
+        text.push_str(&String::from_utf8_lossy(&err));
+        let dropped = (out_total - out.len()) + (err_total - err.len());
+        if dropped > 0 {
+            text.push_str(&format!("\n[{dropped} more bytes of output weren't kept]\n"));
+        }
+        let status = match status.code() {
             Some(code) => format!("exit code {code}"),
             None => "stopped by a signal".to_owned(),
         };
         Ok(format!("{text}[{status}]"))
     }
+}
+
+/// A command's process group, which stops when this is dropped before the
+/// command is done: on a timeout, or when the turn's future is dropped
+/// (Esc). Killing the shell alone would leave what it started running.
+struct Group(Option<u32>);
+
+impl Group {
+    /// The command finished: nothing to stop.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+            // SAFETY: killpg only sends a signal. The group is the one the
+            // command was started in (`process_group(0)` makes its ID the
+            // shell's), and the shell hasn't been waited for yet, so the ID
+            // can't have been reused.
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Reads all of `pipe`, keeping the first `MAX_OUTPUT` bytes: a command
+/// that prints gigabytes costs no more memory than one that prints enough.
+/// Returns what was kept, and how much there was.
+async fn read_capped(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> (Vec<u8>, usize) {
+    use tokio::io::AsyncReadExt;
+    let Some(mut pipe) = pipe else { return (Vec::new(), 0) };
+    let (mut kept, mut total, mut buf) = (Vec::new(), 0, [0u8; 8192]);
+    while let Ok(n @ 1..) = pipe.read(&mut buf).await {
+        total += n;
+        let room = MAX_OUTPUT.saturating_sub(kept.len());
+        kept.extend_from_slice(&buf[..n.min(room)]);
+    }
+    (kept, total)
 }
 
 struct Edited {
@@ -506,6 +566,57 @@ fn truncate(mut text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether a process whose whole command is `command` is alive (not
+    /// just waiting to be reaped). Whole, so a shell that merely mentions it
+    /// doesn't count.
+    fn running(command: &str) -> bool {
+        // A moment for SIGKILL to land.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let ps = std::process::Command::new("ps").args(["-axo", "stat=,command="]).output().unwrap();
+        String::from_utf8_lossy(&ps.stdout).lines().any(|line| {
+            let (stat, rest) = line.trim_start().split_once(' ').unwrap_or_default();
+            !stat.starts_with('Z') && rest.trim() == command
+        })
+    }
+
+    fn bash_call(command: &str, timeout: Option<u64>) -> ToolCall {
+        ToolCall { call_id: "b".into(), name: "bash".into(), arguments: json!({ "command": command, "timeout_seconds": timeout }).to_string() }
+    }
+
+    #[tokio::test]
+    async fn a_command_stopped_by_its_timeout_takes_everything_it_started_with_it() {
+        let tools = Tools::new(project("timeout-group", &[]));
+        let output = tools.run(&bash_call("sleep 41.17 & sleep 41.17", Some(1))).await;
+        assert!(output.contains("took longer"), "{output}");
+        assert!(!running("sleep 41.17"), "the sleeps were left running");
+    }
+
+    #[tokio::test]
+    async fn a_command_whose_turn_is_stopped_takes_everything_it_started_with_it() {
+        let tools = Tools::new(project("dropped-group", &[]));
+        // The turn's future is dropped mid-command, as Esc does.
+        let stopped = tokio::time::timeout(std::time::Duration::from_millis(300), tools.run(&bash_call("sleep 42.23 & sleep 42.23", None))).await;
+        assert!(stopped.is_err());
+        assert!(!running("sleep 42.23"), "the sleeps were left running");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_finishes_leaves_what_it_put_in_the_background() {
+        let tools = Tools::new(project("background", &[]));
+        let output = tools.run(&bash_call("sleep 43.31 >/dev/null 2>&1 & echo started", None)).await;
+        assert!(output.contains("started"), "{output}");
+        assert!(running("sleep 43.31"), "a server started with & keeps running");
+        let _ = std::process::Command::new("pkill").args(["-x", "-f", "sleep 43.31"]).status();
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_output_isnt_all_kept() {
+        let tools = Tools::new(project("flood", &[]));
+        let output = tools.run(&bash_call("head -c 20000000 /dev/zero | tr '\\0' x", None)).await;
+        assert!(output.len() < 100_000, "{} bytes kept", output.len());
+        assert!(output.contains("more bytes"), "{}", &output[output.len().saturating_sub(200)..]);
+    }
 
     /// A fresh directory for one test, with `files` written into it.
     fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {

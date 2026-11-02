@@ -18,6 +18,7 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -25,8 +26,9 @@ use crate::decode::Decode;
 use crate::chat::Quirks;
 use crate::{Api, Error, Event, ModelInfo, Request, Result, anthropic, chat, gemini, openai};
 
-/// How requests prove who's asking.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How requests prove who's asking. Its `Debug` never shows the secret,
+/// so neither can a log line, a `dbg!` or a panic message.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Auth {
     /// Nothing, as for a server on this computer.
     None,
@@ -34,6 +36,16 @@ pub enum Auth {
     Bearer(String),
     /// A header of the provider's own, like Anthropic's `x-api-key`.
     Header(&'static str, String),
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Auth::None => f.write_str("Auth::None"),
+            Auth::Bearer(_) => f.write_str("Auth::Bearer(..)"),
+            Auth::Header(name, _) => write!(f, "Auth::Header({name:?}, ..)"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,9 +56,16 @@ pub struct Client {
     auth: Auth,
     /// What this provider needs that it can't say in an error.
     quirks: Quirks,
+    /// How long an answer may go quiet before rein gives up on it.
+    idle: Duration,
     /// How requests went over the wire, shared by the client's clones.
     wire: Arc<Wire>,
 }
+
+/// How long a streaming answer may send nothing at all. Providers send
+/// something (text, thinking, or a keep-alive) far more often than this
+/// while they work; Codex gives up after the same time.
+const IDLE: Duration = Duration::from_secs(300);
 
 /// Bodies smaller than this go as they are: there'd be little to save.
 const COMPRESS_FROM: usize = 1024;
@@ -93,7 +112,13 @@ impl Client {
     /// which speaks `api`.
     pub fn new(http: reqwest::Client, api: Api, base_url: impl Into<String>, auth: Auth) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
-        Client { http, api, base_url, auth, quirks: Quirks::default(), wire: Arc::default() }
+        Client { http, api, base_url, auth, quirks: Quirks::default(), idle: IDLE, wire: Arc::default() }
+    }
+
+    /// Gives up on an answer that sends nothing for `idle`.
+    pub fn with_idle_timeout(mut self, idle: Duration) -> Self {
+        self.idle = idle;
+        self
     }
 
     pub fn with_quirks(mut self, quirks: Quirks) -> Self {
@@ -215,7 +240,7 @@ impl Client {
         loop {
             let body = self.body(request, &omitted);
             match self.send(request, &body, &omitted).await {
-                Ok(response) => return Ok(ResponseStream { response, decoder: self.decoder(request), record: None }),
+                Ok(response) => return Ok(ResponseStream { response, decoder: self.decoder(request), record: None, idle: self.idle }),
                 // The server named a field it doesn't take: once more
                 // without it, and never again with it.
                 Err(e) if let Some(field) = rejected_field(&e, &body, self.optional(), &omitted) => {
@@ -336,6 +361,7 @@ pub struct ResponseStream {
     response: reqwest::Response,
     decoder: Box<dyn Decode>,
     record: Option<File>,
+    idle: Duration,
 }
 
 impl ResponseStream {
@@ -352,7 +378,11 @@ impl ResponseStream {
             if self.decoder.is_finished() {
                 return None;
             }
-            match self.response.chunk().await {
+            let Ok(chunk) = tokio::time::timeout(self.idle, self.response.chunk()).await else {
+                self.decoder.fail();
+                return Some(Err(Error::Incomplete(format!("the provider sent nothing for {} seconds", self.idle.as_secs()))));
+            };
+            match chunk {
                 Ok(Some(bytes)) => {
                     if let Some(file) = &mut self.record
                         && let Err(e) = file.write_all(&bytes)
@@ -375,6 +405,39 @@ impl ResponseStream {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn an_answer_that_goes_quiet_is_given_up_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0u8; 65536]).await;
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            let event = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n";
+            socket.write_all(format!("{head}{:x}\r\n{event}\r\n", event.len()).as_bytes()).await.unwrap();
+            // And then nothing, with the connection left open.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None).with_idle_timeout(Duration::from_millis(300));
+        let request = Request { model: "m".into(), instructions: None, input: vec![], tools: vec![], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        let mut stream = client.stream(&request).await.unwrap();
+        assert!(matches!(stream.next().await, Some(Ok(Event::TextDelta(_)))));
+        let started = std::time::Instant::now();
+        assert!(matches!(stream.next().await, Some(Err(Error::Incomplete(_)))));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(stream.next().await.is_none(), "nothing after giving up");
+        server.abort();
+    }
+
+    #[test]
+    fn keys_never_show_in_debug_output() {
+        let client = Client::new(reqwest::Client::new(), Api::Anthropic, "https://x", Auth::Header("x-api-key", "sk-ant-secret".into()));
+        let shown = format!("{client:?} {:?}", Auth::Bearer("sk-or-secret".into()));
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("Auth::Header(\"x-api-key\", ..)"), "{shown}");
+    }
 
     #[test]
     fn parses_every_error_body_shape() {

@@ -17,6 +17,7 @@ use reqwest::Url;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::client::check;
 use crate::oauth::{pkce_challenge, random_token, read_request_target, respond};
@@ -72,31 +73,27 @@ impl PendingSignIn {
 
 /// Serves the callback on every address until the real one arrives. Each
 /// connection gets its own task: browsers open spare ones that never send a
-/// request.
+/// request. All of them live in `JoinSet`s, which stop every task they hold
+/// when dropped: given up on (Esc, a timeout), nothing keeps listening.
 async fn wait_for_callback(listeners: Vec<TcpListener>, state: String) -> Result<String> {
     let (tx, mut rx) = mpsc::channel(1);
-    let serving: Vec<_> = listeners
-        .into_iter()
-        .map(|listener| {
-            let (tx, state) = (tx.clone(), state.clone());
-            tokio::spawn(async move {
-                while let Ok((socket, _)) = listener.accept().await {
-                    let (tx, state) = (tx.clone(), state.clone());
-                    tokio::spawn(async move {
-                        if let Some(result) = handle_callback(socket, &state).await {
-                            let _ = tx.send(result).await;
-                        }
-                    });
-                }
-            })
-        })
-        .collect();
-    drop(tx);
-    let result = rx.recv().await.unwrap_or_else(|| Err(Error::Auth("nothing could wait for the browser".into())));
-    for task in serving {
-        task.abort();
+    let mut serving = JoinSet::new();
+    for listener in listeners {
+        let (tx, state) = (tx.clone(), state.clone());
+        serving.spawn(async move {
+            let mut connections = JoinSet::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                let (tx, state) = (tx.clone(), state.clone());
+                connections.spawn(async move {
+                    if let Some(result) = handle_callback(socket, &state).await {
+                        let _ = tx.send(result).await;
+                    }
+                });
+            }
+        });
     }
-    result
+    drop(tx);
+    rx.recv().await.unwrap_or_else(|| Err(Error::Auth("nothing could wait for the browser".into())))
 }
 
 /// Handles one browser request; `None` for ones that aren't the callback.
@@ -172,6 +169,20 @@ mod tests {
         let (key, ()) = tokio::join!(pending.finish(&http, &api_base), browser);
         assert_eq!(key.unwrap(), "sk-or-v1-test");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_given_up_on_stops_listening() {
+        let pending = begin(AUTH_URL, "rein").await.unwrap();
+        let url = Url::parse(&pending.url).unwrap();
+        let callback = Url::parse(&url.query_pairs().find(|(k, _)| k == "callback_url").unwrap().1).unwrap();
+        let port = callback.port().unwrap();
+        let http = reqwest::Client::new();
+        // Esc: the wait is dropped.
+        let given_up = tokio::time::timeout(std::time::Duration::from_millis(100), pending.finish(&http, "http://127.0.0.1:9")).await;
+        assert!(given_up.is_err());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err(), "the old tab can still reach rein");
     }
 
     #[tokio::test]

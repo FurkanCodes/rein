@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rein_llm::openai::signin::{self, Credentials};
@@ -172,7 +172,7 @@ async fn login(http: &rein_llm::reqwest::Client, tell: &dyn Fn(&str)) -> CliResu
 
     let pending = signin::begin(&host_id, AGENT_NAME, previous.as_ref()).await.map_err(describe)?;
     tell("Continue with ChatGPT: finish signing in in your browser...");
-    if !open_browser(&pending.url) {
+    if !open_browser(&pending.url).await {
         tell(&format!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url));
     }
     let credentials = tokio::time::timeout(Duration::from_secs(600), pending.finish(http))
@@ -795,11 +795,12 @@ async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Term
                 _ => None,
             });
             let Some(text) = last else { return Err("nothing to copy yet: rein hasn't answered in this conversation".into()) };
-            if !input::copy(text) {
-                return Err("couldn't copy: no clipboard".into());
-            }
             let lines = text.lines().count();
-            say!("{pad}{} copied rein's last answer ({lines} line{})", s.green("✓"), if lines == 1 { "" } else { "s" });
+            let lines = format!("{lines} line{}", if lines == 1 { "" } else { "s" });
+            match input::copy(text) {
+                input::Copied::Clipboard => say!("{pad}{} copied rein's last answer ({lines})", s.green("✓")),
+                input::Copied::AskedTerminal => say!("{pad}{} asked the terminal to copy rein's last answer ({lines}); some terminals don't allow it", s.green("✓")),
+            }
         }
         Slash::Undo => {
             let undone = agent.undo().map_err(describe)?;
@@ -1061,6 +1062,8 @@ fn switch(agent: &mut Agent<Llm>, loaded: Loaded, context: Option<String>) {
     agent.window.full = loaded.full;
     agent.window.measured = None;
     agent.permissions.forget_approvals();
+    // `/undo` is for this conversation's changes, not the last one's.
+    agent.tools.forget_changes();
 }
 
 fn mode_name(mode: Mode) -> &'static str {
@@ -1641,7 +1644,8 @@ impl Ui for Terminal {
                 Read::Line(answer) => approval(&answer),
                 // Ctrl-C at a question stops the whole turn.
                 Read::Interrupted => {
-                    self.interrupted.notify_one();
+                    // The turn is waiting on this; nothing is kept for later.
+                    self.interrupted.notify_waiters();
                     std::future::pending().await
                 }
                 // No answer (input has ended) means no.
@@ -1978,22 +1982,32 @@ fn mask_email(email: &str) -> String {
 
 /// Opens `url` with `$BROWSER` if it's set, as many tools do, or else the
 /// system's way.
-fn open_browser(url: &str) -> bool {
-    if let Some(browser) = std::env::var("BROWSER").ok().filter(|b| !b.trim().is_empty()) {
-        let mut words = browser.split_whitespace();
-        let mut command = Command::new(words.next().unwrap_or_default());
-        return command.args(words).arg(url).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-    }
-    let mut command = if cfg!(target_os = "macos") {
-        Command::new("open")
-    } else if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
-    } else {
-        Command::new("xdg-open")
+///
+/// `open` and `xdg-open` hand the link over and exit at once, but a browser
+/// named in `$BROWSER` may run until it's closed, and rein has one thread:
+/// it waits a moment for a failure, and a browser still running then is
+/// showing the page.
+async fn open_browser(url: &str) -> bool {
+    let mut command = match std::env::var("BROWSER").ok().filter(|b| !b.trim().is_empty()) {
+        Some(browser) => {
+            let mut words = browser.split_whitespace();
+            let mut command = tokio::process::Command::new(words.next().unwrap_or_default());
+            command.args(words);
+            command
+        }
+        None if cfg!(target_os = "macos") => tokio::process::Command::new("open"),
+        None if cfg!(windows) => {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "start", ""]);
+            command
+        }
+        None => tokio::process::Command::new("xdg-open"),
     };
-    command.arg(url).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    let Ok(mut child) = command.arg(url).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false };
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(status) => status.is_ok_and(|s| s.success()),
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]

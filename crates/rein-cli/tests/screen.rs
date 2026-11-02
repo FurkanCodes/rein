@@ -55,6 +55,8 @@ struct Model {
     home: Vec<(String, String)>,
     /// Requests turned away for having a field this server doesn't take.
     turned_away: Arc<Mutex<usize>>,
+    /// Its model list takes a while, as a busy provider's can.
+    slow_list: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The wire format a model server speaks.
@@ -107,6 +109,12 @@ impl Model {
         model
     }
 
+    /// Its model list takes a second and a half from now on.
+    fn with_slow_model_list(self) -> Model {
+        self.slow_list.store(true, Ordering::Relaxed);
+        self
+    }
+
     /// Also sets `name` to `value` in rein's environment.
     fn with_env(mut self, name: &str, value: &str) -> Model {
         self.env.push((name.into(), value.into()));
@@ -120,6 +128,8 @@ impl Model {
         let (seen, how, heard) = (requests.clone(), gzipped.clone(), heads.clone());
         let turned_away = Arc::new(Mutex::new(0));
         let refused = turned_away.clone();
+        let slow_list = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slow = slow_list.clone();
         std::thread::spawn(move || {
             let mut turns = turns.into_iter();
             for socket in listener.incoming() {
@@ -134,6 +144,9 @@ impl Model {
                     heard.lock().unwrap().push(format!("{head}{}", String::from_utf8_lossy(&body)));
                     http(200, "application/json", br#"{"key":"good-key","user_id":"u1"}"#)
                 } else if head.starts_with("GET") {
+                    if slow.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(1500));
+                    }
                     let models = match wire {
                         Wire::Responses => json!({ "data": [{ "id": "test-model" }, { "id": "gpt-6.1-sol" }] }),
                         Wire::Messages => json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false }),
@@ -171,7 +184,7 @@ impl Model {
                 let _ = socket.write_all(&reply);
             }
         });
-        Model { base, requests, heads, gzipped, env: Vec::new(), home: Vec::new(), turned_away }
+        Model { base, requests, heads, gzipped, env: Vec::new(), home: Vec::new(), turned_away, slow_list }
     }
 
     fn turned_away(&self) -> usize {
@@ -836,7 +849,8 @@ fn copy_puts_the_last_answer_on_the_clipboard() {
     term.wait_for("then commit.");
     term.wait_for(IDLE);
     term.keys("/copy\r");
-    term.wait_for("copied rein's last answer (1 line)");
+    // No clipboard command here: the terminal is asked, and rein says so.
+    term.wait_for("asked the terminal to copy rein's last answer (1 line)");
     let copied = term.screen.lock().unwrap().callbacks().copied.clone();
     assert_eq!(copied, ["Run `cargo test --all`, then **commit**."], "as the model wrote it, Markdown and all");
 }
@@ -1368,4 +1382,40 @@ fn a_menu_is_chosen_from_with_the_arrows_and_enter() {
     term.wait_until("only xhigh", |screen| screen.contains("› xhigh") && !screen.contains("minimal"));
     term.keys("\r");
     term.wait_for("✓ reasoning effort: xhigh");
+}
+
+#[test]
+fn esc_while_rein_looks_something_up_doesnt_stop_the_next_turn() {
+    let claude = Model::claude(vec![]);
+    let gpt = Model::start(vec![says("Still here.")]).with_env("ANTHROPIC_API_KEY", "test-key").with_env("ANTHROPIC_BASE_URL", &claude.base);
+    let mut term = Term::start(&gpt, "stale-stop", 30, 100);
+    term.wait_for(IDLE);
+    let claude = claude.with_slow_model_list();
+    term.keys("/model\r");
+    term.wait_for("Looking up the other providers' models");
+    // Esc while nothing can be stopped...
+    term.keys("\x1b");
+    term.wait_for("choose a model");
+    term.keys("\x1b");
+    term.wait_for(IDLE);
+    // ...mustn't be kept for the next turn.
+    term.keys("hi\r");
+    term.wait_for("Still here.");
+    assert!(!term.text().contains("(interrupted"), "{}", term.text());
+    drop(claude);
+}
+
+#[test]
+fn undo_in_a_new_conversation_doesnt_reach_into_the_last_one() {
+    let model = Model::start(vec![calls("write", json!({ "path": "a.txt", "content": "changed\n" })), says("Wrote it.")]).with_env("REIN_MODE", "edits");
+    let mut term = Term::start_with(&model, "undo-new", 30, 100, &[("a.txt", "original\n")]);
+    term.wait_for(IDLE);
+    term.keys("change a.txt\r");
+    term.wait_for("Wrote it.");
+    term.wait_for(IDLE);
+    term.keys("/new\r");
+    term.wait_for("a fresh conversation");
+    term.keys("/undo\r");
+    term.wait_for("nothing to undo");
+    assert_eq!(std::fs::read_to_string(term.dir.join("project/a.txt")).unwrap(), "changed\n", "the last conversation's change stays");
 }

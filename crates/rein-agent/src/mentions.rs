@@ -59,13 +59,15 @@ fn split_lines(word: &str) -> (&str, Option<(usize, Option<usize>)>) {
         Some((first, last)) => (first, Some(last.trim_start_matches('L'))),
         None => (range, None),
     };
-    let Ok(first) = first.parse::<usize>() else { return (word, None) };
+    // Lines count from 1: `:0` means the start. Clamped before the order is
+    // checked, so `:0-0` can't become lines 1 to 0.
+    let Ok(first) = first.parse::<usize>().map(|first| first.max(1)) else { return (word, None) };
     let last = match last.map(str::parse::<usize>) {
         Some(Ok(last)) if last >= first => Some(last),
         Some(_) => return (word, None),
         None => None,
     };
-    (path, Some((first.max(1), last)))
+    (path, Some((first, last)))
 }
 
 #[cfg(test)]
@@ -74,6 +76,19 @@ mod tests {
 
     fn paths(text: &str) -> Vec<String> {
         find(text).into_iter().map(|m| m.path).collect()
+    }
+
+    #[test]
+    fn a_range_never_ends_before_it_starts() {
+        assert_eq!(split_lines("a.rs:0-0"), ("a.rs:0-0", None));
+        assert_eq!(split_lines("a.rs:0-5"), ("a.rs", Some((1, Some(5)))));
+        assert_eq!(split_lines("a.rs:0"), ("a.rs", Some((1, None))));
+        assert_eq!(split_lines("a.rs:9-3"), ("a.rs:9-3", None));
+        for (_, lines) in find("@a.rs:0-0 @b.rs:0-1 @c.rs:5-5").into_iter().map(|m| (m.path, m.lines)) {
+            if let Some((first, Some(last))) = lines {
+                assert!(last >= first);
+            }
+        }
     }
 
     #[test]

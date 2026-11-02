@@ -147,18 +147,23 @@ impl Permissions {
     fn decide_command(&self, line: &str) -> Decision {
         let parts = split_command(line);
         // Deny first. When the splitter gives up, check every run of words
-        // in the line instead, so a deny rule still can't be dodged by
-        // adding a `$` somewhere.
-        let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+        // in the line instead, cut at anything that can start a command
+        // and with quotes taken off, so a deny rule still can't be dodged
+        // by adding a `$` somewhere or gluing the command to a `;`.
+        let words = loose_words(line);
         let fallback: Vec<&[String]> = (0..words.len()).map(|i| &words[i..]).collect();
         let candidates: Vec<&[String]> = match &parts {
             Some(parts) => parts.iter().map(Vec::as_slice).collect(),
             None => fallback,
         };
-        if let Some(rule) = self.rules.iter().find(|r| r.kind == Kind::Deny && candidates.iter().any(|c| r.matches(c))) {
+        let denies = self.rules.iter().filter(|r| r.kind == Kind::Deny);
+        if let Some(rule) = denies.clone().find(|r| candidates.iter().any(|c| r.matches(c))) {
             return Decision::Deny(format!("Blocked by a rule: `deny {}`.", rule.prefix.join(" ")));
         }
         match self.mode {
+            // What rein couldn't take apart, it can't promise no deny rule
+            // covers: it asks, rather than trust a guess.
+            Mode::Trust if parts.is_none() && denies.count() > 0 => return Decision::Ask,
             Mode::Trust => return Decision::Allow,
             Mode::ReadOnly => return Decision::Deny("Commands are turned off: rein is in read-only mode.".into()),
             Mode::Ask | Mode::Edits => {}
@@ -189,6 +194,17 @@ impl Permissions {
             _ => {}
         }
     }
+}
+
+/// The words of a line rein couldn't take apart, for deny rules to look
+/// through: split at spaces and at everything that can start or end a
+/// command (`;`, `&`, `|`, brackets, backticks, `$`), quotes and escapes
+/// taken off. A guess, but one that errs towards finding a command.
+fn loose_words(line: &str) -> Vec<String> {
+    line.split(|c: char| c.is_whitespace() || ";&|(){}`$<>".contains(c))
+        .map(|word| word.chars().filter(|c| !matches!(c, '\'' | '"' | '\\')).collect::<String>())
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 /// Splits a shell command line into its commands, each as a list of words,
@@ -354,6 +370,21 @@ mod tests {
         let trusting = Permissions::new(Mode::Trust, RULES).unwrap();
         assert_eq!(trusting.decide(&bash("git push --force")), blocked);
         assert_eq!(trusting.decide(&bash("rm -rf target")), Decision::Allow);
+    }
+
+    #[test]
+    fn a_deny_rule_cant_be_dodged_by_what_the_splitter_gives_up_on() {
+        let trusting = Permissions::new(Mode::Trust, "deny git push").unwrap();
+        // Glued to punctuation, quoted, or after something rein can't read:
+        // still the command the rule is about.
+        for dodge in ["echo $X;git push", "x=1;git push", "echo $(true) && git 'push'", "(git push)", "true|git push", "`git push`", "echo \"$(git push)\""] {
+            assert_ne!(trusting.decide(&bash(dodge)), Decision::Allow, "{dodge}");
+        }
+        // What can't be read, with a deny rule in place, is asked about.
+        assert_eq!(trusting.decide(&bash("echo $(curl example.com)")), Decision::Ask);
+        // Without deny rules, trust is trust.
+        let trusting = Permissions::new(Mode::Trust, "").unwrap();
+        assert_eq!(trusting.decide(&bash("echo $X;git push")), Decision::Allow);
     }
 
     #[test]

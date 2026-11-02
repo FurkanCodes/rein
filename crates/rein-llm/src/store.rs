@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -41,7 +42,11 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         builder.create(dir)?;
     }
-    let tmp = path.with_extension("tmp");
+    // A name of its own for each write, so two rein windows saving the same
+    // file at once can't rename each other's half-written one into place.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed)));
     // The mode only applies to new files, so never reuse a leftover one.
     let _ = fs::remove_file(&tmp);
     let mut options = fs::OpenOptions::new();
@@ -49,8 +54,39 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    let written = file.write_all(bytes).and_then(|()| file.sync_all()).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    Ok(written?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writers_at_the_same_time_never_leave_a_half_written_file() {
+        let dir = std::env::temp_dir().join(format!("rein-store-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("keys.json");
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..40 {
+                        write_private(&path, format!("{{\"writer\":{n},\"write\":{i},\"pad\":\"{}\"}}", "x".repeat(4096)).as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["writer"].is_u64(), "{saved}");
+        let left: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["keys.json"], "no temporary files left");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

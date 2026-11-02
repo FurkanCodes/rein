@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::oauth::{new_uuid, pkce_challenge, random_token, read_request_target, respond};
 use crate::{Error, Result};
@@ -46,7 +47,8 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const REFRESH_MARGIN_SECS: u64 = 180;
 
 /// Everything kept after signing in. Store it so only the user can read it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Its `Debug` leaves the tokens out.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub email: Option<String>,
     /// The account's stable ID, from the ID token.
@@ -61,6 +63,18 @@ pub struct Credentials {
     pub scopes: Vec<String>,
     /// When `access_token` expires, in Unix seconds.
     pub expires_at: u64,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("email", &self.email)
+            .field("subject", &self.subject)
+            .field("client_id", &self.client_id)
+            .field("scopes", &self.scopes)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Credentials {
@@ -187,12 +201,14 @@ impl PendingSignIn {
     /// that may never send a request.
     async fn wait_for_callback(&self) -> Result<(String, String)> {
         let (tx, mut rx) = mpsc::channel(1);
+        // Dropped, as when the sign-in is given up on, it stops them all.
+        let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let (socket, _) = accepted?;
                     let (tx, state, saved) = (tx.clone(), self.state.clone(), self.client_id.clone());
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         if let Some(result) = handle_callback(socket, &state, saved.as_deref()).await {
                             let _ = tx.send(result).await;
                         }
@@ -347,6 +363,23 @@ fn now() -> u64 {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn tokens_never_show_in_debug_output() {
+        let credentials = Credentials {
+            email: None,
+            subject: "user-1".into(),
+            client_id: "oaiapp_1".into(),
+            ext_agent_host_id: "urn:uuid:x".into(),
+            id_token: "id-secret".into(),
+            access_token: "access-secret".into(),
+            refresh_token: "refresh-secret".into(),
+            scopes: vec![],
+            expires_at: 0,
+        };
+        let shown = format!("{credentials:?}");
+        assert!(!shown.contains("secret") && shown.contains("user-1"), "{shown}");
+    }
 
     #[test]
     fn host_id_is_a_v4_uuid_urn() {

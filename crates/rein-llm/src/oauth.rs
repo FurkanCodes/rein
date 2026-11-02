@@ -39,6 +39,11 @@ pub(crate) fn pkce_challenge(verifier: &str) -> String {
 /// Reads an HTTP request head and returns its target, like
 /// `/auth/callback?code=...`.
 pub(crate) async fn read_request_target(socket: &mut TcpStream) -> Option<String> {
+    // A browser's spare connection may never send anything: it isn't kept.
+    tokio::time::timeout(std::time::Duration::from_secs(10), read_head(socket)).await.ok().flatten()
+}
+
+async fn read_head(socket: &mut TcpStream) -> Option<String> {
     let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") {

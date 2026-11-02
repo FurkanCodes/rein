@@ -731,10 +731,11 @@ impl Boxed {
                     }
                     self.editor.replace(&text);
                 }
-                // Only while a turn runs: a stop kept for later would end
-                // the next turn as soon as it started.
+                // Only what's waiting to be stopped hears it: a stop kept
+                // for later (`notify_one` keeps one) would end the next turn
+                // as soon as it started.
                 if self.busy.is_some() {
-                    self.interrupted.notify_one();
+                    self.interrupted.notify_waiters();
                 }
             }
             // Ctrl-C clears what you typed; on an empty box it's for leaving.
@@ -794,7 +795,11 @@ impl Boxed {
                 if let Some(text) = screen::select(x, y, Drag::End) {
                     let lines = text.lines().count();
                     let what = if lines > 1 { format!("{lines} lines") } else { format!("{} characters", text.chars().count()) };
-                    self.notice = Some((if copy(&text) { format!("copied {what}") } else { "couldn't copy: no clipboard".into() }, Instant::now()));
+                    let note = match copy(&text) {
+                        Copied::Clipboard => format!("copied {what}"),
+                        Copied::AskedTerminal => format!("asked the terminal to copy {what}"),
+                    };
+                    self.notice = Some((note, Instant::now()));
                     self.draw();
                 }
             }
@@ -925,10 +930,19 @@ fn hard_wrap(line: &str, width: usize) -> Vec<String> {
     pieces
 }
 
+/// How `copy` copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Copied {
+    /// With the system's own command: it's on the clipboard.
+    Clipboard,
+    /// By asking the terminal (OSC 52), which works over ssh too, but only
+    /// in terminals that allow it; rein can't tell whether it did.
+    AskedTerminal,
+}
+
 /// Puts `text` on the clipboard: with the system's own command where there
-/// is one, and otherwise by asking the terminal (OSC 52), which works over
-/// ssh too, in terminals that allow it.
-pub fn copy(text: &str) -> bool {
+/// is one, and otherwise by asking the terminal.
+pub fn copy(text: &str) -> Copied {
     use std::io::Write as _;
     let commands: &[&[&str]] = if cfg!(target_os = "macos") {
         &[&["pbcopy"]]
@@ -946,12 +960,12 @@ pub fn copy(text: &str) -> bool {
         if let Ok(mut child) = child {
             let written = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
             if child.wait().is_ok_and(|status| status.success()) && written {
-                return true;
+                return Copied::Clipboard;
             }
         }
     }
     screen::clipboard(&base64(text.as_bytes()));
-    true
+    Copied::AskedTerminal
 }
 
 /// Standard base64, for OSC 52.

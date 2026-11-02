@@ -5,6 +5,7 @@ edition.workspace = true
 description = "The agent loop and tools for the rein agent harness"
 
 [dependencies]
+libc = "0.2.191"
 rein-llm = { version = "0.1.0", path = "../rein-llm" }
 regex-lite = "0.1.9"
 serde = { version = "1.0.229", features = ["derive"] }
