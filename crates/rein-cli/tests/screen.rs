@@ -66,6 +66,8 @@ enum Wire {
     Messages,
     /// Chat Completions, as most other providers speak it.
     Chat,
+    /// Gemini's own API, with thought signatures.
+    Gemini,
 }
 
 impl Model {
@@ -97,6 +99,14 @@ impl Model {
         model
     }
 
+    /// Gemini, as Google serves it, and rein set to use it.
+    fn gemini(turns: Vec<Turn>) -> Model {
+        let mut model = Model::serve(turns, true, Wire::Gemini, None);
+        let base = model.base.clone();
+        model.env.extend([("GEMINI_API_KEY".into(), "test-key".into()), ("GOOGLE_GEMINI_BASE_URL".into(), base), ("REIN_MODEL".into(), "gemini-3.8-flash".into())]);
+        model
+    }
+
     /// Also sets `name` to `value` in rein's environment.
     fn with_env(mut self, name: &str, value: &str) -> Model {
         self.env.push((name.into(), value.into()));
@@ -115,11 +125,16 @@ impl Model {
             for socket in listener.incoming() {
                 let Ok(mut socket) = socket else { break };
                 let Some((head, body)) = read_request(&mut socket) else { continue };
-                let reply = if head.starts_with("GET") {
+                let reply = if head.starts_with("GET /v1/key ") {
+                    // As OpenRouter does: only a good key gets an answer here.
+                    let good = head.to_lowercase().contains("authorization: bearer good-key");
+                    if good { http(200, "application/json", br#"{"data":{"label":"test"}}"#) } else { http(401, "application/json", br#"{"error":{"message":"No auth credentials found","code":401}}"#) }
+                } else if head.starts_with("GET") {
                     let models = match wire {
                         Wire::Responses => json!({ "data": [{ "id": "test-model" }, { "id": "gpt-6.1-sol" }] }),
                         Wire::Messages => json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false }),
                         Wire::Chat => json!({ "object": "list", "data": [{ "id": "llama-test", "context_window": 131_072 }] }),
+                        Wire::Gemini => json!({ "models": [{ "name": "models/gemini-3.8-flash", "inputTokenLimit": 1_048_576, "outputTokenLimit": 65_536, "supportedGenerationMethods": ["generateContent"] }] }),
                     };
                     http(200, "application/json", models.to_string().as_bytes())
                 } else {
@@ -144,6 +159,7 @@ impl Model {
                             // About what a tokenizer would count, mostly cached.
                             Wire::Messages => messages_sse(&turn, seen.len() - 1, body.len() as u64 / 4),
                             Wire::Chat => chat_sse(&turn),
+                            Wire::Gemini => gemini_sse(&turn, seen.len() - 1),
                         };
                         http(200, "text/event-stream", stream.as_bytes())
                     }
@@ -308,6 +324,40 @@ fn chat_sse(turn: &Turn) -> String {
     chunk(json!({}), json!(if called > 0 { "tool_calls" } else { "stop" }));
     let usage = json!({ "prompt_tokens": 1200, "completion_tokens": 20, "prompt_tokens_details": { "cached_tokens": 600 } });
     out += &format!("data: {}\n\ndata: [DONE]\n\n", json!({ "choices": [], "usage": usage }));
+    out
+}
+
+/// A turn as Gemini streams it: a thought, the text in pieces, and calls,
+/// the first signed `gsig-<n>` for the `n`th request; the stream just ends.
+fn gemini_sse(turn: &Turn, n: usize) -> String {
+    let mut out = String::new();
+    let mut chunk = |parts: Value, finish: Option<&str>| {
+        let mut candidate = json!({ "content": { "role": "model", "parts": parts } });
+        if let Some(finish) = finish {
+            candidate["finishReason"] = json!(finish);
+        }
+        let usage = json!({ "promptTokenCount": 1000, "cachedContentTokenCount": 250, "candidatesTokenCount": 20, "thoughtsTokenCount": 10 });
+        out += &format!("data: {}\r\n\r\n", json!({ "candidates": [candidate], "usageMetadata": usage }));
+    };
+    chunk(json!([{ "text": "**Pondering**", "thought": true }]), None);
+    let mut signed = false;
+    for item in &turn.out {
+        match item {
+            Out::Text(text) => {
+                for piece in text.split_inclusive(' ') {
+                    chunk(json!([{ "text": piece }]), None);
+                }
+            }
+            Out::Call(tool, arguments) => {
+                let mut part = json!({ "functionCall": { "name": tool, "args": arguments } });
+                if !std::mem::replace(&mut signed, true) {
+                    part["thoughtSignature"] = json!(format!("gsig-{n}"));
+                }
+                chunk(json!([part]), None);
+            }
+        }
+    }
+    chunk(json!([{ "text": "" }]), Some("STOP"));
     out
 }
 
@@ -1048,6 +1098,46 @@ fn run(model: &Model, home: &std::path::Path, args: &[&str], input: &str) -> (bo
 }
 
 #[test]
+fn a_key_is_checked_where_only_a_good_one_gets_an_answer() {
+    // OpenRouter lists its models for anyone, so that proves nothing.
+    let model = Model::chat(vec![], None);
+    let home = std::env::temp_dir().join(format!("rein-login-or-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("providers"), format!("[openrouter]\nurl = {}\n", model.base)).unwrap();
+    let (ok, said) = run(&model, &home, &["login", "openrouter"], "bad-key\n");
+    assert!(!ok && said.contains("that key didn't work") && said.contains("nothing was saved"), "{said}");
+    assert!(!home.join("keys.json").exists());
+    let (ok, said) = run(&model, &home, &["login", "openrouter"], "good-key\n");
+    assert!(ok && said.contains("Saved. Your OpenRouter key works"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn ctrl_c_at_the_key_prompt_shows_typing_again() {
+    let model = Model::claude(vec![]);
+    let dir = std::env::temp_dir().join(format!("rein-screen-{}-secret", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut term = Term::spawn_with(&model, dir, 24, 100, &["login", "anthropic"]);
+    term.wait_for("Paste your Anthropic API key");
+    let echoing = |term: &Term| {
+        // SAFETY: an all-zero termios is valid, and tcgetattr fills it.
+        let mut now: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(term.keyboard.as_raw_fd(), &mut now) }, 0);
+        now.c_lflag & libc::ECHO != 0
+    };
+    let start = Instant::now();
+    while echoing(&term) && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!echoing(&term), "the key isn't shown as it's typed");
+    term.keys("sk-ant-half\x03");
+    term.wait_exit();
+    assert!(echoing(&term), "the terminal shows what's typed again");
+    assert!(!term.text().contains("sk-ant-half"));
+}
+
+#[test]
 fn a_saved_key_is_checked_kept_private_used_and_forgotten() {
     let model = Model::claude(vec![]);
     let home = std::env::temp_dir().join(format!("rein-login-{}", std::process::id()));
@@ -1100,4 +1190,30 @@ fn a_chat_completions_server_works_and_what_it_turns_away_is_left_out() {
     let result = messages.iter().find(|m| m["role"] == "tool").unwrap();
     assert_eq!(result["tool_call_id"], call["tool_calls"][0]["id"]);
     assert!(result["content"].as_str().unwrap().contains("a.txt"), "{result}");
+}
+
+#[test]
+fn gemini_gets_its_thought_signatures_back_on_the_same_parts() {
+    let model = Model::gemini(vec![calls("glob", json!({ "pattern": "*.txt", "path": null })), says("Two text files."), says("It says a.")]);
+    let mut term = Term::start_with(&model, "gemini", 24, 100, &[("a.txt", "a"), ("b.txt", "b")]);
+    term.wait_for(IDLE);
+    assert!(term.text().contains("gemini-3.8-flash"), "{}", term.text());
+    term.keys("which text files are there?\r");
+    term.wait_for("Two text files.");
+    term.wait_for(IDLE);
+    let screen = term.text();
+    assert!(screen.contains("✻ Pondering") && screen.contains("cache 25%"), "{screen}");
+    let head = model.heads()[0].to_lowercase();
+    assert!(head.starts_with("post /v1/models/gemini-3.8-flash:streamgeneratecontent?alt=sse ") && head.contains("x-goog-api-key: test-key"), "{head}");
+    let contents = model.requests()[1]["contents"].as_array().unwrap().clone();
+    let call = contents.iter().find(|c| c["role"] == "model").unwrap();
+    assert_eq!(call["parts"][0]["thoughtSignature"], "gsig-0", "its signature, on the call it came with");
+    let result = &contents[2]["parts"][0]["functionResponse"];
+    assert_eq!((result["name"].clone(), result["id"].clone()), (json!("glob"), call["parts"][0]["functionCall"]["id"].clone()));
+    // A file you point at is read by rein, not Gemini: its call says so.
+    term.keys("what does @a.txt say?\r");
+    term.wait_for("It says a.");
+    let contents = model.requests()[2]["contents"].as_array().unwrap().clone();
+    let mention = contents.iter().rev().find(|c| c["role"] == "model" && c["parts"][0].get("functionCall").is_some()).unwrap();
+    assert_eq!(mention["parts"][0]["thoughtSignature"], "skip_thought_signature_validator");
 }

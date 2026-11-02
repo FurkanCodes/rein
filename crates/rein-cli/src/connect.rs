@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use rein_llm::openai::signin::{self, Credentials};
@@ -47,14 +48,46 @@ fn env_key(provider: &Provider) -> Option<(&str, String)> {
     provider.key_env.iter().find_map(|var| env(var).map(|key| (var.as_str(), key)))
 }
 
+/// What pays for a provider's requests, in the order rein looks.
+enum Payment {
+    /// Your ChatGPT plan: you've signed in with `rein login`.
+    Plan,
+    /// A key in one of the provider's variables.
+    Key { var: String, key: String },
+    /// A gateway's token, sent as a bearer token.
+    Token { var: String, token: String },
+    /// A key saved with `rein login <provider>`.
+    Saved(String),
+    /// Nothing: a server on this computer, say.
+    Free,
+}
+
+fn payment(provider: &Provider, keys: &Keys) -> Option<Payment> {
+    if provider.chatgpt && config_dir().is_ok_and(|dir| dir.join(CREDENTIALS_FILE).exists()) {
+        return Some(Payment::Plan);
+    }
+    if let Some((var, key)) = env_key(provider) {
+        return Some(Payment::Key { var: var.to_owned(), key });
+    }
+    if let Some(var) = &provider.token_env
+        && let Some(token) = env(var)
+    {
+        return Some(Payment::Token { var: var.clone(), token });
+    }
+    if let Some(key) = keys.get(&provider.name) {
+        return Some(Payment::Saved(key.clone()));
+    }
+    (!provider.needs_key).then_some(Payment::Free)
+}
+
 /// Whether rein has something to pay `provider` with, or it needs nothing
 /// and you've set it up.
 pub fn usable(provider: &Provider, keys: &Keys) -> bool {
-    (!provider.needs_key && provider.yours)
-        || env_key(provider).is_some()
-        || keys.contains_key(&provider.name)
-        || (provider.name == "anthropic" && env("ANTHROPIC_AUTH_TOKEN").is_some())
-        || (provider.name == "openai" && config_dir().is_ok_and(|dir| dir.join(CREDENTIALS_FILE).exists()))
+    match payment(provider, keys) {
+        Some(Payment::Free) => provider.yours,
+        Some(_) => true,
+        None => false,
+    }
 }
 
 /// The model to use when none is named: OpenAI's if you can pay for it,
@@ -66,63 +99,55 @@ pub fn default_model(providers: &[Provider], keys: &Keys) -> String {
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_owned())
 }
 
-/// A client for `provider`, with the first key there is. Prints which
-/// one, so it's always clear who pays.
-pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, keys: &Keys) -> CliResult<Client> {
-    if provider.name == "openai"
-        && let Some(client) = chatgpt(http).await?
-    {
-        return Ok(client);
+/// Where `provider`'s requests go: its own server, or the one its
+/// variable points to (a proxy, say), as the provider's own libraries read it.
+fn base_url(provider: &Provider) -> (String, bool) {
+    match provider.url_env.as_deref().and_then(env) {
+        Some(url) => (url, true),
+        None => (provider.base_url.clone(), false),
     }
-    // Another server that speaks the same API, like a proxy: the variables
-    // the providers' own libraries read.
-    let url = provider.url_env.as_deref().and_then(env);
-    let base = url.clone().unwrap_or_else(|| provider.base_url.clone());
-    let pays = |whose: &str| match &url {
-        Some(url) => format!("{whose} with {url}"),
-        None if provider.name == "openai" => format!("{whose} (billed to your API account)"),
-        None => format!("{whose} (billed to your {} account)", provider.title),
-    };
-    let auth = |key: String| match provider.key_header {
+}
+
+/// How `key` goes with requests to `provider`.
+fn auth(provider: &Provider, key: String) -> Auth {
+    match provider.key_header {
         Some(header) => Auth::Header(header, key),
         None => Auth::Bearer(key),
-    };
-    if let Some((var, key)) = env_key(provider) {
-        say!("Using {}", pays(var));
-        return Ok(Client::new(http.clone(), provider.api, base, auth(key)).with_quirks(provider.quirks));
     }
-    // A gateway in front of Claude takes its own token, as a bearer token.
-    if provider.name == "anthropic"
-        && let Some(token) = env("ANTHROPIC_AUTH_TOKEN")
-    {
-        say!("Using {}", pays("ANTHROPIC_AUTH_TOKEN"));
-        return Ok(Client::new(http.clone(), provider.api, base, Auth::Bearer(token)));
+}
+
+/// A client for `provider`, with the first way to pay there is, and a line
+/// saying which, so it's always clear who pays.
+pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, keys: &Keys) -> CliResult<(Client, String)> {
+    let (base, elsewhere) = base_url(provider);
+    let pays = |whose: &str| if elsewhere { format!("Using {whose} with {base}") } else { format!("Using {whose} (billed to your {} API account)", provider.title) };
+    let client = |auth: Auth| Client::new(http.clone(), provider.api, base.clone(), auth).with_quirks(provider.quirks);
+    match payment(provider, keys) {
+        Some(Payment::Plan) => Ok((chatgpt(http).await?, format!("Using ChatGPT plan (manage usage: {USAGE_URL})"))),
+        Some(Payment::Key { var, key }) => Ok((client(auth(provider, key)), pays(&var))),
+        Some(Payment::Token { var, token }) => Ok((client(Auth::Bearer(token)), pays(&var))),
+        Some(Payment::Saved(key)) => Ok((client(auth(provider, key)), pays(&format!("your saved {} key", provider.title)))),
+        Some(Payment::Free) => Ok((client(Auth::None), format!("Using {} at {base}", provider.title))),
+        None => Err(no_key(provider)),
     }
-    if let Some(key) = keys.get(&provider.name) {
-        say!("Using {}", pays(&format!("your saved {} key", provider.title)));
-        return Ok(Client::new(http.clone(), provider.api, base, auth(key.clone())).with_quirks(provider.quirks));
-    }
-    // A server on this computer, say: nothing to pay.
-    if !provider.needs_key {
-        say!("Using {} at {base}", provider.title);
-        return Ok(Client::new(http.clone(), provider.api, base, Auth::None).with_quirks(provider.quirks));
-    }
-    Err(no_key(provider))
 }
 
 fn no_key(provider: &Provider) -> String {
     let get = provider.keys_url.as_deref().map(|url| format!(" (get one at {url})")).unwrap_or_default();
     let vars = provider.key_env.join(" or ");
-    match provider.name.as_str() {
-        "openai" => format!("not signed in. Run `rein login` to continue with ChatGPT, or set {vars}{get}."),
-        name => format!("no key for {}: set {vars}, or run `rein login {name}`{get}", provider.title),
+    if provider.chatgpt {
+        format!("not signed in. Run `rein login` to continue with ChatGPT, or set {vars}{get}.")
+    } else {
+        format!("no key for {}: set {vars}, or run `rein login {}`{get}", provider.title, provider.name)
     }
 }
 
-/// A client on your ChatGPT plan, if you've signed in with `rein login`.
-async fn chatgpt(http: &rein_llm::reqwest::Client) -> CliResult<Option<Client>> {
+/// A client on your ChatGPT plan, which you've signed in to with `rein login`.
+async fn chatgpt(http: &rein_llm::reqwest::Client) -> CliResult<Client> {
     let path = config_dir()?.join(CREDENTIALS_FILE);
-    let Some(mut credentials) = store::read_json::<Credentials>(&path).map_err(describe)? else { return Ok(None) };
+    let Some(mut credentials) = store::read_json::<Credentials>(&path).map_err(describe)? else {
+        return Err("you're not signed in with ChatGPT any more; run `rein login`".into());
+    };
     if !credentials.plan_enabled() {
         return Err("your ChatGPT sign-in doesn't allow using your plan; run `rein login` and allow it".into());
     }
@@ -132,13 +157,14 @@ async fn chatgpt(http: &rein_llm::reqwest::Client) -> CliResult<Option<Client>> 
             .map_err(|e| format!("couldn't renew your ChatGPT sign-in ({}); run `rein login` to sign in again", describe(e)))?;
         store::write_json_private(&path, &credentials).map_err(describe)?;
     }
-    say!("Using ChatGPT plan (manage usage: {USAGE_URL})");
-    Ok(Some(Client::openai(http.clone(), credentials.access_token)))
+    Ok(Client::openai(http.clone(), credentials.access_token))
 }
 
 /// A model, and the client that reaches it.
 pub struct Connected {
     pub provider: Provider,
+    /// Who pays, to say.
+    pub pays: String,
     /// The model's ID at the provider.
     pub model: String,
     pub client: Client,
@@ -169,7 +195,7 @@ pub fn resolve<'a>(spec: &str, providers: &'a [Provider]) -> CliResult<(&'a Prov
 /// Connects to whoever serves `spec`, and starts fetching its model list.
 pub async fn connect(http: &rein_llm::reqwest::Client, providers: &[Provider], keys: &Keys, spec: &str, compress: bool) -> CliResult<Connected> {
     let (provider, model) = resolve(spec, providers)?;
-    let mut client = client_for(http, provider, keys).await?;
+    let (mut client, pays) = client_for(http, provider, keys).await?;
     if !compress {
         client = client.without_compression();
     }
@@ -177,7 +203,7 @@ pub async fn connect(http: &rein_llm::reqwest::Client, providers: &[Provider], k
         let client = client.clone();
         tokio::spawn(async move { client.list_models().await })
     };
-    Ok(Connected { provider: provider.clone(), model, client, models })
+    Ok(Connected { provider: provider.clone(), pays, model, client, models })
 }
 
 /// `rein login <provider>`: saves a key for it, after checking it works.
@@ -195,26 +221,20 @@ pub async fn login(http: &rein_llm::reqwest::Client, name: &str) -> CliResult {
     if key.is_empty() {
         return Err("no key given; nothing was saved".into());
     }
-    let base = provider.url_env.as_deref().and_then(env).unwrap_or_else(|| provider.base_url.clone());
-    let client = Client::new(
-        http.clone(),
-        provider.api,
-        base,
-        match provider.key_header {
-            Some(header) => Auth::Header(header, key.clone()),
-            None => Auth::Bearer(key.clone()),
-        },
-    )
-    .with_quirks(provider.quirks);
-    let models = client.list_models().await.map_err(|e| format!("that key didn't work ({}); nothing was saved", describe(e)))?;
+    let client = Client::new(http.clone(), provider.api, base_url(provider).0, auth(provider, key.clone())).with_quirks(provider.quirks);
+    let didnt = |e| format!("that key didn't work ({}); nothing was saved", describe(e));
+    client.check_key(&provider.key_check).await.map_err(didnt)?;
+    let models = client.list_models().await.unwrap_or_default();
     let dir = config_dir()?;
     let mut keys = load_keys(&dir)?;
     keys.insert(provider.name.clone(), key);
     store::write_json_private(&dir.join(KEYS_FILE), &keys).map_err(describe)?;
     let count = if models.len() == 1 { "1 model".to_owned() } else { format!("{} models", models.len()) };
     say!("Saved. Your {} key works: {count}. `rein models {name}` lists them.", provider.title);
-    if let Some((var, _)) = env_key(provider) {
-        say!("While {var} is set, rein uses that instead.");
+    match payment(provider, &keys) {
+        Some(Payment::Plan) => say!("You're signed in with ChatGPT, which comes first; `rein logout chatgpt` to use this key instead."),
+        Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => say!("While ${var} is set, rein uses that instead."),
+        _ => {}
     }
     Ok(())
 }
@@ -250,17 +270,21 @@ pub async fn models(http: &rein_llm::reqwest::Client, name: Option<&str>) -> Cli
         None => providers.iter().filter(|p| usable(p, &keys)).collect(),
     };
     if chosen.is_empty() {
-        return Err(no_key(&providers[0]));
+        return Err(match providers.iter().find(|p| p.chatgpt) {
+            Some(openai) => no_key(openai),
+            None => "no provider has a key yet; `rein providers` lists them".into(),
+        });
     }
     for provider in &chosen {
-        let client = client_for(http, provider, &keys).await?;
+        let (client, pays) = client_for(http, provider, &keys).await?;
+        say!("{pays}");
         let models = client.list_models().await.map_err(describe)?;
         if chosen.len() > 1 {
             println!("{}:", provider.name);
         }
         let pad = if chosen.len() > 1 { "  " } else { "" };
         for model in models {
-            let id = if chosen.len() > 1 || provider.name != "openai" { provider::shown(provider, &model.id) } else { model.id.clone() };
+            let id = provider::shown(provider, &model.id);
             if model.name == model.id {
                 println!("{pad}{id}");
             } else {
@@ -276,24 +300,34 @@ pub fn list() -> CliResult {
     let dir = config_dir()?;
     let (providers, keys) = (providers(&dir)?, load_keys(&dir)?);
     for provider in &providers {
-        let signed_in = provider.name == "openai" && dir.join(CREDENTIALS_FILE).exists();
-        let pays = if signed_in {
-            "your ChatGPT plan".to_owned()
-        } else if let Some((var, _)) = env_key(provider) {
-            format!("${var}")
-        } else if provider.name == "anthropic" && env("ANTHROPIC_AUTH_TOKEN").is_some() {
-            "$ANTHROPIC_AUTH_TOKEN".to_owned()
-        } else if keys.contains_key(&provider.name) {
-            "your saved key".to_owned()
-        } else if !provider.needs_key {
-            "nothing: no key needed".to_owned()
-        } else {
-            format!("no key yet: ${} or `rein login {}`", provider.key_env.join(" or $"), provider.name)
+        let pays = match payment(provider, &keys) {
+            Some(Payment::Plan) => "your ChatGPT plan".to_owned(),
+            Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => format!("${var}"),
+            Some(Payment::Saved(_)) => "your saved key".to_owned(),
+            Some(Payment::Free) => "nothing: no key needed".to_owned(),
+            None => format!("no key yet: ${} or `rein login {}`", provider.key_env.join(" or $"), provider.name),
         };
-        let url = provider.url_env.as_deref().and_then(env).unwrap_or_else(|| provider.base_url.clone());
-        println!("{:<11} {:<10} {:<42} {pays}", provider.name, provider.api.name(), url);
+        println!("{:<11} {:<10} {:<42} {pays}", provider.name, provider.api.name(), base_url(provider).0);
     }
     Ok(())
+}
+
+/// The terminal as it was before a key was typed into it unseen, for
+/// Ctrl-C to put back.
+static SHOWN: OnceLock<libc::termios> = OnceLock::new();
+
+/// Ctrl-C while a key is typed: the terminal shows what's typed again,
+/// then rein stops, as Ctrl-C would have it.
+extern "C" fn interrupted(_: libc::c_int) {
+    // SAFETY: tcsetattr, write and _exit are async-signal-safe, and SHOWN
+    // was set before this handler was.
+    unsafe {
+        if let Some(shown) = SHOWN.get() {
+            libc::tcsetattr(0, libc::TCSANOW, shown);
+        }
+        libc::write(2, b"\n".as_ptr().cast(), 1);
+        libc::_exit(130);
+    }
 }
 
 /// A line typed without showing it, like a password; or piped in.
@@ -301,19 +335,27 @@ fn read_secret(prompt: &str) -> CliResult<String> {
     let tty = std::io::stdin().is_terminal();
     eprint!("{prompt}");
     // SAFETY: an all-zero termios is a valid value, and tcgetattr fills it.
-    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    let quiet = tty && unsafe { libc::tcgetattr(0, &mut saved) } == 0;
+    let mut shown: libc::termios = unsafe { std::mem::zeroed() };
+    let quiet = tty && unsafe { libc::tcgetattr(0, &mut shown) } == 0;
     if quiet {
-        let mut hidden = saved;
+        let _ = SHOWN.set(shown);
+        let mut hidden = shown;
         hidden.c_lflag &= !libc::ECHO;
-        // SAFETY: a termios that tcgetattr gave, with echo off.
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &hidden) };
+        // SAFETY: the handler only uses async-signal-safe calls; the
+        // termios is one tcgetattr gave, with echo off.
+        unsafe {
+            libc::signal(libc::SIGINT, interrupted as extern "C" fn(libc::c_int) as libc::sighandler_t);
+            libc::tcsetattr(0, libc::TCSANOW, &hidden);
+        }
     }
     let mut line = String::new();
     let read = std::io::stdin().read_line(&mut line);
     if quiet {
-        // SAFETY: putting back what tcgetattr gave.
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+        // SAFETY: putting back what tcgetattr gave, and Ctrl-C as it was.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &shown);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
         eprintln!();
     }
     read.map_err(|e| format!("couldn't read the key: {e}"))?;

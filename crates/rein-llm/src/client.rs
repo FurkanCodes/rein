@@ -23,7 +23,7 @@ use serde_json::Value;
 
 use crate::decode::Decode;
 use crate::chat::Quirks;
-use crate::{Api, Error, Event, ModelInfo, Request, Result, anthropic, chat, openai};
+use crate::{Api, Error, Event, ModelInfo, Request, Result, anthropic, chat, gemini, openai};
 
 /// How requests prove who's asking.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,10 +83,10 @@ pub enum Compression {
     Refused,
 }
 
-/// The fields a format can do without: the word a server's error would
-/// name it by (also its key in the body), and what rein calls leaving it
-/// out.
-pub(crate) type Optional = &'static [(&'static str, &'static str)];
+/// The fields a format can do without: the word (in lower case) a server's
+/// error would name it by, its key in the body, and what rein calls leaving
+/// it out.
+pub(crate) type Optional = &'static [(&'static str, &'static str, &'static str)];
 
 impl Client {
     /// A client for the server at `base_url` (like `https://api.anthropic.com/v1`),
@@ -105,10 +105,6 @@ impl Client {
     /// access token, which go in the same header; only who pays differs.
     pub fn openai(http: reqwest::Client, bearer: impl Into<String>) -> Self {
         Client::new(http, Api::Responses, openai::API_BASE, Auth::Bearer(bearer.into()))
-    }
-
-    pub fn api(&self) -> Api {
-        self.api
     }
 
     pub fn base_url(&self) -> &str {
@@ -141,7 +137,14 @@ impl Client {
             Api::Responses => openai::models(self).await,
             Api::Anthropic => anthropic::models(self).await,
             Api::Chat => chat::models(self).await,
+            Api::Gemini => gemini::models(self).await,
         }
+    }
+
+    /// Whether the server takes this client's key: `path` is one it only
+    /// answers for a good one.
+    pub async fn check_key(&self, path: &str) -> Result<()> {
+        self.get(path).await.map(|_| ())
     }
 
     /// `GET`s `path` (after the base URL) as this client, as JSON.
@@ -166,7 +169,7 @@ impl Client {
         match self.api {
             Api::Responses => openai::headers(request),
             Api::Anthropic => anthropic::headers(request),
-            Api::Chat => Vec::new(),
+            Api::Chat | Api::Gemini => Vec::new(),
         }
     }
 
@@ -175,6 +178,7 @@ impl Client {
             Api::Responses => openai::request_body(request),
             Api::Anthropic => anthropic::request_body(request, omitted, &self.base_url),
             Api::Chat => chat::request_body(request, omitted, self.quirks),
+            Api::Gemini => gemini::request_body(request, omitted),
         }
     }
 
@@ -183,6 +187,7 @@ impl Client {
             Api::Responses => &[],
             Api::Anthropic => anthropic::OPTIONAL,
             Api::Chat => chat::OPTIONAL,
+            Api::Gemini => gemini::OPTIONAL,
         }
     }
 
@@ -191,17 +196,17 @@ impl Client {
             Api::Responses => Box::new(openai::EventDecoder::default()),
             Api::Anthropic => Box::new(anthropic::decoder(&request.model)),
             Api::Chat => Box::new(chat::decoder()),
+            Api::Gemini => Box::new(gemini::decoder()),
         }
     }
 
     fn endpoint(&self, request: &Request) -> String {
-        let path = match self.api {
-            Api::Responses => "responses".to_owned(),
-            Api::Anthropic => "messages".to_owned(),
-            Api::Chat => "chat/completions".to_owned(),
-        };
-        let _ = request;
-        format!("{}/{path}", self.base_url)
+        match self.api {
+            Api::Responses => format!("{}/responses", self.base_url),
+            Api::Anthropic => format!("{}/messages", self.base_url),
+            Api::Chat => format!("{}/chat/completions", self.base_url),
+            Api::Gemini => gemini::endpoint(&self.base_url, &request.model),
+        }
     }
 
     /// Sends the request and returns the answer as a stream of events.
@@ -225,25 +230,25 @@ impl Client {
     }
 
     /// Posts `body`, gzipped if it's worth it and the server takes it.
-    async fn send(&self, request: &Request, body: &Value, omitted: &[&str]) -> Result<reqwest::Response> {
-        let json = body;
-        let headers = self.headers(Some((request, body)));
-        let body = serde_json::to_vec(body)?;
+    async fn send(&self, request: &Request, json: &Value, omitted: &[&str]) -> Result<reqwest::Response> {
+        let headers = self.headers(Some((request, json)));
+        let body = serde_json::to_vec(json)?;
         let gzipped = (body.len() >= COMPRESS_FROM && !self.wire.off.load(Ordering::Relaxed)).then(|| gzip(&body)).flatten();
         let compressed = gzipped.is_some();
-        match check(self.post(request, &headers, &body, gzipped).await?).await {
-            // A server that can't unpack the body can't read it: the same
-            // request again as it is. If that goes through, compression was
-            // the trouble, and it's off from now on; if not, it wasn't. (One
-            // that names a field in it read it fine.)
-            Err(e @ Error::Api { status: Some(400 | 415 | 422), .. }) if compressed && rejected_field(&e, json, self.optional(), omitted).is_none() => {
-                drop(e);
+        let answer = check(self.post(request, &headers, &body, gzipped).await?).await;
+        // A server that can't unpack the body can't read it: the same
+        // request again as it is. If that goes through, compression was the
+        // trouble, and it's off from now on; if not, it wasn't. (One that
+        // names a field in it read it fine.)
+        let unreadable = |e: &Error| matches!(e.status(), Some(400 | 415 | 422)) && rejected_field(e, json, self.optional(), omitted).is_none();
+        match answer {
+            Err(e) if compressed && unreadable(&e) => {
                 let plain = check(self.post(request, &headers, &body, None).await?).await?;
                 self.wire.refused.store(true, Ordering::Relaxed);
                 self.wire.off.store(true, Ordering::Relaxed);
                 Ok(plain)
             }
-            other => other,
+            answer => answer,
         }
     }
 
@@ -278,8 +283,8 @@ fn rejected_field(error: &Error, body: &Value, optional: Optional, omitted: &[&s
     let body = body.to_string();
     optional
         .iter()
-        .find(|(word, field)| message.contains(word) && !omitted.contains(field) && body.contains(&format!("\"{word}\"")))
-        .map(|(_, field)| *field)
+        .find(|(word, key, field)| message.contains(word) && !omitted.contains(field) && body.contains(&format!("\"{key}\"")))
+        .map(|(_, _, field)| *field)
 }
 
 /// `bytes` gzipped. Level 6, zlib's own default: within a few percent of the
@@ -385,12 +390,12 @@ mod tests {
 
     #[test]
     fn learns_only_from_a_field_the_server_names() {
-        const OPTIONAL: Optional = &[("reasoning_effort", "reasoning_effort"), ("stream_options", "stream_options")];
+        const OPTIONAL: Optional = &[("reasoning_effort", "reasoning_effort", "effort"), ("stream_options", "stream_options", "stream_options")];
         let body = json!({ "model": "m", "reasoning_effort": "low", "stream_options": { "include_usage": true } });
         let error = |status, message: &str| Error::api(Some(status), None, message.into(), None);
         let named = error(400, "`reasoning_effort` is not supported with this model");
-        assert_eq!(rejected_field(&named, &body, OPTIONAL, &[]), Some("reasoning_effort"));
-        assert_eq!(rejected_field(&named, &body, OPTIONAL, &["reasoning_effort"]), None, "left out already: a real error");
+        assert_eq!(rejected_field(&named, &body, OPTIONAL, &[]), Some("effort"));
+        assert_eq!(rejected_field(&named, &body, OPTIONAL, &["effort"]), None, "left out already: a real error");
         assert_eq!(rejected_field(&error(400, "invalid model"), &body, OPTIONAL, &[]), None);
         assert_eq!(rejected_field(&error(401, "reasoning_effort needs a paid key"), &body, OPTIONAL, &[]), None);
         let without = json!({ "model": "m" });

@@ -11,6 +11,7 @@ pub mod anthropic;
 pub mod chat;
 pub mod client;
 pub mod decode;
+pub mod gemini;
 pub mod openai;
 pub mod provider;
 pub mod sse;
@@ -96,6 +97,8 @@ pub enum Api {
     /// Chat Completions, `POST /chat/completions`: most other providers,
     /// and servers on your own computer.
     Chat,
+    /// Gemini's own, `POST /models/{model}:streamGenerateContent`.
+    Gemini,
 }
 
 impl Api {
@@ -104,11 +107,12 @@ impl Api {
             Api::Responses => "responses",
             Api::Anthropic => "anthropic",
             Api::Chat => "chat",
+            Api::Gemini => "gemini",
         }
     }
 
     pub fn parse(name: &str) -> Option<Api> {
-        [Api::Responses, Api::Anthropic, Api::Chat].into_iter().find(|api| api.name() == name)
+        [Api::Responses, Api::Anthropic, Api::Chat, Api::Gemini].into_iter().find(|api| api.name() == name)
     }
 }
 
@@ -172,6 +176,12 @@ pub struct Request {
 /// A fresh ID for one conversation, for [`Request::session_id`].
 pub fn new_session_id() -> Result<String> {
     openai::signin::new_uuid()
+}
+
+/// An ID for a tool call whose provider gave it none: unique in the
+/// conversation, as rein needs.
+pub(crate) fn new_call_id() -> String {
+    format!("call_{}", openai::signin::new_uuid().unwrap_or_default().replace('-', ""))
 }
 
 /// A model a provider offers.

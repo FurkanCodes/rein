@@ -114,25 +114,12 @@ Each request carries the whole conversation, so rein gzips it on the way:
 about three times fewer bytes, and the same text for the model. A server that
 doesn't take compressed requests gets them uncompressed instead.
 
-A model's name says who serves it: claude-* is Anthropic's, gpt-* OpenAI's,
-deepseek-* DeepSeek's. Or name the provider first, like openrouter/qwen/qwen3-coder
-or ollama/qwen3:8b; /model switches mid-conversation, even to another
-provider. rein knows OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, xAI,
-Mistral, Cerebras, Together, Fireworks, Moonshot, Z.ai, and Ollama and LM
-Studio on this computer; `rein providers` lists them. Add your own, or point
-one elsewhere, in ~/.config/rein/providers:
-  [local]
-  api = chat                     responses, anthropic or chat
-  url = http://localhost:8080/v1
-  context = 131072               when its model list doesn't say
-Keys come from each provider's variable, like $ANTHROPIC_API_KEY or
-$OPENROUTER_API_KEY ($ANTHROPIC_AUTH_TOKEN for a gateway in front of Claude),
-or from `rein login <provider>`, which keeps them in ~/.config/rein/keys.json,
-readable only by you. $OPENAI_BASE_URL and $ANTHROPIC_BASE_URL point rein at
-another server that speaks the same API. Signed in with ChatGPT, OpenAI's
-models use your plan; otherwise $OPENAI_API_KEY, billed to your API account.
-A server that turns away a field rein can do without gets the request again
-without it, and never that field again.";
+A model's name says who serves it (claude-* is Anthropic's, gpt-* OpenAI's,
+gemini-* Google's), or name the provider first: openrouter/qwen/qwen3-coder,
+ollama/qwen3:8b. `rein providers` lists the providers and what pays for each;
+add your own in ~/.config/rein/providers. Keys come from each provider's
+variable, like $ANTHROPIC_API_KEY, or from `rein login <provider>`. Signed in
+with ChatGPT, OpenAI's models use your plan.";
 
 type CliResult<T = ()> = Result<T, String>;
 
@@ -315,7 +302,11 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
         latest.as_deref().and_then(session::peek).map(|header| header.model)
     };
     let mut connected = match &early {
-        Some(spec) => Some(connect::connect(http, &providers, &keys, spec, args.compress).await?),
+        Some(spec) => {
+            let connected = connect::connect(http, &providers, &keys, spec, args.compress).await?;
+            say!("{}", connected.pays);
+            Some(connected)
+        }
         None => None,
     };
     let record = match &args.record {
@@ -331,24 +322,10 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
     terminal.model = connected.as_ref().map(|c| provider::shown(&c.provider, &c.model)).unwrap_or_default();
     terminal.effort = args.effort.clone();
     terminal.input.set_bar(terminal.bar());
-    let mut setup = Setup {
-        folder,
-        personal: dir.join("AGENTS.md"),
-        root: root.clone(),
-        system: args.system.clone(),
-        models: Vec::new(),
-        compact_at,
-        http: http.clone(),
-        provider: providers[0].clone(),
-        providers,
-        keys,
-        compress: args.compress,
-    };
-
     let saved = match args.resume {
         Resume::New => None,
         Resume::Latest => latest,
-        Resume::Pick => match pick(&setup.folder, &mut terminal).await? {
+        Resume::Pick => match pick(&folder, &mut terminal).await? {
             Some(path) => Some(path),
             None => return Ok(()),
         },
@@ -356,25 +333,44 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
     if saved.is_some() && args.system.is_some() {
         return Err("-s can't change a saved conversation's system prompt; start a new one instead".into());
     }
-    let wanted = setup.canonical(&wanted)?;
-    let (mut loaded, context) = setup.open(saved, &wanted)?;
+    let canonical = |spec: &str| connect::resolve(spec, &providers).map(|(p, model)| provider::spec(p, &model));
+    let wanted = canonical(&wanted)?;
     // A continued conversation keeps its model unless -m says otherwise,
     // and then it's saved with it.
-    let theirs = setup.canonical(&loaded.session.header().model)?;
-    let spec = if args.model_given || args.resume == Resume::New { wanted } else { theirs.clone() };
-    if args.resume != Resume::New && args.model_given && theirs != spec {
-        loaded.session.append_model(&spec).map_err(describe)?;
-    }
-    let (provider, model_name) = connect::resolve(&spec, &setup.providers)?;
+    let theirs = saved.as_deref().and_then(session::peek).map(|header| canonical(&header.model)).transpose()?;
+    let spec = match &theirs {
+        Some(theirs) if !args.model_given => theirs.clone(),
+        _ => wanted,
+    };
+    let (provider, model_name) = connect::resolve(&spec, &providers)?;
     let provider = provider.clone();
     // Connected to another provider than the conversation's, or to none yet.
     let connected = match connected.take() {
         Some(connected) if connected.provider.name == provider.name => connected,
-        _ => connect::connect(http, &setup.providers, &setup.keys, &spec, args.compress).await?,
+        _ => {
+            let connected = connect::connect(http, &providers, &keys, &spec, args.compress).await?;
+            say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&connected.pays));
+            connected
+        }
     };
     let (client, models) = connected.models().await;
-    setup.provider = provider;
-    setup.models = models;
+    let mut setup = Setup {
+        folder,
+        personal: dir.join("AGENTS.md"),
+        root: root.clone(),
+        system: args.system.clone(),
+        models,
+        compact_at,
+        http: http.clone(),
+        provider,
+        providers,
+        keys,
+        compress: args.compress,
+    };
+    let (mut loaded, context) = setup.open(saved, &spec)?;
+    if theirs.is_some_and(|theirs| theirs != spec) {
+        loaded.session.append_model(&spec).map_err(describe)?;
+    }
     let header = loaded.session.header().clone();
     let limit = setup.limit(&model_name)?;
     terminal.context_limit = limit;
@@ -855,7 +851,9 @@ async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut Terminal, 
     let provider = provider.clone();
     let missing = |models: &[ModelInfo]| !models.is_empty() && !models.iter().any(|m| m.id == model);
     if provider.name != setup.provider.name {
-        let (client, models) = connect::connect(&setup.http, &setup.providers, &setup.keys, spec, setup.compress).await?.models().await;
+        let connected = connect::connect(&setup.http, &setup.providers, &setup.keys, spec, setup.compress).await?;
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&connected.pays));
+        let (client, models) = connected.models().await;
         if missing(&models) {
             return Err(format!("{} has no model called {model}; `rein models {}` lists them", provider.title, provider.name));
         }

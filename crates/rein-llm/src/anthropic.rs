@@ -45,11 +45,11 @@ const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// What a server that speaks this format may not take: a gateway in front
 /// of an older model, or another provider's copy of the API.
 pub(crate) const OPTIONAL: Optional = &[
-    ("fallbacks", "fallbacks"),
-    ("display", "thinking.display"),
-    ("output_config", "output_config"),
-    ("effort", "output_config"),
-    ("cache_control", "cache_control"),
+    ("fallbacks", "fallbacks", "fallbacks"),
+    ("display", "display", "thinking.display"),
+    ("output_config", "output_config", "output_config"),
+    ("effort", "effort", "output_config"),
+    ("cache_control", "cache_control", "cache_control"),
 ];
 
 pub(crate) fn headers(request: Option<(&Request, &Value)>) -> Vec<(&'static str, String)> {

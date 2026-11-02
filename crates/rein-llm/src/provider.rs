@@ -32,6 +32,15 @@ pub struct Provider {
     pub base_url: String,
     /// The environment variables its key may be in, the first set one winning.
     pub key_env: Vec<String>,
+    /// A variable for a gateway's own token, sent as a bearer token instead
+    /// of a key, as `ANTHROPIC_AUTH_TOKEN` is.
+    pub token_env: Option<String>,
+    /// It can be paid for with a ChatGPT plan (`rein login`), which comes
+    /// first when you've signed in.
+    pub chatgpt: bool,
+    /// What to `GET`, after the base URL, to tell whether a key works: a
+    /// path the server only answers for a good key.
+    pub key_check: String,
     /// Whether it needs a key at all: a server on your own computer doesn't.
     pub needs_key: bool,
     /// The header the key goes in; `None` for `Authorization: Bearer`.
@@ -58,6 +67,9 @@ impl Provider {
             api,
             base_url: base_url.into(),
             key_env: key_env.iter().map(|v| (*v).to_owned()).collect(),
+            token_env: None,
+            chatgpt: false,
+            key_check: "models".into(),
             needs_key: !key_env.is_empty(),
             key_header: key_header(api),
             url_env: None,
@@ -79,6 +91,7 @@ impl Provider {
 fn key_header(api: Api) -> Option<&'static str> {
     match api {
         Api::Anthropic => Some("x-api-key"),
+        Api::Gemini => Some("x-goog-api-key"),
         Api::Responses | Api::Chat => None,
     }
 }
@@ -90,16 +103,25 @@ pub fn builtin() -> Vec<Provider> {
     vec![
         Provider {
             url_env: Some("OPENAI_BASE_URL".into()),
+            chatgpt: true,
             default_model: Some("gpt-6.1-sol".into()),
             ..Provider::new("openai", "OpenAI", Api::Responses, crate::openai::API_BASE, &["OPENAI_API_KEY"]).keys_at("https://platform.openai.com/api-keys")
         },
         Provider {
             url_env: Some("ANTHROPIC_BASE_URL".into()),
+            token_env: Some("ANTHROPIC_AUTH_TOKEN".into()),
             default_model: Some("claude-opus-5-5".into()),
             ..Provider::new("anthropic", "Anthropic", Api::Anthropic, crate::anthropic::API_BASE, &["ANTHROPIC_API_KEY"]).keys_at("https://platform.claude.com/settings/keys")
         },
         Provider {
+            url_env: Some("GOOGLE_GEMINI_BASE_URL".into()),
+            default_model: Some("gemini-3.8-flash".into()),
+            ..Provider::new("gemini", "Google Gemini", Api::Gemini, crate::gemini::API_BASE, &["GEMINI_API_KEY", "GOOGLE_API_KEY"]).keys_at("https://aistudio.google.com/apikey")
+        },
+        Provider {
             quirks: Quirks { effort_object: true, ..Quirks::default() },
+            // Its model list is public: only this says whether a key works.
+            key_check: "key".into(),
             ..chat("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY").keys_at("https://openrouter.ai/keys")
         },
         chat("groq", "Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY").keys_at("https://console.groq.com/keys"),
@@ -153,7 +175,7 @@ pub fn with_file(text: &str) -> Result<Vec<Provider>, String> {
         provider.yours = true;
         match key {
             "api" => {
-                provider.api = Api::parse(value).ok_or_else(|| at(format!("no API called {value}; use responses, anthropic or chat")))?;
+                provider.api = Api::parse(value).ok_or_else(|| at(format!("no API called {value}; use responses, anthropic, chat or gemini")))?;
                 provider.key_header = key_header(provider.api);
             }
             "url" => provider.base_url = value.trim_end_matches('/').to_owned(),
@@ -181,6 +203,7 @@ pub fn guess(model: &str) -> Option<&'static str> {
     let families: &[(&[&str], &str)] = &[
         (&["claude-"], "anthropic"),
         (&["gpt-", "o1", "o3", "o4", "codex-", "chatgpt-"], "openai"),
+        (&["gemini-", "gemma-"], "gemini"),
         (&["grok-"], "xai"),
         (&["deepseek-"], "deepseek"),
         (&["mistral-", "codestral", "devstral", "magistral"], "mistral"),
@@ -233,6 +256,7 @@ mod tests {
         assert_eq!(resolved("ollama/qwen3:8b"), Some(("ollama".into(), "qwen3:8b".into())));
         assert_eq!(resolved("deepseek-chat"), Some(("deepseek".into(), "deepseek-chat".into())));
         assert_eq!(resolved("grok-5"), Some(("xai".into(), "grok-5".into())));
+        assert_eq!(resolved("gemini-3.8-flash"), Some(("gemini".into(), "gemini-3.8-flash".into())));
         // Unknown: OpenAI's, as before, for servers behind OPENAI_BASE_URL.
         assert_eq!(resolved("test-model"), Some(("openai".into(), "test-model".into())));
         assert_eq!(resolved("qwen/qwen3-coder"), Some(("openai".into(), "qwen/qwen3-coder".into())), "no provider called qwen");
@@ -258,6 +282,7 @@ mod tests {
         assert!(find("groq").needs_key);
         assert_eq!(find("anthropic").key_header, Some("x-api-key"));
         assert_eq!(find("openrouter").key_header, None);
+        assert_eq!(find("gemini").key_header, Some("x-goog-api-key"));
         assert!(find("openrouter").quirks.effort_object && find("mistral").quirks.short_ids);
         let mut names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
         names.dedup();
@@ -283,7 +308,7 @@ mod tests {
     #[test]
     fn a_providers_file_says_what_is_wrong() {
         assert_eq!(with_file("api = chat").unwrap_err(), "line 1: settings go under a [provider] line");
-        assert_eq!(with_file("[x]\napi = soap").unwrap_err(), "line 2: no API called soap; use responses, anthropic or chat");
+        assert_eq!(with_file("[x]\napi = soap").unwrap_err(), "line 2: no API called soap; use responses, anthropic, chat or gemini");
         assert_eq!(with_file("[x]\napi = chat").unwrap_err(), "[x] needs a url");
         assert_eq!(with_file("[a/b]").unwrap_err(), "line 1: [a/b] isn't a name rein can use: one word, no slashes");
         assert_eq!(with_file("[x]\ncolour = blue").unwrap_err(), "line 2: unknown setting colour; use api, url, key_env, title, model or context");

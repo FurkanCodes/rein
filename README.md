@@ -16,16 +16,15 @@ cargo build --release
 
 ## Models and who pays for them
 
-rein speaks three APIs: OpenAI's Responses API, Anthropic's Messages API,
-and Chat Completions, which nearly everyone else speaks. With them it knows
-OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, xAI, Mistral, Cerebras,
-Together, Fireworks, Moonshot and Z.ai, and Ollama and LM Studio on your own
-computer; `rein providers` lists them, and what pays for each. A model's name
-says who serves it (`claude-*` is Anthropic's, `gpt-*` OpenAI's,
-`deepseek-*` DeepSeek's), or you name the provider first:
+rein speaks four APIs: OpenAI's Responses API, Anthropic's Messages API,
+Gemini's own, and Chat Completions, which most other providers speak. It
+knows OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, DeepSeek, xAI,
+Mistral, Cerebras, Together, Fireworks, Moonshot and Z.ai, and Ollama and LM
+Studio on your own computer; `rein providers` lists them and what pays for
+each. A model's name says who serves it (`claude-*` is Anthropic's, `gpt-*`
+OpenAI's, `gemini-*` Google's), or you name the provider first:
 `anthropic/claude-sonnet-5-5`, `openrouter/qwen/qwen3-coder`,
-`ollama/qwen3:8b`. Each model's context window comes from the provider's own
-model list, so it's never out of date and rein carries no catalog.
+`ollama/qwen3:8b`. Context windows come from each provider's own model list.
 
 - **Your ChatGPT plan, for OpenAI's models.** Run `rein login` to continue
   with ChatGPT. This uses OpenAI's official [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
@@ -33,20 +32,24 @@ model list, so it's never out of date and rein carries no catalog.
   five-hour limit is shared with every other app that uses your plan. Manage it at
   [ChatGPT settings → Usage](https://chatgpt.com/settings/usage).
 - **An API key.** The provider's variable (`OPENAI_API_KEY`,
-  `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, ...), billed to
-  that account, or a key you save with `rein login <provider>`: it goes in
-  `~/.config/rein/keys.json`, readable only by you, once a call with it has
-  worked. The variable wins over the saved key. A gateway in front of Claude
-  takes `ANTHROPIC_AUTH_TOKEN` instead. `OPENAI_BASE_URL` and
-  `ANTHROPIC_BASE_URL` point rein at another server that speaks the same API,
-  like a proxy.
+  `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, ...), or a key
+  saved with `rein login <provider>`, which checks it first and keeps it in
+  `~/.config/rein/keys.json`, readable only by you. The variable wins over the
+  saved key. A gateway in front of Claude takes `ANTHROPIC_AUTH_TOKEN`.
+  `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL` and `GOOGLE_GEMINI_BASE_URL` point
+  rein at another server that speaks the same API, like a proxy.
+- **Nothing, on your own computer.** Ollama and LM Studio need no key.
 
-Servers on your own computer need no key. Add your own provider, or point
-one of rein's elsewhere, in `~/.config/rein/providers`:
+Claude and Gemini plans can't be used: Anthropic and Google don't allow
+other apps to sign in with them. rein prints what pays on every run. With no
+model named, it uses `gpt-6.1-sol`, or, with no way to pay OpenAI, the first
+provider you have a key for (`claude-opus-5-5`, `gemini-3.8-flash`, ...).
+
+Add a provider, or point one of rein's elsewhere, in `~/.config/rein/providers`:
 
 ```text
 [local]
-api = chat                       # responses, anthropic or chat
+api = chat                       # responses, anthropic, chat or gemini
 url = http://localhost:8080/v1
 context = 131072                 # when its model list doesn't say
 model = qwen3-coder              # the model to use when none is named
@@ -56,46 +59,41 @@ url = https://proxy.example.com/openrouter/v1
 key_env = MY_OPENROUTER_KEY
 ```
 
-Servers that speak an API don't all take every field of it. When one turns
-a request away naming a field rein can do without (`reasoning_effort` on a
-server that has none, say), rein sends it again without it, and leaves that
-field out from then on. No table of which server takes what to keep up to
-date: the server says. What can't be learned that way, like Mistral's
-nine-character tool call IDs, rein knows. Answers are read in every
-dialect: reasoning as `reasoning_content` or `reasoning`, calls in pieces or
-whole, with or without a closing `[DONE]`.
+Servers that speak an API don't all take every field of it. When one turns a
+request away naming a field rein can do without (`reasoning_effort` on a
+server that has none, say), rein sends it again without it and leaves that
+field out from then on. What an error can't say, like Mistral's
+nine-character tool call IDs, rein knows per provider.
 
-There's no signing in with a Claude plan, or a Gemini one: Anthropic and
-Google don't allow other apps to use them. rein prints which key it's using on every run. With no model
-named, it uses `gpt-6.1-sol`, or `claude-opus-5-5` if Anthropic is the only
-provider you have a key for.
+`/model` lists the provider's models and switches to any provider's, in the
+middle of a conversation: what was said, and every tool call and result,
+carries over in the new provider's format. Reasoning only one provider can
+read (OpenAI's encrypted reasoning, Claude's signed thinking, Gemini's
+thought signatures) only goes back to that provider. `rein -c` continues with
+the model the conversation was left with.
 
-`/model` lists the models of the provider in use, and switches to another,
-from any provider, in the middle of a conversation. The conversation goes on
-as it was: what was said and every tool call and result carry over, in the
-new provider's own format. Reasoning only one provider can read (OpenAI's
-encrypted reasoning, Claude's signed thinking) only goes back to that one.
-`rein -c` continues with the model the conversation was left with.
+### Claude and Gemini
 
-### Claude, done properly
-
-- **Its cache is used.** Claude caches nothing unless asked, so rein marks
-  the end of the system prompt and the end of the conversation in every
-  request: each one reads the one before it from the cache, and the status
-  bar's cache figure says how much did.
-- **Its thinking stays valid.** Claude's thinking comes back signed together
-  with everything before it, and Anthropic turns it away if anything earlier
-  in the conversation has changed. Compaction does change it, so at that
-  moment rein drops exactly the thinking after the change and keeps the rest,
-  and records that in the session file. A test checks every request against
-  Anthropic's own rule. If Anthropic still turns some away (an older rein's
-  tools, say), rein drops it once and goes on.
-- **Effort is Claude's own.** `--effort` and `/effort` (`low` to `max`) set
-  how hard it thinks, and its thinking shows as it goes. Models from before
-  adaptive thinking get a thinking budget instead.
-- **A refusal by mistake isn't the end.** On Anthropic's own API, the models
-  that have one ask for its server-side fallback: if a classifier declines
-  (security work can look risky), another model answers, and rein says which.
+- **Caching.** Claude caches nothing unless asked, so rein marks the end of
+  the system prompt and the end of the conversation in every request; the
+  status bar's cache figure says how much each request read from the cache.
+- **Claude's thinking.** It comes back signed together with everything before
+  it, and Anthropic turns it away if anything earlier in the conversation
+  changed. Compaction changes it, so rein then drops the thinking after the
+  change, keeps the rest, and records that in the session file. If Anthropic
+  still turns some away (from an older rein's tools, say), rein drops it and
+  asks again, once.
+- **Effort.** `--effort` and `/effort` (`low` to `max`) become Claude's
+  effort, Gemini's thinking level, or `reasoning_effort`. Claude models from
+  before adaptive thinking get a thinking budget instead.
+- **Gemini's signatures.** Gemini's answers carry thought signatures that have
+  to come back on the parts they came on, and a function call without one is
+  turned away. rein keeps each with its part. A call Gemini didn't make (a
+  file you pointed at with `@`, or a call from another provider's turn) is
+  marked as such.
+- **Refusals.** On Anthropic's own API, Claude models that have a server-side
+  fallback ask for it: if a classifier declines by mistake, another model
+  answers, and rein says which.
 
 ## Usage
 
@@ -314,7 +312,7 @@ doesn't stop `/bin/rm`.
 
 | Crate | What it is |
 |---|---|
-| `crates/rein-llm` | Streaming LLM provider layer: one client for every provider, the Responses, Messages and Chat Completions APIs, the providers rein knows, Sign in with ChatGPT |
+| `crates/rein-llm` | Streaming LLM provider layer: one client for every provider, the Responses, Messages, Gemini and Chat Completions APIs, the providers rein knows, Sign in with ChatGPT |
 | `crates/rein-agent` | The agent loop, the tools, the permission engine, saved conversations, and what the model is told first |
 | `crates/rein-cli` | The `rein` command |
 
@@ -327,9 +325,14 @@ cargo test
 The tests replay saved response streams from `crates/rein-llm/tests/fixtures`,
 so they need no network and spend no tokens. `crates/rein-cli/tests/screen.rs`
 runs the real `rein` in a pseudo-terminal, against a model that follows a
-script, and reads the screen through a terminal emulator kept in memory: it
+script, speaking each API rein does, and reads the screen through a terminal
+emulator kept in memory: it
 types, scrolls, approves commands, resizes the window, leaves and comes back,
 and checks what you would see, and when the bell rang and what was copied.
+It also checks what goes over the wire: that each block of Claude's thinking
+rein sends back follows exactly the conversation it was signed with, through
+compactions, as Anthropic checks; that Gemini's signatures go back on their
+parts; and that a field a server turned away isn't sent to it again.
 Record a real stream with
 `rein --record crates/rein-llm/tests/fixtures/<name>.sse "<prompt>"`. Recordings
 contain your account's `safety_identifier`; change it to `user-REDACTED` before

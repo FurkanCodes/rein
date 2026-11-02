@@ -32,11 +32,11 @@ pub struct Quirks {
 }
 
 pub(crate) const OPTIONAL: Optional = &[
-    ("stream_options", "stream_options"),
-    ("reasoning_content", "replay"),
-    ("reasoning_details", "replay"),
-    ("reasoning_effort", "effort"),
-    ("reasoning", "effort"),
+    ("stream_options", "stream_options", "stream_options"),
+    ("reasoning_content", "reasoning_content", "replay"),
+    ("reasoning_details", "reasoning_details", "replay"),
+    ("reasoning_effort", "reasoning_effort", "effort"),
+    ("reasoning", "reasoning", "effort"),
 ];
 
 /// The models a server offers, with their windows where it says.
@@ -338,9 +338,8 @@ impl Completions {
         if !self.text.is_empty() {
             out.push(Ok(Event::Item(Item::Assistant(std::mem::take(&mut self.text)))));
         }
-        for (n, call) in std::mem::take(&mut self.calls).into_iter().enumerate() {
-            // A server that gives no ID: one that's unique in the conversation.
-            let call_id = if call.id.is_empty() { format!("call_{}_{n}", crate::openai::signin::new_uuid().unwrap_or_default().replace('-', "")) } else { call.id };
+        for call in std::mem::take(&mut self.calls) {
+            let call_id = if call.id.is_empty() { crate::new_call_id() } else { call.id };
             let arguments = if call.arguments.trim().is_empty() { "{}".to_owned() } else { call.arguments };
             out.push(Ok(Event::Item(Item::ToolCall(ToolCall { call_id, name: call.name, arguments }))));
         }
