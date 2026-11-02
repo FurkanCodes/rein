@@ -16,7 +16,7 @@
 use std::path::Path;
 
 use rein_agent::sandbox::Access;
-use rein_agent::tools::{BashCall, ToolName};
+use rein_agent::tools::{self, BashCall, Ended, ToolName};
 use rein_llm::ToolCall;
 use rein_llm::serde_json::{self, Value};
 
@@ -192,11 +192,16 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
     match ToolName::of(call) {
         Some(ToolName::Bash) => {
             let mut lines: Vec<&str> = output.lines().collect();
-            let code = lines.last().and_then(|last| last.strip_prefix("[exit code ")?.strip_suffix(']')).map(str::to_owned);
-            let stopped = lines.last().is_some_and(|last| last.starts_with("[stopped"));
-            if code.is_some() || stopped {
-                lines.pop();
+            // What the command printed; rein's notes after it are the model's.
+            let ended = tools::ended(output);
+            if let Some((at, _)) = ended {
+                lines.truncate(at);
             }
+            let code = match ended {
+                Some((_, Ended::Code(code))) => Some(code.to_owned()),
+                _ => None,
+            };
+            let stopped = matches!(ended, Some((_, Ended::Signal)));
             let failed = code.as_deref() != Some("0");
             let status = match code.as_deref() {
                 Some("0") => style.dim("exit 0"),
@@ -454,6 +459,9 @@ mod tests {
     #[test]
     fn sums_up_commands() {
         assert_eq!(status("bash", json!({}), "3 passed in 0.04s\n[exit code 0]"), ("exit 0".into(), vec!["3 passed in 0.04s".into()], 0));
+        // rein's notes after the exit line don't hide it.
+        let noted = "3 passed in 0.04s\n[exit code 0]\n[rein: that was the last step this turn may take.]";
+        assert_eq!(status("bash", json!({}), noted), ("exit 0".into(), vec!["3 passed in 0.04s".into()], 0));
         let failing = "Compiling\nrunning 48 tests\ntest a ... ok\ntest b ... FAILED\nleft: 1\n\nmore\n[exit code 101]";
         let (s, details, more) = status("bash", json!({}), failing);
         assert_eq!(s, "exit 101");

@@ -1664,3 +1664,69 @@ fn a_command_outside_the_sandbox_still_gets_your_keys() {
     term.wait_for("Done.");
     assert_eq!(results(&model)[0], "key=test\n[exit code 0]");
 }
+
+#[test]
+fn a_model_going_round_in_circles_is_stopped_and_you_can_go_on() {
+    let same = || Turn { out: vec![bash("echo same", "look", None)] };
+    let mut turns: Vec<Turn> = (0..5).map(|_| same()).collect();
+    turns.push(says("Trying something else."));
+    let model = Model::start(turns).with_env("REIN_MODE", "trust");
+    let mut term = Term::start(&model, "circles", 30, 120);
+    term.wait_for(IDLE);
+    term.keys("work\r");
+    term.wait_for("stopped going round in circles: Run echo same, 5 times in a row with the same result");
+    assert_eq!(model.requests().len(), 5, "a sixth step never went");
+    let told = results(&model);
+    assert!(told[2].contains("same call, with the same result, several times in a row"), "the model was told first: {told:?}");
+    term.wait_for(IDLE);
+    term.keys("continue\r");
+    term.wait_for("Trying something else.");
+}
+
+#[test]
+fn auto_mode_stops_at_max_steps_and_says_where_it_got_to() {
+    let steps = Turn { out: vec![bash("echo one", "look", None)] };
+    let more = Turn { out: vec![bash("echo two", "look", None)] };
+    let model = Model::start(vec![steps, more, says("Did one and two; three is left.")]).with_env("REIN_MODE", "auto").with_env("REIN_MAX_STEPS", "2");
+    let mut term = Term::start(&model, "max-steps", 30, 120);
+    term.wait_for(IDLE);
+    term.keys("do all three\r");
+    term.wait_for("Did one and two; three is left.");
+    term.wait_for("(stopped after 2 steps, the most a turn may take when nobody's watching; type continue to go on)");
+    let told = results(&model);
+    assert!(told.last().is_some_and(|last| last.contains("that was the last step this turn may take")), "{told:?}");
+    term.wait_for(IDLE);
+    term.keys("/status\r");
+    term.wait_for("at most 2 a turn, as nobody's watching (auto mode)");
+}
+
+#[test]
+fn a_task_left_to_run_that_doesnt_finish_exits_with_an_error() {
+    let model =
+        Model::start(vec![Turn { out: vec![bash("echo one", "look", None)] }, says("Started; the rest is left.")]).with_env("REIN_MODE", "trust").with_env("REIN_MAX_STEPS", "1");
+    let dir = std::env::temp_dir().join(format!("rein-screen-{}-unfinished", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut term = Term::spawn_with(&model, dir, 24, 120, &["do", "it", "all"]);
+    term.wait_exit();
+    let status = term.child.try_wait().unwrap().expect("exited");
+    assert!(!status.success(), "{}", term.text());
+    let screen = term.text();
+    assert!(screen.contains("Started; the rest is left.") && screen.contains("the task isn't finished"), "{screen}");
+}
+
+#[test]
+fn switching_to_auto_mode_brings_the_step_limit_and_back_again() {
+    let model = Model::start(Vec::new());
+    let mut term = Term::start(&model, "steps-mode", 30, 120);
+    term.wait_for(IDLE);
+    term.keys("/status\r");
+    term.wait_for("no limit while you watch; 200 in auto mode");
+    term.wait_for(IDLE);
+    // ask, edits, auto.
+    for mode in ["edits: ", "auto: nothing asks"] {
+        term.keys("\x1b[Z");
+        term.wait_for(mode);
+    }
+    term.keys("/status\r");
+    term.wait_for("at most 200 a turn, as nobody's watching (auto mode)");
+}

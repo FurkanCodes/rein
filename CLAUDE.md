@@ -142,6 +142,16 @@ finding. Each says why in a line.
   what's protected inside the project is guarded (noted, then put back), and
   a rule on `/tmp` reaches a project in it: grant around what's excepted.
 
+## The agent loop
+
+- Stop what's stuck, not what's long. A fixed 25 steps a turn cut off real
+  work once the sandbox stopped asking; a loop is the same call giving the
+  same result again and again, and that's what's caught. Only a turn nobody
+  watches has a step limit, and its last step asks for a report.
+- A guard against rein looping on its own work goes by progress, not a
+  count: compacting "once per message" overflowed long turns. Compact again
+  after a step since the last time, and not after one that made no room.
+
 ## Encapsulation
 
 - Fields that must change together are private, behind methods. `Agent`'s

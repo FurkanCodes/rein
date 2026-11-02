@@ -125,9 +125,12 @@ fn calls(history: &[Item]) -> HashMap<&str, (usize, Call)> {
         .collect()
 }
 
-/// The exit code a bash result ends with, if it does.
+/// The exit code a bash result gives, if it does.
 fn exit_code(output: &str) -> Option<&str> {
-    output.trim_end().lines().last()?.strip_prefix("[exit code ")?.strip_suffix(']')
+    match crate::tools::ended(output)? {
+        (_, crate::tools::Ended::Code(code)) => Some(code),
+        (_, crate::tools::Ended::Signal) => None,
+    }
 }
 
 /// The tool results worth retiring, each with what replaces it: a read of

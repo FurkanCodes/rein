@@ -248,14 +248,15 @@ model = "gpt-6.1-sol"
 effort = "medium"
 mode = "edits"
 compact_at = 120000
+max_steps = 200
 bell = off
 compress = off
 sandbox = on
 ```
 
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
-`$REIN_COMPACT_AT`, `$REIN_BELL`, `$REIN_COMPRESS` and `$REIN_SANDBOX`, which
-win over the file.
+`$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS` and
+`$REIN_SANDBOX`, which win over the file.
 
 ## Small things that matter
 
@@ -263,6 +264,21 @@ win over the file.
   server, a rate limit) is retried, 1, 2 and 4 seconds apart.
 - Commands are stopped after 60 seconds; the model can ask for up to 10
   minutes for a slow build or test suite.
+- A turn goes on until the model is done, however many steps that takes,
+  as in Claude Code, Codex and pi: you're watching, and Esc stops it. A
+  model going round in circles is caught instead of counted: when the same
+  call (or a short cycle of calls) gives the same result three times in a
+  row, rein tells it, and at five it stops the turn and says so. A call
+  repeated while its result changes, like a build getting further, is
+  progress, not a loop. Type `continue` to go on.
+- A turn nobody watches (`auto` mode, or `rein "task"`) stops after
+  `max_steps` steps, 200 by default (`--max-steps`, or `off`). Its last
+  step tells the model, which then says what it did and what's left, so you
+  come back to a report, not a turn cut off; a task cut off like this exits
+  with an error.
+- A long turn is compacted as often as it needs, though never twice
+  without a step in between, nor again after a compaction that didn't make
+  room.
 - For work with several steps the model keeps a plan, shown as a checklist.
 - What the model thought about shows as one dim line: `✻ Checking the tests`.
 

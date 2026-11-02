@@ -2,6 +2,7 @@
 
 use crate::CliResult;
 use crate::settings::Settings;
+use rein_agent::agent::DEFAULT_MAX_STEPS;
 use rein_agent::permissions::Mode;
 use rein_llm::Effort;
 use std::path::PathBuf;
@@ -60,6 +61,9 @@ Options:
                           read-only  only reading: commands look, nothing changes
                           trust      everything, without the sandbox, except what
                                      deny rules block
+      --max-steps <n>   How many steps a turn may take when nobody is
+                        watching (auto mode, a one-shot task), or off;
+                        default 200. While you watch there's no limit
       --record <file>   Also save the raw response stream, for tests
 
 Rules in .rein/permissions refine the mode for commands, one per line:
@@ -77,10 +81,15 @@ read the keys and logins in your home folder, or change what runs code
 later (.git/hooks, .git/config, .rein). Without a sandbox, commands ask
 first.
 
+A turn goes on until the model is done, or you press Esc. One that keeps
+making the same call with the same result is told, then stopped, and a turn
+nobody watches stops at max_steps, with the model saying where it got to.
+
 Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
-compact_at, and bell, compress and sandbox (on or off), like `mode = edits`.
-Flags win over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE, $REIN_COMPACT_AT,
-$REIN_BELL, $REIN_COMPRESS and $REIN_SANDBOX, which win over the file.
+compact_at, max_steps, and bell, compress and sandbox (on or off), like
+`mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE,
+$REIN_COMPACT_AT, $REIN_MAX_STEPS, $REIN_BELL, $REIN_COMPRESS and
+$REIN_SANDBOX, which win over the file.
 
 Each request carries the whole conversation, so rein gzips it on the way:
 about three times fewer bytes, and the same text for the model. A server that
@@ -120,6 +129,8 @@ pub(crate) struct AskArgs {
     pub(crate) compress: bool,
     /// Run commands in the sandbox, where there is one.
     pub(crate) sandbox: bool,
+    /// How many steps a turn nobody is watching may take; `None`: no limit.
+    pub(crate) max_steps: Option<usize>,
     /// `None` starts a conversation instead of doing one task.
     pub(crate) prompt: Option<String>,
 }
@@ -141,6 +152,10 @@ impl AskArgs {
             Some(other) => Err(format!("{key} should be on or off, not {other}")),
         };
         let (bell, compress, sandbox) = (switch("bell", "REIN_BELL")?, switch("compress", "REIN_COMPRESS")?, switch("sandbox", "REIN_SANDBOX")?);
+        let mut max_steps = match settings.get("max_steps", "REIN_MAX_STEPS") {
+            Some(value) => steps(&value)?,
+            None => Some(DEFAULT_MAX_STEPS),
+        };
         let (mut model_given, mut resume) = (false, Resume::New);
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -157,6 +172,7 @@ impl AskArgs {
                     mode = name.parse()?;
                 }
                 "-s" | "--system" => system = Some(value(&mut args, &arg)?),
+                "--max-steps" => max_steps = steps(&value(&mut args, &arg)?)?,
                 "--record" => record = Some(PathBuf::from(value(&mut args, &arg)?)),
                 "--" => words.extend(args.by_ref()),
                 flag if flag.starts_with('-') && flag.len() > 1 => {
@@ -166,7 +182,15 @@ impl AskArgs {
             }
         }
         let prompt = if words.is_empty() { None } else { Some(words.join(" ")) };
-        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, sandbox, prompt })
+        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, sandbox, max_steps, prompt })
+    }
+}
+
+/// A step limit as written: a number of steps, or `off` for none.
+fn steps(value: &str) -> CliResult<Option<usize>> {
+    match value.trim() {
+        "off" => Ok(None),
+        number => number.parse::<usize>().ok().filter(|n| *n > 0).map(Some).ok_or_else(|| format!("max_steps should be a number of steps, or off, not {value}")),
     }
 }
 
@@ -207,6 +231,17 @@ mod tests {
         let wrong = AskArgs::parse(vec!["hi".into()], &Settings::parse("sandbox = maybe").unwrap());
         assert_eq!(wrong.err().as_deref(), Some("sandbox should be on or off, not maybe"));
         assert_eq!(args("--mode auto").unwrap().mode, Mode::Auto);
+    }
+
+    #[test]
+    fn a_step_limit_is_a_number_or_off() {
+        assert_eq!(args("hi").unwrap().max_steps, Some(DEFAULT_MAX_STEPS));
+        assert_eq!(args("--max-steps 50 hi").unwrap().max_steps, Some(50));
+        assert_eq!(args("--max-steps off hi").unwrap().max_steps, None);
+        assert_eq!(AskArgs::parse(vec!["hi".into()], &Settings::parse("max_steps = 30").unwrap()).unwrap().max_steps, Some(30));
+        for wrong in ["0", "many", "-3"] {
+            assert_eq!(args(&format!("--max-steps {wrong} hi")).err(), Some(format!("max_steps should be a number of steps, or off, not {wrong}")));
+        }
     }
 
     #[test]

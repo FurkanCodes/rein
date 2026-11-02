@@ -18,8 +18,17 @@ use crate::permissions::{Decision, Permissions};
 use crate::session::{Loaded, Session};
 use crate::tools::{ToolName, Tools};
 
-/// After this many model turns in a row, stop and give the user control back.
-pub const MAX_TURNS: usize = 25;
+/// How many steps a turn nobody is watching may take: in auto mode, or a
+/// one-shot task. While you watch there's no limit; you can press Esc.
+pub const DEFAULT_MAX_STEPS: usize = 200;
+
+/// How many times in a row the same call may come out the same (one call,
+/// or a short cycle of them) before the model is told, and before rein
+/// stops the turn: a model going round in circles, not one that's slow.
+const REPEATS_NOTED: usize = 3;
+const REPEATS_STOP: usize = 5;
+/// The longest cycle of calls that counts as repeating: `a, b, a, b`.
+const LONGEST_CYCLE: usize = 4;
 
 /// What streams in while the model answers.
 pub enum Streamed<'a> {
@@ -136,6 +145,19 @@ pub const DECLINED_CHANGE: &str = "The user declined this change.";
 pub const DECLINED_AND_STOPPED: &str = "The user declined this and stopped, to tell you what to do instead.";
 /// What a step cut short by Ctrl-C or Esc gets.
 pub const INTERRUPTED: &str = "The user interrupted this before it finished. It may have partly run.";
+/// Added to a result that came out the same as the ones before it,
+/// `REPEATS_NOTED` times in a row.
+pub const REPEATING: &str = "\n[rein: that's the same call, with the same result, several times in a row. \
+                             If it isn't getting anywhere, try something different, or stop and ask the user.]";
+/// Added to the result that made it `REPEATS_STOP`: the turn stops there.
+pub const STOPPED_REPEATING: &str = "\n[rein stopped the turn here: the same call kept giving the same result.]";
+/// The result of each call a stuck turn didn't get to.
+pub const NOT_RUN_STUCK: &str = "Not run: rein stopped the turn, which was going round in circles.";
+/// Added to the last result of the last step a turn may take.
+pub const LAST_STEP: &str = "\n[rein: that was the last step this turn may take. Don't call any more tools: \
+                             say what you've done, what's left, and how to go on.]";
+/// The result of each call asked for after the last step.
+pub const NOT_RUN_PAST_LIMIT: &str = "Not run: the turn had taken all the steps it may.";
 
 /// What a compaction did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,11 +193,76 @@ impl Default for Window {
 pub enum Outcome {
     /// The model answered without asking for a tool.
     Done,
-    /// It kept asking for tools; we stopped after `MAX_TURNS`.
-    TurnLimit,
+    /// The turn took the steps it may ([`Agent::step_limit`]), and the
+    /// model was asked to say where it got to.
+    StepLimit(usize),
+    /// The model made `call` again and again with the same result: it was
+    /// going round in circles, and rein stopped the turn.
+    Stuck { call: ToolCall, times: usize },
     /// The user declined a step and stopped the turn, to say what to do
     /// instead.
     Stopped,
+}
+
+/// How a step's calls went.
+enum Ran {
+    /// Each one ran, or was refused, declined or skipped.
+    All,
+    /// The user declined one and stopped the turn.
+    Stopped,
+    /// One came out the same as before, too many times in a row.
+    Stuck { call: ToolCall, times: usize },
+}
+
+/// What each call in a turn gave, in order, so that a model going round in
+/// circles shows: the same calls, with the same results, again and again.
+#[derive(Default)]
+struct Repeats(Vec<u64>);
+
+impl Repeats {
+    /// Adds what `call` gave; how many times in a row the calls at the end
+    /// (one, or a short cycle of them) have now come out the same.
+    fn add(&mut self, call: &ToolCall, output: &str) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        call.name.hash(&mut hasher);
+        // The same arguments however they're spaced or ordered.
+        serde_json::from_str::<Value>(&call.arguments).map_or_else(|_| call.arguments.clone(), |args| args.to_string()).hash(&mut hasher);
+        output.hash(&mut hasher);
+        self.0.push(hasher.finish());
+        repeated(&self.0)
+    }
+}
+
+/// How many times the calls at the end of `seen` repeat, as one call or a
+/// cycle of up to `LONGEST_CYCLE`: `[x, a, b, a, b, a, b]` is 3.
+fn repeated(seen: &[u64]) -> usize {
+    (1..=LONGEST_CYCLE.min(seen.len()))
+        .map(|cycle| {
+            let last = &seen[seen.len() - cycle..];
+            let mut times = 1;
+            while (times + 1) * cycle <= seen.len() && &seen[seen.len() - (times + 1) * cycle..seen.len() - times * cycle] == last {
+                times += 1;
+            }
+            times
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// `output` with what rein tells the model about the turn: that the call
+/// came out the same `times` in a row, if that's many, and that this was
+/// the last result of its last step, when `call` is `closing`.
+fn with_note(mut output: String, call: &ToolCall, closing: Option<&str>, times: usize) -> String {
+    if times >= REPEATS_STOP {
+        output.push_str(STOPPED_REPEATING);
+    } else if times >= REPEATS_NOTED {
+        output.push_str(REPEATING);
+    }
+    if closing == Some(call.call_id.as_str()) {
+        output.push_str(LAST_STEP);
+    }
+    output
 }
 
 /// The agent: settings anyone may change (the public fields), and the
@@ -191,6 +278,10 @@ pub struct Agent<M> {
     pub reasoning_effort: Option<rein_llm::Effort>,
     /// The most one answer may take, when the model list says.
     pub max_output: Option<u64>,
+    /// How many steps (answers from the model) a turn may take before it's
+    /// stopped, and the model asked to sum up: `None` while someone is
+    /// watching, who can press Esc; a number when nobody is.
+    pub step_limit: Option<usize>,
     /// The tools offered: the same in every request, so built once.
     specs: Vec<Tool>,
     /// The system prompt, the same for the whole conversation.
@@ -223,24 +314,28 @@ impl<M: Model> Agent<M> {
         }
         self.record(Item::User(prompt.clone()))?;
         self.attach(&prompt, ui).await?;
-        // Compact at most once per message, so a summary that is itself too
-        // big can't start a loop of summaries.
-        let mut compacted = false;
+        // Compact when the conversation gets too long, as often as a long turn
+        // needs, but only after a step since the last time, and never again
+        // after one that didn't make room: a summary that is itself too big
+        // mustn't start a loop of summaries.
+        let (mut steps, mut compacted_at, mut no_room) = (0, None, false);
+        let mut repeats = Repeats::default();
         let mut unbound = false;
-        for _ in 0..MAX_TURNS {
-            if !compacted && self.estimated() > self.window.limit {
+        loop {
+            let may_compact = !no_room && compacted_at != Some(steps);
+            if may_compact && self.estimated() > self.window.limit {
                 self.compact(None, false, ui).await?;
-                compacted = true;
+                (compacted_at, no_room) = (Some(steps), self.estimated() > self.window.limit);
             }
             let request = self.request(&self.history);
             let sent = self.history.len();
             ui.thinking();
             let (items, usage) = match self.model.respond(&request, &mut |streamed| stream_to(ui, streamed)).await {
                 // The provider says it's too long after all: make room and
-                // try again, once.
-                Err(e) if !compacted && e.kind() == Some(ErrorKind::ContextFull) => {
+                // try again.
+                Err(e) if !no_room && compacted_at != Some(steps) && e.kind() == Some(ErrorKind::ContextFull) => {
                     self.compact(None, true, ui).await?;
-                    compacted = true;
+                    compacted_at = Some(steps);
                     continue;
                 }
                 // The provider turned the conversation's thinking away (it
@@ -255,6 +350,7 @@ impl<M: Model> Agent<M> {
             };
             ui.usage(&usage);
             self.window.measured = Some((usage.input_tokens, sent));
+            steps += 1;
 
             let calls: Vec<ToolCall> = items
                 .iter()
@@ -268,91 +364,139 @@ impl<M: Model> Agent<M> {
             for item in items {
                 self.record(item)?;
             }
+            // Past the limit: the model was told its last step was its last.
+            let past = self.step_limit.filter(|limit| steps > *limit);
             if calls.is_empty() {
+                if let Some(limit) = past {
+                    return Ok(Outcome::StepLimit(limit));
+                }
                 // Done, unless the user wrote meanwhile: then that's next.
                 if !self.steer(ui.steering(), ui).await? {
                     return Ok(Outcome::Done);
                 }
                 continue;
             }
-
-            let mut next = 0;
-            while next < calls.len() {
-                // The user wrote: what's left was planned before that, so
-                // it doesn't run. Every call still gets a result, as the
-                // conversation needs one for each.
-                let steering = ui.steering();
-                if !steering.is_empty() {
-                    for skipped in &calls[next..] {
-                        ui.tool_finished(skipped, SKIPPED);
-                        self.record(Item::ToolResult { call_id: skipped.call_id.clone(), output: SKIPPED.to_owned() })?;
-                    }
-                    self.steer(steering, ui).await?;
-                    break;
+            if let Some(limit) = past {
+                for call in &calls {
+                    ui.tool_finished(call, NOT_RUN_PAST_LIMIT);
+                    self.record(Item::ToolResult { call_id: call.call_id.clone(), output: NOT_RUN_PAST_LIMIT.to_owned() })?;
                 }
-                // Lookups asked for together run at once: they only look.
-                let together =
-                    calls[next..].iter().take_while(|call| ToolName::of(call).is_some_and(ToolName::only_looks) && self.permissions.decide(call) == Decision::Allow).count();
-                if together > 1 {
-                    let batch = &calls[next..next + together];
-                    ui.tools_started(batch);
-                    let outputs = all(batch.iter().map(|call| self.tools.run(call, self.permissions.how(call))).collect()).await;
-                    for (call, output) in batch.iter().zip(outputs) {
-                        ui.tool_finished(call, &output);
-                        self.record(Item::ToolResult { call_id: call.call_id.clone(), output })?;
-                    }
-                    next += together;
-                    continue;
-                }
-                let call = calls[next].clone();
-                next += 1;
-                // Searching the conversation is rein's own business: no
-                // permission needed, nothing outside is touched.
-                if ToolName::of(&call) == Some(ToolName::Recall) {
-                    ui.tool_started(&call);
-                    let output = compact::recall(&self.window.full, &call.arguments);
-                    ui.tool_finished(&call, &output);
-                    self.record(Item::ToolResult { call_id: call.call_id, output })?;
-                    continue;
-                }
-                let approved = match self.permissions.decide(&call) {
-                    Decision::Allow => Ok(()),
-                    Decision::Deny(reason) => {
-                        ui.tool_blocked(&call, &reason);
-                        Err(reason)
-                    }
-                    Decision::Ask => match ui.approve(&call).await {
-                        Approval::Yes => Ok(()),
-                        Approval::Always => {
-                            self.permissions.remember(&call);
-                            Ok(())
-                        }
-                        Approval::No => Err(match ToolName::of(&call) {
-                            Some(ToolName::Bash) => DECLINED_COMMAND.to_owned(),
-                            _ => DECLINED_CHANGE.to_owned(),
-                        }),
-                        Approval::Stop => {
-                            let output = DECLINED_AND_STOPPED.to_owned();
-                            ui.tool_finished(&call, &output);
-                            self.record(Item::ToolResult { call_id: call.call_id, output })?;
-                            return Ok(Outcome::Stopped);
-                        }
-                    },
-                };
-                let output = match approved {
-                    Ok(()) => {
-                        ui.tool_started(&call);
-                        self.tools.run(&call, self.permissions.how(&call)).await
-                    }
-                    Err(reason) => reason,
-                };
-                ui.tool_finished(&call, &output);
-                self.record(Item::ToolResult { call_id: call.call_id, output })?;
+                return Ok(Outcome::StepLimit(limit));
+            }
+            let last = self.step_limit == Some(steps);
+            match self.run_step(&calls, last, &mut repeats, ui).await? {
+                Ran::All => {}
+                Ran::Stopped => return Ok(Outcome::Stopped),
+                Ran::Stuck { call, times } => return Ok(Outcome::Stuck { call, times }),
             }
             // What the user wrote during the last step goes with its result.
             self.steer(ui.steering(), ui).await?;
         }
-        Ok(Outcome::TurnLimit)
+    }
+
+    /// Runs one step's `calls`, lookups asked for together at once, and
+    /// records each result. On the turn's `last` step, the last result tells
+    /// the model so.
+    async fn run_step(&mut self, calls: &[ToolCall], last: bool, repeats: &mut Repeats, ui: &mut impl Ui) -> Result<Ran> {
+        let closing = if last { calls.last().map(|call| call.call_id.clone()) } else { None };
+        let mut next = 0;
+        while next < calls.len() {
+            // The user wrote: what's left was planned before that, so it
+            // doesn't run. Every call still gets a result, as the
+            // conversation needs one for each.
+            let steering = ui.steering();
+            if !steering.is_empty() {
+                for skipped in &calls[next..] {
+                    let output = with_note(SKIPPED.to_owned(), skipped, closing.as_deref(), 0);
+                    ui.tool_finished(skipped, &output);
+                    self.record(Item::ToolResult { call_id: skipped.call_id.clone(), output })?;
+                }
+                self.steer(steering, ui).await?;
+                return Ok(Ran::All);
+            }
+            // Lookups asked for together run at once: they only look.
+            let together = calls[next..].iter().take_while(|call| ToolName::of(call).is_some_and(ToolName::only_looks) && self.permissions.decide(call) == Decision::Allow).count();
+            if together > 1 {
+                let batch = &calls[next..next + together];
+                ui.tools_started(batch);
+                let outputs = all(batch.iter().map(|call| self.tools.run(call, self.permissions.how(call))).collect()).await;
+                for (i, (call, output)) in batch.iter().zip(outputs).enumerate() {
+                    if let Some(stuck) = self.finish(call, output, repeats, closing.as_deref(), ui)? {
+                        return self.stop_stuck(stuck, &calls[next + i + 1..], ui);
+                    }
+                }
+                next += together;
+                continue;
+            }
+            let call = calls[next].clone();
+            next += 1;
+            // Searching the conversation is rein's own business: no
+            // permission needed, nothing outside is touched.
+            if ToolName::of(&call) == Some(ToolName::Recall) {
+                ui.tool_started(&call);
+                let output = compact::recall(&self.window.full, &call.arguments);
+                if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
+                    return self.stop_stuck(stuck, &calls[next..], ui);
+                }
+                continue;
+            }
+            let approved = match self.permissions.decide(&call) {
+                Decision::Allow => Ok(()),
+                Decision::Deny(reason) => {
+                    ui.tool_blocked(&call, &reason);
+                    Err(reason)
+                }
+                Decision::Ask => match ui.approve(&call).await {
+                    Approval::Yes => Ok(()),
+                    Approval::Always => {
+                        self.permissions.remember(&call);
+                        Ok(())
+                    }
+                    Approval::No => Err(match ToolName::of(&call) {
+                        Some(ToolName::Bash) => DECLINED_COMMAND.to_owned(),
+                        _ => DECLINED_CHANGE.to_owned(),
+                    }),
+                    Approval::Stop => {
+                        let output = DECLINED_AND_STOPPED.to_owned();
+                        ui.tool_finished(&call, &output);
+                        self.record(Item::ToolResult { call_id: call.call_id, output })?;
+                        return Ok(Ran::Stopped);
+                    }
+                },
+            };
+            let output = match approved {
+                Ok(()) => {
+                    ui.tool_started(&call);
+                    self.tools.run(&call, self.permissions.how(&call)).await
+                }
+                Err(reason) => reason,
+            };
+            if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
+                return self.stop_stuck(stuck, &calls[next..], ui);
+            }
+        }
+        Ok(Ran::All)
+    }
+
+    /// Records what `call` gave, noting when it has come out the same many
+    /// times in a row, and when it's the last of the turn's last step.
+    /// `Some` when it came out the same too many times: the turn stops.
+    fn finish(&mut self, call: &ToolCall, output: String, repeats: &mut Repeats, closing: Option<&str>, ui: &mut impl Ui) -> Result<Option<Ran>> {
+        let times = repeats.add(call, &output);
+        let output = with_note(output, call, closing, times);
+        ui.tool_finished(call, &output);
+        self.record(Item::ToolResult { call_id: call.call_id.clone(), output })?;
+        Ok((times >= REPEATS_STOP).then(|| Ran::Stuck { call: call.clone(), times }))
+    }
+
+    /// Stops a turn that's going round in circles: what it didn't get to
+    /// gets a result, as every call needs one.
+    fn stop_stuck(&mut self, stuck: Ran, left: &[ToolCall], ui: &mut impl Ui) -> Result<Ran> {
+        for call in left {
+            ui.tool_finished(call, NOT_RUN_STUCK);
+            self.record(Item::ToolResult { call_id: call.call_id.clone(), output: NOT_RUN_STUCK.to_owned() })?;
+        }
+        Ok(stuck)
     }
 
     /// Adds the messages the user sent to steer the turn, where it is now,
@@ -560,6 +704,7 @@ impl<M> Agent<M> {
             model_name,
             reasoning_effort: None,
             max_output: None,
+            step_limit: None,
             instructions: header.instructions,
             session_id: Some(header.id),
             history: conversation.history,
@@ -587,8 +732,8 @@ impl<M> Agent<M> {
 
     /// The same agent, in the same conversation, answered by `model`.
     pub fn with_model<N>(self, model: N) -> Agent<N> {
-        let Agent { model: _, tools, permissions, model_name, reasoning_effort, max_output, specs, instructions, session_id, history, session, context, window } = self;
-        Agent { model, tools, permissions, model_name, reasoning_effort, max_output, specs, instructions, session_id, history, session, context, window }
+        let Agent { model: _, tools, permissions, model_name, reasoning_effort, max_output, step_limit, specs, instructions, session_id, history, session, context, window } = self;
+        Agent { model, tools, permissions, model_name, reasoning_effort, max_output, step_limit, specs, instructions, session_id, history, session, context, window }
     }
 
     /// Compact once a request would carry more than this many tokens.
@@ -1073,6 +1218,7 @@ mod tests {
             instructions: None,
             reasoning_effort: None,
             max_output: None,
+            step_limit: None,
             session_id: Some("session-1".into()),
             history: Vec::new(),
             session: None,
@@ -1299,11 +1445,125 @@ mod tests {
         assert_eq!(agent.history.len(), 5);
     }
 
+    /// The result the model got for `call_id`, as the history has it.
+    fn result_of<'a>(agent: &'a Agent<Scripted>, call_id: &str) -> &'a str {
+        agent
+            .history
+            .iter()
+            .find_map(|item| match item {
+                Item::ToolResult { call_id: id, output } if id == call_id => Some(output.as_str()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no result for {call_id}"))
+    }
+
     #[tokio::test]
-    async fn stops_a_model_that_never_stops_asking() {
-        let turns = (0..MAX_TURNS).map(|i| vec![bash(&format!("c{i}"), "true")]).collect();
-        let mut agent = agent("limit", turns);
+    async fn while_youre_watching_a_turn_takes_as_many_steps_as_it_needs() {
+        let mut turns: Vec<Vec<Item>> = (0..40).map(|i| vec![bash(&format!("c{i}"), &format!("echo {i}"))]).collect();
+        turns.push(vec![Item::Assistant("Done, in 40 steps.".into())]);
+        let mut agent = agent("unlimited", turns);
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
-        assert_eq!(agent.send("loop".into(), &mut person).await.unwrap(), Outcome::TurnLimit);
+        assert_eq!(agent.send("work".into(), &mut person).await.unwrap(), Outcome::Done);
+        assert_eq!(agent.model.requests.borrow().len(), 41);
+    }
+
+    #[tokio::test]
+    async fn a_turn_nobody_watches_stops_at_its_limit_and_sums_up() {
+        let mut turns: Vec<Vec<Item>> = (0..3).map(|i| vec![bash(&format!("c{i}"), &format!("echo {i}"))]).collect();
+        turns.push(vec![Item::Assistant("Three of five done; the parser is left.".into())]);
+        let mut agent = agent("limit", turns);
+        agent.step_limit = Some(3);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        assert_eq!(agent.send("work".into(), &mut person).await.unwrap(), Outcome::StepLimit(3));
+        // The last step's result said so, and one more answer summed up.
+        assert!(result_of(&agent, "c2").ends_with(LAST_STEP), "{}", result_of(&agent, "c2"));
+        assert!(!result_of(&agent, "c1").contains(LAST_STEP));
+        assert_eq!(agent.model.requests.borrow().len(), 4);
+        assert_eq!(agent.history.last(), Some(&Item::Assistant("Three of five done; the parser is left.".into())));
+    }
+
+    #[tokio::test]
+    async fn what_a_model_asks_for_after_its_last_step_doesnt_run() {
+        let mut turns: Vec<Vec<Item>> = (0..2).map(|i| vec![bash(&format!("c{i}"), &format!("echo {i}"))]).collect();
+        turns.push(vec![bash("late", "touch ran.txt")]);
+        let mut agent = agent("past-limit", turns);
+        agent.step_limit = Some(2);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        assert_eq!(agent.send("work".into(), &mut person).await.unwrap(), Outcome::StepLimit(2));
+        assert_eq!(result_of(&agent, "late"), NOT_RUN_PAST_LIMIT);
+        assert!(!root_of("past-limit").join("ran.txt").exists());
+        assert_eq!(agent.model.requests.borrow().len(), 3, "and nothing more is asked");
+    }
+
+    #[tokio::test]
+    async fn a_model_going_round_in_circles_is_told_then_stopped() {
+        let turns = (0..6).map(|i| vec![bash(&format!("c{i}"), "echo same")]).collect();
+        let mut agent = agent("circles", turns);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        let outcome = agent.send("work".into(), &mut person).await.unwrap();
+        let ToolCall { call_id, .. } = match &outcome {
+            Outcome::Stuck { call, times: 5 } => call.clone(),
+            other => panic!("not stopped as stuck: {other:?}"),
+        };
+        assert_eq!(call_id, "c4", "the fifth time");
+        assert!(!result_of(&agent, "c1").contains(REPEATING));
+        assert!(result_of(&agent, "c2").ends_with(REPEATING), "told the third time: {}", result_of(&agent, "c2"));
+        assert!(result_of(&agent, "c4").ends_with(STOPPED_REPEATING));
+        assert_eq!(agent.model.requests.borrow().len(), 5, "the sixth step never came");
+    }
+
+    #[tokio::test]
+    async fn a_cycle_of_calls_going_nowhere_counts_too() {
+        let turns = (0..10).map(|i| vec![bash(&format!("c{i}"), if i % 2 == 0 { "echo a" } else { "echo b" })]).collect();
+        let mut agent = agent("cycle", turns);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        assert!(matches!(agent.send("work".into(), &mut person).await.unwrap(), Outcome::Stuck { times: 5, .. }));
+        assert_eq!(agent.model.requests.borrow().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn the_same_call_getting_somewhere_isnt_going_round_in_circles() {
+        // Each time, the same command, and something new: a build making progress.
+        let mut turns: Vec<Vec<Item>> = (0..8).map(|i| vec![bash(&format!("c{i}"), "echo x >> log.txt && wc -l < log.txt")]).collect();
+        turns.push(vec![Item::Assistant("It got there.".into())]);
+        let mut agent = agent("progress", turns);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        assert_eq!(agent.send("work".into(), &mut person).await.unwrap(), Outcome::Done);
+        assert!(!result_of(&agent, "c7").contains(REPEATING));
+    }
+
+    #[tokio::test]
+    async fn a_long_turn_compacts_as_often_as_it_needs() {
+        let read = |id: &str, path: &str| Item::ToolCall(ToolCall { call_id: id.into(), name: "read".into(), arguments: json!({ "path": path }).to_string() });
+        let mut agent = agent(
+            "compact-twice",
+            vec![
+                vec![read("r1", "one.txt")],
+                vec![Item::Assistant("Goal: read both. Read one.".into())],
+                vec![read("r2", "two.txt")],
+                vec![Item::Assistant("Goal: read both. Read both.".into())],
+                vec![Item::Assistant("Both read.".into())],
+            ],
+        );
+        let root = root_of("compact-twice");
+        std::fs::write(root.join("one.txt"), "hay one\n".repeat(2000)).unwrap();
+        std::fs::write(root.join("two.txt"), "hay two\n".repeat(2000)).unwrap();
+        agent.window.limit = 2_000;
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        assert_eq!(agent.send("read both".into(), &mut person).await.unwrap(), Outcome::Done);
+        let requests = agent.model.requests.borrow().clone();
+        let asked_to_sum_up = requests.iter().filter(|r| matches!(r.input.last(), Some(Item::User(text)) if text.starts_with("Pause the work"))).count();
+        assert_eq!(asked_to_sum_up, 2, "once for each file that filled the window");
+        assert_eq!(requests.len(), 5);
+    }
+
+    #[test]
+    fn counts_how_often_the_calls_at_the_end_repeat() {
+        assert_eq!(repeated(&[]), 0);
+        assert_eq!(repeated(&[1]), 1);
+        assert_eq!(repeated(&[2, 1, 1, 1]), 3);
+        assert_eq!(repeated(&[9, 1, 2, 1, 2, 1, 2]), 3);
+        assert_eq!(repeated(&[1, 2, 3, 1, 2, 3]), 2);
+        assert_eq!(repeated(&[1, 2, 3, 4, 5]), 1);
     }
 }

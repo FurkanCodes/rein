@@ -144,6 +144,33 @@ struct EditArgs {
 /// what worked by it.
 pub const ERROR: &str = "error: ";
 
+/// How a command ended, as the line `bash` writes after its output says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended<'a> {
+    /// It exited with this code.
+    Code(&'a str),
+    /// A signal stopped it.
+    Signal,
+}
+
+const SIGNAL_LINE: &str = "[stopped by a signal]";
+
+/// How the command whose result is `output` ended, and which of its lines
+/// says so: everything before that line is what the command printed. Notes
+/// rein adds (the sandbox's walls, a step limit) come after it, so it's the
+/// last such line, not the last line. `None` for a result without one, from
+/// a command that never ran.
+pub fn ended(output: &str) -> Option<(usize, Ended<'_>)> {
+    let lines: Vec<&str> = output.lines().collect();
+    lines.iter().enumerate().rev().find_map(|(i, line)| {
+        let line = *line;
+        if line == SIGNAL_LINE {
+            return Some((i, Ended::Signal));
+        }
+        line.strip_prefix("[exit code ")?.strip_suffix(']').map(|code| (i, Ended::Code(code)))
+    })
+}
+
 /// rein's tools. The model names one in each call; [`ToolName::of`] reads
 /// that name once, and everything after works with this, so a misspelt
 /// tool is a compile error, not a call that quietly does nothing.
@@ -584,10 +611,10 @@ impl Tools {
             note.push_str(&format!("\n[The sandbox here can't keep a command from files that run code later, so rein put them back as they were: {}.]", restored.join(", ")));
         }
         let status = match status.code() {
-            Some(code) => format!("exit code {code}"),
-            None => "stopped by a signal".to_owned(),
+            Some(code) => format!("[exit code {code}]"),
+            None => SIGNAL_LINE.to_owned(),
         };
-        Ok(format!("{text}[{status}]{note}"))
+        Ok(format!("{text}{status}{note}"))
     }
 }
 
@@ -923,6 +950,16 @@ mod tests {
         let answer = tools.run(&bash_call("echo x > a.txt", None), look).await;
         assert!(answer.contains("Operation not permitted") && answer.contains("[exit code 1]\n[It ran in the sandbox with look access"), "{answer}");
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "hi\n");
+    }
+
+    #[test]
+    fn how_a_command_ended_is_found_past_reins_notes() {
+        assert_eq!(ended("ok\n[exit code 0]"), Some((1, Ended::Code("0"))));
+        assert_eq!(ended("x\n[exit code 1]\n[It ran in the sandbox with look access.]\n[rein: that was the last step.]"), Some((1, Ended::Code("1"))));
+        assert_eq!(ended("[stopped by a signal]"), Some((0, Ended::Signal)));
+        // What the command printed doesn't count once its own line follows.
+        assert_eq!(ended("[exit code 0]\nthen it failed\n[exit code 2]"), Some((2, Ended::Code("2"))));
+        assert_eq!(ended("error: there's no sandbox here to run it in"), None);
     }
 
     #[test]

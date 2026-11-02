@@ -9,7 +9,7 @@ use crate::terminal::{Last, Terminal, you_said};
 use crate::ui::history::{self, History};
 use crate::ui::style::GUTTER;
 use crate::{CREDENTIALS_FILE, CliResult, config_dir, describe, login};
-use rein_agent::agent::{Agent, Llm, MAX_TURNS, Outcome};
+use rein_agent::agent::{Agent, Llm, Outcome};
 use rein_agent::compact;
 use rein_agent::permissions::{Mode, Permissions};
 use rein_agent::sandbox::{self, Missing, Places, Sandbox};
@@ -104,6 +104,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         models,
         others: None,
         compact_at,
+        max_steps: args.max_steps,
         http: http.clone(),
         provider,
         providers,
@@ -122,13 +123,19 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     let mut agent = Agent::new(Llm { client, record }, Tools::new(root).with_sandbox(sandbox), permissions, model_name, limit, loaded, context);
     agent.max_output = max_output;
     agent.reasoning_effort = args.effort;
+    agent.step_limit = step_limit(args.mode, args.prompt.is_some(), args.max_steps);
     // A continued conversation is as full as it was.
     terminal.context_used = agent.estimated();
     terminal.input.set_bar(terminal.bar());
     match args.prompt {
+        // A task left to run on its own that didn't finish says so in how
+        // rein exits, for whatever started it.
         Some(prompt) => {
             terminal.start_turn(Some(&prompt));
-            turn(&mut agent, prompt, &mut terminal).await
+            match turn(&mut agent, prompt, &mut terminal).await? {
+                Outcome::StepLimit(_) | Outcome::Stuck { .. } => Err("the task isn't finished".into()),
+                Outcome::Done | Outcome::Stopped => Ok(()),
+            }
         }
         None => conversation(&mut agent, &mut terminal, &mut setup).await,
     }
@@ -151,6 +158,8 @@ pub(crate) struct Setup {
     others: Option<Vec<(Provider, Vec<ModelInfo>)>>,
     /// `compact_at` from the settings or the environment.
     compact_at: Option<String>,
+    /// How many steps a turn nobody is watching may take.
+    max_steps: Option<usize>,
     /// For connecting to another provider, when `/model` names one.
     http: rein_llm::reqwest::Client,
     /// The provider in use.
@@ -216,7 +225,9 @@ impl Setup {
 /// Ctrl-C. Interrupting drops the turn mid-flight: the request is closed,
 /// a running command is killed, and the history is repaired so the
 /// conversation can go on.
-pub(crate) async fn turn(agent: &mut Agent<Llm>, prompt: String, terminal: &mut Terminal) -> CliResult {
+/// Works on `prompt` until the turn ends, and says how it did if that
+/// wasn't by finishing.
+pub(crate) async fn turn(agent: &mut Agent<Llm>, prompt: String, terminal: &mut Terminal) -> CliResult<Outcome> {
     let interrupted = terminal.interrupted.clone();
     let outcome = tokio::select! {
         outcome = agent.send(prompt, terminal) => Some(outcome),
@@ -231,7 +242,7 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, prompt: String, terminal: &mut 
         agent.repair();
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(interrupted; what should rein do instead?)"));
         terminal.end_turn();
-        return Ok(());
+        return Ok(Outcome::Stopped);
     };
     terminal.end_turn();
     // Said once: rein's requests to this server go uncompressed.
@@ -239,14 +250,27 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, prompt: String, terminal: &mut 
     if refused && !std::mem::replace(&mut terminal.said_uncompressed, true) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(this server doesn't take compressed requests, so they go uncompressed)"));
     }
-    match outcome.map_err(describe)? {
-        Outcome::Done => Ok(()),
-        Outcome::Stopped => {
-            say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(stopped; what should rein do instead?)"));
-            Ok(())
+    let outcome = outcome.map_err(describe)?;
+    let said = match &outcome {
+        Outcome::Done => None,
+        Outcome::Stopped => Some("(stopped; what should rein do instead?)".to_owned()),
+        Outcome::StepLimit(steps) => Some(format!("(stopped after {steps} steps, the most a turn may take when nobody's watching; type continue to go on)")),
+        Outcome::Stuck { call, times } => {
+            let (verb, what) = crate::ui::steps::describe(call);
+            Some(format!("(stopped going round in circles: {verb} {what}, {times} times in a row with the same result; say what to do instead, or type continue)"))
         }
-        Outcome::TurnLimit => Err(format!("stopped after {MAX_TURNS} turns of tool calls; ask again to continue")),
+    };
+    if let Some(said) = said {
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&said));
     }
+    Ok(outcome)
+}
+
+/// How many steps a turn may take: no limit while you're watching, who can
+/// press Esc; `max_steps` when nobody is, in auto mode or a task rein was
+/// given to do on its own.
+pub(crate) fn step_limit(mode: Mode, one_shot: bool, max_steps: Option<usize>) -> Option<usize> {
+    if mode == Mode::Auto || one_shot { max_steps } else { None }
 }
 
 /// When to compact: `compact_at` tokens if set (the settings, or
@@ -336,6 +360,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
             Said::NextMode => {
                 let mode = next_mode(agent.permissions.mode);
                 agent.permissions.mode = mode;
+                agent.step_limit = step_limit(mode, false, setup.max_steps);
                 terminal.mode = mode;
                 terminal.input.set_bar(terminal.bar());
                 terminal.input.notice(&format!("{} · shift-tab for the next", mode_description(mode, terminal.sandboxed)));
@@ -420,6 +445,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         Slash::Mode(None) | Slash::Model(None) | Slash::Login(None) | Slash::Logout(None) | Slash::Effort(None) => {}
         Slash::Mode(Some(mode)) => {
             agent.permissions.mode = mode;
+            agent.step_limit = step_limit(mode, false, setup.max_steps);
             terminal.mode = mode;
             say!("{pad}{} {}", s.green("✓"), mode_description(mode, terminal.sandboxed));
         }
@@ -450,6 +476,14 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 ("effort", agent.reasoning_effort.map_or("the model's default", Effort::as_str).to_owned()),
                 ("mode", mode_description(agent.permissions.mode, terminal.sandboxed).to_owned()),
                 ("sandbox", agent.permissions.sandbox().describe()),
+                (
+                    "steps",
+                    match (agent.step_limit, setup.max_steps) {
+                        (Some(limit), _) => format!("at most {limit} a turn, as nobody's watching (auto mode)"),
+                        (None, Some(limit)) => format!("no limit while you watch; {limit} in auto mode"),
+                        (None, None) => "no limit".to_owned(),
+                    },
+                ),
                 ("rules", format!("{} from .rein/permissions", agent.permissions.rule_count())),
                 ("context", format!("about {} of {} tokens before compacting", thousands(agent.estimated()), thousands(agent.limit()))),
                 ("sent", traffic(agent.model.client.traffic())),
