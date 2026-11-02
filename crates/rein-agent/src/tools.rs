@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use rein_llm::{Tool, ToolCall};
 
+use crate::sandbox::{self, Access, Run};
 use crate::search;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -25,6 +26,8 @@ pub struct Tools {
     /// What files looked like before rein changed them, one list per turn,
     /// for `undo`.
     checkpoints: std::sync::Mutex<Vec<Checkpoint>>,
+    /// What holds commands in: `bash` runs in it, when it's told to.
+    sandbox: sandbox::Shared,
 }
 
 /// Each file a turn changed, as it was before: its bytes, or `None` if the
@@ -84,11 +87,40 @@ enum StepStatus {
     Done,
 }
 
-#[derive(Deserialize)]
-struct BashArgs {
+/// A `bash` call: the command, and what it needs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BashCall {
     command: String,
     /// How long it may run, if longer than the default.
+    #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// Missing or null is look, the least there is.
+    #[serde(default)]
+    access: Option<Access>,
+    /// Why it needs network or outside access, for the user.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+impl BashCall {
+    /// The `bash` call `call` is: `None` for another tool, or arguments
+    /// that don't read as one.
+    pub fn of(call: &ToolCall) -> Option<BashCall> {
+        (ToolName::of(call) == Some(ToolName::Bash)).then(|| parse(&call.arguments).ok()).flatten()
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn access(&self) -> Access {
+        self.access.unwrap_or_default()
+    }
+
+    /// The reason given, if it says anything.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref().map(str::trim).filter(|reason| !reason.is_empty())
+    }
 }
 
 /// The longest a command may ask to run.
@@ -177,8 +209,15 @@ impl std::fmt::Display for ToolName {
 }
 
 impl Tools {
+    /// Tools for the project at `root`, with no sandbox: commands told to
+    /// run in one are refused until [`Tools::with_sandbox`] gives one.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Tools { root: root.into(), timeout: Duration::from_secs(60), checkpoints: Default::default() }
+        Tools { root: root.into(), timeout: Duration::from_secs(60), checkpoints: Default::default(), sandbox: Default::default() }
+    }
+
+    pub fn with_sandbox(mut self, sandbox: sandbox::Shared) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Starts a new turn: file changes from now on are undone together.
@@ -238,6 +277,26 @@ impl Tools {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// What the model is told about `bash`. It's the same in every mode,
+    /// so that changing modes doesn't change the start of every request
+    /// and lose the prompt cache: what a mode allows, a refusal says.
+    fn bash_description(&self) -> &'static str {
+        if self.sandbox.available() {
+            "Run a shell command in the project root and return its output and exit code. Commands run in a \
+             sandbox, so say what each needs in access, and ask for no more: look for one that only reads, write \
+             for one that changes files in the project (builds and tests usually do), network for one that also \
+             uses the internet, and outside for one that must write elsewhere (installing packages into a cache in \
+             the home folder), or use docker, ssh or a terminal. Depending on the mode, more access may need the \
+             user's approval, or be refused. Even in the sandbox, secrets in the home folder can't be read and \
+             files that run code later (.git/hooks, .git/config, .rein) can't be changed. Commands are stopped \
+             after 60 seconds unless you ask for longer, up to 600, for slow builds and test suites."
+        } else {
+            "Run a shell command in the project root and return its output and exit code. The user approves \
+             each command before it runs; say what it needs in access. Commands are stopped after 60 seconds \
+             unless you ask for longer, up to 600, for slow builds and test suites."
+        }
     }
 
     /// What the model is told about each tool.
@@ -327,25 +386,31 @@ impl Tools {
             },
             Tool {
                 name: ToolName::Bash.as_str().into(),
-                description: "Run a shell command in the project root and return its output and exit code. \
-                              The user approves each command before it runs. Commands are stopped after 60 seconds \
-                              unless you ask for longer, up to 600, for slow builds and test suites."
-                    .into(),
+                description: self.bash_description().into(),
                 parameters: object(json!({
                     "command": { "type": "string", "description": "The command line, run with `sh -c`." },
-                    "timeout_seconds": { "type": ["integer", "null"], "description": "How long it may run, at most 600. Null for 60." }
+                    "timeout_seconds": { "type": ["integer", "null"], "description": "How long it may run, at most 600. Null for 60." },
+                    "access": {
+                        "type": "string",
+                        "enum": Access::ALL.map(Access::as_str),
+                        "description": "What the command needs. look: only reads. write: also changes files in the project. network: also uses the internet. outside: runs without the sandbox."
+                    },
+                    "reason": { "type": ["string", "null"], "description": "For network or outside: why, in a few words the user will read. Null otherwise." }
                 })),
             },
         ]
     }
 
-    /// Runs one call and returns the text to send back to the model.
-    pub async fn run(&self, call: &ToolCall) -> String {
+    /// Runs one call and returns the text to send back to the model. `how`
+    /// is how a command runs, as the permissions decided: in the sandbox,
+    /// within its walls, or not. The other tools keep to the project
+    /// themselves, and run as they always do.
+    pub async fn run(&self, call: &ToolCall, how: Run) -> String {
         let result = match ToolName::of(call) {
             Some(ToolName::Read) => self.read(&call.arguments).await,
             Some(ToolName::Grep) => self.grep(&call.arguments).await,
             Some(ToolName::Glob) => self.glob(&call.arguments).await,
-            Some(ToolName::Bash) => self.bash(&call.arguments).await,
+            Some(ToolName::Bash) => self.bash(&call.arguments, how).await,
             Some(ToolName::Write) => self.write(&call.arguments).await,
             Some(ToolName::Edit) => self.edit(&call.arguments).await,
             // The checklist is for showing; the model keeps it in its own words.
@@ -465,11 +530,27 @@ impl Tools {
         Ok(format!("edited {}: replaced {times}", args.path))
     }
 
-    async fn bash(&self, arguments: &str) -> Result<String, String> {
-        let args: BashArgs = parse(arguments)?;
+    async fn bash(&self, arguments: &str, how: Run) -> Result<String, String> {
+        let args: BashCall = parse(arguments)?;
         let timeout = args.timeout_seconds.map_or(self.timeout, |s| Duration::from_secs(s).clamp(Duration::from_secs(1), MAX_TIMEOUT));
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg(&args.command).current_dir(&self.root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        // Where the sandbox can't keep a command from what runs code later,
+        // that's noted now and put back once it's done, or dropped (Esc).
+        // Before the command, so it's dropped after its group is stopped.
+        let guard = match how {
+            Run::Sandboxed(walls) => self.sandbox.guard(walls)?,
+            Run::Unsandboxed => None,
+        };
+        let mut command = match how {
+            // Never run unconfined what was meant to be confined.
+            Run::Sandboxed(walls) => self.sandbox.wrap(&args.command, walls)?,
+            Run::Unsandboxed => {
+                let mut command = tokio::process::Command::new("sh");
+                // Your whole environment, keys rein kept for itself included.
+                command.arg("-c").arg(&args.command).envs(sandbox::secrets::all().iter().map(|(name, value)| (name, value)));
+                command
+            }
+        };
+        command.current_dir(&self.root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         // A group of its own, so stopping it stops what it started too.
         #[cfg(unix)]
         command.process_group(0);
@@ -492,11 +573,21 @@ impl Tools {
         if dropped > 0 {
             text.push_str(&format!("\n[{dropped} more bytes of output weren't kept]\n"));
         }
+        // A sandboxed command that failed says what its walls were: they may
+        // be why, and the model can ask for more.
+        let mut note = match how {
+            Run::Sandboxed(walls) if !status.success() => format!("\n{}", walls.note()),
+            _ => String::new(),
+        };
+        let restored = guard.map(sandbox::Guard::finish).unwrap_or_default();
+        if !restored.is_empty() {
+            note.push_str(&format!("\n[The sandbox here can't keep a command from files that run code later, so rein put them back as they were: {}.]", restored.join(", ")));
+        }
         let status = match status.code() {
             Some(code) => format!("exit code {code}"),
             None => "stopped by a signal".to_owned(),
         };
-        Ok(format!("{text}[{status}]"))
+        Ok(format!("{text}[{status}]{note}"))
     }
 }
 
@@ -645,6 +736,11 @@ fn truncate(mut text: String) -> String {
 mod tests {
     use super::*;
 
+    /// Runs `call` as rein's tools did before the sandbox: commands unconfined.
+    async fn run(tools: &Tools, call: &ToolCall) -> String {
+        tools.run(call, Run::Unsandboxed).await
+    }
+
     /// Whether a process whose whole command is `command` is alive (not
     /// just waiting to be reaped). Whole, so a shell that merely mentions it
     /// doesn't count.
@@ -666,17 +762,17 @@ mod tests {
     async fn a_misspelt_choice_is_an_error_the_model_hears_about() {
         let tools = Tools::new(project("misspelt", &[("a.rs", "fn main() {}\n")]));
         let call = |name: &str, arguments: Value| ToolCall { call_id: "c".into(), name: name.into(), arguments: arguments.to_string() };
-        let grep = tools.run(&call("grep", json!({ "pattern": "main", "path": null, "glob": null, "ignore_case": false, "output": "filez", "context": null }))).await;
+        let grep = run(&tools, &call("grep", json!({ "pattern": "main", "path": null, "glob": null, "ignore_case": false, "output": "filez", "context": null }))).await;
         assert!(grep.starts_with("error: bad arguments") && grep.contains("filez"), "{grep}");
-        let plan = tools.run(&call("plan", json!({ "steps": [{ "step": "a", "status": "finished" }] }))).await;
+        let plan = run(&tools, &call("plan", json!({ "steps": [{ "step": "a", "status": "finished" }] }))).await;
         assert!(plan.starts_with("error: bad arguments") && plan.contains("finished"), "{plan}");
-        assert_eq!(tools.run(&call("plan", json!({ "steps": [{ "step": "a", "status": "in_progress" }] }))).await, "Plan updated: 0 of 1 done.");
+        assert_eq!(run(&tools, &call("plan", json!({ "steps": [{ "step": "a", "status": "in_progress" }] }))).await, "Plan updated: 0 of 1 done.");
     }
 
     #[tokio::test]
     async fn a_command_stopped_by_its_timeout_takes_everything_it_started_with_it() {
         let tools = Tools::new(project("timeout-group", &[]));
-        let output = tools.run(&bash_call("sleep 41.17 & sleep 41.17", Some(1))).await;
+        let output = run(&tools, &bash_call("sleep 41.17 & sleep 41.17", Some(1))).await;
         assert!(output.contains("took longer"), "{output}");
         assert!(!running("sleep 41.17"), "the sleeps were left running");
     }
@@ -685,7 +781,7 @@ mod tests {
     async fn a_command_whose_turn_is_stopped_takes_everything_it_started_with_it() {
         let tools = Tools::new(project("dropped-group", &[]));
         // The turn's future is dropped mid-command, as Esc does.
-        let stopped = tokio::time::timeout(std::time::Duration::from_millis(300), tools.run(&bash_call("sleep 42.23 & sleep 42.23", None))).await;
+        let stopped = tokio::time::timeout(std::time::Duration::from_millis(300), run(&tools, &bash_call("sleep 42.23 & sleep 42.23", None))).await;
         assert!(stopped.is_err());
         assert!(!running("sleep 42.23"), "the sleeps were left running");
     }
@@ -693,7 +789,7 @@ mod tests {
     #[tokio::test]
     async fn a_command_that_finishes_leaves_what_it_put_in_the_background() {
         let tools = Tools::new(project("background", &[]));
-        let output = tools.run(&bash_call("sleep 43.31 >/dev/null 2>&1 & echo started", None)).await;
+        let output = run(&tools, &bash_call("sleep 43.31 >/dev/null 2>&1 & echo started", None)).await;
         assert!(output.contains("started"), "{output}");
         assert!(running("sleep 43.31"), "a server started with & keeps running");
         let _ = std::process::Command::new("pkill").args(["-x", "-f", "sleep 43.31"]).status();
@@ -702,7 +798,7 @@ mod tests {
     #[tokio::test]
     async fn a_flood_of_output_isnt_all_kept() {
         let tools = Tools::new(project("flood", &[]));
-        let output = tools.run(&bash_call("head -c 20000000 /dev/zero | tr '\\0' x", None)).await;
+        let output = run(&tools, &bash_call("head -c 20000000 /dev/zero | tr '\\0' x", None)).await;
         assert!(output.len() < 100_000, "{} bytes kept", output.len());
         assert!(output.contains("more bytes"), "{}", &output[output.len().saturating_sub(200)..]);
     }
@@ -725,8 +821,8 @@ mod tests {
     #[tokio::test]
     async fn read_returns_the_file() {
         let tools = Tools::new(project("read", &[("a.txt", "hello")]));
-        assert_eq!(tools.run(&call("read", json!({"path": "a.txt"}))).await, "hello");
-        let missing = tools.run(&call("read", json!({"path": "nope.txt"}))).await;
+        assert_eq!(run(&tools, &call("read", json!({"path": "a.txt"}))).await, "hello");
+        let missing = run(&tools, &call("read", json!({"path": "nope.txt"}))).await;
         assert!(missing.starts_with("error: can't read nope.txt"), "{missing}");
     }
 
@@ -735,20 +831,20 @@ mod tests {
         let text: String = (1..=5000).map(|n| format!("line {n}\n")).collect();
         let tools = Tools::new(project("pages", &[("long.txt", &text), ("short.txt", "a\nb\nc\n")]));
 
-        let first = tools.run(&call("read", json!({"path": "long.txt", "start_line": null, "line_count": null}))).await;
+        let first = run(&tools, &call("read", json!({"path": "long.txt", "start_line": null, "line_count": null}))).await;
         assert!(first.starts_with("line 1\n"));
         assert!(first.len() <= MAX_OUTPUT);
         let note = first.lines().last().unwrap();
         assert!(note.starts_with("[lines 1-") && note.contains(" of 5000; read again with start_line ") && note.ends_with(" for more]"), "{note}");
 
-        let middle = tools.run(&call("read", json!({"path": "long.txt", "start_line": 4000, "line_count": 3}))).await;
+        let middle = run(&tools, &call("read", json!({"path": "long.txt", "start_line": 4000, "line_count": 3}))).await;
         assert_eq!(middle, "line 4000\nline 4001\nline 4002\n[lines 4000-4002 of 5000; read again with start_line 4003 for more]");
 
-        let end = tools.run(&call("read", json!({"path": "long.txt", "start_line": 4999, "line_count": null}))).await;
+        let end = run(&tools, &call("read", json!({"path": "long.txt", "start_line": 4999, "line_count": null}))).await;
         assert_eq!(end, "line 4999\nline 5000\n[lines 4999-5000 of 5000]");
 
-        assert_eq!(tools.run(&call("read", json!({"path": "short.txt"}))).await, "a\nb\nc\n");
-        let past = tools.run(&call("read", json!({"path": "short.txt", "start_line": 9, "line_count": null}))).await;
+        assert_eq!(run(&tools, &call("read", json!({"path": "short.txt"}))).await, "a\nb\nc\n");
+        let past = run(&tools, &call("read", json!({"path": "short.txt", "start_line": 9, "line_count": null}))).await;
         assert_eq!(past, "error: short.txt has only 3 lines");
     }
 
@@ -758,7 +854,7 @@ mod tests {
         // Enough `..` to reach / from any temp dir; extra ones stay at /.
         let climb = format!("{}etc/hosts", "../".repeat(20));
         for path in [climb.as_str(), "/etc/hosts"] {
-            let answer = tools.run(&call("read", json!({ "path": path }))).await;
+            let answer = run(&tools, &call("read", json!({ "path": path }))).await;
             assert_eq!(answer, format!("error: {path} is outside the project"));
         }
     }
@@ -767,14 +863,14 @@ mod tests {
     async fn searches_stay_in_the_project() {
         let tools = Tools::new(project("search", &[("a.rs", "fn main() {}\n"), ("b.md", "main ideas\n")]));
         let grep = |path: Value, output: &str| call("grep", json!({"pattern": "main", "path": path, "glob": null, "ignore_case": false, "output": output, "context": null}));
-        assert_eq!(tools.run(&grep(Value::Null, "files")).await, "2 files with matches (2 matching lines)\na.rs (1 match)\nb.md (1 match)");
-        assert_eq!(tools.run(&grep(json!("a.rs"), "lines")).await, "1 match in 1 file\na.rs\n1:fn main() {}");
-        assert_eq!(tools.run(&call("glob", json!({"pattern": "*.md", "path": null}))).await, "1 file\nb.md");
+        assert_eq!(run(&tools, &grep(Value::Null, "files")).await, "2 files with matches (2 matching lines)\na.rs (1 match)\nb.md (1 match)");
+        assert_eq!(run(&tools, &grep(json!("a.rs"), "lines")).await, "1 match in 1 file\na.rs\n1:fn main() {}");
+        assert_eq!(run(&tools, &call("glob", json!({"pattern": "*.md", "path": null}))).await, "1 file\nb.md");
         let climb = format!("{}etc", "../".repeat(20));
         for path in ["/etc", climb.as_str()] {
-            assert_eq!(tools.run(&grep(json!(path), "lines")).await, format!("error: {path} is outside the project"));
+            assert_eq!(run(&tools, &grep(json!(path), "lines")).await, format!("error: {path} is outside the project"));
         }
-        assert_eq!(tools.run(&call("glob", json!({"pattern": "*", "path": "a.rs"}))).await, "error: a.rs isn't a folder");
+        assert_eq!(run(&tools, &call("glob", json!({"pattern": "*", "path": "a.rs"}))).await, "error: a.rs isn't a folder");
     }
 
     #[tokio::test]
@@ -782,11 +878,11 @@ mod tests {
         let dir = project("undo", &[("a.txt", "one\n")]);
         let tools = Tools::new(&dir);
         tools.checkpoint();
-        tools.run(&call("edit", json!({"path": "a.txt", "old_text": "one", "new_text": "two", "replace_all": false}))).await;
+        run(&tools, &call("edit", json!({"path": "a.txt", "old_text": "one", "new_text": "two", "replace_all": false}))).await;
         tools.checkpoint();
-        tools.run(&call("edit", json!({"path": "a.txt", "old_text": "two", "new_text": "three", "replace_all": false}))).await;
-        tools.run(&call("edit", json!({"path": "a.txt", "old_text": "three", "new_text": "four", "replace_all": false}))).await;
-        tools.run(&call("write", json!({"path": "new/b.txt", "content": "made"}))).await;
+        run(&tools, &call("edit", json!({"path": "a.txt", "old_text": "two", "new_text": "three", "replace_all": false}))).await;
+        run(&tools, &call("edit", json!({"path": "a.txt", "old_text": "three", "new_text": "four", "replace_all": false}))).await;
+        run(&tools, &call("write", json!({"path": "new/b.txt", "content": "made"}))).await;
         tools.checkpoint(); // a turn that changed nothing
 
         assert_eq!(tools.undo().unwrap(), ["a.txt", "new/b.txt"]);
@@ -800,26 +896,63 @@ mod tests {
     #[tokio::test]
     async fn bash_returns_output_and_exit_code() {
         let tools = Tools::new(project("bash", &[]));
-        let answer = tools.run(&call("bash", json!({"command": "echo hi; echo oops >&2; exit 3"}))).await;
+        let answer = run(&tools, &call("bash", json!({"command": "echo hi; echo oops >&2; exit 3"}))).await;
         assert_eq!(answer, "hi\noops\n[exit code 3]");
+    }
+
+    #[tokio::test]
+    async fn a_command_meant_for_the_sandbox_never_runs_without_one() {
+        let root = project("no-sandbox", &[]);
+        let tools = Tools::new(&root);
+        let look = Run::Sandboxed(Access::Look.walls().unwrap());
+        let answer = tools.run(&bash_call("touch ran.txt", None), look).await;
+        assert_eq!(answer, "error: there's no sandbox here to run it in");
+        assert!(!root.join("ran.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_command_that_fails_says_what_its_walls_were() {
+        let root = project("walls", &[("a.txt", "hi\n")]);
+        let sandbox = sandbox::Sandbox::detect(sandbox::Places::new(&root, None, None)).await;
+        if !sandbox.available() {
+            return;
+        }
+        let tools = Tools::new(&root).with_sandbox(std::sync::Arc::new(sandbox));
+        let look = Run::Sandboxed(Access::Look.walls().unwrap());
+        assert_eq!(tools.run(&bash_call("cat a.txt", None), look).await, "hi\n[exit code 0]", "a command that worked says nothing more");
+        let answer = tools.run(&bash_call("echo x > a.txt", None), look).await;
+        assert!(answer.contains("Operation not permitted") && answer.contains("[exit code 1]\n[It ran in the sandbox with look access"), "{answer}");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "hi\n");
+    }
+
+    #[test]
+    fn a_bash_call_says_what_it_needs() {
+        let call = |arguments: Value| ToolCall { call_id: "c".into(), name: "bash".into(), arguments: arguments.to_string() };
+        let fetch = BashCall::of(&call(json!({ "command": "cargo fetch", "access": "network", "reason": "  to download the crates " }))).unwrap();
+        assert_eq!((fetch.command(), fetch.access(), fetch.reason()), ("cargo fetch", Access::Network, Some("to download the crates")));
+        // Saying nothing, or null, is the least there is.
+        let plain = BashCall::of(&call(json!({ "command": "ls", "access": null, "reason": "" }))).unwrap();
+        assert_eq!((plain.access(), plain.reason()), (Access::Look, None));
+        assert!(BashCall::of(&call(json!({ "command": "ls", "access": "all" }))).is_none());
+        assert!(BashCall::of(&ToolCall { name: "read".into(), ..call(json!({ "command": "ls" })) }).is_none());
     }
 
     #[tokio::test]
     async fn bash_stops_slow_commands() {
         let tools = Tools::new(project("slow", &[])).with_timeout(Duration::from_millis(200));
-        let answer = tools.run(&call("bash", json!({"command": "sleep 5"}))).await;
+        let answer = run(&tools, &call("bash", json!({"command": "sleep 5"}))).await;
         assert_eq!(answer, "error: the command took longer than 200ms and was stopped");
         // Asking for longer works, within the limit.
         let tools = Tools::new(project("slow-ok", &[])).with_timeout(Duration::from_millis(200));
-        let answer = tools.run(&call("bash", json!({"command": "sleep 1.2; echo done", "timeout_seconds": 3}))).await;
+        let answer = run(&tools, &call("bash", json!({"command": "sleep 1.2; echo done", "timeout_seconds": 3}))).await;
         assert_eq!(answer, "done\n[exit code 0]");
     }
 
     #[tokio::test]
     async fn mistakes_come_back_as_text() {
         let tools = Tools::new(project("mistakes", &[]));
-        assert_eq!(tools.run(&call("rm", json!({}))).await, "error: there is no tool called rm");
-        let bad = tools.run(&call("read", json!({"file": "a.txt"}))).await;
+        assert_eq!(run(&tools, &call("rm", json!({}))).await, "error: there is no tool called rm");
+        let bad = run(&tools, &call("read", json!({"file": "a.txt"}))).await;
         assert!(bad.starts_with("error: bad arguments: missing field `path`"), "{bad}");
     }
 
@@ -827,10 +960,10 @@ mod tests {
     async fn write_creates_files_and_folders_inside_the_project() {
         let dir = project("write", &[]);
         let tools = Tools::new(&dir);
-        let created = tools.run(&call("write", json!({"path": "src/new/a.txt", "content": "one\ntwo\n"}))).await;
+        let created = run(&tools, &call("write", json!({"path": "src/new/a.txt", "content": "one\ntwo\n"}))).await;
         assert_eq!(created, "created src/new/a.txt (2 lines)");
         assert_eq!(std::fs::read_to_string(dir.join("src/new/a.txt")).unwrap(), "one\ntwo\n");
-        let replaced = tools.run(&call("write", json!({"path": "src/new/a.txt", "content": "three"}))).await;
+        let replaced = run(&tools, &call("write", json!({"path": "src/new/a.txt", "content": "three"}))).await;
         assert_eq!(replaced, "replaced src/new/a.txt (1 line)");
     }
 
@@ -846,7 +979,7 @@ mod tests {
             ("/tmp/escape.txt", "error: /tmp/escape.txt is outside the project"),
             ("link/escape.txt", "error: link/escape.txt is outside the project"),
         ] {
-            assert_eq!(tools.run(&call("write", json!({"path": path, "content": "x"}))).await, error);
+            assert_eq!(run(&tools, &call("write", json!({"path": path, "content": "x"}))).await, error);
         }
         assert!(!outside.join("escape.txt").exists());
     }
@@ -856,14 +989,14 @@ mod tests {
         let dir = project("edit", &[("a.rs", "fn a() {}\nfn b() {}\n")]);
         let tools = Tools::new(&dir);
         let edit = |old: &str, new: &str, all: bool| call("edit", json!({"path": "a.rs", "old_text": old, "new_text": new, "replace_all": all}));
-        assert_eq!(tools.run(&edit("fn b() {}", "fn c() {}", false)).await, "edited a.rs: replaced 1 place");
+        assert_eq!(run(&tools, &edit("fn b() {}", "fn c() {}", false)).await, "edited a.rs: replaced 1 place");
         assert_eq!(std::fs::read_to_string(dir.join("a.rs")).unwrap(), "fn a() {}\nfn c() {}\n");
 
-        let twice = tools.run(&edit("() {}", "() { todo!() }", false)).await;
+        let twice = run(&tools, &edit("() {}", "() { todo!() }", false)).await;
         assert_eq!(twice, "error: old_text appears 2 times; add surrounding lines to make it unique, or set replace_all in a.rs");
-        assert_eq!(tools.run(&edit("() {}", "() { todo!() }", true)).await, "edited a.rs: replaced 2 places");
+        assert_eq!(run(&tools, &edit("() {}", "() { todo!() }", true)).await, "edited a.rs: replaced 2 places");
 
-        let missing = tools.run(&edit("fn z() {}", "fn y() {}", false)).await;
+        let missing = run(&tools, &edit("fn z() {}", "fn y() {}", false)).await;
         assert!(missing.starts_with("error: old_text wasn't found"), "{missing}");
     }
 

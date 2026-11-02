@@ -11,3 +11,7 @@ pub mod prompt;
 pub mod search;
 pub mod session;
 pub mod tools;
+
+/// The walls commands run inside: its own crate, so it can be built and
+/// tested alone, on every system it supports.
+pub use rein_sandbox as sandbox;

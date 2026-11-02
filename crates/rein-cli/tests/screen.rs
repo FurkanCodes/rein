@@ -31,8 +31,9 @@ fn says(text: &str) -> Turn {
     Turn { out: vec![Out::Text(text.to_owned())] }
 }
 
+/// A command that changes files, as the model asks for one.
 fn runs(command: &str) -> Turn {
-    calls("bash", json!({ "command": command, "timeout_seconds": null }))
+    calls("bash", json!({ "command": command, "timeout_seconds": null, "access": "write", "reason": null }))
 }
 
 fn calls(tool: &'static str, arguments: Value) -> Turn {
@@ -466,6 +467,7 @@ impl Term {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         for (name, text) in &model.home {
+            std::fs::create_dir_all(home.join(name).parent().unwrap()).unwrap();
             std::fs::write(home.join(name), text).unwrap();
         }
 
@@ -658,7 +660,7 @@ fn a_command_is_asked_about_whole_and_runs_once_allowed() {
     let mut term = Term::start(&model, "approve", 24, 50);
     term.wait_for(IDLE);
     term.keys("go\r");
-    term.wait_for("Allow this command?");
+    term.wait_for("Allow this command");
     // The whole command is there to judge, though it's wider than the box.
     let screen = term.text();
     for word in command.split(' ') {
@@ -729,8 +731,8 @@ fn the_wheel_scrolls_back_and_pgdn_returns() {
 fn two_steps() -> Turn {
     Turn {
         out: vec![
-            Out::Call("bash", json!({ "command": "sleep 1", "timeout_seconds": null })),
-            Out::Call("bash", json!({ "command": "touch planned.txt", "timeout_seconds": null })),
+            Out::Call("bash", json!({ "command": "sleep 1", "timeout_seconds": null, "access": "write", "reason": null })),
+            Out::Call("bash", json!({ "command": "touch planned.txt", "timeout_seconds": null, "access": "write", "reason": null })),
         ],
     }
 }
@@ -868,7 +870,7 @@ fn the_bell_rings_when_rein_needs_you_and_youre_away() {
     // The window is in front: a question doesn't ring.
     term.keys("\x1b[I");
     term.keys("go\r");
-    term.wait_for("Allow this command?");
+    term.wait_for("Allow this command");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(term.bells(), 0, "you were looking");
     // You go to another window while it waits: it rings, once.
@@ -1366,12 +1368,12 @@ fn a_menu_is_chosen_from_with_the_arrows_and_enter() {
     // Down, and down again from the last comes back to the first.
     term.keys("\x1b[B");
     term.wait_for("› edits");
-    term.keys("\x1b[B\x1b[B\x1b[B");
+    term.keys("\x1b[B\x1b[B\x1b[B\x1b[B");
     term.wait_for("› ask•");
-    term.keys("\x1b[A\x1b[A\x1b[A");
+    term.keys("\x1b[A\x1b[A\x1b[A\x1b[A");
     term.wait_for("› edits");
     term.keys("\r");
-    term.wait_for("✓ edits: file changes in this folder don't ask");
+    term.wait_for("✓ edits: file changes in this folder");
     term.wait_until("the bar says edits", |screen| screen.lines().last().is_some_and(|bar| bar.contains("edits")));
 
     // Esc changes nothing; what's typed narrows the list.
@@ -1422,4 +1424,172 @@ fn undo_in_a_new_conversation_doesnt_reach_into_the_last_one() {
     term.keys("/undo\r");
     term.wait_for("nothing to undo");
     assert_eq!(std::fs::read_to_string(term.dir.join("project/a.txt")).unwrap(), "changed\n", "the last conversation's change stays");
+}
+
+/// A command as the model asks for one: what it needs, and why.
+fn bash(command: &str, access: &str, reason: Option<&str>) -> Out {
+    Out::Call("bash", json!({ "command": command, "timeout_seconds": null, "access": access, "reason": reason }))
+}
+
+/// What rein sent back for each step, in the latest request.
+fn results(model: &Model) -> Vec<String> {
+    let requests = model.requests();
+    let input = requests.last().and_then(|request| request["input"].as_array()).cloned().unwrap_or_default();
+    input.iter().filter_map(|item| item["output"].as_str().map(str::to_owned)).collect()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_command_that_only_looks_runs_without_asking_and_changes_nothing() {
+    let model = Model::start(vec![Turn { out: vec![bash("cat notes.txt", "look", None), bash("echo changed > notes.txt", "look", None)] }, says("Read them.")]);
+    let mut term = Term::start_with(&model, "sandbox-look", 30, 100, &[("notes.txt", "kept\n")]);
+    term.wait_for(IDLE);
+    term.keys("read the notes\r");
+    term.wait_for("Read them.");
+    assert!(!term.text().contains("Allow this"), "nothing was asked:\n{}", term.text());
+    let results = results(&model);
+    assert_eq!(results[0], "kept\n[exit code 0]");
+    assert!(results[1].contains("Operation not permitted") && results[1].contains("It ran in the sandbox with look access"), "{results:?}");
+    assert_eq!(std::fs::read_to_string(term.dir.join("project/notes.txt")).unwrap(), "kept\n");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn going_past_the_sandbox_asks_and_says_why() {
+    let fetch = bash("echo fetched", "network", Some("to download the crates"));
+    let model = Model::start(vec![Turn { out: vec![fetch] }, says("Fetched.")]).with_env("REIN_MODE", "edits");
+    let mut term = Term::start(&model, "sandbox-network", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("fetch the crates\r");
+    term.wait_for("Allow this command to use the network?");
+    term.wait_for("Why: to download the crates");
+    // Keys too soon after a question still go to the box.
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Fetched.");
+    assert!(term.text().contains("echo fetched (with network)"), "the transcript says it went past:\n{}", term.text());
+    assert_eq!(results(&model)[0], "fetched\n[exit code 0]");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn read_only_runs_what_looks_and_refuses_the_rest() {
+    let model = Model::start(vec![Turn { out: vec![bash("ls", "look", None), bash("touch made.txt", "write", None)] }, says("Looked.")]).with_env("REIN_MODE", "read-only");
+    let mut term = Term::start_with(&model, "sandbox-read-only", 30, 100, &[("a.txt", "a\n")]);
+    term.wait_for(IDLE);
+    term.keys("look around\r");
+    term.wait_for("Looked.");
+    let results = results(&model);
+    assert_eq!(results[0], "a.txt\n[exit code 0]");
+    assert!(results[1].starts_with("rein is in read-only mode"), "{results:?}");
+    assert!(!term.dir.join("project/made.txt").exists() && !term.text().contains("Allow this"), "{}", term.text());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn auto_never_asks_and_refuses_what_would_go_past_the_sandbox() {
+    let past = bash("docker ps", "outside", Some("to see the containers"));
+    let model = Model::start(vec![Turn { out: vec![bash("touch made.txt", "write", None), past] }, says("Made it.")]).with_env("REIN_MODE", "auto");
+    let mut term = Term::start(&model, "sandbox-auto", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("make the file\r");
+    term.wait_for("Made it.");
+    let results = results(&model);
+    assert_eq!(results[0], "[exit code 0]");
+    assert!(results[1].starts_with("rein is in auto mode, where nothing asks"), "{results:?}");
+    assert!(term.dir.join("project/made.txt").exists() && !term.text().contains("Allow this"), "{}", term.text());
+    term.wait_for(IDLE);
+    term.keys("/status\r");
+    term.wait_for("on: macOS Seatbelt");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn keys_and_secrets_stay_out_of_commands() {
+    let mut model = Model::start(vec![Turn { out: vec![bash("echo key=${OPENAI_API_KEY:-none}", "look", None), bash("cat ~/.ssh/id_test", "look", None)] }, says("Checked.")]);
+    model.home.push((".ssh/id_test".into(), "secret\n".into()));
+    let mut term = Term::start(&model, "sandbox-secrets", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("check\r");
+    term.wait_for("Checked.");
+    let results = results(&model);
+    // rein has a key in its environment; the command doesn't.
+    assert_eq!(results[0], "key=none\n[exit code 0]");
+    assert!(results[1].contains("Operation not permitted") && !results[1].lines().any(|line| line == "secret"), "{results:?}");
+}
+
+#[test]
+fn with_the_sandbox_off_commands_ask_first() {
+    let model = Model::start(vec![Turn { out: vec![bash("ls", "look", None)] }, says("Listed.")]).with_env("REIN_SANDBOX", "off");
+    let mut term = Term::start(&model, "sandbox-off", 30, 100);
+    term.wait_for("Sandbox: off in the settings, so commands ask before they run");
+    term.wait_for(IDLE);
+    term.keys("list\r");
+    term.wait_for("Allow this command?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Listed.");
+}
+
+#[test]
+fn shift_tab_goes_through_the_modes_auto_among_them() {
+    let model = Model::start(Vec::new());
+    let mut term = Term::start(&model, "mode-cycle", 30, 100);
+    term.wait_for(IDLE);
+    for mode in ["edits: ", "auto: nothing asks", "read-only: ", "ask: "] {
+        term.keys("\x1b[Z");
+        term.wait_for(mode);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_command_cant_read_what_you_type() {
+    // rein's terminal is the command's too: reading it would take your keys.
+    let model = Model::start(vec![Turn { out: vec![bash("head -c 1 /dev/tty", "look", None)] }, says("Tried.")]);
+    let mut term = Term::start(&model, "sandbox-tty", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("read the terminal\r");
+    term.wait_for("Tried.");
+    let results = results(&model);
+    assert!(results[0].contains("Operation not permitted"), "{results:?}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_command_cant_read_reins_keys_from_its_environment() {
+    // macOS gives any process of yours another's environment (sysctl
+    // KERN_PROCARGS2), sandbox or not: rein mustn't have its keys there.
+    let probe = r#"import ctypes, sys
+libc = ctypes.CDLL(None)
+mib = (ctypes.c_int * 3)(1, 49, int(sys.argv[1]))
+size = ctypes.c_size_t(1 << 20)
+buf = ctypes.create_string_buffer(size.value)
+read = libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0
+print("leaked" if b"OPENAI_API_KEY=test" in buf.raw[: size.value] else ("kept" if read else "unread"))"#;
+    let command = format!("if command -v python3 >/dev/null; then python3 -I -c '{probe}' $PPID; else echo no-python; fi");
+    let model = Model::start(vec![Turn { out: vec![bash(&command, "look", None)] }, says("Probed."), says("Still signed in.")]);
+    let mut term = Term::start(&model, "sandbox-environment", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("probe\r");
+    term.wait_for("Probed.");
+    let results = results(&model);
+    if results[0].starts_with("no-python") {
+        return;
+    }
+    assert_eq!(results[0], "kept\n[exit code 0]", "{results:?}");
+    // rein itself still has its key: the next request goes out with it.
+    term.wait_for(IDLE);
+    term.keys("again\r");
+    term.wait_for("Still signed in.");
+}
+
+#[test]
+fn a_command_outside_the_sandbox_still_gets_your_keys() {
+    let model = Model::start(vec![Turn { out: vec![bash("echo key=${OPENAI_API_KEY:-none}", "outside", Some("to call the API"))] }, says("Done.")]).with_env("REIN_MODE", "trust");
+    let mut term = Term::start(&model, "outside-environment", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("run it\r");
+    term.wait_for("Done.");
+    assert_eq!(results(&model)[0], "key=test\n[exit code 0]");
 }

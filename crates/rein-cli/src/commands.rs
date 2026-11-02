@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn says_what_went_wrong() {
-        assert_eq!(parse("/mode yolo"), Some(Err("no mode called yolo; use ask, edits, read-only or trust".into())));
+        assert_eq!(parse("/mode yolo"), Some(Err("no mode called yolo; use ask, edits, auto, read-only or trust".into())));
         assert_eq!(parse("/frobnicate"), Some(Err("there's no /frobnicate command; /help lists them".into())));
     }
 

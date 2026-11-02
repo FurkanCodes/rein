@@ -42,10 +42,19 @@ const HOST_ID_FILE: &str = "host-id";
 
 type CliResult<T = ()> = Result<T, String>;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // First, while rein has one thread: other programs can read the
+    // environment it was started with, and the keys in it are rein's.
+    rein_agent::sandbox::secrets::keep();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(args).await {
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("rein: can't start: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             say!("rein: {message}");

@@ -49,10 +49,14 @@ Options:
   -r, --resume          Choose which saved conversation to continue
   -s, --system <text>   Standing instructions, added to rein's system prompt
       --mode <mode>     What runs without asking:
-                          ask        nothing; ask about every change (default)
-                          edits      file changes in this folder
-                          read-only  nothing runs or changes; only reading
-                          trust      everything, except what deny rules block
+                          ask        reading, and commands that only look (default)
+                          edits      file changes in this folder, and commands
+                                     that stay in the sandbox
+                          auto       the same, and nothing ever asks: what would
+                                     go past the sandbox is refused
+                          read-only  only reading: commands look, nothing changes
+                          trust      everything, without the sandbox, except what
+                                     deny rules block
       --record <file>   Also save the raw response stream, for tests
 
 Rules in .rein/permissions refine the mode for commands, one per line:
@@ -62,10 +66,18 @@ Rules in .rein/permissions refine the mode for commands, one per line:
 Deny beats ask beats allow, and a command only runs without asking if every
 part of it is allowed. Rules decide when rein asks; they aren't a sandbox.
 
+Commands run in a sandbox: macOS's own, or on Linux Landlock and seccomp.
+Each says what it needs: look, write (files in this folder), network (and
+the internet) or outside (no sandbox), and the sandbox holds it to that.
+Even with write access a command can't change files outside this folder,
+read the keys and logins in your home folder, or change what runs code
+later (.git/hooks, .git/config, .rein). Without a sandbox, commands ask
+first.
+
 Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
-compact_at, bell and compress (on or off), like `mode = edits`. Flags win
-over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE, $REIN_COMPACT_AT, $REIN_BELL and
-$REIN_COMPRESS, which win over the file.
+compact_at, and bell, compress and sandbox (on or off), like `mode = edits`.
+Flags win over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE, $REIN_COMPACT_AT,
+$REIN_BELL, $REIN_COMPRESS and $REIN_SANDBOX, which win over the file.
 
 Each request carries the whole conversation, so rein gzips it on the way:
 about three times fewer bytes, and the same text for the model. A server that
@@ -103,6 +115,8 @@ pub(crate) struct AskArgs {
     pub(crate) bell: bool,
     /// Gzip request bodies.
     pub(crate) compress: bool,
+    /// Run commands in the sandbox, where there is one.
+    pub(crate) sandbox: bool,
     /// `None` starts a conversation instead of doing one task.
     pub(crate) prompt: Option<String>,
 }
@@ -123,7 +137,7 @@ impl AskArgs {
             Some("off") => Ok(false),
             Some(other) => Err(format!("{key} should be on or off, not {other}")),
         };
-        let (bell, compress) = (switch("bell", "REIN_BELL")?, switch("compress", "REIN_COMPRESS")?);
+        let (bell, compress, sandbox) = (switch("bell", "REIN_BELL")?, switch("compress", "REIN_COMPRESS")?, switch("sandbox", "REIN_SANDBOX")?);
         let (mut model_given, mut resume) = (false, Resume::New);
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -149,7 +163,7 @@ impl AskArgs {
             }
         }
         let prompt = if words.is_empty() { None } else { Some(words.join(" ")) };
-        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, prompt })
+        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, sandbox, prompt })
     }
 }
 
@@ -170,7 +184,7 @@ mod tests {
         let parsed = args("--mode edits fix the bug").unwrap();
         assert_eq!((parsed.mode, parsed.prompt.as_deref()), (Mode::Edits, Some("fix the bug")));
         assert_eq!(args("--mode edits").unwrap().prompt, None, "no task: a conversation");
-        assert_eq!(args("--mode yolo hi").err().as_deref(), Some("no mode called yolo; use ask, edits, read-only or trust"));
+        assert_eq!(args("--mode yolo hi").err().as_deref(), Some("no mode called yolo; use ask, edits, auto, read-only or trust"));
     }
 
     #[test]
@@ -181,6 +195,15 @@ mod tests {
         assert_eq!(args("--effort loud hi").err().as_deref(), Some("no effort called loud; use minimal, low, medium, high, xhigh or max"));
         let parsed = AskArgs::parse(["--mode", "trust", "-m", "flagged", "hi"].map(str::to_owned).to_vec(), &settings).unwrap();
         assert_eq!((parsed.mode, parsed.model.as_deref()), (Mode::Trust, Some("flagged")));
+    }
+
+    #[test]
+    fn the_sandbox_is_on_unless_turned_off() {
+        assert!(args("hi").unwrap().sandbox);
+        assert!(!AskArgs::parse(vec!["hi".into()], &Settings::parse("sandbox = off").unwrap()).unwrap().sandbox);
+        let wrong = AskArgs::parse(vec!["hi".into()], &Settings::parse("sandbox = maybe").unwrap());
+        assert_eq!(wrong.err().as_deref(), Some("sandbox should be on or off, not maybe"));
+        assert_eq!(args("--mode auto").unwrap().mode, Mode::Auto);
     }
 
     #[test]

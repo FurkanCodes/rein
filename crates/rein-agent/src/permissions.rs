@@ -1,5 +1,6 @@
-//! What the model may do without asking. A mode sets the broad policy;
-//! rules in a project file refine it for specific commands:
+//! What the model may do without asking. A mode sets the broad policy,
+//! the sandbox decides much of it (what runs inside the walls needs no
+//! asking), and rules in a project file refine it for specific commands:
 //!
 //! ```text
 //! # .rein/permissions: one rule per line
@@ -9,40 +10,50 @@
 //! deny  git push
 //! ```
 //!
-//! Deny beats ask beats allow. A command only runs without asking if every
-//! part of it is allowed: `allow cargo test` doesn't cover
-//! `cargo test && rm -rf target`. Anything the splitter can't take apart,
-//! like `$(...)`, redirects or globs, is asked about, never allowed.
+//! Deny beats ask beats allow. A command only runs without asking by an
+//! allow rule if every part of it is allowed: `allow cargo test` doesn't
+//! cover `cargo test && rm -rf target`. Anything the splitter can't take
+//! apart, like `$(...)`, redirects or globs, no allow rule covers, while
+//! deny and ask rules still find the commands in it.
 //!
 //! Rules aren't a sandbox: `deny rm` doesn't stop `/bin/rm`, or a script
-//! that deletes files itself. They decide when rein asks you.
+//! that deletes files itself. They decide when rein asks you; the sandbox
+//! decides what a command can reach.
 
 use rein_llm::ToolCall;
 use serde::Deserialize;
 
-use crate::tools::ToolName;
+use crate::sandbox::{self, Access, Run};
+use crate::tools::{BashCall, ERROR, ToolName};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
-    /// Ask before every command and file change.
+    /// Ask before file changes, and before commands that do more than look.
     #[default]
     Ask,
-    /// File changes inside the project are fine; commands still ask.
+    /// File changes inside the project are fine, and so are commands that
+    /// stay in the sandbox; going past it asks.
     Edits,
-    /// Look, never change: file changes and commands are refused.
+    /// Never ask: work inside the sandbox, and refuse what would go past it.
+    /// For leaving rein to work on its own.
+    Auto,
+    /// Look, never change: commands run only with look access, in the
+    /// sandbox, and file changes are refused.
     ReadOnly,
-    /// Run everything without asking, except what deny rules block.
+    /// Run everything without asking, without the sandbox, except what deny
+    /// rules block.
     Trust,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 4] = [Mode::Ask, Mode::Edits, Mode::ReadOnly, Mode::Trust];
+    pub const ALL: [Mode; 5] = [Mode::Ask, Mode::Edits, Mode::Auto, Mode::ReadOnly, Mode::Trust];
 
     /// Its name, as `--mode` and `/mode` take it.
     pub const fn as_str(self) -> &'static str {
         match self {
             Mode::Ask => "ask",
             Mode::Edits => "edits",
+            Mode::Auto => "auto",
             Mode::ReadOnly => "read-only",
             Mode::Trust => "trust",
         }
@@ -54,7 +65,10 @@ impl std::str::FromStr for Mode {
 
     /// A mode by name; what's wrong, with the names there are, if none.
     fn from_str(name: &str) -> Result<Mode, String> {
-        Mode::ALL.into_iter().find(|mode| mode.as_str() == name.trim()).ok_or_else(|| format!("no mode called {name}; use ask, edits, read-only or trust"))
+        Mode::ALL.into_iter().find(|mode| mode.as_str() == name.trim()).ok_or_else(|| {
+            let names: Vec<&str> = Mode::ALL.iter().map(|m| m.as_str()).collect();
+            format!("no mode called {name}; use {} or {}", names[..names.len() - 1].join(", "), names[names.len() - 1])
+        })
     }
 }
 
@@ -97,20 +111,44 @@ impl Rule {
 pub struct Permissions {
     pub mode: Mode,
     rules: Vec<Rule>,
-    /// Exact commands you said yes to for the rest of this session.
-    approved: Vec<Vec<String>>,
+    /// Exact commands you said yes to for the rest of this session, each
+    /// with the access it was for.
+    approved: Vec<(Vec<String>, Access)>,
     /// Whether you said yes to all file changes for this session.
     approved_edits: bool,
+    /// What holds commands in, if anything does, and what's protected.
+    sandbox: sandbox::Shared,
 }
 
+/// A file tool's call, for the file it changes.
 #[derive(Deserialize)]
-struct Command {
-    command: String,
+struct FileCall {
+    path: String,
 }
+
+/// What the model is told when auto mode refuses a command.
+fn auto_refuses(access: Access) -> String {
+    format!(
+        "rein is in auto mode, where nothing asks: commands run in the sandbox with look or write access only. \
+         Do without {access} access, or tell the user what you need it for."
+    )
+}
+
+const AUTO_ASK_RULE: &str = "rein is in auto mode, where nothing asks, and a rule says to ask before this command. \
+                             Do without it, or tell the user what you need it for.";
+const AUTO_NO_SANDBOX: &str = "rein is in auto mode, where nothing asks, but there's no sandbox here to hold commands in, \
+                               so only those the rules allow run.";
+const AUTO_PROTECTED: &str = "rein is in auto mode, where nothing asks, and this file runs code later or holds rein's rules: \
+                              changing it takes the user's approval. Leave it, or tell the user what to change.";
+const READ_ONLY_CHANGES: &str = "File changes are turned off: rein is in read-only mode.";
+const READ_ONLY_COMMANDS: &str = "rein is in read-only mode: commands run with look access only, and change nothing.";
+const READ_ONLY_NO_SANDBOX: &str = "Commands are turned off: rein is in read-only mode, and there's no sandbox here \
+                                    to keep them from changing things.";
 
 impl Permissions {
     /// Reads rules in the format shown at the top of this file. Blank lines
-    /// and `#` comments are skipped.
+    /// and `#` comments are skipped. There's no sandbox until
+    /// [`Permissions::with_sandbox`] gives one, so commands ask.
     pub fn new(mode: Mode, rules: &str) -> Result<Self, String> {
         let mut parsed = Vec::new();
         for (n, line) in rules.lines().enumerate() {
@@ -134,6 +172,16 @@ impl Permissions {
         Ok(Permissions { mode, rules: parsed, ..Default::default() })
     }
 
+    /// Decides with `sandbox`: what it can hold in, and what it protects.
+    pub fn with_sandbox(mut self, sandbox: sandbox::Shared) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    pub fn sandbox(&self) -> &sandbox::Sandbox {
+        &self.sandbox
+    }
+
     /// Forgets what you said "always" to: that was for one conversation.
     pub fn forget_approvals(&mut self) {
         self.approved.clear();
@@ -149,66 +197,104 @@ impl Permissions {
             // `read`, `grep` and `glob` can only look, and only inside the
             // project; `plan` only writes a checklist on screen.
             Some(tool) if tool.only_looks() || tool == ToolName::Plan => Decision::Allow,
-            Some(tool) if tool.changes_files() => match self.mode {
-                Mode::ReadOnly => Decision::Deny("File changes are turned off: rein is in read-only mode.".into()),
-                Mode::Edits | Mode::Trust => Decision::Allow,
-                Mode::Ask if self.approved_edits => Decision::Allow,
-                Mode::Ask => Decision::Ask,
-            },
-            Some(ToolName::Bash) => match serde_json::from_str::<Command>(&call.arguments) {
-                Ok(c) => self.decide_command(&c.command),
-                Err(_) => Decision::Ask,
+            Some(tool) if tool.changes_files() => self.decide_change(call),
+            // What doesn't read as a command doesn't run as one either.
+            Some(ToolName::Bash) => match serde_json::from_str::<BashCall>(&call.arguments) {
+                Ok(c) => self.decide_command(c.command(), c.access()),
+                Err(e) => Decision::Deny(format!("{ERROR}bad arguments: {e}")),
             },
             // `recall` never comes here: the agent runs it itself.
             Some(_) | None => Decision::Ask,
         }
     }
 
-    fn decide_command(&self, line: &str) -> Decision {
+    /// How `call` runs once it's allowed: a command in the sandbox, within
+    /// the walls its access asks for, unless it asked to run outside, the
+    /// mode is trust, or there's no sandbox here. rein's own tools run as
+    /// they always do.
+    pub fn how(&self, call: &ToolCall) -> Run {
+        match BashCall::of(call) {
+            Some(c) if self.mode != Mode::Trust && self.sandbox.available() => c.access().walls().map_or(Run::Unsandboxed, Run::Sandboxed),
+            _ => Run::Unsandboxed,
+        }
+    }
+
+    fn decide_change(&self, call: &ToolCall) -> Decision {
+        // What runs code later is asked about in every mode that asks at all.
+        let protected = serde_json::from_str::<FileCall>(&call.arguments).is_ok_and(|file| self.sandbox.places().protects(&file.path));
+        match self.mode {
+            Mode::ReadOnly => Decision::Deny(READ_ONLY_CHANGES.into()),
+            Mode::Trust => Decision::Allow,
+            Mode::Auto if protected => Decision::Deny(AUTO_PROTECTED.into()),
+            _ if protected => Decision::Ask,
+            Mode::Edits | Mode::Auto => Decision::Allow,
+            Mode::Ask if self.approved_edits => Decision::Allow,
+            Mode::Ask => Decision::Ask,
+        }
+    }
+
+    fn decide_command(&self, line: &str, access: Access) -> Decision {
         let parts = split_command(line);
         // Deny first. When the splitter gives up, check every run of words
         // in the line instead, cut at anything that can start a command
         // and with quotes taken off, so a deny rule still can't be dodged
-        // by adding a `$` somewhere or gluing the command to a `;`.
+        // by adding a `$` somewhere or gluing the command to a `;`. Ask
+        // rules are looked for the same way: the sandbox would otherwise
+        // run what you asked to be asked about.
         let words = loose_words(line);
         let fallback: Vec<&[String]> = (0..words.len()).map(|i| &words[i..]).collect();
         let candidates: Vec<&[String]> = match &parts {
             Some(parts) => parts.iter().map(Vec::as_slice).collect(),
             None => fallback,
         };
-        let denies = self.rules.iter().filter(|r| r.kind == Kind::Deny);
-        if let Some(rule) = denies.clone().find(|r| candidates.iter().any(|c| r.matches(c))) {
+        let covered = |kind: Kind| self.rules.iter().filter(|r| r.kind == kind).find(|r| candidates.iter().any(|c| r.matches(c)));
+        if let Some(rule) = covered(Kind::Deny) {
             return Decision::Deny(format!("Blocked by a rule: `deny {}`.", rule.prefix.join(" ")));
         }
+        let denies = self.rules.iter().filter(|r| r.kind == Kind::Deny).count();
         match self.mode {
             // What rein couldn't take apart, it can't promise no deny rule
             // covers: it asks, rather than trust a guess.
-            Mode::Trust if parts.is_none() && denies.count() > 0 => return Decision::Ask,
+            Mode::Trust if parts.is_none() && denies > 0 => return Decision::Ask,
             Mode::Trust => return Decision::Allow,
-            Mode::ReadOnly => return Decision::Deny("Commands are turned off: rein is in read-only mode.".into()),
-            Mode::Ask | Mode::Edits => {}
+            _ => {}
         }
-        let Some(parts) = parts else { return Decision::Ask };
+        let sandboxed = self.sandbox.available();
+        let asked = covered(Kind::Ask).is_some();
+        // Inside the walls, nothing needs asking.
+        let free = sandboxed
+            && match access {
+                Access::Look => true,
+                Access::Write => matches!(self.mode, Mode::Edits | Mode::Auto),
+                Access::Network | Access::Outside => false,
+            };
         let rule = |part: &Vec<String>, kind: Kind| self.rules.iter().any(|r| r.kind == kind && r.matches(part));
-        if parts.iter().any(|p| rule(p, Kind::Ask)) {
-            return Decision::Ask;
+        // Without a sandbox, the access a command says it needs is only words.
+        let approved = |part: &Vec<String>| self.approved.iter().any(|(words, granted)| words == part && (*granted >= access || !sandboxed));
+        let allowed = parts.as_ref().is_some_and(|parts| parts.iter().all(|p| rule(p, Kind::Allow) || approved(p)));
+        match self.mode {
+            Mode::ReadOnly if !sandboxed => Decision::Deny(READ_ONLY_NO_SANDBOX.into()),
+            Mode::ReadOnly if access > Access::Look => Decision::Deny(READ_ONLY_COMMANDS.into()),
+            Mode::Auto if asked => Decision::Deny(AUTO_ASK_RULE.into()),
+            _ if asked => Decision::Ask,
+            _ if free || allowed => Decision::Allow,
+            Mode::Auto if !sandboxed => Decision::Deny(AUTO_NO_SANDBOX.into()),
+            Mode::Auto => Decision::Deny(auto_refuses(access)),
+            _ => Decision::Ask,
         }
-        if parts.iter().all(|p| rule(p, Kind::Allow) || self.approved.contains(p)) {
-            return Decision::Allow;
-        }
-        Decision::Ask
     }
 
     /// "Yes, and don't ask again this session": for a command, exactly these
-    /// commands; for a file change, all file changes.
+    /// commands, with as much access as this time; for a file change, all
+    /// file changes but protected ones.
     pub fn remember(&mut self, call: &ToolCall) {
         match ToolName::of(call) {
             Some(ToolName::Write | ToolName::Edit) => self.approved_edits = true,
             Some(ToolName::Bash) => {
-                if let Ok(c) = serde_json::from_str::<Command>(&call.arguments)
-                    && let Some(parts) = split_command(&c.command)
+                if let Some(c) = BashCall::of(call)
+                    && let Some(parts) = split_command(c.command())
                 {
-                    self.approved.extend(parts);
+                    self.approved.extend(parts.into_iter().map(|part| (part, c.access())));
                 }
             }
             _ => {}
@@ -434,6 +520,119 @@ mod tests {
         assert_eq!(p.decide(&bash("cargo test --release")), Decision::Ask);
         p.remember(&file("edit"));
         assert_eq!(p.decide(&file("write")), Decision::Allow);
+    }
+
+    fn command(command: &str, access: &str) -> ToolCall {
+        ToolCall { call_id: "c".into(), name: "bash".into(), arguments: json!({ "command": command, "access": access, "reason": null }).to_string() }
+    }
+
+    /// A project folder of its own, and permissions for it with a sandbox
+    /// that says it's there.
+    fn sandboxed(mode: Mode, rules: &str, name: &str) -> Permissions {
+        let root = std::env::temp_dir().join(format!("rein-permissions-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let sandbox = crate::sandbox::Sandbox::assume(crate::sandbox::Places::new(&root, None, None));
+        Permissions::new(mode, rules).unwrap().with_sandbox(std::sync::Arc::new(sandbox))
+    }
+
+    #[test]
+    fn in_the_sandbox_the_mode_decides_by_what_a_command_needs() {
+        use Decision::{Allow, Ask};
+        let deny = Decision::Deny(String::new());
+        // look, write, network, outside
+        let table = [
+            (Mode::ReadOnly, [Allow, deny.clone(), deny.clone(), deny.clone()]),
+            (Mode::Ask, [Allow, Ask, Ask, Ask]),
+            (Mode::Edits, [Allow, Allow, Ask, Ask]),
+            (Mode::Auto, [Allow, Allow, deny.clone(), deny.clone()]),
+            (Mode::Trust, [Allow, Allow, Allow, Allow]),
+        ];
+        for (mode, expected) in table {
+            let p = sandboxed(mode, "", "table");
+            for (access, expected) in ["look", "write", "network", "outside"].iter().zip(expected) {
+                let decided = match p.decide(&command("cargo test", access)) {
+                    Decision::Deny(_) => Decision::Deny(String::new()),
+                    other => other,
+                };
+                assert_eq!(decided, expected, "{mode} with {access} access");
+            }
+        }
+        // What the splitter can't take apart is held in by the walls too.
+        assert_eq!(sandboxed(Mode::Ask, "", "loose").decide(&command("ls $HOME | head", "look")), Decision::Allow);
+        // A command that says nothing about access only looks.
+        assert_eq!(sandboxed(Mode::Ask, "", "unsaid").decide(&bash("cargo test")), Decision::Allow);
+        assert_eq!(sandboxed(Mode::Ask, "", "unsaid").how(&bash("cargo test")), Run::Sandboxed(Access::Look.walls().unwrap()));
+    }
+
+    #[test]
+    fn rules_still_count_in_the_sandbox() {
+        let p = sandboxed(Mode::Edits, "deny git push\nask git commit\nallow cargo fetch\n", "rules");
+        assert!(matches!(p.decide(&command("git push", "look")), Decision::Deny(_)));
+        // You asked to be asked: the walls don't change that, even where
+        // the splitter gives up.
+        assert_eq!(p.decide(&command("git commit -m x", "write")), Decision::Ask);
+        assert_eq!(p.decide(&command("echo $X && git commit -m x", "write")), Decision::Ask);
+        // An allow rule lets a command past the walls without asking.
+        assert_eq!(p.decide(&command("cargo fetch", "outside")), Decision::Allow);
+        let auto = sandboxed(Mode::Auto, "ask git commit\nallow cargo fetch\n", "auto-rules");
+        assert!(matches!(auto.decide(&command("git commit -m x", "write")), Decision::Deny(_)), "auto never asks");
+        assert_eq!(auto.decide(&command("cargo fetch", "outside")), Decision::Allow);
+        // Read-only changes nothing, whatever a rule allows.
+        let read_only = sandboxed(Mode::ReadOnly, "allow cargo fetch\n", "read-only-rules");
+        assert!(matches!(read_only.decide(&command("cargo fetch", "network")), Decision::Deny(_)));
+    }
+
+    #[test]
+    fn always_remembers_the_access_too() {
+        let mut p = sandboxed(Mode::Ask, "", "remember");
+        p.remember(&command("cargo fetch", "network"));
+        assert_eq!(p.decide(&command("cargo fetch", "network")), Decision::Allow);
+        assert_eq!(p.decide(&command("cargo fetch", "write")), Decision::Allow);
+        assert_eq!(p.decide(&command("cargo fetch", "outside")), Decision::Ask, "yes to the network isn't yes to everything");
+        // Without a sandbox, access is only words: yes is yes.
+        let mut unsandboxed = Permissions::new(Mode::Ask, "").unwrap();
+        unsandboxed.remember(&command("cargo fetch", "look"));
+        assert_eq!(unsandboxed.decide(&command("cargo fetch", "outside")), Decision::Allow);
+    }
+
+    #[test]
+    fn how_a_command_runs() {
+        let walls = |access: Access| Run::Sandboxed(access.walls().unwrap());
+        let edits = sandboxed(Mode::Edits, "", "how");
+        assert_eq!(edits.how(&command("cargo test", "write")), walls(Access::Write));
+        assert_eq!(edits.how(&command("cargo fetch", "network")), walls(Access::Network));
+        assert_eq!(edits.how(&command("docker ps", "outside")), Run::Unsandboxed);
+        assert_eq!(sandboxed(Mode::Trust, "", "how-trust").how(&command("ls", "look")), Run::Unsandboxed);
+        // No sandbox here: what's allowed runs as it always did.
+        assert_eq!(Permissions::new(Mode::Ask, "").unwrap().how(&command("ls", "look")), Run::Unsandboxed);
+        assert_eq!(edits.how(&file("write")), Run::Unsandboxed);
+    }
+
+    #[test]
+    fn what_runs_code_later_asks_even_in_edits_mode() {
+        let change = |path: &str| ToolCall { call_id: "c".into(), name: "write".into(), arguments: json!({ "path": path, "content": "allow rm" }).to_string() };
+        let mut edits = sandboxed(Mode::Edits, "", "protected");
+        assert_eq!(edits.decide(&change("src/main.rs")), Decision::Allow);
+        for path in [".rein/permissions", ".git/hooks/pre-commit", ".git", ".vscode/tasks.json", ".REIN/permissions"] {
+            assert_eq!(edits.decide(&change(path)), Decision::Ask, "{path}");
+        }
+        // "Always" for file changes isn't for these.
+        edits.remember(&change("src/main.rs"));
+        assert_eq!(edits.decide(&change(".rein/permissions")), Decision::Ask);
+        assert!(matches!(sandboxed(Mode::Auto, "", "protected-auto").decide(&change(".rein/permissions")), Decision::Deny(_)));
+        assert_eq!(sandboxed(Mode::Trust, "", "protected-trust").decide(&change(".rein/permissions")), Decision::Allow);
+    }
+
+    #[test]
+    fn a_command_that_doesnt_read_is_refused_with_why() {
+        let p = sandboxed(Mode::Edits, "", "bad");
+        let Decision::Deny(why) = p.decide(&command("ls", "everything")) else { panic!("allowed a call that doesn't read") };
+        assert!(why.starts_with("error: bad arguments") && why.contains("everything"), "{why}");
+    }
+
+    #[test]
+    fn a_misspelt_mode_names_them_all() {
+        assert_eq!("yolo".parse::<Mode>().unwrap_err(), "no mode called yolo; use ask, edits, auto, read-only or trust");
     }
 
     #[test]

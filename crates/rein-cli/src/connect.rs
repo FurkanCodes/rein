@@ -39,8 +39,10 @@ pub fn load_keys(dir: &Path) -> CliResult<Keys> {
     Ok(store::read_json(&dir.join(KEYS_FILE)).map_err(describe)?.unwrap_or_default())
 }
 
+/// A variable from rein's environment: keys and tokens from the copy rein
+/// kept when it started (see `secrets`).
 fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    rein_agent::sandbox::secrets::get(name).filter(|v| !v.trim().is_empty())
 }
 
 /// The first of `provider`'s variables that holds a key, and the key.

@@ -12,6 +12,7 @@ use crate::{CREDENTIALS_FILE, CliResult, config_dir, describe, login};
 use rein_agent::agent::{Agent, Llm, MAX_TURNS, Outcome};
 use rein_agent::compact;
 use rein_agent::permissions::{Mode, Permissions};
+use rein_agent::sandbox::{self, Missing, Places, Sandbox};
 use rein_agent::session::{self, Header, Loaded, Session};
 use rein_agent::tools::Tools;
 use rein_agent::{context, prompt};
@@ -52,11 +53,13 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         Some(path) => Some(File::create(path).map_err(|e| format!("can't create {}: {e}", path.display()))?),
         None => None,
     };
-    let permissions = load_permissions(&root, args.mode)?;
+    let sandbox = std::sync::Arc::new(find_sandbox(&root, &dir, args.sandbox).await);
+    let permissions = load_permissions(&root, args.mode, sandbox.clone())?;
     // What you sent from this folder before, for ↑ and Ctrl-R: only a
     // conversation has a box to bring it back in.
     let sent = if args.prompt.is_none() { History::load(history::file(&dir, &root)) } else { History::default() };
     let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none(), sent, args.bell);
+    terminal.sandboxed = sandbox.available();
     // The box goes up now, so typing can start while the model list loads.
     terminal.model = connected.as_ref().map(|c| provider::shown(&c.provider, &c.model)).unwrap_or_default();
     terminal.effort = args.effort;
@@ -116,7 +119,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.model = provider::shown(&setup.provider, &model_name);
     terminal.input.set_bar(terminal.bar());
     let max_output = setup.max_output(&model_name);
-    let mut agent = Agent::new(Llm { client, record }, Tools::new(root), permissions, model_name, limit, loaded, context);
+    let mut agent = Agent::new(Llm { client, record }, Tools::new(root).with_sandbox(sandbox), permissions, model_name, limit, loaded, context);
     agent.max_output = max_output;
     agent.reasoning_effort = args.effort;
     // A continued conversation is as full as it was.
@@ -335,7 +338,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 agent.permissions.mode = mode;
                 terminal.mode = mode;
                 terminal.input.set_bar(terminal.bar());
-                terminal.input.notice(&format!("{} · shift-tab for the next", mode_description(mode)));
+                terminal.input.notice(&format!("{} · shift-tab for the next", mode_description(mode, terminal.sandboxed)));
                 continue;
             }
             Said::Leave => break,
@@ -383,7 +386,8 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
 pub(crate) fn next_mode(mode: Mode) -> Mode {
     match mode {
         Mode::Ask => Mode::Edits,
-        Mode::Edits => Mode::ReadOnly,
+        Mode::Edits => Mode::Auto,
+        Mode::Auto => Mode::ReadOnly,
         Mode::ReadOnly | Mode::Trust => Mode::Ask,
     }
 }
@@ -417,7 +421,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         Slash::Mode(Some(mode)) => {
             agent.permissions.mode = mode;
             terminal.mode = mode;
-            say!("{pad}{} {}", s.green("✓"), mode_description(mode));
+            say!("{pad}{} {}", s.green("✓"), mode_description(mode, terminal.sandboxed));
         }
         Slash::Model(Some(spec)) => {
             let shown = use_model(&spec, agent, terminal, setup).await?;
@@ -444,7 +448,8 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 ("model", terminal.model.clone()),
                 ("provider", format!("{} · {}", setup.provider.title, agent.model.client.base_url())),
                 ("effort", agent.reasoning_effort.map_or("the model's default", Effort::as_str).to_owned()),
-                ("mode", mode_description(agent.permissions.mode).to_owned()),
+                ("mode", mode_description(agent.permissions.mode, terminal.sandboxed).to_owned()),
+                ("sandbox", agent.permissions.sandbox().describe()),
                 ("rules", format!("{} from .rein/permissions", agent.permissions.rule_count())),
                 ("context", format!("about {} of {} tokens before compacting", thousands(agent.estimated()), thousands(agent.limit()))),
                 ("sent", traffic(agent.model.client.traffic())),
@@ -510,7 +515,10 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
         Slash::Mode(None) => {
             let modes = Mode::ALL;
             // "edits: file changes ...": the name is the item's already.
-            let about = |m: Mode| mode_description(m).split_once(": ").map_or(mode_description(m), |(_, about)| about).to_owned();
+            let about = |m: Mode| {
+                let description = mode_description(m, terminal.sandboxed);
+                description.split_once(": ").map_or(description, |(_, about)| about).to_owned()
+            };
             let items = modes.iter().map(|&m| (m.to_string(), about(m))).collect();
             let current = modes.iter().position(|&m| m == agent.permissions.mode);
             terminal.input.choose(menu("what runs without asking", items, current)).await.map(|i| Slash::Mode(Some(modes[i])))
@@ -719,34 +727,57 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
     Ok(terminal.model.clone())
 }
 
-pub(crate) fn mode_description(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Ask => "ask: file changes and commands ask first",
-        Mode::Edits => "edits: file changes in this folder don't ask; commands do",
-        Mode::ReadOnly => "read-only: nothing runs or changes",
-        Mode::Trust => "trust: everything runs without asking; only deny rules stop it",
+/// What `mode` lets through, `name: what`, as it is with a sandbox
+/// here (`sandboxed`) or without one.
+pub(crate) fn mode_description(mode: Mode, sandboxed: bool) -> &'static str {
+    match (mode, sandboxed) {
+        (Mode::Ask, true) => "ask: file changes ask first, and so do commands that do more than look",
+        (Mode::Ask, false) => "ask: file changes and commands ask first",
+        (Mode::Edits, true) => "edits: file changes in this folder and commands in the sandbox don't ask; going past it does",
+        (Mode::Edits, false) => "edits: file changes in this folder don't ask; commands do",
+        (Mode::Auto, true) => "auto: nothing asks; commands stay in the sandbox, and what would go past it is refused",
+        (Mode::Auto, false) => "auto: nothing asks; file changes in this folder go ahead, and only the commands rules allow run",
+        (Mode::ReadOnly, true) => "read-only: commands only look, in the sandbox, and nothing changes",
+        (Mode::ReadOnly, false) => "read-only: nothing runs or changes",
+        (Mode::Trust, _) => "trust: everything runs without asking, without the sandbox; only deny rules stop it",
     }
 }
 
-/// The mode plus the project's `.rein/permissions`, if it has one. Says what
-/// it's using whenever that's anything other than the plain default.
-pub(crate) fn load_permissions(root: &Path, mode: Mode) -> CliResult<Permissions> {
+/// The sandbox for the project at `root`, with rein's own folder `rein`
+/// among what's hidden from commands; none if `on` is false.
+async fn find_sandbox(root: &Path, rein: &Path, on: bool) -> Sandbox {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let places = Places::new(root, home.as_deref(), Some(rein));
+    if on { Sandbox::detect(places).await } else { Sandbox::missing(places, Missing::TurnedOff) }
+}
+
+/// The mode plus the project's `.rein/permissions`, if it has one, deciding
+/// with `sandbox`. Says what it's using whenever that's anything other than
+/// the plain default, and when commands can't be sandboxed.
+pub(crate) fn load_permissions(root: &Path, mode: Mode, sandbox: sandbox::Shared) -> CliResult<Permissions> {
     let path = root.join(".rein").join("permissions");
     let rules = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("can't read .rein/permissions: {e}")),
     };
-    let permissions = Permissions::new(mode, &rules).map_err(|e| format!(".rein/permissions {e}"))?;
+    let sandboxed = sandbox.available();
+    match (mode, sandbox.missing_why()) {
+        // Trust doesn't use it, and without it nothing changes for you.
+        (Mode::Trust, _) | (_, None) => {}
+        (_, Some(Missing::TurnedOff)) => say!("Sandbox: off in the settings, so commands ask before they run"),
+        (_, Some(Missing::NotHere)) => say!("Sandbox: none on this system yet, so commands ask before they run"),
+        (_, Some(Missing::Failed(said))) => say!("Sandbox: it didn't start ({said}), so commands ask before they run"),
+    }
+    let permissions = Permissions::new(mode, &rules).map_err(|e| format!(".rein/permissions {e}"))?.with_sandbox(sandbox);
     let count = permissions.rule_count();
     if count > 0 {
         say!("Using {count} rule{} from .rein/permissions", if count == 1 { "" } else { "s" });
     }
-    match mode {
-        Mode::Ask => {}
-        Mode::Edits => say!("Mode: edits (file changes in this folder don't ask; commands do)"),
-        Mode::ReadOnly => say!("Mode: read-only (nothing runs or changes)"),
-        Mode::Trust => say!("Mode: trust. Commands run and files change without asking; only deny rules stop them"),
+    if mode != Mode::Ask {
+        let description = mode_description(mode, sandboxed);
+        let (name, about) = description.split_once(": ").unwrap_or((description, ""));
+        say!("Mode: {name} ({about})");
     }
     Ok(permissions)
 }

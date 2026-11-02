@@ -12,7 +12,8 @@ use crate::ui::wrap::Wrap;
 use rein_agent::agent::{Approval, Compacted, Ui};
 use rein_agent::compact;
 use rein_agent::permissions::Mode;
-use rein_agent::tools::ToolName;
+use rein_agent::sandbox::Access;
+use rein_agent::tools::{BashCall, ToolName};
 use rein_llm::{Effort, ToolCall, Usage};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -67,6 +68,8 @@ pub(crate) struct Terminal {
     pub(crate) model: String,
     pub(crate) effort: Option<Effort>,
     pub(crate) mode: Mode,
+    /// Commands run in a sandbox: what one asks for past it is what's asked about.
+    pub(crate) sandboxed: bool,
     pub(crate) input: Input,
     /// Ctrl-C pressed at a question; the turn waits on this to stop.
     pub(crate) interrupted: std::sync::Arc<tokio::sync::Notify>,
@@ -171,6 +174,7 @@ impl Terminal {
             model: String::new(),
             effort: None,
             mode,
+            sandboxed: false,
             input,
             interrupted,
             context_limit: compact::DEFAULT_LIMIT,
@@ -314,7 +318,7 @@ impl Terminal {
         // The modes that ask less stand out.
         let mode = match self.mode {
             Mode::Trust => s.red(Mode::Trust.as_str()),
-            Mode::Edits => s.yellow(Mode::Edits.as_str()),
+            mode @ (Mode::Edits | Mode::Auto) => s.yellow(mode.as_str()),
             mode => mode.to_string(),
         };
         let cache = (self.turn.cached * 100).checked_div(self.turn.input).or(self.last_cache);
@@ -370,6 +374,18 @@ impl Terminal {
 
     /// Prints a step's line before its question, with the change it would
     /// make, unless it's on screen already.
+    /// What to ask about a command: with a sandbox, what it wants past it;
+    /// without one, all of it.
+    fn command_question(&self, bash: Option<&BashCall>) -> &'static str {
+        match bash.map(BashCall::access) {
+            _ if !self.sandboxed => "Allow this command?",
+            Some(Access::Write) => "Allow this command to change files?",
+            Some(Access::Network) => "Allow this command to use the network?",
+            Some(Access::Outside) => "Allow this command to run outside the sandbox?",
+            Some(Access::Look) | None => "Allow this command?",
+        }
+    }
+
     fn show_header(&mut self, call: &ToolCall) {
         let shown = self.step.as_ref().is_some_and(|step| step.call_id == call.call_id && step.header_shown);
         if !shown {
@@ -490,15 +506,22 @@ impl Ui for Terminal {
         self.end_line();
         self.input.busy(None, std::time::Instant::now());
         self.step = None;
+        let bash = BashCall::of(call);
         let (question, always) = match ToolName::of(call) {
-            Some(ToolName::Bash) => ("Allow this command?", "Yes, and don't ask again for this command"),
+            Some(ToolName::Bash) => (self.command_question(bash.as_ref()), "Yes, and don't ask again for this command"),
             Some(ToolName::Edit) => ("Allow this edit?", "Yes, and don't ask again for file changes"),
             Some(ToolName::Write) => ("Allow writing this file?", "Yes, and don't ask again for file changes"),
             _ => ("Allow this?", "Yes, and don't ask again"),
         };
+        // Why it needs to go past the sandbox, as the model put it.
+        let reason = bash.as_ref().and_then(BashCall::reason).map(|reason| format!("Why: {reason}"));
         if !self.input.pinned() {
             self.show_header(call);
-            let prompt = format!("{}{question}  [y]es  [n]o  [a]lways › ", " ".repeat(steps::INDENT));
+            let pad = " ".repeat(steps::INDENT);
+            if let Some(reason) = &reason {
+                say!("{pad}{}", self.err.dim(reason));
+            }
+            let prompt = format!("{pad}{question}  [y]es  [n]o  [a]lways › ");
             return match self.input.read(&prompt, false).await {
                 Read::Line(answer) => approval(&answer),
                 // Ctrl-C at a question stops the whole turn.
@@ -527,7 +550,7 @@ impl Ui for Terminal {
             });
         }
         let answers = vec![("y", "Yes".to_owned()), ("a", always.to_owned()), ("n", "No".to_owned()), ("esc", "No, and tell rein what to do instead".to_owned())];
-        let answer = match self.input.ask(Question { title: question.to_owned(), command, answers }).await {
+        let answer = match self.input.ask(Question { title: question.to_owned(), detail: reason, command, answers }).await {
             Read::Line(key) => approval(&key),
             _ => Approval::No,
         };

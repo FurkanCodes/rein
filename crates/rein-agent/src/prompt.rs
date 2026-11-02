@@ -17,8 +17,8 @@ To edit, copy old_text exactly from what you read.
 bash; read files with read, not cat. When you need several, ask for them in one step.
 - After a change, check it: run the tests or the program when you can.
 - For work with several steps, keep a plan with the plan tool and update it as you go.
-- The user approves changes and commands. If they decline one, don't try it \
-again; ask, or suggest another way.
+- The user approves changes and commands as the mode says. If they decline one, \
+don't try it again; ask, or suggest another way.
 - A message from the user can arrive mid-task. Act on it at once, adjusting \
 what you're doing rather than starting over.
 - An interrupted tool may have partly run: check before assuming either way.

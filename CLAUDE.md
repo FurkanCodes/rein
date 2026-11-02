@@ -112,6 +112,36 @@ finding. Each says why in a line.
 - Never sign in as another app: no borrowed OAuth client IDs, no spoofed
   headers or system prompts. Official sign-ins and API keys only.
 
+## The sandbox
+
+- A command meant for the sandbox never runs without one: no sandbox means
+  ask, not run (`Run::Sandboxed` without one is an error). Claude Code's
+  default runs commands unsandboxed when its sandbox can't start.
+- Rules allow a list and deny the rest (`(deny default)`), never the other way
+  round: a sandbox that denied a list of bad operations was escaped through
+  what the list forgot. System services are a short list for the same
+  reason; allowing them all let a command reach Launch Services, which opens
+  apps outside the sandbox.
+- A path rule locks the folders above it too: `mv .git x`, write
+  `x/hooks/pre-commit`, `mv x .git` got past a rule on `.git/hooks`.
+- Protect what runs later, not only what runs now: hooks, git's config, rule
+  files, editors' and agents' settings. A command that plants one escapes on
+  your next commit.
+- Network access is the internet, never other programs' sockets: with all
+  network allowed, a command reached Docker's socket, and Docker can mount
+  your home.
+- Compare paths as the file system does: macOS ignores case, so `.REIN` is
+  `.rein` (the sandbox resolves this itself; rein's own checks lower-case).
+- Keys stay out of rein's environment (`secrets::keep`, first in `main`):
+  macOS hands any process of yours another's environment (`KERN_PROCARGS2`),
+  sandbox or not, and a sandboxed command read rein's key from it.
+- Between fork and exec, only system calls on what's ready: no allocating,
+  no locks. The Landlock ruleset is built in rein's process; the command's
+  only takes it on.
+- Landlock allows whole folders and can't wall off part of one, so on Linux
+  what's protected inside the project is guarded (noted, then put back), and
+  a rule on `/tmp` reaches a project in it: grant around what's excepted.
+
 ## Encapsulation
 
 - Fields that must change together are private, behind methods. `Agent`'s
@@ -142,6 +172,8 @@ finding. Each says why in a line.
 - Code the provider formats share (grouping items by role, call IDs, parsing
   arguments) lives once, not in each format.
 - `pub(crate)` unless something outside the crate needs it.
+- The sandbox is its own crate, `rein-sandbox`, with no C in its
+  dependencies: its tests build for Linux from a Mac and run in a container.
 
 ## Tests
 
@@ -154,6 +186,15 @@ finding. Each says why in a line.
 - Check processes by their exact command, not `pgrep -f`, which also matches the
   shell that started the test.
 - An opt-in test is `#[ignore = "why"]`, so it shows as ignored, not passed.
+- A sandbox test skips where there's no sandbox, so it can pass by never
+  running: break the wall it checks and watch it fail. Put the file back
+  newer than the broken one (`touch` it): cargo goes by modification times,
+  and a copy restored with its old time kept the broken build running. Its project lives
+  outside the temp folders, which every command may write; a project in one
+  hid that `look` could write it.
+- Check that apps are out of reach with a probe that only reads
+  (`lsappinfo front`), never an Apple event: one outside the sandbox asks you
+  for permission on screen.
 - Visual checks in tmux use a throwaway `REIN_HOME`, so they don't add to your
   history or saved conversations.
 

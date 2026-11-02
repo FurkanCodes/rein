@@ -296,7 +296,7 @@ impl<M: Model> Agent<M> {
                 if together > 1 {
                     let batch = &calls[next..next + together];
                     ui.tools_started(batch);
-                    let outputs = all(batch.iter().map(|call| self.tools.run(call)).collect()).await;
+                    let outputs = all(batch.iter().map(|call| self.tools.run(call, self.permissions.how(call))).collect()).await;
                     for (call, output) in batch.iter().zip(outputs) {
                         ui.tool_finished(call, &output);
                         self.record(Item::ToolResult { call_id: call.call_id.clone(), output })?;
@@ -342,7 +342,7 @@ impl<M: Model> Agent<M> {
                 let output = match approved {
                     Ok(()) => {
                         ui.tool_started(&call);
-                        self.tools.run(&call).await
+                        self.tools.run(&call, self.permissions.how(&call)).await
                     }
                     Err(reason) => reason,
                 };
@@ -382,7 +382,7 @@ impl<M: Model> Agent<M> {
             let folder = full.is_dir();
             for instructions in self.instructions_for(&mention.path, folder) {
                 let call = self.mention_call("read", json!({ "path": instructions, "start_line": null, "line_count": null }));
-                let text = self.tools.run(&call).await;
+                let text = self.tools.run(&call, self.permissions.how(&call)).await;
                 let output = format!(
                     "Instructions for working in {}/, from {instructions}; follow them there:\n\n{text}",
                     Path::new(&instructions).parent().map(|p| p.display().to_string()).unwrap_or_default()
@@ -398,7 +398,7 @@ impl<M: Model> Agent<M> {
                 };
                 self.mention_call("read", json!({ "path": mention.path, "start_line": start, "line_count": count }))
             };
-            let mut output = self.tools.run(&call).await;
+            let mut output = self.tools.run(&call, self.permissions.how(&call)).await;
             if ToolName::of(&call) == Some(ToolName::Read) && self.last_copy(&call.arguments) == Some(output.as_str()) {
                 output = format!("{} {} is as it was when it was last read in this conversation, so that copy is current.]", compact::UNCHANGED, mention.path);
             }

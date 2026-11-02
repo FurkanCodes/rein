@@ -146,7 +146,7 @@ message, so typing ahead can't answer it by accident.
 | Shift-Enter, Ctrl-J, or `\` at the end of a line | a new line in your message (Shift-Enter where the terminal tells it apart from Enter) |
 | `/` | the commands that match, as you type: ↑↓ pick one, Tab completes it, Enter runs it. `/help` lists them |
 | `@` | the project's files and folders that match, as you type, letters in order (`@prsr` finds `src/parser.rs`): ↑↓ pick, Tab puts the path in, Esc closes the list. What you point at goes with your message |
-| Shift-Tab | the next mode: ask → edits → read-only |
+| Shift-Tab | the next mode: ask → edits → auto → read-only |
 | Enter while rein works | steer it: your message goes into the turn at its next step, and steps rein had planned but not started are skipped. Commands wait for the end of the turn |
 | Tab while rein works | send your message after the turn instead. Esc puts what's waiting back in the box |
 | Esc or Ctrl-C while rein works | stop that turn; the conversation goes on |
@@ -156,7 +156,7 @@ message, so typing ahead can't answer it by accident.
 | Mouse wheel, PgUp / PgDn, Shift-↑ / ↓ | scroll the conversation |
 | Drag over text | select it and copy it to the clipboard |
 | Ctrl-L | draw the window again |
-| `/mode [ask\|edits\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
+| `/mode [ask\|edits\|auto\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort |
 | `/login [provider]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
@@ -224,11 +224,12 @@ mode = "edits"
 compact_at = 120000
 bell = off
 compress = off
+sandbox = on
 ```
 
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
-`$REIN_COMPACT_AT`, `$REIN_BELL` and `$REIN_COMPRESS`, which win over the
-file.
+`$REIN_COMPACT_AT`, `$REIN_BELL`, `$REIN_COMPRESS` and `$REIN_SANDBOX`, which
+win over the file.
 
 ## Small things that matter
 
@@ -298,14 +299,69 @@ leave out, binary files, `.git` and anything behind a symlink, and they
 search on every core at once. At each question, answer `y`, `n`, `a` for "yes, and
 don't ask again this run", or Esc to say no and tell rein what to do instead.
 
-`--mode` sets what runs without asking:
+### The sandbox
 
-| Mode | File changes | Commands |
-|---|---|---|
-| `ask` (default) | ask | ask |
-| `edits` | allowed | ask |
-| `read-only` | refused | refused |
-| `trust` | allowed | allowed, except deny rules |
+Commands run in a sandbox: the operating system holds each one, and
+everything it starts, to what it needs. The model says what that is when it
+asks to run one:
+
+| Access | The command may |
+|---|---|
+| `look` | read files, and change nothing |
+| `write` | also change files in this folder |
+| `network` | also use the internet |
+| `outside` | do anything you can: no sandbox |
+
+Even with `write` or `network`, a command can't change files outside this
+folder, read the keys and logins in your home folder (`~/.ssh`, `~/.aws`,
+`~/.config/gh`, rein's own keys and the like), or change what runs code later
+without anyone choosing to run it: `.git/hooks`, `.git/config`, where
+`core.hooksPath` points, `.rein`, `.envrc`, editors' and other agents'
+settings. Renaming the folder that holds one doesn't get round it. Keys and
+tokens in rein's environment (`*_API_KEY`, `*_TOKEN`, an SSH agent) don't
+reach the command, and with `network` it reaches the internet but not other
+programs on this computer: not Docker's socket, which would let it start a
+container with your home folder in it, and not apps, which could do things
+for it outside.
+
+A sandboxed command that fails says what its walls were, so the model knows
+when to ask for more. Installing packages into a cache in your home folder,
+`docker`, `ssh` and signed commits need `outside`.
+
+On macOS the sandbox is the system's own (Seatbelt), and costs about 10 ms
+per command. On Linux 5.13 or later it's Landlock for files and seccomp for
+sockets, with nothing to install and no user namespaces needed, so it works
+on Ubuntu 24.04 and in containers too. Landlock can only wall off whole
+folders, though, so on Linux what's protected inside the project is guarded
+instead: rein notes it before a command that writes, and puts it back after
+(something the command leaves running in the background could still change
+it later). Where there's no sandbox (Windows, older kernels), or with
+`sandbox = off`, commands ask before they run: rein never runs one
+unconfined when it meant to confine it.
+
+Other programs of yours can read the environment rein was started with,
+and on macOS a command in the sandbox can too. So rein takes the keys and
+tokens out of it when it starts, keeping them where only it can read them;
+commands you let run outside the sandbox still get them.
+
+### Modes
+
+`--mode` sets what runs without asking, by what a command needs:
+
+| Mode | File changes | `look` | `write` | `network`, `outside` |
+|---|---|---|---|---|
+| `ask` (default) | ask | runs | ask | ask |
+| `edits` | allowed | runs | runs | ask |
+| `auto` | allowed | runs | runs | refused |
+| `read-only` | refused | runs | refused | refused |
+| `trust` | allowed | runs | runs | runs |
+
+`trust` runs everything without the sandbox, except what deny rules block.
+`auto` never asks: it's for leaving rein to work on its own, and what would
+go past the sandbox is refused, so the model makes do or tells you what it
+needs. File changes to the protected paths above ask in every mode but
+`trust`, even in `edits`. Without a sandbox, commands ask in `ask` and
+`edits`, and `auto` and `read-only` run only what rules allow.
 
 Rules in `.rein/permissions` refine this for commands:
 
@@ -315,17 +371,20 @@ ask   git commit
 deny  git push
 ```
 
-Deny beats ask beats allow. A command runs without asking only if every part
-of it is allowed, so `allow cargo test` doesn't cover `cargo test && rm -rf x`.
-Anything rein can't take apart, like `$(...)`, redirects or globs, is asked
-about. Rules decide when rein asks; they aren't a sandbox, so `deny rm`
-doesn't stop `/bin/rm`.
+Deny beats ask beats allow. An allow rule lets a command past the sandbox
+without asking only if every part of it is allowed, so `allow cargo fetch`
+doesn't cover `cargo fetch && rm -rf x`; anything rein can't take apart, like
+`$(...)`, redirects or globs, no allow rule covers. Deny and ask rules still
+find the commands in it. An answer of "always" is for that command with as
+much access as that time. Rules decide when rein asks; they aren't a
+sandbox, so `deny rm` doesn't stop `/bin/rm`.
 
 ## Layout
 
 | Crate | What it is |
 |---|---|
 | `crates/rein-llm` | Streaming LLM provider layer: one client for every provider, the Responses, Messages, Gemini and Chat Completions APIs, the providers rein knows, Sign in with ChatGPT |
+| `crates/rein-sandbox` | The walls commands run inside: macOS's Seatbelt, Linux's Landlock and seccomp, what's protected and hidden |
 | `crates/rein-agent` | The agent loop, the tools, the permission engine, saved conversations, and what the model is told first |
 | `crates/rein-cli` | The `rein` command |
 
@@ -354,6 +413,22 @@ off unless asked, since it costs a little:
 
 ```sh
 cargo test --test e2e -- --ignored --nocapture --test-threads 1
+```
+
+The sandbox's tests run its real walls, on the system they run on, and try
+the ways round them: renaming the folder that holds what's protected,
+symlinks, hard links, letter case, other programs' sockets, other processes'
+environments, terminals. `rein-sandbox` has no C in its dependencies, so its
+tests also build for Linux on a Mac (`rustup target add
+aarch64-unknown-linux-musl`, linked with the `rust-lld` that comes with Rust)
+and run in a container:
+
+```sh
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/rust-lld"
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C linker-flavor=ld.lld -C link-self-contained=yes"
+cargo test -p rein-sandbox --target aarch64-unknown-linux-musl --no-run
+docker run --rm -e REIN_TEST_DIR=/work -v "$PWD/target/aarch64-unknown-linux-musl/debug/deps:/t:ro" \
+  <an image with python3 and git, a user, and /work> /t/rein_sandbox-<hash>
 ```
 
 Record a real stream with

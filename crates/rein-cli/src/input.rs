@@ -60,6 +60,8 @@ enum Waiting {
 /// arrows and Enter.
 pub struct Question {
     pub title: String,
+    /// A line under the title: why the model wants it, say.
+    pub detail: Option<String>,
     /// The command it's about, shown whole under the title.
     pub command: Option<String>,
     /// Each answer: the key that picks it (`esc` for Esc), and what it says.
@@ -292,6 +294,7 @@ impl Boxed {
         let bottom = match &self.asking {
             Some(asking) if self.waiting == Waiting::Answer => {
                 let mut lines = vec![s.bold(&asking.question.title)];
+                lines.extend(asking.question.detail.as_ref().map(|detail| s.dim(detail)));
                 if let Some(command) = &asking.question.command {
                     // Wrapped at the box's width now, which a resize changes.
                     let mut shown = command_lines(command, s, self.pinned.text_width());

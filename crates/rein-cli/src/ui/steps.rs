@@ -15,7 +15,8 @@
 
 use std::path::Path;
 
-use rein_agent::tools::ToolName;
+use rein_agent::sandbox::Access;
+use rein_agent::tools::{BashCall, ToolName};
 use rein_llm::ToolCall;
 use rein_llm::serde_json::{self, Value};
 
@@ -69,7 +70,13 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             let command = args["command"].as_str().unwrap_or_default();
             let first = command.lines().next().unwrap_or_default();
             let more = if command.trim_end().contains('\n') { " …" } else { "" };
-            ("Run", format!("{first}{more}"))
+            // What went past the sandbox says so, in the transcript too.
+            let past = match BashCall::of(call).map(|bash| bash.access()) {
+                Some(Access::Network) => " (with network)",
+                Some(Access::Outside) => " (outside the sandbox)",
+                _ => "",
+            };
+            ("Run", format!("{first}{more}{past}"))
         }
         Some(ToolName::Recall) => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
         Some(ToolName::Plan) => {
