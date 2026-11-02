@@ -14,8 +14,10 @@
 //! the cache.
 //!
 //! An API key goes in `x-api-key`; a gateway's token (`ANTHROPIC_AUTH_TOKEN`)
-//! as `Authorization: Bearer`. There's no signing in with a Claude plan:
-//! Anthropic doesn't allow other apps to use one.
+//! as `Authorization: Bearer`. Optional, unofficial subscription OAuth lives
+//! in [`oauth`] and is enabled separately from API-key authentication.
+
+pub mod oauth;
 
 use serde_json::{Value, json};
 

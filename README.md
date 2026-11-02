@@ -45,8 +45,8 @@ OpenAI's, `gemini-*` Google's), or you name the provider first:
   settings. `--key` pastes one instead.
 - **Nothing, on your own computer.** Ollama and LM Studio need no key.
 
-Claude and Gemini plans can't be used: Anthropic and Google don't allow
-other apps to sign in with them. rein prints what pays on every run. With no
+Claude subscription OAuth is available only as an explicit, unofficial opt-in;
+see the warning below. Google Gemini plans aren't supported. rein prints what pays on every run. With no
 model named, it uses `gpt-6.1-sol`, or, with no way to pay OpenAI, the first
 provider you have a key for (`claude-opus-5-5`, `gemini-3.8-flash`, ...).
 
@@ -76,6 +76,32 @@ carries over in the new provider's format. Reasoning only one provider can
 read (OpenAI's encrypted reasoning, Claude's signed thinking, Gemini's
 thought signatures) only goes back to that provider. `rein -c` continues with
 the model the conversation was left with.
+
+### Optional, unofficial Claude subscription OAuth
+
+`rein login anthropic --oauth` (or `/login anthropic --oauth` inside a
+conversation) offers browser login using a Claude subscription. API-key login
+remains unchanged: `rein login anthropic` still asks for an API key.
+
+This integration is **not authorized by Anthropic for third-party apps**. It
+uses Claude Code's public OAuth client identity, compatibility headers and
+system identity. Anthropic may block it or restrict your account without
+notice. See its [authentication policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).
+A warning and explicit acknowledgment are required before opening the browser;
+use an API key instead if you don't accept these risks. Compatibility is not
+guaranteed and no live-account validation is implied.
+
+The browser must run on the same computer; the callback uses localhost port
+54545, which must be free. Sign-in times out after ten minutes and can be
+cancelled. Credentials live in `claude-oauth.json` under rein's private config
+folder, are refreshed as needed, and are never sent to custom endpoints or
+proxies. Environment keys/tokens and saved API keys take precedence over OAuth.
+Each run using OAuth identifies it as unofficial and warns about account risk.
+
+`rein logout anthropic --oauth` (or `/logout anthropic --oauth`) deletes the
+local credentials, not your saved API key. Existing OAuth clients stop working
+once those credentials are removed. Revoke the grant in your Claude account to
+invalidate it remotely. `rein logout anthropic` still forgets only the API key.
 
 ### Claude and Gemini
 

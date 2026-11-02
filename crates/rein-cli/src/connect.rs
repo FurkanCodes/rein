@@ -54,6 +54,8 @@ fn env_key(provider: &Provider) -> Option<(&str, String)> {
 enum Payment {
     /// Your ChatGPT plan: you've signed in with `rein login`.
     Plan,
+    /// Explicitly opted-in, unofficial Claude subscription OAuth.
+    ClaudeOAuth,
     /// A key in one of the provider's variables.
     Key { var: String, key: String },
     /// A gateway's token, sent as a bearer token.
@@ -78,6 +80,14 @@ fn payment(provider: &Provider, keys: &Keys) -> Option<Payment> {
     }
     if let Some(key) = keys.get(&provider.name) {
         return Some(Payment::Saved(key.clone()));
+    }
+    // Never send subscription tokens to a custom provider, proxy or URL override.
+    if provider.name == "anthropic"
+        && provider.api == rein_llm::Api::Anthropic
+        && base_url(provider).0 == rein_llm::anthropic::API_BASE
+        && config_dir().is_ok_and(|dir| dir.join(crate::claude::FILE).exists())
+    {
+        return Some(Payment::ClaudeOAuth);
     }
     (!provider.needs_key).then_some(Payment::Free)
 }
@@ -123,6 +133,10 @@ pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, k
     let client = |auth: Auth| Client::new(http.clone(), provider.api, base.clone(), auth).with_quirks(provider.quirks);
     match payment(provider, keys) {
         Some(Payment::Plan) => Ok((chatgpt(http).await?, format!("Using ChatGPT plan (manage usage: {USAGE_URL})"))),
+        Some(Payment::ClaudeOAuth) => Ok((
+            Client::claude_oauth(http.clone(), config_dir()?.join(crate::claude::FILE)),
+            "Using Claude subscription OAuth (unofficial; not authorized by Anthropic; access or your account may be restricted)".into(),
+        )),
         Some(Payment::Key { var, key }) => Ok((client(auth(provider, key)), pays(&var))),
         Some(Payment::Token { var, token }) => Ok((client(Auth::Bearer(token)), pays(&var))),
         Some(Payment::Saved(key)) => Ok((client(auth(provider, key)), pays(&format!("your saved {} key", provider.title)))),
@@ -289,6 +303,11 @@ pub async fn key_from_browser(http: &rein_llm::reqwest::Client, provider: &Provi
 /// `rein logout <provider>`: forgets its saved key, or your ChatGPT sign-in.
 pub fn logout(name: &str, tell: &dyn Fn(&str)) -> CliResult {
     let dir = config_dir()?;
+    if name == crate::claude::NAME {
+        std::fs::remove_file(dir.join(crate::claude::FILE)).map_err(|e| format!("couldn't sign out of Claude OAuth: {e}"))?;
+        tell("Signed out of Claude OAuth locally. Revoke the grant in your Claude account to invalidate it remotely.");
+        return Ok(());
+    }
     if name == "chatgpt" {
         return match std::fs::remove_file(dir.join(CREDENTIALS_FILE)) {
             Ok(()) => {
@@ -352,6 +371,7 @@ pub async fn models(http: &rein_llm::reqwest::Client, name: Option<&str>) -> Cli
 pub fn pays(provider: &Provider, keys: &Keys, how: bool) -> String {
     match payment(provider, keys) {
         Some(Payment::Plan) => "your ChatGPT plan".to_owned(),
+        Some(Payment::ClaudeOAuth) => "Claude subscription OAuth (unofficial; account risk)".to_owned(),
         Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => format!("${var}"),
         Some(Payment::Saved(_)) => "your saved key".to_owned(),
         Some(Payment::Free) => "nothing: no key needed".to_owned(),
@@ -400,7 +420,7 @@ extern "C" fn interrupted(_: libc::c_int) {
 }
 
 /// A line typed without showing it, like a password; or piped in.
-fn read_secret(prompt: &str) -> CliResult<String> {
+pub(crate) fn read_secret(prompt: &str) -> CliResult<String> {
     let tty = std::io::stdin().is_terminal();
     eprint!("{prompt}");
     // SAFETY: an all-zero termios is a valid value, and tcgetattr fills it.

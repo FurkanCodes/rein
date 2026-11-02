@@ -20,6 +20,7 @@ macro_rules! out {
 }
 
 mod args;
+mod claude;
 mod commands;
 mod connect;
 mod conversation;
@@ -73,6 +74,8 @@ async fn run(args: Vec<String>) -> CliResult {
             Ok(())
         }
         ["login"] | ["login", "chatgpt"] => login(&http, &|line| say!("{line}")).await,
+        ["login", "anthropic", "--oauth"] => claude::login_cli(&http).await,
+        ["logout", "anthropic", "--oauth"] => connect::logout(claude::NAME, &|line| say!("{line}")),
         ["login", provider] => connect::login(&http, provider, false).await,
         ["login", provider, "--key"] => connect::login(&http, provider, true).await,
         ["logout", provider] => connect::logout(provider, &|line| say!("{line}")),

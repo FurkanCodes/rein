@@ -573,6 +573,8 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
                 let how = if provider.sign_in_url.is_some() { ", signs in in the browser" } else { "" };
                 items.push((provider.name.clone(), format!("{}{how}", crate::connect::pays(provider, &setup.keys, false))));
             }
+            names.push(crate::claude::NAME.into());
+            items.push((crate::claude::NAME.into(), "unofficial Claude subscription login; account risk; explicit consent required".into()));
             let current = names.iter().position(|name| *name == setup.provider.name);
             terminal.input.choose(menu("sign in to a provider", items, current)).await.map(|i| Slash::Login(Some(names[i].clone())))
         }
@@ -583,10 +585,28 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
                 names.push("chatgpt".into());
             }
             names.extend(setup.keys.keys().cloned());
+            if config_dir()?.join(crate::claude::FILE).exists() {
+                names.push(crate::claude::NAME.into());
+            }
             if names.is_empty() {
                 return Err("nothing to forget: no saved keys, and not signed in with ChatGPT".into());
             }
-            let items = names.iter().map(|name| (name.clone(), if name == "chatgpt" { "sign out of ChatGPT" } else { "forget the saved key" }.to_owned())).collect();
+            let items = names
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        if name == "chatgpt" {
+                            "sign out of ChatGPT"
+                        } else if name == crate::claude::NAME {
+                            "sign out of unofficial Claude OAuth"
+                        } else {
+                            "forget the saved key"
+                        }
+                        .to_owned(),
+                    )
+                })
+                .collect();
             terminal.input.choose(menu("forget which", items, None)).await.map(|i| Slash::Logout(Some(names[i].clone())))
         }
         command => Some(command),
@@ -640,7 +660,26 @@ pub(crate) async fn login_here(name: &str, agent: &mut Agent<Llm>, terminal: &mu
         }
     };
     let cancelled = || say!("{pad}{}", s.dim("(cancelled; nothing was saved)"));
-    let signed_in = if name == "chatgpt" {
+    let signed_in = if name == crate::claude::NAME {
+        tell(crate::claude::WARNING);
+        let choice = terminal
+            .input
+            .choose(Menu {
+                title: "Accept the risks of unofficial Claude OAuth?".into(),
+                items: vec![("Cancel".into(), "keep using API keys".into()), ("I accept".into(), "continue with unofficial Claude OAuth".into())],
+                current: Some(0),
+            })
+            .await;
+        if choice != Some(1) {
+            cancelled();
+            return Ok(());
+        }
+        if waiting(terminal, "Waiting for unofficial Claude OAuth in the browser", crate::claude::login(&setup.http, &tell)).await?.is_none() {
+            cancelled();
+            return Ok(());
+        }
+        "anthropic"
+    } else if name == "chatgpt" {
         if waiting(terminal, "Waiting for you to sign in to ChatGPT in the browser", login(&setup.http, &tell)).await?.is_none() {
             cancelled();
             return Ok(());

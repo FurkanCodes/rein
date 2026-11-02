@@ -17,6 +17,9 @@ Usage:
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
   rein login <provider> [--key]  Save an API key for a provider, like anthropic;
                                  openrouter signs in in the browser (--key: paste one)
+  rein login anthropic --oauth  Optional, unofficial Claude subscription login;
+                                 warns and requires consent (API keys are supported)
+  rein logout anthropic --oauth Forget the unofficial Claude OAuth credentials
   rein logout <provider>         Forget it (rein logout chatgpt signs out)
   rein providers                 List the providers rein can reach, and what pays
   rein models [<provider>]       List the models you can use
