@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::decode::Decode;
 use crate::chat::Quirks;
+use crate::decode::Decode;
 use crate::{Api, Error, Event, ModelInfo, Request, Result, anthropic, chat, gemini, openai};
 
 /// How requests prove who's asking. Its `Debug` never shows the secret,
@@ -279,10 +279,8 @@ impl Client {
 
     /// Posts `body`, or `gzipped` in its place when there is one.
     async fn post(&self, request: &Request<'_>, headers: &[(&'static str, String)], body: &[u8], gzipped: Option<Vec<u8>>) -> Result<reqwest::Response> {
-        let mut builder = self
-            .authorize(self.http.post(self.endpoint(request)))
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let mut builder =
+            self.authorize(self.http.post(self.endpoint(request))).header(reqwest::header::ACCEPT, "text/event-stream").header(reqwest::header::CONTENT_TYPE, "application/json");
         for (name, value) in headers {
             builder = builder.header(*name, value);
         }
@@ -306,10 +304,7 @@ fn rejected_field(error: &Error, body: &Value, optional: Optional, omitted: &[&s
     let Error::Api { status: Some(400 | 422), message, .. } = error else { return None };
     let message = message.to_lowercase();
     let body = body.to_string();
-    optional
-        .iter()
-        .find(|(word, key, field)| message.contains(word) && !omitted.contains(field) && body.contains(&format!("\"{key}\"")))
-        .map(|(_, _, field)| *field)
+    optional.iter().find(|(word, key, field)| message.contains(word) && !omitted.contains(field) && body.contains(&format!("\"{key}\""))).map(|(_, _, field)| *field)
 }
 
 /// `bytes` gzipped. Level 6, zlib's own default: within a few percent of the
@@ -421,7 +416,8 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None).with_idle_timeout(Duration::from_millis(300));
-        let request = Request { model: "m", instructions: None, input: &[], tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        let request =
+            Request { model: "m", instructions: None, input: &[], tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
         let mut stream = client.stream(&request).await.unwrap();
         assert!(matches!(stream.next().await, Some(Ok(Event::TextDelta(_)))));
         let started = std::time::Instant::now();

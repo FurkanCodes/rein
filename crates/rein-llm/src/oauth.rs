@@ -74,10 +74,7 @@ pub(crate) async fn respond(socket: &mut TcpStream, status: u16, message: &str) 
         "<!doctype html><meta charset=utf-8><title>rein</title>\
          <body style=\"font:16px system-ui,sans-serif;max-width:32em;margin:4em auto\"><p>{message}</p>"
     );
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let response = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
     let _ = socket.write_all(response.as_bytes()).await;
     let _ = socket.shutdown().await;
 }
@@ -88,9 +85,6 @@ mod tests {
 
     #[test]
     fn pkce_matches_rfc_7636_example() {
-        assert_eq!(
-            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
+        assert_eq!(pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
     }
 }

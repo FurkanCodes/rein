@@ -48,11 +48,8 @@ pub(crate) fn request_body(request: &Request<'_>) -> Value {
         body["reasoning"]["summary"] = json!("auto");
     }
     if !request.tools.is_empty() {
-        let tools: Vec<Value> = request
-            .tools
-            .iter()
-            .map(|t| json!({ "type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": true }))
-            .collect();
+        let tools: Vec<Value> =
+            request.tools.iter().map(|t| json!({ "type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": true })).collect();
         body["tools"] = json!([{ "type": "namespace", "name": NAMESPACE, "description": "rein's tools for working in the user's project.", "tools": tools }]);
     }
     body
@@ -84,12 +81,7 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
             .filter(|m| m["visibility"].as_str().is_none_or(|v| v == "list"))
             .filter_map(|m| {
                 let id = m["slug"].as_str()?;
-                Some(ModelInfo {
-                    id: id.to_owned(),
-                    name: m["display_name"].as_str().unwrap_or(id).to_owned(),
-                    context_window: m["context_window"].as_u64(),
-                    max_output: None,
-                })
+                Some(ModelInfo { id: id.to_owned(), name: m["display_name"].as_str().unwrap_or(id).to_owned(), context_window: m["context_window"].as_u64(), max_output: None })
             })
             .collect();
     }
@@ -214,31 +206,20 @@ mod tests {
         let call = ToolCall { call_id: "call_1".into(), name: "read".into(), arguments: r#"{"path":"a.rs"}"#.into() };
         let tools = [Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }];
         let input = [
-                Item::User("open a.rs".into()),
-                Item::Opaque(Opaque::new(Api::Responses, json!({"type": "reasoning", "encrypted_content": "xyz"}))),
-                // Claude's thinking means nothing to OpenAI: it stays out.
-                Item::Opaque(Opaque::new(Api::Anthropic, json!({"type": "thinking", "thinking": "", "signature": "s"}))),
-                Item::ToolCall(call.clone()),
-                Item::ToolResult { call_id: "call_1".into(), output: "fn main() {}".into() },
+            Item::User("open a.rs".into()),
+            Item::Opaque(Opaque::new(Api::Responses, json!({"type": "reasoning", "encrypted_content": "xyz"}))),
+            // Claude's thinking means nothing to OpenAI: it stays out.
+            Item::Opaque(Opaque::new(Api::Anthropic, json!({"type": "thinking", "thinking": "", "signature": "s"}))),
+            Item::ToolCall(call.clone()),
+            Item::ToolResult { call_id: "call_1".into(), output: "fn main() {}".into() },
         ];
-        let request = Request {
-            model: "m",
-            instructions: None,
-            input: &input,
-            tools: &tools,
-            reasoning_effort: None,
-            reasoning_summary: false,
-            session_id: None,
-            max_output_tokens: None,
-        };
+        let request =
+            Request { model: "m", instructions: None, input: &input, tools: &tools, reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
         let body = request_body(&request);
         assert_eq!(body["tools"][0]["type"], "namespace");
         assert_eq!(body["tools"][0]["tools"][0]["name"], "read");
         assert_eq!(body["input"][1], json!({"type": "reasoning", "encrypted_content": "xyz"}));
-        assert_eq!(
-            body["input"][2],
-            json!({"type": "function_call", "call_id": "call_1", "namespace": "rein", "name": "read", "arguments": "{\"path\":\"a.rs\"}"})
-        );
+        assert_eq!(body["input"][2], json!({"type": "function_call", "call_id": "call_1", "namespace": "rein", "name": "read", "arguments": "{\"path\":\"a.rs\"}"}));
         assert_eq!(body["input"][3], json!({"type": "function_call_output", "call_id": "call_1", "output": "fn main() {}"}));
         assert_eq!(body["input"].as_array().unwrap().len(), 4);
 

@@ -138,7 +138,11 @@ impl Model {
                 let reply = if head.starts_with("GET /v1/key ") {
                     // As OpenRouter does: only a good key gets an answer here.
                     let good = head.to_lowercase().contains("authorization: bearer good-key");
-                    if good { http(200, "application/json", br#"{"data":{"label":"test"}}"#) } else { http(401, "application/json", br#"{"error":{"message":"No auth credentials found","code":401}}"#) }
+                    if good {
+                        http(200, "application/json", br#"{"data":{"label":"test"}}"#)
+                    } else {
+                        http(401, "application/json", br#"{"error":{"message":"No auth credentials found","code":401}}"#)
+                    }
                 } else if head.starts_with("POST /v1/auth/keys ") {
                     // As OpenRouter does at the end of its browser sign-in.
                     heard.lock().unwrap().push(format!("{head}{}", String::from_utf8_lossy(&body)));
@@ -149,9 +153,13 @@ impl Model {
                     }
                     let models = match wire {
                         Wire::Responses => json!({ "data": [{ "id": "test-model" }, { "id": "gpt-6.1-sol" }] }),
-                        Wire::Messages => json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false }),
+                        Wire::Messages => {
+                            json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false })
+                        }
                         Wire::Chat => json!({ "object": "list", "data": [{ "id": "llama-test", "context_window": 131_072 }] }),
-                        Wire::Gemini => json!({ "models": [{ "name": "models/gemini-3.8-flash", "inputTokenLimit": 1_048_576, "outputTokenLimit": 65_536, "supportedGenerationMethods": ["generateContent"] }] }),
+                        Wire::Gemini => {
+                            json!({ "models": [{ "name": "models/gemini-3.8-flash", "inputTokenLimit": 1_048_576, "outputTokenLimit": 65_536, "supportedGenerationMethods": ["generateContent"] }] })
+                        }
                     };
                     http(200, "application/json", models.to_string().as_bytes())
                 } else {
@@ -224,10 +232,7 @@ fn read_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
         }
     };
     let head = String::from_utf8_lossy(&data[..head_end]).into_owned();
-    let length = head
-        .lines()
-        .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|n| n.trim().parse::<usize>().unwrap_or(0)))
-        .unwrap_or(0);
+    let length = head.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|n| n.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
     while data.len() < head_end + length {
         let n = socket.read(&mut buf).ok()?;
         if n == 0 {
@@ -1053,9 +1058,7 @@ fn claude_thinking_always_goes_back_after_what_it_was_signed_with() {
 #[test]
 fn a_conversation_moves_between_providers_and_continues_where_it_was() {
     let claude = Model::claude(vec![says("From Claude."), says("Claude again.")]);
-    let gpt = Model::start(vec![says("From GPT."), says("GPT again.")])
-        .with_env("ANTHROPIC_API_KEY", "test-key")
-        .with_env("ANTHROPIC_BASE_URL", &claude.base);
+    let gpt = Model::start(vec![says("From GPT."), says("GPT again.")]).with_env("ANTHROPIC_API_KEY", "test-key").with_env("ANTHROPIC_BASE_URL", &claude.base);
     let mut term = Term::start(&gpt, "switch", 24, 100);
     term.wait_for(IDLE);
     term.keys("hi\r");

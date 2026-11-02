@@ -470,21 +470,24 @@ mod tests {
 
     #[test]
     fn leaves_out_what_gitignore_does() {
-        let root = project("ignore", &[
-            (".gitignore", "# build output\ntarget/\n*.log\n!keep.log\n/only-top.txt\ndocs/*.html\n"),
-            ("src/main.rs", ""),
-            ("src/.gitignore", "generated.rs\n"),
-            ("src/generated.rs", ""),
-            ("target/debug/out", ""),
-            ("a.log", ""),
-            ("keep.log", ""),
-            ("only-top.txt", ""),
-            ("sub/only-top.txt", ""),
-            ("docs/index.html", ""),
-            ("docs/deep/page.html", ""),
-            (".github/ci.yml", ""),
-            (".git/config", ""),
-        ]);
+        let root = project(
+            "ignore",
+            &[
+                (".gitignore", "# build output\ntarget/\n*.log\n!keep.log\n/only-top.txt\ndocs/*.html\n"),
+                ("src/main.rs", ""),
+                ("src/.gitignore", "generated.rs\n"),
+                ("src/generated.rs", ""),
+                ("target/debug/out", ""),
+                ("a.log", ""),
+                ("keep.log", ""),
+                ("only-top.txt", ""),
+                ("sub/only-top.txt", ""),
+                ("docs/index.html", ""),
+                ("docs/deep/page.html", ""),
+                (".github/ci.yml", ""),
+                (".git/config", ""),
+            ],
+        );
         assert_eq!(walk(&root, &root), [".github/ci.yml", ".gitignore", "docs/deep/page.html", "keep.log", "src/.gitignore", "src/main.rs", "sub/only-top.txt"]);
         // Starting further down, the rules above still count.
         assert_eq!(walk(&root, &root.join("src")), ["src/.gitignore", "src/main.rs"]);
@@ -508,17 +511,24 @@ mod tests {
 
     #[test]
     fn grep_shows_matching_lines_by_file() {
-        let root = project("grep", &[
-            ("src/parser.rs", "use x;\nfn parse_list() {}\nfn other() {}\nfn parse_item() {}\n"),
-            ("src/main.rs", "fn main() {\n    parse_list();\n}\n"),
-            ("README.md", "parse_list is documented here\n"),
-            ("logo.png", "\u{0}\u{1}parse_list"),
-        ]);
+        let root = project(
+            "grep",
+            &[
+                ("src/parser.rs", "use x;\nfn parse_list() {}\nfn other() {}\nfn parse_item() {}\n"),
+                ("src/main.rs", "fn main() {\n    parse_list();\n}\n"),
+                ("README.md", "parse_list is documented here\n"),
+                ("logo.png", "\u{0}\u{1}parse_list"),
+            ],
+        );
         assert_eq!(
             grep_in(&root, r"parse_\w+\(", None, false, 0),
             "3 matches in 2 files\nsrc/main.rs\n2:    parse_list();\n\nsrc/parser.rs\n2:fn parse_list() {}\n4:fn parse_item() {}"
         );
-        assert_eq!(grep_in(&root, "^fn", Some("*.rs"), true, 0), "2 files with matches (4 matching lines)\nsrc/main.rs (1 match)\nsrc/parser.rs (3 matches)", "^ is a line's start");
+        assert_eq!(
+            grep_in(&root, "^fn", Some("*.rs"), true, 0),
+            "2 files with matches (4 matching lines)\nsrc/main.rs (1 match)\nsrc/parser.rs (3 matches)",
+            "^ is a line's start"
+        );
         assert_eq!(grep_in(&root, "parse_list", Some("src/**"), true, 0), "2 files with matches (2 matching lines)\nsrc/main.rs (1 match)\nsrc/parser.rs (1 match)");
         let one = grep(&root, &Grep { pattern: "PARSE_ITEM", start: &root.join("src/parser.rs"), glob: None, ignore_case: true, files_only: false, context: 0 }).unwrap();
         assert_eq!(one, "1 match in 1 file\nsrc/parser.rs\n4:fn parse_item() {}");

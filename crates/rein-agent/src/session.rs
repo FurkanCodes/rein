@@ -38,11 +38,24 @@ enum Line {
     Session(Header),
     /// What the model is told before the first message (see `context`).
     /// Sent as a user message, but not something the user typed.
-    Context { text: String },
-    User { text: String },
-    Assistant { text: String },
-    ToolCall { call_id: String, name: String, arguments: String },
-    ToolResult { call_id: String, output: String },
+    Context {
+        text: String,
+    },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    ToolCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        call_id: String,
+        output: String,
+    },
     /// Provider data, with the format that can read it. Conversations
     /// saved before rein spoke more than one say none: OpenAI's.
     Opaque {
@@ -52,12 +65,19 @@ enum Line {
     },
     /// Tool outputs replaced to save space (see `compact`). The originals
     /// stay in the file, earlier.
-    Retired { outputs: Vec<RetiredOutput> },
+    Retired {
+        outputs: Vec<RetiredOutput>,
+    },
     /// The conversation switched to another model from here on.
-    Model { model: String },
+    Model {
+        model: String,
+    },
     /// The conversation was compacted: from here on it's the first message,
     /// this summary, and `kept`, its latest part word for word.
-    Compaction { summary: String, kept: Vec<Line> },
+    Compaction {
+        summary: String,
+        kept: Vec<Line>,
+    },
     /// The provider turned the thinking in the conversation away (it no
     /// longer matched what came before it), so it was dropped from here on.
     Unbound,

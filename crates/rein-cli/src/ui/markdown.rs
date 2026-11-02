@@ -263,10 +263,7 @@ mod tests {
     #[test]
     fn renders_the_common_parts() {
         let text = "# Title\n**Done.** It says `ok`:\n\n```text\nNo tasks yet. *Add* one.\n```\n\n- first\n  * nested\n1. one\n> a quote\n2 * 3 = 6, and a_b_c stays.\n";
-        assert_eq!(
-            render(text),
-            "Title\nDone. It says ok:\n\n│ No tasks yet. *Add* one.\n\n· first\n  · nested\n1. one\n│ a quote\n2 * 3 = 6, and a_b_c stays.\n"
-        );
+        assert_eq!(render(text), "Title\nDone. It says ok:\n\n│ No tasks yet. *Add* one.\n\n· first\n  · nested\n1. one\n│ a quote\n2 * 3 = 6, and a_b_c stays.\n");
     }
 
     #[test]

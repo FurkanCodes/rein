@@ -47,10 +47,7 @@ fn text_and_usage(events: Vec<rein_llm::Result<Event>>) -> (String, Option<Usage
 fn replays_a_whole_stream() {
     let (text, usage) = text_and_usage(replay(HELLO, HELLO.len()));
     assert_eq!(text, "Hello, world! 👋");
-    assert_eq!(
-        usage,
-        Some(Usage { input_tokens: 12, cached_input_tokens: 4, output_tokens: 7, reasoning_tokens: 2 })
-    );
+    assert_eq!(usage, Some(Usage { input_tokens: 12, cached_input_tokens: 4, output_tokens: 7, reasoning_tokens: 2 }));
 }
 
 #[test]
@@ -149,9 +146,6 @@ fn replays_claude_thinking_and_a_tool_call() {
             ],
             "chunk size {chunk}"
         );
-        assert_eq!(
-            events.last(),
-            Some(&Event::Completed { usage: Usage { input_tokens: 2_437, cached_input_tokens: 2_048, output_tokens: 89, reasoning_tokens: 41 } })
-        );
+        assert_eq!(events.last(), Some(&Event::Completed { usage: Usage { input_tokens: 2_437, cached_input_tokens: 2_048, output_tokens: 89, reasoning_tokens: 41 } }));
     }
 }

@@ -244,8 +244,15 @@ pub struct Messages {
 #[derive(Debug)]
 enum Block {
     Text(String),
-    Thinking { thinking: String, signature: String },
-    Tool { id: String, name: String, input: String },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    Tool {
+        id: String,
+        name: String,
+        input: String,
+    },
     /// Sent back as it came: redacted thinking, and blocks rein doesn't know.
     Raw(Value),
     /// From a model that declined: not part of the answer.
@@ -313,11 +320,9 @@ impl Messages {
                 let str = |key: &str| block[key].as_str().unwrap_or_default().to_owned();
                 Block::Thinking { thinking: str("thinking"), signature: str("signature") }
             }
-            "tool_use" => Block::Tool {
-                id: block["id"].as_str().unwrap_or_default().to_owned(),
-                name: block["name"].as_str().unwrap_or_default().to_owned(),
-                input: String::new(),
-            },
+            "tool_use" => {
+                Block::Tool { id: block["id"].as_str().unwrap_or_default().to_owned(), name: block["name"].as_str().unwrap_or_default().to_owned(), input: String::new() }
+            }
             // Another model takes over from here: what the one that
             // declined thought or started calling isn't part of the answer.
             "fallback" => {
@@ -399,9 +404,7 @@ impl Messages {
         for block in std::mem::take(&mut self.blocks) {
             let item = match block {
                 Block::Text(text) if !text.is_empty() => Item::Assistant(text),
-                Block::Thinking { thinking, signature } => {
-                    Item::Opaque(Opaque::new(Api::Anthropic, json!({ "type": "thinking", "thinking": thinking, "signature": signature })))
-                }
+                Block::Thinking { thinking, signature } => Item::Opaque(Opaque::new(Api::Anthropic, json!({ "type": "thinking", "thinking": thinking, "signature": signature }))),
                 Block::Tool { id, name, input } => {
                     let arguments = if input.trim().is_empty() { "{}".to_owned() } else { input };
                     Item::ToolCall(ToolCall { call_id: id, name, arguments })
@@ -616,7 +619,11 @@ mod tests {
 
     #[test]
     fn refusals_limits_and_errors_end_the_answer() {
-        let refused = [start(1, 0, 0), json!({ "type": "message_delta", "delta": { "stop_reason": "refusal", "stop_details": { "type": "refusal", "category": "cyber", "explanation": "Declined." } }, "usage": { "output_tokens": 0 } }), json!({ "type": "message_stop" })];
+        let refused = [
+            start(1, 0, 0),
+            json!({ "type": "message_delta", "delta": { "stop_reason": "refusal", "stop_details": { "type": "refusal", "category": "cyber", "explanation": "Declined." } }, "usage": { "output_tokens": 0 } }),
+            json!({ "type": "message_stop" }),
+        ];
         let Err(e) = stream(&refused).pop().unwrap() else { panic!("a refusal is an error") };
         assert_eq!((e.kind(), e.to_string()), (Some(crate::ErrorKind::Refusal), "Declined.".into()));
 
@@ -641,9 +648,6 @@ mod tests {
     #[test]
     fn reads_the_model_list() {
         let page = json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false });
-        assert_eq!(
-            parse_models(&page),
-            [ModelInfo { id: "claude-opus-5-5".into(), name: "Claude Opus 5.5".into(), context_window: Some(1_000_000), max_output: Some(128_000) }]
-        );
+        assert_eq!(parse_models(&page), [ModelInfo { id: "claude-opus-5-5".into(), name: "Claude Opus 5.5".into(), context_window: Some(1_000_000), max_output: Some(128_000) }]);
     }
 }

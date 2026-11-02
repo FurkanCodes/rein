@@ -93,10 +93,7 @@ pub fn usable(provider: &Provider, keys: &Keys) -> bool {
 /// The model to use when none is named: OpenAI's if you can pay for it,
 /// otherwise the first provider's you have a key for.
 pub fn default_model(providers: &[Provider], keys: &Keys) -> String {
-    providers
-        .iter()
-        .find_map(|p| p.default_model.as_ref().filter(|_| usable(p, keys)).map(|model| provider::spec(p, model)))
-        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_owned())
+    providers.iter().find_map(|p| p.default_model.as_ref().filter(|_| usable(p, keys)).map(|model| provider::spec(p, model))).unwrap_or_else(|| crate::DEFAULT_MODEL.to_owned())
 }
 
 /// Where `provider`'s requests go: its own server, or the one its
@@ -152,9 +149,7 @@ async fn chatgpt(http: &rein_llm::reqwest::Client) -> CliResult<Client> {
         return Err("your ChatGPT sign-in doesn't allow using your plan; run `rein login` and allow it".into());
     }
     if credentials.needs_refresh() {
-        credentials = signin::refresh(http, &credentials)
-            .await
-            .map_err(|e| format!("couldn't renew your ChatGPT sign-in ({}); run `rein login` to sign in again", describe(e)))?;
+        credentials = signin::refresh(http, &credentials).await.map_err(|e| format!("couldn't renew your ChatGPT sign-in ({}); run `rein login` to sign in again", describe(e)))?;
         store::write_json_private(&path, &credentials).map_err(describe)?;
     }
     Ok(Client::openai(http.clone(), credentials.access_token))

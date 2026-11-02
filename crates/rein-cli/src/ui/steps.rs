@@ -264,11 +264,7 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
         }
         Some(ToolName::Recall) => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
-            if found == 0 {
-                plain(Some(true), style.dim("nothing found"))
-            } else {
-                plain(Some(true), style.dim(&format!("{found} match{}", if found == 1 { "" } else { "es" })))
-            }
+            if found == 0 { plain(Some(true), style.dim("nothing found")) } else { plain(Some(true), style.dim(&format!("{found} match{}", if found == 1 { "" } else { "es" }))) }
         }
         // `edited a.rs: replaced 1 place` → `replaced 1 place`: the step
         // already says which file.
@@ -464,11 +460,14 @@ mod tests {
 
     #[test]
     fn shows_a_plan_as_a_checklist() {
-        let plan = call("plan", json!({"steps": [
-            {"step": "Read the parser", "status": "done"},
-            {"step": "Fix trailing commas", "status": "in_progress"},
-            {"step": "Run the tests", "status": "pending"}
-        ]}));
+        let plan = call(
+            "plan",
+            json!({"steps": [
+                {"step": "Read the parser", "status": "done"},
+                {"step": "Fix trailing commas", "status": "in_progress"},
+                {"step": "Run the tests", "status": "pending"}
+            ]}),
+        );
         assert_eq!(describe(&plan), ("Plan", "1 of 3 done".into()));
         let o = outcome(&plan, "Plan updated: 1 of 3 done.", Style::plain());
         assert_eq!(o.details, ["☑ Read the parser", "▸ Fix trailing commas", "☐ Run the tests"]);

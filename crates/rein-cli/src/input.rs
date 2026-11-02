@@ -94,8 +94,13 @@ impl Picking {
         if query.is_empty() {
             return (0..self.menu.items.len()).collect();
         }
-        let mut scored: Vec<(i64, usize)> =
-            self.menu.items.iter().enumerate().filter_map(|(i, (name, about))| Some((fuzzy::score(query, name).or_else(|| Some(fuzzy::score(query, &format!("{name} {about}"))? - 1000))?, i))).collect();
+        let mut scored: Vec<(i64, usize)> = self
+            .menu
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (name, about))| Some((fuzzy::score(query, name).or_else(|| Some(fuzzy::score(query, &format!("{name} {about}"))? - 1000))?, i)))
+            .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.into_iter().map(|(_, i)| i).collect()
     }
@@ -343,7 +348,16 @@ impl Boxed {
             let width = self.pinned.text_width().max(2);
             let dots = self.editor.text().chars().count().min(width - 1);
             let notes = (String::new(), "enter saves it · esc cancels".to_owned());
-            return Bottom { above, tone: Tone::Asking, mark: s.bold(&s.yellow("?")), lines: vec!["•".repeat(dots)], caret: Some((0, dots)), notes, below: self.below(), compact: String::new() };
+            return Bottom {
+                above,
+                tone: Tone::Asking,
+                mark: s.bold(&s.yellow("?")),
+                lines: vec!["•".repeat(dots)],
+                caret: Some((0, dots)),
+                notes,
+                below: self.below(),
+                compact: String::new(),
+            };
         }
         let (mut lines, (line, column)) = self.editor.layout(self.pinned.text_width());
         // Keep the line with the cursor in view.
@@ -582,11 +596,8 @@ impl Boxed {
             let (name, about) = &picking.menu.items[i];
             let mark = if picking.menu.current == Some(i) { "•" } else { " " };
             let pad = " ".repeat(names.saturating_sub(width(name)));
-            let line = if n == picking.picked {
-                format!(" {} {}{mark} {pad} {}", s.blue("›"), s.bold(&s.blue(name)), about)
-            } else {
-                format!("   {name}{mark} {pad} {}", s.dim(about))
-            };
+            let line =
+                if n == picking.picked { format!(" {} {}{mark} {pad} {}", s.blue("›"), s.bold(&s.blue(name)), about) } else { format!("   {name}{mark} {pad} {}", s.dim(about)) };
             below.push(fit(&line, cols.saturating_sub(1)));
         }
         let hidden = matching.len().saturating_sub(first + PICK_LINES);
@@ -624,7 +635,11 @@ impl Boxed {
         // The wheel scrolls the viewer's text, when it's open.
         let key = match key {
             Key::Mouse { button, .. } if self.viewer.is_some() && button & 64 != 0 => {
-                if button & 1 == 0 { Key::Up } else { Key::Down }
+                if button & 1 == 0 {
+                    Key::Up
+                } else {
+                    Key::Down
+                }
             }
             Key::Mouse { .. } if self.viewer.is_some() => return,
             key => key,
@@ -678,8 +693,8 @@ impl Boxed {
             self.redraw();
             return;
         }
-        let answering = self.waiting == Waiting::Answer
-            && self.asking.as_ref().is_some_and(|asking| (paused && asking.since.elapsed() >= GRACE) || matches!(key, Key::Esc | Key::CtrlC));
+        let answering =
+            self.waiting == Waiting::Answer && self.asking.as_ref().is_some_and(|asking| (paused && asking.since.elapsed() >= GRACE) || matches!(key, Key::Esc | Key::CtrlC));
         if answering {
             self.answer(&key);
             self.draw();
@@ -946,11 +961,7 @@ pub enum Copied {
 /// is one, and otherwise by asking the terminal.
 pub fn copy(text: &str) -> Copied {
     use std::io::Write as _;
-    let commands: &[&[&str]] = if cfg!(target_os = "macos") {
-        &[&["pbcopy"]]
-    } else {
-        &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"]]
-    };
+    let commands: &[&[&str]] = if cfg!(target_os = "macos") { &[&["pbcopy"]] } else { &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"]] };
     let local = std::env::var_os("SSH_CONNECTION").is_none();
     for command in commands.iter().filter(|_| local) {
         let child = std::process::Command::new(command[0])
@@ -1050,15 +1061,18 @@ impl Input {
         let (requests, asked) = std::sync::mpsc::channel::<String>();
         let (tx, replies) = tokio::sync::mpsc::unbounded_channel();
         let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
-        if pinned && terminal && let Some(raw) = Raw::enter() {
+        if pinned
+            && terminal
+            && let Some(raw) = Raw::enter()
+        {
             screen::restore_on_panic();
             let boxed = Arc::new(Mutex::new(Boxed {
                 pinned: Pinned::start(Style::stderr()),
                 editor: Editor::with_history(history),
                 waiting: Waiting::Nothing,
                 prompt: String::new(),
-            secret: false,
-            picking: None,
+                secret: false,
+                picking: None,
                 asking: None,
                 busy: None,
                 steering: Vec::new(),

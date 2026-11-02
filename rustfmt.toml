@@ -1,0 +1,4 @@
+# rein is written in long lines on purpose: a line says one thing, and
+# reads whole on a wide screen. This keeps `cargo fmt` close to that.
+max_width = 180
+use_small_heuristics = "Max"

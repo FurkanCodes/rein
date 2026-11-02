@@ -37,7 +37,12 @@ pub enum Key {
     /// The mouse, as the terminal reports it once asked: which button
     /// (64 and 65 are the wheel; 32 is added while dragging), where, from
     /// 1, and whether it was let go.
-    Mouse { button: u16, x: usize, y: usize, up: bool },
+    Mouse {
+        button: u16,
+        x: usize,
+        y: usize,
+        up: bool,
+    },
     /// Delete the word before the cursor.
     DeleteWord,
     /// Delete everything before the cursor.
@@ -332,11 +337,10 @@ mod tests {
     #[test]
     fn reads_the_mouse_and_scrolling_keys() {
         assert_eq!(keys(b"\x1b[<64;10;5M"), [Key::Mouse { button: 64, x: 10, y: 5, up: false }], "the wheel, up");
-        assert_eq!(keys(b"\x1b[<0;3;4M\x1b[<32;6;4M\x1b[<0;6;4m"), [
-            Key::Mouse { button: 0, x: 3, y: 4, up: false },
-            Key::Mouse { button: 32, x: 6, y: 4, up: false },
-            Key::Mouse { button: 0, x: 6, y: 4, up: true },
-        ]);
+        assert_eq!(
+            keys(b"\x1b[<0;3;4M\x1b[<32;6;4M\x1b[<0;6;4m"),
+            [Key::Mouse { button: 0, x: 3, y: 4, up: false }, Key::Mouse { button: 32, x: 6, y: 4, up: false }, Key::Mouse { button: 0, x: 6, y: 4, up: true },]
+        );
         assert_eq!(keys(b"\x1b[1;2A\x1b[1;2B\x1b[A"), [Key::ScrollUp, Key::ScrollDown, Key::Up]);
     }
 

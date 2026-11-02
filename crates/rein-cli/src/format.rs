@@ -50,14 +50,7 @@ pub(crate) fn local_time(time: SystemTime) -> LocalTime {
     // writes into the one we pass.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&seconds, &mut tm) };
-    LocalTime {
-        year: tm.tm_year + 1900,
-        month: (tm.tm_mon + 1) as u32,
-        day: tm.tm_mday as u32,
-        hour: tm.tm_hour as u32,
-        minute: tm.tm_min as u32,
-        second: tm.tm_sec as u32,
-    }
+    LocalTime { year: tm.tm_year + 1900, month: (tm.tm_mon + 1) as u32, day: tm.tm_mday as u32, hour: tm.tm_hour as u32, minute: tm.tm_min as u32, second: tm.tm_sec as u32 }
 }
 
 /// What the requests cost on the wire: `412 KB as 128 KB (gzip, 3.2× fewer bytes)`.

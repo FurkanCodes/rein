@@ -55,11 +55,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Vec<String>) -> CliResult {
-    let http = rein_llm::reqwest::Client::builder()
-        .user_agent(concat!("rein/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let http =
+        rein_llm::reqwest::Client::builder().user_agent(concat!("rein/", env!("CARGO_PKG_VERSION"))).connect_timeout(Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["-h" | "--help"] => {

@@ -160,16 +160,7 @@ async fn begin_on(port: u16, host_id: &str, agent_name: &str, previous: Option<&
         }
     }
     let url = Url::parse_with_params(AUTHORIZE_URL, &params).expect("authorize URL is valid").to_string();
-    Ok(PendingSignIn {
-        url,
-        listener,
-        redirect_uri,
-        state,
-        nonce,
-        verifier,
-        host_id: host_id.to_owned(),
-        client_id: previous.map(|p| p.client_id.clone()),
-    })
+    Ok(PendingSignIn { url, listener, redirect_uri, state, nonce, verifier, host_id: host_id.to_owned(), client_id: previous.map(|p| p.client_id.clone()) })
 }
 
 impl PendingSignIn {
@@ -273,12 +264,7 @@ fn callback_result(query: &HashMap<String, String>, saved_client_id: Option<&str
 pub async fn refresh(http: &reqwest::Client, credentials: &Credentials) -> Result<Credentials> {
     let token = request_token(
         http,
-        &[
-            ("grant_type", "refresh_token"),
-            ("client_id", credentials.client_id.as_str()),
-            ("refresh_token", credentials.refresh_token.as_str()),
-            ("resource", RESOURCE),
-        ],
+        &[("grant_type", "refresh_token"), ("client_id", credentials.client_id.as_str()), ("refresh_token", credentials.refresh_token.as_str()), ("resource", RESOURCE)],
     )
     .await?;
     let mut next = credentials.clone();
@@ -333,9 +319,7 @@ struct IdClaims {
 /// for verification against its published keys, so that's a follow-up.
 fn id_token_claims(id_token: &str, client_id: &str, nonce: &str) -> Result<IdClaims> {
     let payload = id_token.split('.').nth(1).ok_or_else(|| auth_error("the ID token isn't a JWT"))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .map_err(|_| auth_error("the ID token isn't valid base64url"))?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).map_err(|_| auth_error("the ID token isn't valid base64url"))?;
     let claims: Value = serde_json::from_slice(&bytes)?;
     if claims["iss"] != ISSUER {
         return Err(auth_error("the ID token has the wrong issuer"));

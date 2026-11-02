@@ -297,15 +297,8 @@ impl Error {
     pub fn api(status: Option<u16>, code: Option<String>, message: String, request_id: Option<String>) -> Error {
         let lower = message.to_lowercase();
         let rejected = status.is_none_or(|s| matches!(s, 400 | 413 | 422));
-        let full = [
-            "prompt is too long",
-            "context length",
-            "context window",
-            "maximum context",
-            "exceeds the maximum number of tokens",
-            "input token count",
-            "too many input tokens",
-        ];
+        let full =
+            ["prompt is too long", "context length", "context window", "maximum context", "exceeds the maximum number of tokens", "input token count", "too many input tokens"];
         let named = code.as_deref().unwrap_or_default();
         let kind = if named == "context_length_exceeded" || rejected && full.iter().any(|words| lower.contains(words)) {
             ErrorKind::ContextFull
@@ -377,14 +370,7 @@ impl fmt::Display for Error {
             Error::Json(e) => write!(f, "unexpected response: {e}"),
             Error::Api { status, code, message, request_id, .. } => {
                 write!(f, "{message}")?;
-                let details: Vec<String> = [
-                    status.map(|s| format!("HTTP {s}")),
-                    code.clone(),
-                    request_id.as_ref().map(|r| format!("request {r}")),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
+                let details: Vec<String> = [status.map(|s| format!("HTTP {s}")), code.clone(), request_id.as_ref().map(|r| format!("request {r}"))].into_iter().flatten().collect();
                 if !details.is_empty() {
                     write!(f, " ({})", details.join(", "))?;
                 }

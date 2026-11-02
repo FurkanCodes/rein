@@ -73,8 +73,7 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str]) -> Value {
         body["systemInstruction"] = json!({ "parts": [{ "text": instructions }] });
     }
     if !request.tools.is_empty() {
-        let declarations: Vec<Value> =
-            request.tools.iter().map(|t| json!({ "name": t.name, "description": t.description, "parametersJsonSchema": t.parameters })).collect();
+        let declarations: Vec<Value> = request.tools.iter().map(|t| json!({ "name": t.name, "description": t.description, "parametersJsonSchema": t.parameters })).collect();
         body["tools"] = json!([{ "functionDeclarations": declarations }]);
     }
     let mut thinking = json!({});
@@ -427,7 +426,9 @@ mod tests {
             parts(json!([{ "text": "**Planning**", "thought": true }])),
             parts(json!([{ "text": "Let me " }])),
             parts(json!([{ "text": "look.", "thoughtSignature": "sigT" }])),
-            parts(json!([{ "functionCall": { "name": "read", "args": { "path": "a.rs" } }, "thoughtSignature": "sigC" }, { "functionCall": { "id": "fc_2", "name": "glob", "args": {} } }])),
+            parts(
+                json!([{ "functionCall": { "name": "read", "args": { "path": "a.rs" } }, "thoughtSignature": "sigC" }, { "functionCall": { "id": "fc_2", "name": "glob", "args": {} } }]),
+            ),
             json!({ "candidates": [{ "content": { "role": "model", "parts": [{ "text": "" }] }, "finishReason": "STOP" }],
                     "usageMetadata": { "promptTokenCount": 1000, "cachedContentTokenCount": 800, "candidatesTokenCount": 20, "thoughtsTokenCount": 30 } }),
         ];
@@ -477,9 +478,6 @@ mod tests {
             { "name": "models/gemini-3.8-flash", "displayName": "Gemini 3.8 Flash", "inputTokenLimit": 1048576, "outputTokenLimit": 65536, "supportedGenerationMethods": ["generateContent", "countTokens"] },
             { "name": "models/text-embedding-005", "supportedGenerationMethods": ["embedContent"] },
         ] });
-        assert_eq!(
-            parse_models(&page),
-            [ModelInfo { id: "gemini-3.8-flash".into(), name: "Gemini 3.8 Flash".into(), context_window: Some(1_048_576), max_output: Some(65_536) }]
-        );
+        assert_eq!(parse_models(&page), [ModelInfo { id: "gemini-3.8-flash".into(), name: "Gemini 3.8 Flash".into(), context_window: Some(1_048_576), max_output: Some(65_536) }]);
     }
 }

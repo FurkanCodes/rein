@@ -48,13 +48,7 @@ pub async fn begin(auth_url: &str, label: &str) -> Result<PendingSignIn> {
     }
     let (state, verifier) = (random_token()?, random_token()?);
     let callback = format!("http://localhost:{port}{CALLBACK_PATH}");
-    let params = [
-        ("callback_url", callback.as_str()),
-        ("code_challenge", &pkce_challenge(&verifier)),
-        ("code_challenge_method", "S256"),
-        ("state", &state),
-        ("key_label", label),
-    ];
+    let params = [("callback_url", callback.as_str()), ("code_challenge", &pkce_challenge(&verifier)), ("code_challenge_method", "S256"), ("state", &state), ("key_label", label)];
     let url = Url::parse_with_params(auth_url, &params).map_err(|e| Error::Auth(format!("bad sign-in URL: {e}")))?.to_string();
     Ok(PendingSignIn { url, listeners, state, verifier })
 }
@@ -113,7 +107,11 @@ async fn handle_callback(mut socket: TcpStream, state: &str) -> Option<Result<St
         (Some(code), None) => Ok(code.clone()),
         (_, error) => Err(Error::Auth(format!("sign-in wasn't completed ({})", error.map_or("no code came back", String::as_str)))),
     };
-    let page = if result.is_ok() { "rein is connected to OpenRouter. You can close this tab and go back to the terminal." } else { "OpenRouter wasn't connected. You can close this tab and go back to the terminal." };
+    let page = if result.is_ok() {
+        "rein is connected to OpenRouter. You can close this tab and go back to the terminal."
+    } else {
+        "OpenRouter wasn't connected. You can close this tab and go back to the terminal."
+    };
     respond(&mut socket, if result.is_ok() { 200 } else { 400 }, page).await;
     Some(result)
 }

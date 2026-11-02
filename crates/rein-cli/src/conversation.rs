@@ -1,9 +1,14 @@
 //! A conversation: starting or continuing one, its loop of messages and
 //! commands, and the menus and sign-ins those open.
 
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use crate::args::{AskArgs, Resume};
+use crate::commands::{EffortSetting, Slash};
+use crate::format::{local_time, shorten, shown_path, thousands, traffic};
+use crate::input::{Menu, Read};
+use crate::terminal::{Last, Terminal, you_said};
+use crate::ui::history::{self, History};
+use crate::ui::style::GUTTER;
+use crate::{CREDENTIALS_FILE, CliResult, config_dir, describe, login};
 use rein_agent::agent::{Agent, Llm, MAX_TURNS, Outcome};
 use rein_agent::compact;
 use rein_agent::permissions::{Mode, Permissions};
@@ -13,14 +18,9 @@ use rein_agent::{context, prompt};
 use rein_llm::Item;
 use rein_llm::provider::{self, Provider};
 use rein_llm::{Effort, ModelInfo};
-use crate::commands::{EffortSetting, Slash};
-use crate::input::{Menu, Read};
-use crate::ui::history::{self, History};
-use crate::ui::style::GUTTER;
-use crate::args::{AskArgs, Resume};
-use crate::terminal::{Last, Terminal, you_said};
-use crate::format::{local_time, shorten, shown_path, thousands, traffic};
-use crate::{login, CREDENTIALS_FILE, CliResult, config_dir, describe};
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option<String>) -> CliResult {
     let dir = config_dir()?;
@@ -39,11 +39,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     // Whoever serves the model, as soon as that's known: the model list,
     // which says how big each model's context window is, loads while
     // everything else gets ready.
-    let early = if args.model_given || args.resume == Resume::New {
-        Some(wanted.clone())
-    } else {
-        latest.as_deref().and_then(session::peek).map(|header| header.model)
-    };
+    let early = if args.model_given || args.resume == Resume::New { Some(wanted.clone()) } else { latest.as_deref().and_then(session::peek).map(|header| header.model) };
     let mut connected = match &early {
         Some(spec) => {
             let connected = crate::connect::connect(http, &providers, &keys, spec, args.compress).await?;
@@ -562,7 +558,8 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
             setup.keys = crate::connect::load_keys(&config_dir()?)?;
             let signed_in = config_dir()?.join(CREDENTIALS_FILE).exists();
             let mut names = vec!["chatgpt".to_owned()];
-            let mut items = vec![("chatgpt".to_owned(), if signed_in { "signed in: your ChatGPT plan pays for OpenAI's models" } else { "your ChatGPT plan, for OpenAI's models" }.to_owned())];
+            let mut items =
+                vec![("chatgpt".to_owned(), if signed_in { "signed in: your ChatGPT plan pays for OpenAI's models" } else { "your ChatGPT plan, for OpenAI's models" }.to_owned())];
             for provider in setup.providers.iter().filter(|p| p.needs_key) {
                 names.push(provider.name.clone());
                 let how = if provider.sign_in_url.is_some() { ", signs in in the browser" } else { "" };

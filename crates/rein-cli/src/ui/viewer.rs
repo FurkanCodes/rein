@@ -130,11 +130,8 @@ impl Viewer {
         let title = self.entries.get(self.index).map_or("", |entry| entry.title.as_str());
         let count = self.lines().len();
         // A read's title already says how many lines it has.
-        let head = if title.ends_with(" lines") || title.ends_with(" line") {
-            format!(" {title} ")
-        } else {
-            format!(" {title} · {count} line{} ", if count == 1 { "" } else { "s" })
-        };
+        let head =
+            if title.ends_with(" lines") || title.ends_with(" line") { format!(" {title} ") } else { format!(" {title} · {count} line{} ", if count == 1 { "" } else { "s" }) };
         let place = format!(" {} of {} ", self.index + 1, self.entries.len());
         let room = (inner + 2).saturating_sub(1 + width(&place));
         let head = cut(&head, room);

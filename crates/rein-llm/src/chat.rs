@@ -89,11 +89,8 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], quirks: Quir
         body["stream_options"] = json!({ "include_usage": true });
     }
     if !request.tools.is_empty() {
-        let tools: Vec<Value> = request
-            .tools
-            .iter()
-            .map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } }))
-            .collect();
+        let tools: Vec<Value> =
+            request.tools.iter().map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } })).collect();
         body["tools"] = json!(tools);
     }
     if let Some(effort) = request.reasoning_effort
@@ -386,7 +383,17 @@ mod tests {
     fn items_become_chat_messages() {
         let reasoning = Item::Opaque(Opaque::new(Api::Chat, json!({ "reasoning_content": "Let me look." })));
         let claude = Item::Opaque(Opaque::new(Api::Anthropic, json!({ "type": "thinking", "thinking": "", "signature": "s" })));
-        let input = vec![Item::User("read a.rs".into()), claude, reasoning, Item::Assistant("Reading.".into()), call("c1"), call("c2"), result("c1"), result("c2"), Item::Assistant("Done.".into())];
+        let input = vec![
+            Item::User("read a.rs".into()),
+            claude,
+            reasoning,
+            Item::Assistant("Reading.".into()),
+            call("c1"),
+            call("c2"),
+            result("c1"),
+            result("c2"),
+            Item::Assistant("Done.".into()),
+        ];
         let body = request_body(&request(&input), &[], Quirks::default());
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[0], json!({ "role": "system", "content": "be brief" }));

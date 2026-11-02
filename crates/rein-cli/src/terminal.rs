@@ -1,14 +1,7 @@
 //! The terminal rein talks through: what it shows of a turn as it
 //! happens, and how it asks, as the agent's [`Ui`].
 
-use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
-use std::time::Duration;
-use rein_agent::agent::{Approval, Compacted, Ui};
-use rein_agent::compact;
-use rein_agent::permissions::Mode;
-use rein_agent::tools::ToolName;
-use rein_llm::{Effort, ToolCall, Usage};
+use crate::format::thousands;
 use crate::input::{Input, Question, Read};
 use crate::ui::history::History;
 use crate::ui::markdown::Markdown;
@@ -16,7 +9,14 @@ use crate::ui::spinner::Spinner;
 use crate::ui::steps;
 use crate::ui::style::{GUTTER, Style, strip};
 use crate::ui::wrap::Wrap;
-use crate::format::{thousands};
+use rein_agent::agent::{Approval, Compacted, Ui};
+use rein_agent::compact;
+use rein_agent::permissions::Mode;
+use rein_agent::tools::ToolName;
+use rein_llm::{Effort, ToolCall, Usage};
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
+use std::time::Duration;
 
 /// The width of the terminal showing rein's answers, if stdout is one.
 pub(crate) fn terminal_width() -> Option<usize> {
@@ -427,10 +427,7 @@ impl Ui for Terminal {
                 let lead = if self.out.on() { lead } else { strip(&lead) };
                 out!("{lead}");
             }
-            self.answer = Some(Answer {
-                markdown: width.map(|_| Markdown::new(self.out.on())),
-                wrap: width.map(|width| Wrap::new(width, GUTTER, GUTTER)),
-            });
+            self.answer = Some(Answer { markdown: width.map(|_| Markdown::new(self.out.on())), wrap: width.map(|width| Wrap::new(width, GUTTER, GUTTER)) });
             if self.input.pinned() && !self.compacting {
                 self.doing("Writing");
             }
@@ -628,7 +625,11 @@ impl Ui for Terminal {
         };
         let note = self.noted.take().map(|note| format!("{}{} {}", " ".repeat(steps::INDENT), s.green("✓"), s.dim(&note)));
         // Reads in a row share a line.
-        if ToolName::of(call) == Some(ToolName::Read) && outcome.ok == Some(true) && note.is_none() && let Some(lead) = lead.clone() {
+        if ToolName::of(call) == Some(ToolName::Read)
+            && outcome.ok == Some(true)
+            && note.is_none()
+            && let Some(lead) = lead.clone()
+        {
             self.show_read(call, outcome.status, lead);
             self.last = Last::Step;
             return;

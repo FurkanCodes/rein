@@ -439,9 +439,6 @@ mod tests {
     #[test]
     fn bad_rules_are_reported_with_their_line() {
         assert_eq!(Permissions::new(Mode::Ask, "allow ls\npermit ls").unwrap_err(), "line 2: start with allow, ask or deny");
-        assert_eq!(
-            Permissions::new(Mode::Ask, "allow ls && rm").unwrap_err(),
-            "line 1: give one plain command, like `cargo test`"
-        );
+        assert_eq!(Permissions::new(Mode::Ask, "allow ls && rm").unwrap_err(), "line 1: give one plain command, like `cargo test`");
     }
 }

@@ -291,10 +291,8 @@ impl<M: Model> Agent<M> {
                     break;
                 }
                 // Lookups asked for together run at once: they only look.
-                let together = calls[next..]
-                    .iter()
-                    .take_while(|call| ToolName::of(call).is_some_and(ToolName::only_looks) && self.permissions.decide(call) == Decision::Allow)
-                    .count();
+                let together =
+                    calls[next..].iter().take_while(|call| ToolName::of(call).is_some_and(ToolName::only_looks) && self.permissions.decide(call) == Decision::Allow).count();
                 if together > 1 {
                     let batch = &calls[next..next + together];
                     ui.tools_started(batch);
@@ -385,7 +383,10 @@ impl<M: Model> Agent<M> {
             for instructions in self.instructions_for(&mention.path, folder) {
                 let call = self.mention_call("read", json!({ "path": instructions, "start_line": null, "line_count": null }));
                 let text = self.tools.run(&call).await;
-                let output = format!("Instructions for working in {}/, from {instructions}; follow them there:\n\n{text}", Path::new(&instructions).parent().map(|p| p.display().to_string()).unwrap_or_default());
+                let output = format!(
+                    "Instructions for working in {}/, from {instructions}; follow them there:\n\n{text}",
+                    Path::new(&instructions).parent().map(|p| p.display().to_string()).unwrap_or_default()
+                );
                 self.attached(call, output, ui)?;
             }
             let call = if folder {
@@ -432,7 +433,10 @@ impl<M: Model> Agent<M> {
             .filter_map(|dir| {
                 let file = ["AGENTS.md", "CLAUDE.md"].into_iter().map(|name| dir.join(name)).find(|file| self.tools.root().join(file).is_file())?;
                 let file = file.to_string_lossy().into_owned();
-                let held = self.history.iter().any(|item| matches!(item, Item::ToolCall(call) if ToolName::of(call) == Some(ToolName::Read) && read_path(&call.arguments) == Some(file.clone())));
+                let held = self
+                    .history
+                    .iter()
+                    .any(|item| matches!(item, Item::ToolCall(call) if ToolName::of(call) == Some(ToolName::Read) && read_path(&call.arguments) == Some(file.clone())));
                 (!held).then_some(file)
             })
             .collect()
@@ -749,7 +753,10 @@ impl Model for Llm {
         let mut waits = RETRY_WAITS.iter();
         let mut stream = loop {
             match self.client.stream(request).await {
-                Err(e) if e.retryable() && let Some(&seconds) = waits.next() => {
+                Err(e)
+                    if e.retryable()
+                        && let Some(&seconds) = waits.next() =>
+                {
                     tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
                 }
                 result => break result?,
@@ -912,20 +919,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_message_sent_mid_turn_skips_the_steps_not_started() {
-        let mut agent = agent(
-            "steer",
-            vec![vec![bash("c1", "touch one"), bash("c2", "touch two")], vec![Item::Assistant("Using the helper.".into())]],
-        );
+        let mut agent = agent("steer", vec![vec![bash("c1", "touch one"), bash("c2", "touch two")], vec![Item::Assistant("Using the helper.".into())]]);
         let root = std::env::temp_dir().join(format!("rein-agent-{}-steer", std::process::id()));
         let mut steerer = Steerer { message: Some("stop, use the helper".into()), after: 1, finished: 0, log: Vec::new() };
         assert_eq!(agent.send("make two files".into(), &mut steerer).await.unwrap(), Outcome::Done);
         assert!(root.join("one").exists() && !root.join("two").exists(), "the second step never ran");
-        assert_eq!(steerer.log, [
-            r#"ran {"command":"touch one"}"#.to_owned(),
-            "result of c1: [exit code 0]".to_owned(),
-            format!("result of c2: {SKIPPED}"),
-            "steered stop, use the helper".to_owned(),
-        ]);
+        assert_eq!(
+            steerer.log,
+            [r#"ran {"command":"touch one"}"#.to_owned(), "result of c1: [exit code 0]".to_owned(), format!("result of c2: {SKIPPED}"), "steered stop, use the helper".to_owned(),]
+        );
         // The model next sees every call answered, then the message, last:
         // the start of the conversation is unchanged, for the cache.
         let requests = agent.model.requests.borrow();
@@ -979,15 +981,18 @@ mod tests {
         agent.send(message.into(), &mut person).await.unwrap();
         let requests = agent.model.requests.borrow();
         let input = &requests[0].input;
-        assert_eq!(input[..7], [
-            Item::User(message.into()),
-            read_call("mention_1", "src/a.rs", Value::Null, Value::Null),
-            result("mention_1", "fn a() {}\n"),
-            read_call("mention_3", "sub/AGENTS.md", Value::Null, Value::Null),
-            result("mention_3", "Instructions for working in sub/, from sub/AGENTS.md; follow them there:\n\nUse tabs.\n"),
-            read_call("mention_5", "sub/b.rs", json!(2), json!(1)),
-            result("mention_5", "two\n[lines 2-2 of 3; read again with start_line 3 for more]"),
-        ]);
+        assert_eq!(
+            input[..7],
+            [
+                Item::User(message.into()),
+                read_call("mention_1", "src/a.rs", Value::Null, Value::Null),
+                result("mention_1", "fn a() {}\n"),
+                read_call("mention_3", "sub/AGENTS.md", Value::Null, Value::Null),
+                result("mention_3", "Instructions for working in sub/, from sub/AGENTS.md; follow them there:\n\nUse tabs.\n"),
+                read_call("mention_5", "sub/b.rs", json!(2), json!(1)),
+                result("mention_5", "two\n[lines 2-2 of 3; read again with start_line 3 for more]"),
+            ]
+        );
         assert!(matches!(&input[8], Item::ToolResult { output, .. } if output.starts_with("error: can't read gone/x.rs")), "a path that isn't there is said so: {:?}", input[8]);
         assert_eq!(input.len(), 9, "@alice is just a word");
     }
@@ -1011,11 +1016,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(results, [
-            "first\n",
-            "[unchanged: a.txt is as it was when it was last read in this conversation, so that copy is current.]",
-            "changed\n",
-        ]);
+        assert_eq!(results, ["first\n", "[unchanged: a.txt is as it was when it was last read in this conversation, so that copy is current.]", "changed\n",]);
     }
 
     #[tokio::test]
@@ -1025,7 +1026,10 @@ mod tests {
             name: "grep".into(),
             arguments: json!({ "pattern": "two", "path": null, "glob": null, "ignore_case": false, "output": "files", "context": null }).to_string(),
         });
-        let turns = vec![vec![read_call("r1", "a.txt", Value::Null, Value::Null), read_call("r2", "b.txt", Value::Null, Value::Null), grep, bash("c1", "echo after")], vec![Item::Assistant("Done.".into())]];
+        let turns = vec![
+            vec![read_call("r1", "a.txt", Value::Null, Value::Null), read_call("r2", "b.txt", Value::Null, Value::Null), grep, bash("c1", "echo after")],
+            vec![Item::Assistant("Done.".into())],
+        ];
         let mut agent = agent("together", turns);
         let root = root_of("together");
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
@@ -1034,18 +1038,21 @@ mod tests {
         agent.send("look".into(), &mut person).await.unwrap();
         // The three lookups start together and their results come in order;
         // the command, which asks first, comes after them on its own.
-        assert_eq!(person.log, [
-            "ran read",
-            "ran read",
-            "ran grep",
-            "result one\n",
-            "result two\n",
-            "result 1 file with matches (1 matching line)\nb.txt (1 match)",
-            r#"asked {"command":"echo after"}"#,
-            "ran bash",
-            "result after\n[exit code 0]",
-            "text Done.",
-        ]);
+        assert_eq!(
+            person.log,
+            [
+                "ran read",
+                "ran read",
+                "ran grep",
+                "result one\n",
+                "result two\n",
+                "result 1 file with matches (1 matching line)\nb.txt (1 match)",
+                r#"asked {"command":"echo after"}"#,
+                "ran bash",
+                "result after\n[exit code 0]",
+                "text Done.",
+            ]
+        );
     }
 
     fn bash(id: &str, command: &str) -> Item {
@@ -1106,19 +1113,11 @@ mod tests {
 
     #[tokio::test]
     async fn saves_the_conversation_and_loads_it_back_the_same() {
-        let mut agent = agent(
-            "save",
-            vec![vec![bash("c1", "echo hi")], vec![Item::Assistant("Done.".into())]],
-        );
+        let mut agent = agent("save", vec![vec![bash("c1", "echo hi")], vec![Item::Assistant("Done.".into())]]);
         let folder = std::env::temp_dir().join(format!("rein-agent-{}-save-sessions", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
-        agent.session = Some(Session::new(&folder, "t", crate::session::Header {
-            id: "session-1".into(),
-            cwd: "/p".into(),
-            started: "now".into(),
-            model: "m".into(),
-            instructions: None,
-        }));
+        agent.session =
+            Some(Session::new(&folder, "t", crate::session::Header { id: "session-1".into(), cwd: "/p".into(), started: "now".into(), model: "m".into(), instructions: None }));
         agent.context = Some("<environment>here</environment>".into());
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("first".into(), &mut person).await.unwrap();
@@ -1155,13 +1154,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rein-agent-{}-compact", std::process::id()));
         std::fs::write(root.join("big.txt"), format!("{}needle 42\n", "hay\n".repeat(3000))).unwrap();
         let folder = root.join(".sessions");
-        agent.session = Some(Session::new(&folder, "t", crate::session::Header {
-            id: "session-1".into(),
-            cwd: "/p".into(),
-            started: "now".into(),
-            model: "m".into(),
-            instructions: None,
-        }));
+        agent.session =
+            Some(Session::new(&folder, "t", crate::session::Header { id: "session-1".into(), cwd: "/p".into(), started: "now".into(), model: "m".into(), instructions: None }));
         agent.window.limit = 2_000;
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("where is the needle?".into(), &mut person).await.unwrap();
@@ -1220,16 +1214,8 @@ mod tests {
         let client = Client::new(rein_llm::reqwest::Client::new(), rein_llm::Api::Responses, format!("http://127.0.0.1:{port}"), rein_llm::Auth::Bearer("test".into()));
         let model = Llm { client, record: None };
         let input = [Item::User("hi".into())];
-        let request = Request {
-            model: "m",
-            instructions: None,
-            input: &input,
-            tools: &[],
-            reasoning_effort: None,
-            reasoning_summary: false,
-            session_id: None,
-            max_output_tokens: None,
-        };
+        let request =
+            Request { model: "m", instructions: None, input: &input, tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
         let started = std::time::Instant::now();
         let (items, _) = model.respond(&request, &mut |_| {}).await.unwrap();
         assert!(items.iter().any(|item| matches!(item, Item::Assistant(_))));
@@ -1239,18 +1225,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_command_never_runs() {
-        let mut agent =
-            agent("refuse", vec![vec![bash("c1", "touch made-it")], vec![Item::Assistant("Okay.".into())]]);
+        let mut agent = agent("refuse", vec![vec![bash("c1", "touch made-it")], vec![Item::Assistant("Okay.".into())]]);
         let mut person = Person { answer: Approval::No, log: Vec::new() };
         agent.send("make a file".into(), &mut person).await.unwrap();
 
         assert!(!person.log.contains(&"ran bash".to_owned()));
         let root = std::env::temp_dir().join(format!("rein-agent-{}-refuse", std::process::id()));
         assert!(!root.join("made-it").exists());
-        assert!(agent.history.contains(&Item::ToolResult {
-            call_id: "c1".into(),
-            output: "The user declined to run this command.".into()
-        }));
+        assert!(agent.history.contains(&Item::ToolResult { call_id: "c1".into(), output: "The user declined to run this command.".into() }));
     }
 
     #[tokio::test]
@@ -1268,11 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_changes_ask_first_too() {
-        let write = Item::ToolCall(ToolCall {
-            call_id: "c1".into(),
-            name: "write".into(),
-            arguments: json!({"path": "notes.txt", "content": "hi"}).to_string(),
-        });
+        let write = Item::ToolCall(ToolCall { call_id: "c1".into(), name: "write".into(), arguments: json!({"path": "notes.txt", "content": "hi"}).to_string() });
         let mut agent = agent("refuse-write", vec![vec![write], vec![Item::Assistant("Okay.".into())]]);
         let mut person = Person { answer: Approval::No, log: Vec::new() };
         agent.send("write a note".into(), &mut person).await.unwrap();
@@ -1312,12 +1290,7 @@ mod tests {
     #[test]
     fn repair_answers_calls_a_cancelled_turn_left_open() {
         let mut agent = agent("repair", vec![]);
-        agent.history = vec![
-            Item::User("go".into()),
-            bash("c1", "echo done"),
-            Item::ToolResult { call_id: "c1".into(), output: "done".into() },
-            bash("c2", "sleep 100"),
-        ];
+        agent.history = vec![Item::User("go".into()), bash("c1", "echo done"), Item::ToolResult { call_id: "c1".into(), output: "done".into() }, bash("c2", "sleep 100")];
         agent.repair();
         assert_eq!(agent.history.len(), 5);
         assert!(matches!(&agent.history[4], Item::ToolResult { call_id, output } if call_id == "c2" && output.contains("interrupted")));

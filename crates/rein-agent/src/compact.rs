@@ -160,19 +160,13 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
                     *j > i && later.path.as_ref() == Some(path) && matches!(later.tool, Some(ToolName::Read | ToolName::Write | ToolName::Edit)) && !notes.contains(id)
                 });
                 if touched_later {
-                    retired.push((
-                        call_id.clone(),
-                        format!("{RETIRED} an older read of {path}. It was read or changed again later; read it again if you need it.]"),
-                    ));
+                    retired.push((call_id.clone(), format!("{RETIRED} an older read of {path}. It was read or changed again later; read it again if you need it.]")));
                 }
             }
             (Some(ToolName::Bash), _, Some(command)) if i < recent => {
                 let lines = output.lines().count();
                 let code = exit_code(output).map(|c| format!(", exit code {c}")).unwrap_or_default();
-                retired.push((
-                    call_id.clone(),
-                    format!("{RETIRED} the output of `{command}` ({lines} lines{code}). Run it again, or use recall to search it.]"),
-                ));
+                retired.push((call_id.clone(), format!("{RETIRED} the output of `{command}` ({lines} lines{code}). Run it again, or use recall to search it.]")));
             }
             (Some(ToolName::Grep | ToolName::Glob), _, _) if i < recent => {
                 let pattern = call.pattern.as_deref().unwrap_or_default();
@@ -352,11 +346,7 @@ pub fn recall_spec() -> Tool {
 pub fn recall(full: &[Item], arguments: &str) -> String {
     let query = serde_json::from_str::<Value>(arguments).ok().and_then(|v| v["query"].as_str().map(str::to_owned)).unwrap_or_default();
     // Models like to quote their search terms; the quotes aren't in the text.
-    let words: Vec<String> = query
-        .split_whitespace()
-        .map(|word| word.trim_matches(|c| matches!(c, '"' | '\'' | '`')).to_lowercase())
-        .filter(|word| !word.is_empty())
-        .collect();
+    let words: Vec<String> = query.split_whitespace().map(|word| word.trim_matches(|c| matches!(c, '"' | '\'' | '`')).to_lowercase()).filter(|word| !word.is_empty()).collect();
     if words.is_empty() {
         return "error: give some words to search for".into();
     }

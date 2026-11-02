@@ -469,14 +469,7 @@ impl Tools {
         let args: BashArgs = parse(arguments)?;
         let timeout = args.timeout_seconds.map_or(self.timeout, |s| Duration::from_secs(s).clamp(Duration::from_secs(1), MAX_TIMEOUT));
         let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg(&args.command)
-            .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        command.arg("-c").arg(&args.command).current_dir(&self.root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         // A group of its own, so stopping it stops what it started too.
         #[cfg(unix)]
         command.process_group(0);

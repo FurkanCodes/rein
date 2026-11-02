@@ -1,10 +1,10 @@
 //! The command line: rein's help, and what its flags and settings say.
 
-use std::path::PathBuf;
+use crate::CliResult;
+use crate::settings::Settings;
 use rein_agent::permissions::Mode;
 use rein_llm::Effort;
-use crate::settings::Settings;
-use crate::{CliResult};
+use std::path::PathBuf;
 
 pub(crate) const HELP: &str = "\
 rein: a tiny, fast agent harness. You hold the reins.
