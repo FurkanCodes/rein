@@ -41,6 +41,9 @@ pub struct Provider {
     /// What to `GET`, after the base URL, to tell whether a key works: a
     /// path the server only answers for a good key.
     pub key_check: String,
+    /// Where its official browser sign-in starts, for a provider that
+    /// makes you a key that way (OpenRouter's OAuth with PKCE).
+    pub sign_in_url: Option<String>,
     /// Whether it needs a key at all: a server on your own computer doesn't.
     pub needs_key: bool,
     /// The header the key goes in; `None` for `Authorization: Bearer`.
@@ -70,6 +73,7 @@ impl Provider {
             token_env: None,
             chatgpt: false,
             key_check: "models".into(),
+            sign_in_url: None,
             needs_key: !key_env.is_empty(),
             key_header: key_header(api),
             url_env: None,
@@ -122,6 +126,7 @@ pub fn builtin() -> Vec<Provider> {
             quirks: Quirks { effort_object: true, ..Quirks::default() },
             // Its model list is public: only this says whether a key works.
             key_check: "key".into(),
+            sign_in_url: Some(crate::openrouter::AUTH_URL.into()),
             ..chat("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY").keys_at("https://openrouter.ai/keys")
         },
         chat("groq", "Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY").keys_at("https://console.groq.com/keys"),

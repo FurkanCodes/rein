@@ -12,7 +12,9 @@ pub mod chat;
 pub mod client;
 pub mod decode;
 pub mod gemini;
+mod oauth;
 pub mod openai;
+pub mod openrouter;
 pub mod provider;
 pub mod sse;
 pub mod store;
@@ -175,13 +177,13 @@ pub struct Request {
 
 /// A fresh ID for one conversation, for [`Request::session_id`].
 pub fn new_session_id() -> Result<String> {
-    openai::signin::new_uuid()
+    oauth::new_uuid()
 }
 
 /// An ID for a tool call whose provider gave it none: unique in the
 /// conversation, as rein needs.
 pub(crate) fn new_call_id() -> String {
-    format!("call_{}", openai::signin::new_uuid().unwrap_or_default().replace('-', ""))
+    format!("call_{}", oauth::new_uuid().unwrap_or_default().replace('-', ""))
 }
 
 /// A model a provider offers.

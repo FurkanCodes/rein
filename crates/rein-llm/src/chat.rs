@@ -503,6 +503,19 @@ mod tests {
     }
 
     #[test]
+    fn reads_openrouters_real_model_list() {
+        // Trimmed from OpenRouter's public `GET /api/v1/models`, 2026-11-02.
+        let real: Value = serde_json::from_str(include_str!("../tests/fixtures/real-openrouter-models.json")).unwrap();
+        let models = parse_models(&real);
+        assert_eq!(models.len(), 3);
+        assert_eq!(
+            models[0],
+            ModelInfo { id: "recursive/flint-v1.0:free".into(), name: "Recursive: Flint (free)".into(), context_window: Some(262_144), max_output: Some(235_929) }
+        );
+        assert_eq!((models[2].id.as_str(), models[2].context_window, models[2].max_output), ("anthropic/claude-haiku-5.5", Some(1_000_000), Some(128_000)));
+    }
+
+    #[test]
     fn reads_every_model_list() {
         let openrouter = json!({ "data": [{ "id": "qwen/qwen3-coder", "name": "Qwen3 Coder", "context_length": 262144, "top_provider": { "max_completion_tokens": 65536 } }] });
         assert_eq!(parse_models(&openrouter)[0], ModelInfo { id: "qwen/qwen3-coder".into(), name: "Qwen3 Coder".into(), context_window: Some(262_144), max_output: Some(65_536) });

@@ -38,6 +38,11 @@ OpenAI's, `gemini-*` Google's), or you name the provider first:
   saved key. A gateway in front of Claude takes `ANTHROPIC_AUTH_TOKEN`.
   `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL` and `GOOGLE_GEMINI_BASE_URL` point
   rein at another server that speaks the same API, like a proxy.
+- **OpenRouter, signing in in the browser.** `rein login openrouter` uses
+  OpenRouter's official [sign-in for apps](https://openrouter.ai/docs/use-cases/oauth-pkce):
+  you say yes in the browser, and OpenRouter makes rein a key of its own,
+  billed to your OpenRouter credits, which you can see or delete in its
+  settings. `--key` pastes one instead.
 - **Nothing, on your own computer.** Ollama and LM Studio need no key.
 
 Claude and Gemini plans can't be used: Anthropic and Google don't allow
@@ -100,6 +105,7 @@ the model the conversation was left with.
 ```sh
 rein login                      # continue with ChatGPT
 rein login anthropic            # save an API key, checked first
+rein login openrouter           # sign in in the browser; OpenRouter makes rein a key
 rein providers                  # who rein can reach, and what pays
 rein models                     # list the models you can use, by provider
 rein                            # a conversation in this folder
@@ -333,6 +339,16 @@ It also checks what goes over the wire: that each block of Claude's thinking
 rein sends back follows exactly the conversation it was signed with, through
 compactions, as Anthropic checks; that Gemini's signatures go back on their
 parts; and that a field a server turned away isn't sent to it again.
+`crates/rein-cli/tests/e2e.rs` runs rein against real providers, with your
+keys: an answer with a tool call from each one rein can pay (or that's
+running, for Ollama), Claude's cache across two requests, a conversation
+moved from one provider to another, and Claude through a compaction. It's
+off unless asked, since it costs a little:
+
+```sh
+REIN_E2E=1 cargo test --test e2e -- --nocapture --test-threads 1
+```
+
 Record a real stream with
 `rein --record crates/rein-llm/tests/fixtures/<name>.sse "<prompt>"`. Recordings
 contain your account's `safety_identifier`; change it to `user-REDACTED` before

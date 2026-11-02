@@ -129,6 +129,10 @@ impl Model {
                     // As OpenRouter does: only a good key gets an answer here.
                     let good = head.to_lowercase().contains("authorization: bearer good-key");
                     if good { http(200, "application/json", br#"{"data":{"label":"test"}}"#) } else { http(401, "application/json", br#"{"error":{"message":"No auth credentials found","code":401}}"#) }
+                } else if head.starts_with("POST /v1/auth/keys ") {
+                    // As OpenRouter does at the end of its browser sign-in.
+                    heard.lock().unwrap().push(format!("{head}{}", String::from_utf8_lossy(&body)));
+                    http(200, "application/json", br#"{"key":"good-key","user_id":"u1"}"#)
                 } else if head.starts_with("GET") {
                     let models = match wire {
                         Wire::Responses => json!({ "data": [{ "id": "test-model" }, { "id": "gpt-6.1-sol" }] }),
@@ -469,6 +473,8 @@ impl Term {
             .envs(model.env.iter().map(|(name, value)| (name, value)))
             // Copies go to the terminal (OSC 52), never this computer's clipboard.
             .env("SSH_CONNECTION", "screen-test")
+            // Links are shown, never opened in this computer's browser.
+            .env("BROWSER", "false")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -1087,6 +1093,8 @@ fn run(model: &Model, home: &std::path::Path, args: &[&str], input: &str) -> (bo
         .env("HOME", home)
         .env("REIN_HOME", home)
         .env("ANTHROPIC_BASE_URL", &model.base)
+        // Never this computer's browser.
+        .env("BROWSER", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1105,10 +1113,10 @@ fn a_key_is_checked_where_only_a_good_one_gets_an_answer() {
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("providers"), format!("[openrouter]\nurl = {}\n", model.base)).unwrap();
-    let (ok, said) = run(&model, &home, &["login", "openrouter"], "bad-key\n");
+    let (ok, said) = run(&model, &home, &["login", "openrouter", "--key"], "bad-key\n");
     assert!(!ok && said.contains("that key didn't work") && said.contains("nothing was saved"), "{said}");
     assert!(!home.join("keys.json").exists());
-    let (ok, said) = run(&model, &home, &["login", "openrouter"], "good-key\n");
+    let (ok, said) = run(&model, &home, &["login", "openrouter", "--key"], "good-key\n");
     assert!(ok && said.contains("Saved. Your OpenRouter key works"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1216,4 +1224,58 @@ fn gemini_gets_its_thought_signatures_back_on_the_same_parts() {
     let contents = model.requests()[2]["contents"].as_array().unwrap().clone();
     let mention = contents.iter().rev().find(|c| c["role"] == "model" && c["parts"][0].get("functionCall").is_some()).unwrap();
     assert_eq!(mention["parts"][0]["thoughtSignature"], "skip_thought_signature_validator");
+}
+
+#[test]
+fn openrouter_sign_in_happens_in_the_browser_and_rein_keeps_the_key_it_makes() {
+    use std::io::BufRead;
+    let model = Model::chat(vec![], None);
+    let home = std::env::temp_dir().join(format!("rein-login-browser-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("providers"), format!("[openrouter]\nurl = {}\n", model.base)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rein"))
+        .args(["login", "openrouter"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("REIN_HOME", &home)
+        // A browser that can't open: rein shows the link instead.
+        .env("BROWSER", "false")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut said = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut shown = String::new();
+    let link = loop {
+        let mut line = String::new();
+        assert!(said.read_line(&mut line).unwrap() > 0, "no link shown: {shown}");
+        shown += &line;
+        if let Some(at) = line.find("https://openrouter.ai/auth?") {
+            break rein_llm::reqwest::Url::parse(line[at..].trim()).unwrap();
+        }
+    };
+    let param = |name: &str| link.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()).unwrap();
+    assert_eq!((param("code_challenge_method"), param("key_label")), ("S256".to_owned(), "rein".to_owned()));
+    // The browser comes back with a code, as OpenRouter sends it.
+    let callback = rein_llm::reqwest::Url::parse(&param("callback_url")).unwrap();
+    let mut browser = TcpStream::connect(("127.0.0.1", callback.port().unwrap())).unwrap();
+    write!(browser, "GET {}?code=c1&state={} HTTP/1.1\r\nHost: localhost\r\n\r\n", callback.path(), param("state")).unwrap();
+    let mut page = String::new();
+    browser.read_to_string(&mut page).unwrap();
+    assert!(page.starts_with("HTTP/1.1 200") && page.contains("rein is connected to OpenRouter"), "{page}");
+
+    let mut rest = String::new();
+    said.read_to_string(&mut rest).unwrap();
+    assert!(child.wait().unwrap().success(), "{shown}{rest}");
+    assert!(rest.contains("Signed in. OpenRouter made rein a key of its own"), "{rest}");
+    assert!(std::fs::read_to_string(home.join("keys.json")).unwrap().contains("good-key"));
+    let traded = model.heads().into_iter().find(|h| h.starts_with("POST /v1/auth/keys")).unwrap();
+    assert!(traded.contains("\"code\":\"c1\"") && traded.contains("code_verifier"), "{traded}");
+
+    let (ok, said) = run(&model, &home, &["logout", "openrouter"], "");
+    assert!(ok && said.contains("still works there until you delete it"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
 }

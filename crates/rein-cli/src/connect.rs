@@ -207,7 +207,9 @@ pub async fn connect(http: &rein_llm::reqwest::Client, providers: &[Provider], k
 }
 
 /// `rein login <provider>`: saves a key for it, after checking it works.
-pub async fn login(http: &rein_llm::reqwest::Client, name: &str) -> CliResult {
+/// A provider with an official browser sign-in makes one that way, unless
+/// `paste` says you'd rather paste one.
+pub async fn login(http: &rein_llm::reqwest::Client, name: &str, paste: bool) -> CliResult {
     let providers = providers(&config_dir()?)?;
     let Some(provider) = providers.iter().find(|p| p.name == name) else {
         let names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
@@ -216,8 +218,14 @@ pub async fn login(http: &rein_llm::reqwest::Client, name: &str) -> CliResult {
     if !provider.needs_key {
         return Err(format!("{} needs no key: use a model of it, like {name}/<model>", provider.title));
     }
-    let get = provider.keys_url.as_deref().map(|url| format!(" (from {url})")).unwrap_or_default();
-    let key = read_secret(&format!("Paste your {} API key{get}: ", provider.title))?;
+    let signed_in = provider.sign_in_url.as_deref().filter(|_| !paste);
+    let key = match signed_in {
+        Some(auth_url) => key_from_browser(http, provider, auth_url).await?,
+        None => {
+            let get = provider.keys_url.as_deref().map(|url| format!(" (from {url})")).unwrap_or_default();
+            read_secret(&format!("Paste your {} API key{get}: ", provider.title))?
+        }
+    };
     if key.is_empty() {
         return Err("no key given; nothing was saved".into());
     }
@@ -230,13 +238,33 @@ pub async fn login(http: &rein_llm::reqwest::Client, name: &str) -> CliResult {
     keys.insert(provider.name.clone(), key);
     store::write_json_private(&dir.join(KEYS_FILE), &keys).map_err(describe)?;
     let count = if models.len() == 1 { "1 model".to_owned() } else { format!("{} models", models.len()) };
-    say!("Saved. Your {} key works: {count}. `rein models {name}` lists them.", provider.title);
+    if signed_in.is_some() {
+        let manage = provider.keys_url.as_deref().map(|url| format!("; see or delete it at {url}")).unwrap_or_default();
+        say!("Signed in. {} made rein a key of its own, billed to your account{manage}.", provider.title);
+        say!("It works: {count}. `rein models {name}` lists them.");
+    } else {
+        say!("Saved. Your {} key works: {count}. `rein models {name}` lists them.", provider.title);
+    }
     match payment(provider, &keys) {
         Some(Payment::Plan) => say!("You're signed in with ChatGPT, which comes first; `rein logout chatgpt` to use this key instead."),
         Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => say!("While ${var} is set, rein uses that instead."),
         _ => {}
     }
     Ok(())
+}
+
+/// A key `provider` makes for rein when you sign in in the browser.
+async fn key_from_browser(http: &rein_llm::reqwest::Client, provider: &Provider, auth_url: &str) -> CliResult<String> {
+    let pending = rein_llm::openrouter::begin(auth_url, "rein").await.map_err(describe)?;
+    say!("Sign in to {} in your browser, and rein gets a key of its own...", provider.title);
+    if !crate::open_browser(&pending.url) {
+        say!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url);
+    }
+    let (base, _) = base_url(provider);
+    tokio::time::timeout(Duration::from_secs(600), pending.finish(http, &base))
+        .await
+        .map_err(|_| format!("sign-in timed out after 10 minutes; run `rein login {}` again", provider.name))?
+        .map_err(describe)
 }
 
 /// `rein logout <provider>`: forgets its saved key, or your ChatGPT sign-in.
@@ -258,6 +286,11 @@ pub fn logout(name: &str) -> CliResult {
     }
     store::write_json_private(&dir.join(KEYS_FILE), &keys).map_err(describe)?;
     say!("Forgot your {name} key.");
+    let providers = providers(&dir)?;
+    if let Some(provider) = providers.iter().find(|p| p.name == name && p.sign_in_url.is_some()) {
+        let at = provider.keys_url.as_deref().map(|url| format!(": delete it at {url}")).unwrap_or_default();
+        say!("If {} made it for rein, it still works there until you delete it{at}.", provider.title);
+    }
     Ok(())
 }
 

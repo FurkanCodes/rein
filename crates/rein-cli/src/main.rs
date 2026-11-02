@@ -60,7 +60,8 @@ Usage:
   rein -c [<prompt...>]          Continue the latest conversation in this folder
   rein -r [<prompt...>]          Choose a saved conversation to continue
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
-  rein login <provider>          Save an API key for a provider, like anthropic
+  rein login <provider> [--key]  Save an API key for a provider, like anthropic;
+                                 openrouter signs in in the browser (--key: paste one)
   rein logout <provider>         Forget it (rein logout chatgpt signs out)
   rein providers                 List the providers rein can reach, and what pays
   rein models [<provider>]       List the models you can use
@@ -148,7 +149,8 @@ async fn run(args: Vec<String>) -> CliResult {
             Ok(())
         }
         ["login"] | ["login", "chatgpt"] => login(&http).await,
-        ["login", provider] => connect::login(&http, provider).await,
+        ["login", provider] => connect::login(&http, provider, false).await,
+        ["login", provider, "--key"] => connect::login(&http, provider, true).await,
         ["logout", provider] => connect::logout(provider),
         ["providers"] => connect::list(),
         ["models"] => connect::models(&http, None).await,
@@ -1797,7 +1799,14 @@ fn mask_email(email: &str) -> String {
     }
 }
 
+/// Opens `url` with `$BROWSER` if it's set, as many tools do, or else the
+/// system's way.
 fn open_browser(url: &str) -> bool {
+    if let Some(browser) = std::env::var("BROWSER").ok().filter(|b| !b.trim().is_empty()) {
+        let mut words = browser.split_whitespace();
+        let mut command = Command::new(words.next().unwrap_or_default());
+        return command.args(words).arg(url).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    }
     let mut command = if cfg!(target_os = "macos") {
         Command::new("open")
     } else if cfg!(windows) {
