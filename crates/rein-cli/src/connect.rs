@@ -19,6 +19,17 @@ use rein_llm::{Auth, Client, ModelInfo, store};
 use crate::{CREDENTIALS_FILE, CliResult, USAGE_URL, config_dir, describe};
 
 pub const KEYS_FILE: &str = "keys.json";
+pub const PROVIDERS_FILE: &str = "providers";
+
+/// rein's providers, and yours from `~/.config/rein/providers`.
+pub fn providers(dir: &Path) -> CliResult<Vec<Provider>> {
+    let path = dir.join(PROVIDERS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => provider::with_file(&text).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(provider::builtin()),
+        Err(e) => Err(format!("can't read {}: {e}", path.display())),
+    }
+}
 
 /// Keys saved with `rein login <provider>`, by provider.
 pub type Keys = BTreeMap<String, String>;
@@ -36,9 +47,11 @@ fn env_key(provider: &Provider) -> Option<(&str, String)> {
     provider.key_env.iter().find_map(|var| env(var).map(|key| (var.as_str(), key)))
 }
 
-/// Whether rein has something to pay `provider` with.
+/// Whether rein has something to pay `provider` with, or it needs nothing
+/// and you've set it up.
 pub fn usable(provider: &Provider, keys: &Keys) -> bool {
-    env_key(provider).is_some()
+    (!provider.needs_key && provider.yours)
+        || env_key(provider).is_some()
         || keys.contains_key(&provider.name)
         || (provider.name == "anthropic" && env("ANTHROPIC_AUTH_TOKEN").is_some())
         || (provider.name == "openai" && config_dir().is_ok_and(|dir| dir.join(CREDENTIALS_FILE).exists()))
@@ -76,7 +89,7 @@ pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, k
     };
     if let Some((var, key)) = env_key(provider) {
         say!("Using {}", pays(var));
-        return Ok(Client::new(http.clone(), provider.api, base, auth(key)));
+        return Ok(Client::new(http.clone(), provider.api, base, auth(key)).with_quirks(provider.quirks));
     }
     // A gateway in front of Claude takes its own token, as a bearer token.
     if provider.name == "anthropic"
@@ -87,7 +100,12 @@ pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, k
     }
     if let Some(key) = keys.get(&provider.name) {
         say!("Using {}", pays(&format!("your saved {} key", provider.title)));
-        return Ok(Client::new(http.clone(), provider.api, base, auth(key.clone())));
+        return Ok(Client::new(http.clone(), provider.api, base, auth(key.clone())).with_quirks(provider.quirks));
+    }
+    // A server on this computer, say: nothing to pay.
+    if !provider.needs_key {
+        say!("Using {} at {base}", provider.title);
+        return Ok(Client::new(http.clone(), provider.api, base, Auth::None).with_quirks(provider.quirks));
     }
     Err(no_key(provider))
 }
@@ -164,11 +182,14 @@ pub async fn connect(http: &rein_llm::reqwest::Client, providers: &[Provider], k
 
 /// `rein login <provider>`: saves a key for it, after checking it works.
 pub async fn login(http: &rein_llm::reqwest::Client, name: &str) -> CliResult {
-    let providers = provider::builtin();
+    let providers = providers(&config_dir()?)?;
     let Some(provider) = providers.iter().find(|p| p.name == name) else {
         let names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
         return Err(format!("no provider called {name}; rein knows {}", names.join(", ")));
     };
+    if !provider.needs_key {
+        return Err(format!("{} needs no key: use a model of it, like {name}/<model>", provider.title));
+    }
     let get = provider.keys_url.as_deref().map(|url| format!(" (from {url})")).unwrap_or_default();
     let key = read_secret(&format!("Paste your {} API key{get}: ", provider.title))?;
     if key.is_empty() {
@@ -183,7 +204,8 @@ pub async fn login(http: &rein_llm::reqwest::Client, name: &str) -> CliResult {
             Some(header) => Auth::Header(header, key.clone()),
             None => Auth::Bearer(key.clone()),
         },
-    );
+    )
+    .with_quirks(provider.quirks);
     let models = client.list_models().await.map_err(|e| format!("that key didn't work ({}); nothing was saved", describe(e)))?;
     let dir = config_dir()?;
     let mut keys = load_keys(&dir)?;
@@ -221,8 +243,8 @@ pub fn logout(name: &str) -> CliResult {
 
 /// `rein models [provider]`: what each provider you can pay offers.
 pub async fn models(http: &rein_llm::reqwest::Client, name: Option<&str>) -> CliResult {
-    let providers = provider::builtin();
-    let keys = load_keys(&config_dir()?)?;
+    let dir = config_dir()?;
+    let (providers, keys) = (providers(&dir)?, load_keys(&dir)?);
     let chosen: Vec<&Provider> = match name {
         Some(name) => vec![providers.iter().find(|p| p.name == name).ok_or_else(|| format!("no provider called {name}"))?],
         None => providers.iter().filter(|p| usable(p, &keys)).collect(),
@@ -245,6 +267,31 @@ pub async fn models(http: &rein_llm::reqwest::Client, name: Option<&str>) -> Cli
                 println!("{pad}{id:<24} {}", model.name);
             }
         }
+    }
+    Ok(())
+}
+
+/// `rein providers`: who rein can reach, how, and what pays.
+pub fn list() -> CliResult {
+    let dir = config_dir()?;
+    let (providers, keys) = (providers(&dir)?, load_keys(&dir)?);
+    for provider in &providers {
+        let signed_in = provider.name == "openai" && dir.join(CREDENTIALS_FILE).exists();
+        let pays = if signed_in {
+            "your ChatGPT plan".to_owned()
+        } else if let Some((var, _)) = env_key(provider) {
+            format!("${var}")
+        } else if provider.name == "anthropic" && env("ANTHROPIC_AUTH_TOKEN").is_some() {
+            "$ANTHROPIC_AUTH_TOKEN".to_owned()
+        } else if keys.contains_key(&provider.name) {
+            "your saved key".to_owned()
+        } else if !provider.needs_key {
+            "nothing: no key needed".to_owned()
+        } else {
+            format!("no key yet: ${} or `rein login {}`", provider.key_env.join(" or $"), provider.name)
+        };
+        let url = provider.url_env.as_deref().and_then(env).unwrap_or_else(|| provider.base_url.clone());
+        println!("{:<11} {:<10} {:<42} {pays}", provider.name, provider.api.name(), url);
     }
     Ok(())
 }

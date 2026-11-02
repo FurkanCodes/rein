@@ -51,6 +51,10 @@ struct Model {
     /// What rein's environment says besides the defaults: the provider's
     /// key and URL, and settings.
     env: Vec<(String, String)>,
+    /// Files in rein's home (`~/.config/rein`), like a providers file.
+    home: Vec<(String, String)>,
+    /// Requests turned away for having a field this server doesn't take.
+    turned_away: Arc<Mutex<usize>>,
 }
 
 /// The wire format a model server speaks.
@@ -60,22 +64,34 @@ enum Wire {
     Responses,
     /// Anthropic's Messages API, with signed thinking in every turn.
     Messages,
+    /// Chat Completions, as most other providers speak it.
+    Chat,
 }
 
 impl Model {
     fn start(turns: Vec<Turn>) -> Model {
-        Model::serve(turns, true, Wire::Responses)
+        Model::serve(turns, true, Wire::Responses, None)
+    }
+
+    /// A Chat Completions server set up as Groq in a providers file, that
+    /// turns away requests with `rejects` in them, as servers do with
+    /// fields they don't know.
+    fn chat(turns: Vec<Turn>, rejects: Option<&'static str>) -> Model {
+        let mut model = Model::serve(turns, true, Wire::Chat, rejects);
+        model.home.push(("providers".into(), format!("[groq]\nurl = {}\n", model.base)));
+        model.env.extend([("GROQ_API_KEY".into(), "test-key".into()), ("REIN_MODEL".into(), "groq/llama-test".into())]);
+        model
     }
 
     /// A server that, like many a local one, can't unpack a compressed
     /// body, and says it's a bad request.
     fn without_gzip(turns: Vec<Turn>) -> Model {
-        Model::serve(turns, false, Wire::Responses)
+        Model::serve(turns, false, Wire::Responses, None)
     }
 
     /// Claude, as Anthropic serves it, and rein set to use it.
     fn claude(turns: Vec<Turn>) -> Model {
-        let mut model = Model::serve(turns, true, Wire::Messages);
+        let mut model = Model::serve(turns, true, Wire::Messages, None);
         let base = model.base.clone();
         model.env.extend([("ANTHROPIC_API_KEY".into(), "test-key".into()), ("ANTHROPIC_BASE_URL".into(), base), ("REIN_MODEL".into(), "claude-opus-5-5".into())]);
         model
@@ -87,11 +103,13 @@ impl Model {
         self
     }
 
-    fn serve(turns: Vec<Turn>, takes_gzip: bool, wire: Wire) -> Model {
+    fn serve(turns: Vec<Turn>, takes_gzip: bool, wire: Wire, rejects: Option<&'static str>) -> Model {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
         let (requests, gzipped, heads) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
         let (seen, how, heard) = (requests.clone(), gzipped.clone(), heads.clone());
+        let turned_away = Arc::new(Mutex::new(0));
+        let refused = turned_away.clone();
         std::thread::spawn(move || {
             let mut turns = turns.into_iter();
             for socket in listener.incoming() {
@@ -101,15 +119,22 @@ impl Model {
                     let models = match wire {
                         Wire::Responses => json!({ "data": [{ "id": "test-model" }, { "id": "gpt-6.1-sol" }] }),
                         Wire::Messages => json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false }),
+                        Wire::Chat => json!({ "object": "list", "data": [{ "id": "llama-test", "context_window": 131_072 }] }),
                     };
                     http(200, "application/json", models.to_string().as_bytes())
                 } else {
                     let gzip = head.lines().any(|line| line.to_ascii_lowercase().starts_with("content-encoding:") && line.contains("gzip"));
                     how.lock().unwrap().push(gzip);
+                    let unpacked = if gzip && takes_gzip { gunzip(&body) } else { body.clone() };
+                    let rejected = rejects.filter(|field| String::from_utf8_lossy(&unpacked).contains(&format!("\"{field}\"")));
                     if gzip && !takes_gzip {
                         http(400, "application/json", br#"{"detail":"Bad Request"}"#)
+                    } else if let Some(field) = rejected {
+                        *refused.lock().unwrap() += 1;
+                        let error = json!({ "error": { "message": format!("property '{field}' is unsupported"), "type": "invalid_request_error" } });
+                        http(400, "application/json", error.to_string().as_bytes())
                     } else {
-                        let body = if gzip { gunzip(&body) } else { body };
+                        let body = unpacked;
                         let mut seen = seen.lock().unwrap();
                         seen.push(serde_json::from_slice(&body).unwrap_or(Value::Null));
                         heard.lock().unwrap().push(head.clone());
@@ -118,6 +143,7 @@ impl Model {
                             Wire::Responses => sse(&turn),
                             // About what a tokenizer would count, mostly cached.
                             Wire::Messages => messages_sse(&turn, seen.len() - 1, body.len() as u64 / 4),
+                            Wire::Chat => chat_sse(&turn),
                         };
                         http(200, "text/event-stream", stream.as_bytes())
                     }
@@ -125,7 +151,11 @@ impl Model {
                 let _ = socket.write_all(&reply);
             }
         });
-        Model { base, requests, heads, gzipped, env: Vec::new() }
+        Model { base, requests, heads, gzipped, env: Vec::new(), home: Vec::new(), turned_away }
+    }
+
+    fn turned_away(&self) -> usize {
+        *self.turned_away.lock().unwrap()
     }
 
     fn heads(&self) -> Vec<String> {
@@ -250,6 +280,37 @@ fn messages_sse(turn: &Turn, n: usize, tokens: u64) -> String {
     out
 }
 
+/// A turn as Chat Completions streams it: reasoning, the text in pieces,
+/// calls in pieces, then the token counts and `[DONE]`.
+fn chat_sse(turn: &Turn) -> String {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let mut out = String::new();
+    let mut chunk = |delta: Value, finish: Value| out += &format!("data: {}\n\n", json!({ "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] }));
+    chunk(json!({ "role": "assistant", "reasoning_content": "**Thinking it over**" }), Value::Null);
+    let mut called = 0;
+    for item in &turn.out {
+        match item {
+            Out::Text(text) => {
+                for piece in text.split_inclusive(' ') {
+                    chunk(json!({ "content": piece }), Value::Null);
+                }
+            }
+            Out::Call(tool, arguments) => {
+                let id = format!("call_{}", CALLS.fetch_add(1, Ordering::Relaxed));
+                let json = arguments.to_string();
+                let (a, b) = json.split_at(json.len() / 2);
+                chunk(json!({ "tool_calls": [{ "index": called, "id": id, "type": "function", "function": { "name": tool, "arguments": a } }] }), Value::Null);
+                chunk(json!({ "tool_calls": [{ "index": called, "function": { "arguments": b } }] }), Value::Null);
+                called += 1;
+            }
+        }
+    }
+    chunk(json!({}), json!(if called > 0 { "tool_calls" } else { "stop" }));
+    let usage = json!({ "prompt_tokens": 1200, "completion_tokens": 20, "prompt_tokens_details": { "cached_tokens": 600 } });
+    out += &format!("data: {}\n\ndata: [DONE]\n\n", json!({ "choices": [], "usage": usage }));
+    out
+}
+
 /// What the terminal was asked to do besides drawing.
 #[derive(Default)]
 struct Seen {
@@ -332,6 +393,9 @@ impl Term {
         let (project, home) = (dir.join("project"), dir.join("home"));
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&home).unwrap();
+        for (name, text) in &model.home {
+            std::fs::write(home.join(name), text).unwrap();
+        }
 
         let (mut master, mut slave) = (0, 0);
         let mut size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
@@ -1008,4 +1072,32 @@ fn a_saved_key_is_checked_kept_private_used_and_forgotten() {
     let (ok, said) = run(&model, &home, &["models", "anthropic"], "");
     assert!(!ok && said.contains("no key for Anthropic: set ANTHROPIC_API_KEY, or run `rein login anthropic`"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_chat_completions_server_works_and_what_it_turns_away_is_left_out() {
+    let model = Model::chat(vec![calls("glob", json!({ "pattern": "*.txt", "path": null })), says("Two text files.")], Some("reasoning_effort")).with_env("REIN_EFFORT", "low");
+    let mut term = Term::start_with(&model, "chat", 24, 100, &[("a.txt", "a"), ("b.txt", "b")]);
+    term.wait_for(IDLE);
+    assert!(term.text().contains("groq/llama-test"), "{}", term.text());
+    term.keys("which text files are there?\r");
+    term.wait_for("Two text files.");
+    term.wait_for(IDLE);
+    let screen = term.text();
+    assert!(screen.contains("✻ Thinking it over"), "{screen}");
+    assert!(screen.contains("cache 50%"), "{screen}");
+    let head = model.heads()[0].to_lowercase();
+    assert!(head.starts_with("post /v1/chat/completions ") && head.contains("authorization: bearer test-key"), "{head}");
+    // Turned away once for reasoning_effort, then never sent it again.
+    assert_eq!(model.turned_away(), 1);
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.get("reasoning_effort").is_none()));
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let call = messages.iter().find(|m| m["role"] == "assistant").unwrap();
+    assert_eq!(call["tool_calls"][0]["function"]["name"], "glob");
+    assert_eq!(call["reasoning_content"], "**Thinking it over**", "its reasoning goes back with it");
+    let result = messages.iter().find(|m| m["role"] == "tool").unwrap();
+    assert_eq!(result["tool_call_id"], call["tool_calls"][0]["id"]);
+    assert!(result["content"].as_str().unwrap().contains("a.txt"), "{result}");
 }

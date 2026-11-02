@@ -24,6 +24,9 @@ fn replay_with<T: Translate>(mut decoder: Decoder<T>, stream: &[u8], chunk: usiz
         }
     }
     events.extend(decoder.finish());
+    while let Some(event) = decoder.pop() {
+        events.push(event);
+    }
     events
 }
 

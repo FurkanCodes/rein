@@ -62,6 +62,7 @@ Usage:
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
   rein login <provider>          Save an API key for a provider, like anthropic
   rein logout <provider>         Forget it (rein logout chatgpt signs out)
+  rein providers                 List the providers rein can reach, and what pays
   rein models [<provider>]       List the models you can use
 
 rein can read, write and edit files in this folder and run commands. In a
@@ -113,14 +114,25 @@ Each request carries the whole conversation, so rein gzips it on the way:
 about three times fewer bytes, and the same text for the model. A server that
 doesn't take compressed requests gets them uncompressed instead.
 
-A model's name says who serves it: claude-* is Anthropic's, gpt-* OpenAI's.
-Or name the provider first, like anthropic/claude-opus-5-5; /model switches
-mid-conversation, even to another provider. Keys come from $OPENAI_API_KEY and
-$ANTHROPIC_API_KEY ($ANTHROPIC_AUTH_TOKEN for a gateway), or from
-`rein login <provider>`, which keeps them in ~/.config/rein/keys.json, readable
-only by you. $OPENAI_BASE_URL and $ANTHROPIC_BASE_URL point rein at another
-server that speaks the same API. Signed in with ChatGPT, OpenAI's models use
-your plan; otherwise $OPENAI_API_KEY, billed to your API account.";
+A model's name says who serves it: claude-* is Anthropic's, gpt-* OpenAI's,
+deepseek-* DeepSeek's. Or name the provider first, like openrouter/qwen/qwen3-coder
+or ollama/qwen3:8b; /model switches mid-conversation, even to another
+provider. rein knows OpenAI, Anthropic, OpenRouter, Groq, DeepSeek, xAI,
+Mistral, Cerebras, Together, Fireworks, Moonshot, Z.ai, and Ollama and LM
+Studio on this computer; `rein providers` lists them. Add your own, or point
+one elsewhere, in ~/.config/rein/providers:
+  [local]
+  api = chat                     responses, anthropic or chat
+  url = http://localhost:8080/v1
+  context = 131072               when its model list doesn't say
+Keys come from each provider's variable, like $ANTHROPIC_API_KEY or
+$OPENROUTER_API_KEY ($ANTHROPIC_AUTH_TOKEN for a gateway in front of Claude),
+or from `rein login <provider>`, which keeps them in ~/.config/rein/keys.json,
+readable only by you. $OPENAI_BASE_URL and $ANTHROPIC_BASE_URL point rein at
+another server that speaks the same API. Signed in with ChatGPT, OpenAI's
+models use your plan; otherwise $OPENAI_API_KEY, billed to your API account.
+A server that turns away a field rein can do without gets the request again
+without it, and never that field again.";
 
 type CliResult<T = ()> = Result<T, String>;
 
@@ -151,6 +163,7 @@ async fn run(args: Vec<String>) -> CliResult {
         ["login"] | ["login", "chatgpt"] => login(&http).await,
         ["login", provider] => connect::login(&http, provider).await,
         ["logout", provider] => connect::logout(provider),
+        ["providers"] => connect::list(),
         ["models"] => connect::models(&http, None).await,
         ["models", provider] => connect::models(&http, Some(provider)).await,
         _ => {
@@ -282,7 +295,7 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> CliResult<Strin
 async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option<String>) -> CliResult {
     let dir = config_dir()?;
     let keys = connect::load_keys(&dir)?;
-    let providers = provider::builtin();
+    let providers = connect::providers(&dir)?;
     let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
     let folder = session::folder(&dir.join("sessions"), &root);
     let latest = match args.resume {
@@ -447,7 +460,7 @@ impl Setup {
 
     /// When to compact with `model`: see [`compact_limit`].
     fn limit(&self, model: &str) -> CliResult<u64> {
-        let window = self.models.iter().find(|m| m.id == model).and_then(|m| m.context_window);
+        let window = self.models.iter().find(|m| m.id == model).and_then(|m| m.context_window).or(self.provider.context);
         compact_limit(window, self.compact_at.as_deref())
     }
 
@@ -1741,6 +1754,12 @@ fn approval(answer: &str) -> Approval {
 
 /// Error text with the next step, where there's an obvious one.
 fn describe(e: rein_llm::Error) -> String {
+    if let rein_llm::Error::Http(http) = &e
+        && http.is_connect()
+    {
+        let at = http.url().map(|url| url.origin().ascii_serialization()).unwrap_or_else(|| "the server".into());
+        return format!("couldn't connect to {at}: is it running? ({http})");
+    }
     match (e.code(), e.status()) {
         (Some("subscription_sharing_usage_limit_exceeded"), _) => {
             format!("usage limit reached for your ChatGPT plan or for rein. Manage usage: {USAGE_URL}")

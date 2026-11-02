@@ -8,6 +8,7 @@
 //! long tail, and local servers), and Gemini's own.
 
 pub mod anthropic;
+pub mod chat;
 pub mod client;
 pub mod decode;
 pub mod openai;
@@ -92,6 +93,9 @@ pub enum Api {
     Responses,
     /// Anthropic's Messages API, `POST /messages`.
     Anthropic,
+    /// Chat Completions, `POST /chat/completions`: most other providers,
+    /// and servers on your own computer.
+    Chat,
 }
 
 impl Api {
@@ -99,11 +103,12 @@ impl Api {
         match self {
             Api::Responses => "responses",
             Api::Anthropic => "anthropic",
+            Api::Chat => "chat",
         }
     }
 
     pub fn parse(name: &str) -> Option<Api> {
-        [Api::Responses, Api::Anthropic].into_iter().find(|api| api.name() == name)
+        [Api::Responses, Api::Anthropic, Api::Chat].into_iter().find(|api| api.name() == name)
     }
 }
 

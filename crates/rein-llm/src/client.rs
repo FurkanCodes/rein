@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use crate::decode::Decode;
-use crate::{Api, Error, Event, ModelInfo, Request, Result, anthropic, openai};
+use crate::chat::Quirks;
+use crate::{Api, Error, Event, ModelInfo, Request, Result, anthropic, chat, openai};
 
 /// How requests prove who's asking.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub struct Client {
     api: Api,
     base_url: String,
     auth: Auth,
+    /// What this provider needs that it can't say in an error.
+    quirks: Quirks,
     /// How requests went over the wire, shared by the client's clones.
     wire: Arc<Wire>,
 }
@@ -81,7 +84,8 @@ pub enum Compression {
 }
 
 /// The fields a format can do without: the word a server's error would
-/// name it by, and what rein calls leaving it out.
+/// name it by (also its key in the body), and what rein calls leaving it
+/// out.
 pub(crate) type Optional = &'static [(&'static str, &'static str)];
 
 impl Client {
@@ -89,7 +93,12 @@ impl Client {
     /// which speaks `api`.
     pub fn new(http: reqwest::Client, api: Api, base_url: impl Into<String>, auth: Auth) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
-        Client { http, api, base_url, auth, wire: Arc::default() }
+        Client { http, api, base_url, auth, quirks: Quirks::default(), wire: Arc::default() }
+    }
+
+    pub fn with_quirks(mut self, quirks: Quirks) -> Self {
+        self.quirks = quirks;
+        self
     }
 
     /// OpenAI itself: `bearer` is an API key or a Sign in with ChatGPT
@@ -131,6 +140,7 @@ impl Client {
         match self.api {
             Api::Responses => openai::models(self).await,
             Api::Anthropic => anthropic::models(self).await,
+            Api::Chat => chat::models(self).await,
         }
     }
 
@@ -156,6 +166,7 @@ impl Client {
         match self.api {
             Api::Responses => openai::headers(request),
             Api::Anthropic => anthropic::headers(request),
+            Api::Chat => Vec::new(),
         }
     }
 
@@ -163,6 +174,7 @@ impl Client {
         match self.api {
             Api::Responses => openai::request_body(request),
             Api::Anthropic => anthropic::request_body(request, omitted, &self.base_url),
+            Api::Chat => chat::request_body(request, omitted, self.quirks),
         }
     }
 
@@ -170,6 +182,7 @@ impl Client {
         match self.api {
             Api::Responses => &[],
             Api::Anthropic => anthropic::OPTIONAL,
+            Api::Chat => chat::OPTIONAL,
         }
     }
 
@@ -177,6 +190,7 @@ impl Client {
         match self.api {
             Api::Responses => Box::new(openai::EventDecoder::default()),
             Api::Anthropic => Box::new(anthropic::decoder(&request.model)),
+            Api::Chat => Box::new(chat::decoder()),
         }
     }
 
@@ -184,6 +198,7 @@ impl Client {
         let path = match self.api {
             Api::Responses => "responses".to_owned(),
             Api::Anthropic => "messages".to_owned(),
+            Api::Chat => "chat/completions".to_owned(),
         };
         let _ = request;
         format!("{}/{path}", self.base_url)
@@ -194,7 +209,7 @@ impl Client {
         let mut omitted = self.omitted();
         loop {
             let body = self.body(request, &omitted);
-            match self.send(request, &body).await {
+            match self.send(request, &body, &omitted).await {
                 Ok(response) => return Ok(ResponseStream { response, decoder: self.decoder(request), record: None }),
                 // The server named a field it doesn't take: once more
                 // without it, and never again with it.
@@ -210,7 +225,8 @@ impl Client {
     }
 
     /// Posts `body`, gzipped if it's worth it and the server takes it.
-    async fn send(&self, request: &Request, body: &Value) -> Result<reqwest::Response> {
+    async fn send(&self, request: &Request, body: &Value, omitted: &[&str]) -> Result<reqwest::Response> {
+        let json = body;
         let headers = self.headers(Some((request, body)));
         let body = serde_json::to_vec(body)?;
         let gzipped = (body.len() >= COMPRESS_FROM && !self.wire.off.load(Ordering::Relaxed)).then(|| gzip(&body)).flatten();
@@ -218,8 +234,10 @@ impl Client {
         match check(self.post(request, &headers, &body, gzipped).await?).await {
             // A server that can't unpack the body can't read it: the same
             // request again as it is. If that goes through, compression was
-            // the trouble, and it's off from now on; if not, it wasn't.
-            Err(Error::Api { status: Some(400 | 415 | 422), .. }) if compressed => {
+            // the trouble, and it's off from now on; if not, it wasn't. (One
+            // that names a field in it read it fine.)
+            Err(e @ Error::Api { status: Some(400 | 415 | 422), .. }) if compressed && rejected_field(&e, json, self.optional(), omitted).is_none() => {
+                drop(e);
                 let plain = check(self.post(request, &headers, &body, None).await?).await?;
                 self.wire.refused.store(true, Ordering::Relaxed);
                 self.wire.off.store(true, Ordering::Relaxed);
@@ -260,7 +278,7 @@ fn rejected_field(error: &Error, body: &Value, optional: Optional, omitted: &[&s
     let body = body.to_string();
     optional
         .iter()
-        .find(|(word, field)| message.contains(word) && !omitted.contains(field) && body.contains(&format!("\"{}\"", field.rsplit('.').next().unwrap_or(field))))
+        .find(|(word, field)| message.contains(word) && !omitted.contains(field) && body.contains(&format!("\"{word}\"")))
         .map(|(_, field)| *field)
 }
 
