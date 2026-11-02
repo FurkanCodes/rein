@@ -42,7 +42,7 @@ pub(crate) fn request_body(request: &Request) -> Value {
         body["instructions"] = json!(instructions);
     }
     if let Some(effort) = &request.reasoning_effort {
-        body["reasoning"] = json!({ "effort": effort });
+        body["reasoning"] = json!({ "effort": effort.as_str() });
     }
     if request.reasoning_summary {
         body["reasoning"]["summary"] = json!("auto");
@@ -186,7 +186,7 @@ mod tests {
             instructions: Some("be brief".into()),
             input: vec![Item::User("hi".into()), Item::Assistant("hello".into()), Item::User("bye".into())],
             tools: vec![],
-            reasoning_effort: Some("low".into()),
+            reasoning_effort: Some(crate::Effort::Low),
             reasoning_summary: false,
             session_id: None,
             max_output_tokens: None,

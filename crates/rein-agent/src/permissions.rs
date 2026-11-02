@@ -20,6 +20,8 @@
 use rein_llm::ToolCall;
 use serde::Deserialize;
 
+use crate::tools::ToolName;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
     /// Ask before every command and file change.
@@ -34,14 +36,31 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn parse(name: &str) -> Option<Mode> {
-        match name {
-            "ask" => Some(Mode::Ask),
-            "edits" => Some(Mode::Edits),
-            "read-only" => Some(Mode::ReadOnly),
-            "trust" => Some(Mode::Trust),
-            _ => None,
+    pub const ALL: [Mode; 4] = [Mode::Ask, Mode::Edits, Mode::ReadOnly, Mode::Trust];
+
+    /// Its name, as `--mode` and `/mode` take it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Mode::Ask => "ask",
+            Mode::Edits => "edits",
+            Mode::ReadOnly => "read-only",
+            Mode::Trust => "trust",
         }
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    /// A mode by name; what's wrong, with the names there are, if none.
+    fn from_str(name: &str) -> Result<Mode, String> {
+        Mode::ALL.into_iter().find(|mode| mode.as_str() == name.trim()).ok_or_else(|| format!("no mode called {name}; use ask, edits, read-only or trust"))
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -126,21 +145,22 @@ impl Permissions {
     }
 
     pub fn decide(&self, call: &ToolCall) -> Decision {
-        match call.name.as_str() {
+        match ToolName::of(call) {
             // `read`, `grep` and `glob` can only look, and only inside the
             // project; `plan` only writes a checklist on screen.
-            "read" | "grep" | "glob" | "plan" => Decision::Allow,
-            "write" | "edit" => match self.mode {
+            Some(tool) if tool.only_looks() || tool == ToolName::Plan => Decision::Allow,
+            Some(tool) if tool.changes_files() => match self.mode {
                 Mode::ReadOnly => Decision::Deny("File changes are turned off: rein is in read-only mode.".into()),
                 Mode::Edits | Mode::Trust => Decision::Allow,
                 Mode::Ask if self.approved_edits => Decision::Allow,
                 Mode::Ask => Decision::Ask,
             },
-            "bash" => match serde_json::from_str::<Command>(&call.arguments) {
+            Some(ToolName::Bash) => match serde_json::from_str::<Command>(&call.arguments) {
                 Ok(c) => self.decide_command(&c.command),
                 Err(_) => Decision::Ask,
             },
-            _ => Decision::Ask,
+            // `recall` never comes here: the agent runs it itself.
+            Some(_) | None => Decision::Ask,
         }
     }
 
@@ -182,9 +202,9 @@ impl Permissions {
     /// "Yes, and don't ask again this session": for a command, exactly these
     /// commands; for a file change, all file changes.
     pub fn remember(&mut self, call: &ToolCall) {
-        match call.name.as_str() {
-            "write" | "edit" => self.approved_edits = true,
-            "bash" => {
+        match ToolName::of(call) {
+            Some(ToolName::Write | ToolName::Edit) => self.approved_edits = true,
+            Some(ToolName::Bash) => {
                 if let Ok(c) = serde_json::from_str::<Command>(&call.arguments)
                     && let Some(parts) = split_command(&c.command)
                 {

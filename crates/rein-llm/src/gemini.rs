@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::client::{Client, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
 
 pub const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -81,14 +81,14 @@ pub(crate) fn request_body(request: &Request, omitted: &[&str]) -> Value {
     if request.reasoning_summary && !omitted.contains(&"thoughts") {
         thinking["includeThoughts"] = json!(true);
     }
-    if let Some(effort) = &request.reasoning_effort
+    if let Some(effort) = request.reasoning_effort
         && !omitted.contains(&"level")
     {
-        let level = match effort.as_str() {
-            "minimal" => "MINIMAL",
-            "low" => "LOW",
-            "medium" => "MEDIUM",
-            _ => "HIGH",
+        let level = match effort {
+            Effort::Minimal => "MINIMAL",
+            Effort::Low => "LOW",
+            Effort::Medium => "MEDIUM",
+            Effort::High | Effort::XHigh | Effort::Max => "HIGH",
         };
         thinking["thinkingLevel"] = json!(level);
     }
@@ -206,7 +206,7 @@ impl Translate for Generate {
             return out.push(Err(Error::api(None, error["status"].as_str().map(str::to_owned), message, None)));
         }
         if let Some(reason) = v["promptFeedback"]["blockReason"].as_str() {
-            return out.push(Err(Error::api(None, Some("refusal".into()), format!("Gemini wouldn't take this ({reason})"), None)));
+            return out.push(Err(Error::refusal(format!("Gemini wouldn't take this ({reason})"))));
         }
         let candidate = &v["candidates"][0];
         for part in candidate["content"]["parts"].as_array().into_iter().flatten() {
@@ -285,7 +285,7 @@ impl Generate {
         match self.finish.as_deref() {
             Some("MAX_TOKENS") => return out.push(Err(Error::Incomplete("the answer reached its length limit".into()))),
             Some(reason @ ("SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII")) => {
-                return out.push(Err(Error::api(None, Some("refusal".into()), format!("Gemini stopped the answer ({reason})"), None)));
+                return out.push(Err(Error::refusal(format!("Gemini stopped the answer ({reason})"))));
             }
             Some(reason @ ("MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" | "MISSING_THOUGHT_SIGNATURE" | "MALFORMED_RESPONSE")) => {
                 return out.push(Err(Error::Incomplete(format!("Gemini stopped: {reason}"))));
@@ -330,7 +330,7 @@ mod tests {
             instructions: Some("be brief".into()),
             input,
             tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
-            reasoning_effort: Some("xhigh".into()),
+            reasoning_effort: Some(Effort::XHigh),
             reasoning_summary: true,
             session_id: None,
             max_output_tokens: None,
@@ -462,7 +462,7 @@ mod tests {
         let long = [json!({ "candidates": [{ "content": { "parts": [] }, "finishReason": "MAX_TOKENS" }] })];
         assert!(matches!(stream(&long, true).last(), Some(Err(Error::Incomplete(_)))));
         let blocked = [json!({ "promptFeedback": { "blockReason": "SAFETY" } })];
-        assert!(matches!(stream(&blocked, false).last(), Some(Err(e)) if e.code() == Some("refusal")));
+        assert!(matches!(stream(&blocked, false).last(), Some(Err(e)) if e.kind() == Some(crate::ErrorKind::Refusal)));
         let failed = [json!({ "error": { "code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED" } })];
         assert!(matches!(stream(&failed, false).last(), Some(Err(e)) if e.code() == Some("RESOURCE_EXHAUSTED")));
     }

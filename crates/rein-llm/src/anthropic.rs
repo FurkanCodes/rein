@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use crate::client::{Client, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, CONTEXT_FULL, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
 
 pub const API_BASE: &str = "https://api.anthropic.com/v1";
 
@@ -99,13 +99,24 @@ fn legacy(model: &str) -> bool {
 }
 
 /// A thinking budget for the older models, from rein's effort levels.
-fn budget(effort: &str) -> u64 {
+fn budget(effort: Effort) -> u64 {
     match effort {
-        "minimal" => 1024,
-        "low" => 4096,
-        "medium" => 10_000,
-        "high" => 24_000,
-        _ => 32_000,
+        Effort::Minimal => 1024,
+        Effort::Low => 4096,
+        Effort::Medium => 10_000,
+        Effort::High => 24_000,
+        Effort::XHigh | Effort::Max => 32_000,
+    }
+}
+
+/// `output_config.effort`: Claude's levels start at `low`.
+fn claude_effort(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Minimal | Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
     }
 }
 
@@ -137,7 +148,7 @@ pub(crate) fn request_body(request: &Request, omitted: &[&str], base_url: &str) 
         let tools: Vec<Value> = request.tools.iter().map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.parameters })).collect();
         body["tools"] = json!(tools);
     }
-    let effort = request.reasoning_effort.as_deref();
+    let effort = request.reasoning_effort;
     if legacy {
         // They don't think unless given a budget, which the answer's
         // limit has to leave room for.
@@ -157,8 +168,7 @@ pub(crate) fn request_body(request: &Request, omitted: &[&str], base_url: &str) 
         if let Some(effort) = effort
             && !omitted.contains(&"output_config")
         {
-            let effort = if effort == "minimal" { "low" } else { effort };
-            body["output_config"] = json!({ "effort": effort });
+            body["output_config"] = json!({ "effort": claude_effort(effort) });
         }
     }
     // A refusal by mistake (security work looks risky to a classifier)
@@ -373,7 +383,7 @@ impl Messages {
         match self.stop_reason.as_deref() {
             Some("refusal") => {
                 let why = self.stop_details["explanation"].as_str().unwrap_or("Claude declined to go on with this.");
-                out.push(Err(Error::api(None, Some("refusal".into()), why.to_owned(), None)));
+                out.push(Err(Error::refusal(why)));
                 return;
             }
             Some("max_tokens") => {
@@ -381,7 +391,7 @@ impl Messages {
                 return;
             }
             Some("model_context_window_exceeded") => {
-                out.push(Err(Error::api(None, Some(CONTEXT_FULL.into()), "the conversation filled the model's context window".into(), None)));
+                out.push(Err(Error::context_full("the conversation filled the model's context window")));
                 return;
             }
             _ => {}
@@ -416,7 +426,7 @@ mod tests {
             instructions: Some("be brief".into()),
             input,
             tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
-            reasoning_effort: Some("high".into()),
+            reasoning_effort: Some(Effort::High),
             reasoning_summary: true,
             session_id: Some("s".into()),
             max_output_tokens: None,
@@ -603,7 +613,7 @@ mod tests {
     fn refusals_limits_and_errors_end_the_answer() {
         let refused = [start(1, 0, 0), json!({ "type": "message_delta", "delta": { "stop_reason": "refusal", "stop_details": { "type": "refusal", "category": "cyber", "explanation": "Declined." } }, "usage": { "output_tokens": 0 } }), json!({ "type": "message_stop" })];
         let Err(e) = stream(&refused).pop().unwrap() else { panic!("a refusal is an error") };
-        assert_eq!((e.code(), e.to_string()), (Some("refusal"), "Declined. (refusal)".into()));
+        assert_eq!((e.kind(), e.to_string()), (Some(crate::ErrorKind::Refusal), "Declined.".into()));
 
         let [delta, end] = stop("max_tokens", 32_000);
         assert!(matches!(stream(&[start(1, 0, 0), delta, end]).pop(), Some(Err(Error::Incomplete(_)))));

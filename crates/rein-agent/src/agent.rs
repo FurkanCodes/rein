@@ -9,14 +9,14 @@ use std::task::Poll;
 
 use serde_json::{Value, json};
 
-use rein_llm::{Client, Error, Event, Item, Request, Result, STALE_THINKING, Tool, ToolCall, Usage};
+use rein_llm::{Client, Error, ErrorKind, Event, Item, Request, Result, Tool, ToolCall, Usage};
 
 use crate::compact;
 use crate::context;
 use crate::mentions;
 use crate::permissions::{Decision, Permissions};
 use crate::session::Session;
-use crate::tools::Tools;
+use crate::tools::{ToolName, Tools};
 
 /// After this many model turns in a row, stop and give the user control back.
 pub const MAX_TURNS: usize = 25;
@@ -94,9 +94,6 @@ pub trait Ui {
     }
 }
 
-/// The tools that only look, and so may run at the same time.
-const LOOKS: [&str; 3] = ["read", "grep", "glob"];
-
 /// A read's path and lines, to tell whether two reads read the same.
 fn read_args(arguments: &str) -> Option<(String, Option<u64>, Option<u64>)> {
     let args: Value = serde_json::from_str(arguments).ok()?;
@@ -131,6 +128,14 @@ async fn all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// What a step the model asked for gets instead of running, when the user
 /// wrote before it started: what it was for may no longer hold.
 pub const SKIPPED: &str = "Not run: the user sent a message before this step started. It follows; act on it.";
+
+/// What a step gets when the user says no. Compaction's record knows a
+/// declined step by these, so they're said in one place.
+pub const DECLINED_COMMAND: &str = "The user declined to run this command.";
+pub const DECLINED_CHANGE: &str = "The user declined this change.";
+pub const DECLINED_AND_STOPPED: &str = "The user declined this and stopped, to tell you what to do instead.";
+/// What a step cut short by Ctrl-C or Esc gets.
+pub const INTERRUPTED: &str = "The user interrupted this before it finished. It may have partly run.";
 
 /// What a compaction did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +185,7 @@ pub struct Agent<M> {
     pub permissions: Permissions,
     pub model_name: String,
     pub instructions: Option<String>,
-    pub reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<rein_llm::Effort>,
     /// The most one answer may take, when the model list says.
     pub max_output: Option<u64>,
     /// One ID for the whole conversation, so its requests share a prompt cache.
@@ -226,7 +231,7 @@ impl<M: Model> Agent<M> {
             let (items, usage) = match self.model.respond(&request, &mut |streamed| stream_to(ui, streamed)).await {
                 // The provider says it's too long after all: make room and
                 // try again, once.
-                Err(e) if !compacted && e.code() == Some(rein_llm::CONTEXT_FULL) => {
+                Err(e) if !compacted && e.kind() == Some(ErrorKind::ContextFull) => {
                     self.compact(None, true, ui).await?;
                     compacted = true;
                     continue;
@@ -234,7 +239,7 @@ impl<M: Model> Agent<M> {
                 // The provider turned the conversation's thinking away (it
                 // was signed with a conversation that has changed since,
                 // say by an older rein's tools): without it, once.
-                Err(e) if !unbound && e.code() == Some(STALE_THINKING) => {
+                Err(e) if !unbound && e.kind() == Some(ErrorKind::StaleThinking) => {
                     self.unbind()?;
                     unbound = true;
                     continue;
@@ -281,7 +286,7 @@ impl<M: Model> Agent<M> {
                 // Lookups asked for together run at once: they only look.
                 let together = calls[next..]
                     .iter()
-                    .take_while(|call| LOOKS.contains(&call.name.as_str()) && self.permissions.decide(call) == Decision::Allow)
+                    .take_while(|call| ToolName::of(call).is_some_and(ToolName::only_looks) && self.permissions.decide(call) == Decision::Allow)
                     .count();
                 if together > 1 {
                     let batch = &calls[next..next + together];
@@ -298,7 +303,7 @@ impl<M: Model> Agent<M> {
                 next += 1;
                 // Searching the conversation is rein's own business: no
                 // permission needed, nothing outside is touched.
-                if call.name == "recall" {
+                if ToolName::of(&call) == Some(ToolName::Recall) {
                     ui.tool_started(&call);
                     let output = compact::recall(&self.window.full, &call.arguments);
                     ui.tool_finished(&call, &output);
@@ -317,12 +322,12 @@ impl<M: Model> Agent<M> {
                             self.permissions.remember(&call);
                             Ok(())
                         }
-                        Approval::No => Err(match call.name.as_str() {
-                            "bash" => "The user declined to run this command.".to_owned(),
-                            _ => "The user declined this change.".to_owned(),
+                        Approval::No => Err(match ToolName::of(&call) {
+                            Some(ToolName::Bash) => DECLINED_COMMAND.to_owned(),
+                            _ => DECLINED_CHANGE.to_owned(),
                         }),
                         Approval::Stop => {
-                            let output = "The user declined this and stopped, to tell you what to do instead.".to_owned();
+                            let output = DECLINED_AND_STOPPED.to_owned();
                             ui.tool_finished(&call, &output);
                             self.record(Item::ToolResult { call_id: call.call_id, output })?;
                             return Ok(Outcome::Stopped);
@@ -386,7 +391,7 @@ impl<M: Model> Agent<M> {
                 self.mention_call("read", json!({ "path": mention.path, "start_line": start, "line_count": count }))
             };
             let mut output = self.tools.run(&call).await;
-            if call.name == "read" && self.last_copy(&call.arguments) == Some(output.as_str()) {
+            if ToolName::of(&call) == Some(ToolName::Read) && self.last_copy(&call.arguments) == Some(output.as_str()) {
                 output = format!("{} {} is as it was when it was last read in this conversation, so that copy is current.]", compact::UNCHANGED, mention.path);
             }
             self.attached(call, output, ui)?;
@@ -420,7 +425,7 @@ impl<M: Model> Agent<M> {
             .filter_map(|dir| {
                 let file = ["AGENTS.md", "CLAUDE.md"].into_iter().map(|name| dir.join(name)).find(|file| self.tools.root().join(file).is_file())?;
                 let file = file.to_string_lossy().into_owned();
-                let held = self.history.iter().any(|item| matches!(item, Item::ToolCall(call) if call.name == "read" && read_path(&call.arguments) == Some(file.clone())));
+                let held = self.history.iter().any(|item| matches!(item, Item::ToolCall(call) if ToolName::of(call) == Some(ToolName::Read) && read_path(&call.arguments) == Some(file.clone())));
                 (!held).then_some(file)
             })
             .collect()
@@ -434,7 +439,7 @@ impl<M: Model> Agent<M> {
         let mut latest = None;
         for item in &self.history {
             match item {
-                Item::ToolCall(call) if call.name == "read" && read_args(&call.arguments) == wanted => {
+                Item::ToolCall(call) if ToolName::of(call) == Some(ToolName::Read) && read_args(&call.arguments) == wanted => {
                     ids.insert(call.call_id.as_str());
                 }
                 Item::ToolResult { call_id, output } if ids.contains(call_id.as_str()) && !output.starts_with(compact::UNCHANGED) => {
@@ -488,7 +493,7 @@ impl<M: Model> Agent<M> {
             input.push(Item::User(compact::prompt(focus)));
             ui.thinking();
             match self.model.respond(&self.request(input), &mut |streamed| stream_to(ui, streamed)).await {
-                Err(e) if tries == 0 && e.code() == Some(STALE_THINKING) => {
+                Err(e) if tries == 0 && e.kind() == Some(ErrorKind::StaleThinking) => {
                     self.unbind()?;
                     tries += 1;
                 }
@@ -546,7 +551,7 @@ impl<M> Agent<M> {
             instructions: self.instructions.clone(),
             input,
             tools: self.specs(),
-            reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_effort: self.reasoning_effort,
             reasoning_summary: true,
             session_id: self.session_id.clone(),
             max_output_tokens: self.max_output,
@@ -625,7 +630,7 @@ impl<M> Agent<M> {
             };
             repaired.push(item);
             if let Some(call_id) = orphan {
-                let output = "The user interrupted this before it finished. It may have partly run.".to_owned();
+                let output = INTERRUPTED.to_owned();
                 repaired.push(Item::ToolResult { call_id, output });
             }
         }

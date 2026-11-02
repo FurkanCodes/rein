@@ -28,6 +28,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use rein_llm::{Item, Tool};
+
+use crate::agent::{DECLINED_AND_STOPPED, DECLINED_CHANGE, DECLINED_COMMAND, INTERRUPTED};
+use crate::tools::{ERROR, ToolName};
 use serde_json::{Value, json};
 
 /// Compact once a request would carry more than this many tokens. Well
@@ -98,7 +101,7 @@ fn typed(item: &Item) -> Option<&str> {
 
 /// What a tool call was about, from its arguments.
 struct Call {
-    name: String,
+    tool: Option<ToolName>,
     path: Option<String>,
     command: Option<String>,
     /// What a search looked for.
@@ -115,7 +118,7 @@ fn calls(history: &[Item]) -> HashMap<&str, (usize, Call)> {
                 let path = args["path"].as_str().map(|p| p.trim_start_matches("./").to_owned());
                 let command = args["command"].as_str().map(str::to_owned);
                 let pattern = args["pattern"].as_str().map(str::to_owned);
-                Some((call.call_id.as_str(), (i, Call { name: call.name.clone(), path, command, pattern })))
+                Some((call.call_id.as_str(), (i, Call { tool: ToolName::of(call), path, command, pattern })))
             }
             _ => None,
         })
@@ -150,11 +153,11 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
             continue;
         }
         let Some((_, call)) = calls.get(call_id.as_str()) else { continue };
-        match (call.name.as_str(), &call.path, &call.command) {
-            ("read", Some(path), _) => {
+        match (call.tool, &call.path, &call.command) {
+            (Some(ToolName::Read), Some(path), _) => {
                 // Read again or changed: a search in it doesn't count.
                 let touched_later = calls.iter().any(|(id, (j, later))| {
-                    *j > i && later.path.as_ref() == Some(path) && matches!(later.name.as_str(), "read" | "write" | "edit") && !notes.contains(id)
+                    *j > i && later.path.as_ref() == Some(path) && matches!(later.tool, Some(ToolName::Read | ToolName::Write | ToolName::Edit)) && !notes.contains(id)
                 });
                 if touched_later {
                     retired.push((
@@ -163,7 +166,7 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
                     ));
                 }
             }
-            ("bash", _, Some(command)) if i < recent => {
+            (Some(ToolName::Bash), _, Some(command)) if i < recent => {
                 let lines = output.lines().count();
                 let code = exit_code(output).map(|c| format!(", exit code {c}")).unwrap_or_default();
                 retired.push((
@@ -171,7 +174,7 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
                     format!("{RETIRED} the output of `{command}` ({lines} lines{code}). Run it again, or use recall to search it.]"),
                 ));
             }
-            ("grep" | "glob", _, _) if i < recent => {
+            (Some(ToolName::Grep | ToolName::Glob), _, _) if i < recent => {
                 let pattern = call.pattern.as_deref().unwrap_or_default();
                 let found = output.lines().next().unwrap_or_default().trim_end_matches('.');
                 retired.push((call_id.clone(), format!("{RETIRED} an older search for `{pattern}`: {found}. Search again if you need it.]")));
@@ -243,19 +246,20 @@ pub fn record(full: &[Item]) -> String {
     ordered.sort_by_key(|(i, _, _)| **i);
     for (_, id, call) in ordered {
         let result = results.get(id).copied().unwrap_or("");
-        let worked = !result.starts_with("error:") && !result.starts_with("The user declined");
-        match (call.name.as_str(), &call.path, &call.command) {
-            ("write" | "edit", Some(path), _) if worked => {
+        let declined = [DECLINED_COMMAND, DECLINED_CHANGE, DECLINED_AND_STOPPED].contains(&result);
+        let worked = !result.starts_with(ERROR) && !declined;
+        match (call.tool, &call.path, &call.command) {
+            (Some(ToolName::Write | ToolName::Edit), Some(path), _) if worked => {
                 changed.insert(path.clone());
             }
-            ("read", Some(path), _) => {
+            (Some(ToolName::Read), Some(path), _) => {
                 read.insert(path.clone());
             }
-            ("bash", _, Some(command)) => {
+            (Some(ToolName::Bash), _, Some(command)) => {
                 let outcome = match exit_code(result) {
                     Some(code) => format!("exit code {code}"),
-                    None if result.starts_with("The user declined") => "declined".into(),
-                    None if result.contains("interrupted") => "interrupted".into(),
+                    None if declined => "declined".into(),
+                    None if result == INTERRUPTED => "interrupted".into(),
                     None => "no exit code".into(),
                 };
                 commands.push(format!("- `{}`: {outcome}", shorten(command, 200)));
@@ -330,7 +334,7 @@ pub fn recent_start(history: &[Item], from: usize, budget: u64) -> usize {
 /// The tool for searching the conversation, offered once it's been compacted.
 pub fn recall_spec() -> Tool {
     Tool {
-        name: "recall".into(),
+        name: ToolName::Recall.as_str().into(),
         description: "Search the whole conversation, including the parts compacted away, for messages and tool \
                       output containing all the given words. Use it when the summary doesn't have a detail you need."
             .into(),

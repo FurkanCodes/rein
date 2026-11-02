@@ -47,9 +47,17 @@ struct GrepArgs {
     glob: Option<String>,
     #[serde(default)]
     ignore_case: bool,
-    /// `lines` or `files`.
-    output: Option<String>,
+    output: Option<GrepOutput>,
     context: Option<usize>,
+}
+
+/// What a search gives back. A value the model misspells is an error it's
+/// told about, not quietly the default.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum GrepOutput {
+    Lines,
+    Files,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +73,15 @@ struct PlanArgs {
 
 #[derive(Deserialize)]
 struct PlanStep {
-    status: String,
+    status: StepStatus,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StepStatus {
+    Pending,
+    InProgress,
+    Done,
 }
 
 #[derive(Deserialize)]
@@ -90,6 +106,74 @@ struct EditArgs {
     old_text: String,
     new_text: String,
     replace_all: bool,
+}
+
+/// How a tool's output starts when it failed. Compaction's record tells
+/// what worked by it.
+pub const ERROR: &str = "error: ";
+
+/// rein's tools. The model names one in each call; [`ToolName::of`] reads
+/// that name once, and everything after works with this, so a misspelt
+/// tool is a compile error, not a call that quietly does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolName {
+    Read,
+    Grep,
+    Glob,
+    Write,
+    Edit,
+    Plan,
+    Bash,
+    /// Searching the conversation: rein's own, see `compact::recall`.
+    Recall,
+}
+
+impl ToolName {
+    pub const ALL: [ToolName; 8] = [Self::Read, Self::Grep, Self::Glob, Self::Write, Self::Edit, Self::Plan, Self::Bash, Self::Recall];
+
+    /// The name the model knows it by.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Grep => "grep",
+            Self::Glob => "glob",
+            Self::Write => "write",
+            Self::Edit => "edit",
+            Self::Plan => "plan",
+            Self::Bash => "bash",
+            Self::Recall => "recall",
+        }
+    }
+
+    /// The tool `call` asks for; `None` for one rein doesn't have.
+    pub fn of(call: &ToolCall) -> Option<ToolName> {
+        call.name.parse().ok()
+    }
+
+    /// Only looks, inside the project: needs no permission, and runs at the
+    /// same time as other looks.
+    pub const fn only_looks(self) -> bool {
+        matches!(self, Self::Read | Self::Grep | Self::Glob)
+    }
+
+    /// Changes files: undone with `/undo`, and allowed by file-change modes.
+    pub const fn changes_files(self) -> bool {
+        matches!(self, Self::Write | Self::Edit)
+    }
+}
+
+impl std::str::FromStr for ToolName {
+    type Err = ();
+
+    fn from_str(name: &str) -> Result<Self, ()> {
+        Self::ALL.into_iter().find(|tool| tool.as_str() == name).ok_or(())
+    }
+}
+
+impl std::fmt::Display for ToolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl Tools {
@@ -160,7 +244,7 @@ impl Tools {
     pub fn specs(&self) -> Vec<Tool> {
         vec![
             Tool {
-                name: "read".into(),
+                name: ToolName::Read.as_str().into(),
                 description: "Read a UTF-8 text file in the project. A long file comes back in parts: the \
                               reply ends by saying which lines it holds and where to continue."
                     .into(),
@@ -171,7 +255,7 @@ impl Tools {
                 })),
             },
             Tool {
-                name: "grep".into(),
+                name: ToolName::Grep.as_str().into(),
                 description: "Search what the project's files say with a regular expression (Rust syntax), and \
                               get the matching lines with their numbers, grouped by file. Files that .gitignore \
                               leaves out, binary files and .git aren't searched. Use this rather than grep or rg \
@@ -187,7 +271,7 @@ impl Tools {
                 })),
             },
             Tool {
-                name: "glob".into(),
+                name: ToolName::Glob.as_str().into(),
                 description: "Find files in the project by name or path, like `*.rs`, `src/**/test_*.py` or \
                               `Cargo.toml`. Returns their paths relative to the project root, sorted. Files that \
                               .gitignore leaves out aren't listed."
@@ -198,7 +282,7 @@ impl Tools {
                 })),
             },
             Tool {
-                name: "write".into(),
+                name: ToolName::Write.as_str().into(),
                 description: "Create a text file, or replace an existing file's whole contents. Missing folders \
                               are created. To change part of a file, use edit instead."
                     .into(),
@@ -208,7 +292,7 @@ impl Tools {
                 })),
             },
             Tool {
-                name: "edit".into(),
+                name: ToolName::Edit.as_str().into(),
                 description: "Replace text in a file. old_text must match the file exactly, spaces and \
                               indentation included, and appear exactly once unless replace_all is true: add \
                               surrounding lines to make it unique. Read the file first if you haven't."
@@ -221,7 +305,7 @@ impl Tools {
                 })),
             },
             Tool {
-                name: "plan".into(),
+                name: ToolName::Plan.as_str().into(),
                 description: "Keep a short checklist for work with several steps, so you and the user can see \
                               where things stand. Send the whole list each time, with one step in_progress; mark \
                               steps done as you finish them. Skip it for small tasks."
@@ -242,7 +326,7 @@ impl Tools {
                 })),
             },
             Tool {
-                name: "bash".into(),
+                name: ToolName::Bash.as_str().into(),
                 description: "Run a shell command in the project root and return its output and exit code. \
                               The user approves each command before it runs. Commands are stopped after 60 seconds \
                               unless you ask for longer, up to 600, for slow builds and test suites."
@@ -257,21 +341,22 @@ impl Tools {
 
     /// Runs one call and returns the text to send back to the model.
     pub async fn run(&self, call: &ToolCall) -> String {
-        let result = match call.name.as_str() {
-            "read" => self.read(&call.arguments).await,
-            "grep" => self.grep(&call.arguments).await,
-            "glob" => self.glob(&call.arguments).await,
-            "bash" => self.bash(&call.arguments).await,
-            "write" => self.write(&call.arguments).await,
-            "edit" => self.edit(&call.arguments).await,
+        let result = match ToolName::of(call) {
+            Some(ToolName::Read) => self.read(&call.arguments).await,
+            Some(ToolName::Grep) => self.grep(&call.arguments).await,
+            Some(ToolName::Glob) => self.glob(&call.arguments).await,
+            Some(ToolName::Bash) => self.bash(&call.arguments).await,
+            Some(ToolName::Write) => self.write(&call.arguments).await,
+            Some(ToolName::Edit) => self.edit(&call.arguments).await,
             // The checklist is for showing; the model keeps it in its own words.
-            "plan" => parse::<PlanArgs>(&call.arguments).map(|plan| {
-                let done = plan.steps.iter().filter(|step| step.status == "done").count();
+            Some(ToolName::Plan) => parse::<PlanArgs>(&call.arguments).map(|plan| {
+                let done = plan.steps.iter().filter(|step| step.status == StepStatus::Done).count();
                 format!("Plan updated: {done} of {} done.", plan.steps.len())
             }),
-            other => Err(format!("there is no tool called {other}")),
+            // `recall` is the agent's own: it searches the conversation.
+            Some(ToolName::Recall) | None => Err(format!("there is no tool called {}", call.name)),
         };
-        truncate(result.unwrap_or_else(|e| format!("error: {e}")))
+        truncate(result.unwrap_or_else(|e| format!("{ERROR}{e}")))
     }
 
     async fn read(&self, arguments: &str) -> Result<String, String> {
@@ -293,7 +378,7 @@ impl Tools {
                 start: &start,
                 glob: args.glob.as_deref(),
                 ignore_case: args.ignore_case,
-                files_only: args.output.as_deref() == Some("files"),
+                files_only: args.output == Some(GrepOutput::Files),
                 context: args.context.unwrap_or(0),
             };
             search::grep(&root, &grep)
@@ -582,6 +667,17 @@ mod tests {
 
     fn bash_call(command: &str, timeout: Option<u64>) -> ToolCall {
         ToolCall { call_id: "b".into(), name: "bash".into(), arguments: json!({ "command": command, "timeout_seconds": timeout }).to_string() }
+    }
+
+    #[tokio::test]
+    async fn a_misspelt_choice_is_an_error_the_model_hears_about() {
+        let tools = Tools::new(project("misspelt", &[("a.rs", "fn main() {}\n")]));
+        let call = |name: &str, arguments: Value| ToolCall { call_id: "c".into(), name: name.into(), arguments: arguments.to_string() };
+        let grep = tools.run(&call("grep", json!({ "pattern": "main", "path": null, "glob": null, "ignore_case": false, "output": "filez", "context": null }))).await;
+        assert!(grep.starts_with("error: bad arguments") && grep.contains("filez"), "{grep}");
+        let plan = tools.run(&call("plan", json!({ "steps": [{ "step": "a", "status": "finished" }] }))).await;
+        assert!(plan.starts_with("error: bad arguments") && plan.contains("finished"), "{plan}");
+        assert_eq!(tools.run(&call("plan", json!({ "steps": [{ "step": "a", "status": "in_progress" }] }))).await, "Plan updated: 0 of 1 done.");
     }
 
     #[tokio::test]

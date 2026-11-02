@@ -11,11 +11,11 @@ use rein_agent::agent::{Agent, Approval, Compacted, Llm, MAX_TURNS, Outcome, Ui,
 use rein_agent::compact;
 use rein_agent::permissions::{Mode, Permissions};
 use rein_agent::session::{self, Header, Loaded, Session};
-use rein_agent::tools::Tools;
+use rein_agent::tools::{ToolName, Tools};
 use rein_agent::{context, prompt};
 use rein_llm::Item;
 use rein_llm::provider::{self, Provider};
-use rein_llm::{ModelInfo, ToolCall, Usage, store};
+use rein_llm::{Effort, ModelInfo, ToolCall, Usage, store};
 
 /// `eprintln!` that waits its turn: the spinner and the input box draw
 /// from other threads.
@@ -35,7 +35,7 @@ mod input;
 mod settings;
 use settings::Settings;
 mod ui;
-use commands::Slash;
+use commands::{EffortSetting, Slash};
 use input::{Input, Menu, Question, Read};
 use ui::history::{self, History};
 use ui::markdown::Markdown;
@@ -88,7 +88,8 @@ Options:
   -m, --model <id>      Model to use, like claude-opus-5-5 or anthropic/claude-sonnet-5-5
                         (default: $REIN_MODEL, or gpt-6.1-sol; claude-opus-5-5 when
                         Anthropic is the only provider you have a key for)
-      --effort <level>  Reasoning effort: low, medium, high, ...
+      --effort <level>  How hard the model thinks: minimal, low, medium, high,
+                        xhigh or max (where the model has them)
   -c, --continue        Continue the latest conversation in this folder
   -r, --resume          Choose which saved conversation to continue
   -s, --system <text>   Standing instructions, added to rein's system prompt
@@ -220,7 +221,7 @@ struct AskArgs {
     /// `-m` was given, so a continued conversation switches to `model`.
     model_given: bool,
     resume: Resume,
-    effort: Option<String>,
+    effort: Option<Effort>,
     /// The system prompt: standing instructions sent with every request.
     system: Option<String>,
     mode: Mode,
@@ -238,9 +239,10 @@ impl AskArgs {
     /// environment), then rein's defaults.
     fn parse(args: Vec<String>, settings: &Settings) -> CliResult<Self> {
         let mut model = settings.get("model", "REIN_MODEL");
-        let (mut effort, mut system, mut record, mut words) = (settings.get("effort", "REIN_EFFORT"), None, None, Vec::new());
+        let effort = settings.get("effort", "REIN_EFFORT").map(|e| e.parse::<Effort>().map_err(|e| format!("{e} (in the settings)"))).transpose()?;
+        let (mut effort, mut system, mut record, mut words) = (effort, None, None, Vec::new());
         let mut mode = match settings.get("mode", "REIN_MODE") {
-            Some(name) => Mode::parse(&name).ok_or(format!("unknown mode {name} in the settings; use ask, edits, read-only or trust"))?,
+            Some(name) => name.parse::<Mode>().map_err(|e| format!("{e} (in the settings)"))?,
             None => Mode::Ask,
         };
         let switch = |key: &str, env: &str| match settings.get(key, env).as_deref() {
@@ -259,10 +261,10 @@ impl AskArgs {
                 }
                 "-c" | "--continue" => resume = Resume::Latest,
                 "-r" | "--resume" => resume = Resume::Pick,
-                "--effort" => effort = Some(value(&mut args, &arg)?),
+                "--effort" => effort = Some(value(&mut args, &arg)?.parse()?),
                 "--mode" => {
                     let name = value(&mut args, &arg)?;
-                    mode = Mode::parse(&name).ok_or(format!("unknown mode {name}; use ask, edits, read-only or trust"))?;
+                    mode = name.parse()?;
                 }
                 "-s" | "--system" => system = Some(value(&mut args, &arg)?),
                 "--record" => record = Some(PathBuf::from(value(&mut args, &arg)?)),
@@ -323,7 +325,7 @@ async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option
     let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none(), sent, args.bell);
     // The box goes up now, so typing can start while the model list loads.
     terminal.model = connected.as_ref().map(|c| provider::shown(&c.provider, &c.model)).unwrap_or_default();
-    terminal.effort = args.effort.clone();
+    terminal.effort = args.effort;
     terminal.input.set_bar(terminal.bar());
     let saved = match args.resume {
         Resume::New => None,
@@ -664,7 +666,7 @@ async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &m
             Said::NextMode => {
                 let mode = next_mode(agent.permissions.mode);
                 agent.permissions.mode = mode;
-                terminal.mode = mode_name(mode);
+                terminal.mode = mode;
                 terminal.input.set_bar(terminal.bar());
                 terminal.input.notice(&format!("{} · shift-tab for the next", mode_description(mode)));
                 continue;
@@ -747,7 +749,7 @@ async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Term
         Slash::Mode(None) | Slash::Model(None) | Slash::Login(None) | Slash::Logout(None) | Slash::Effort(None) => {}
         Slash::Mode(Some(mode)) => {
             agent.permissions.mode = mode;
-            terminal.mode = mode_name(mode);
+            terminal.mode = mode;
             say!("{pad}{} {}", s.green("✓"), mode_description(mode));
         }
         Slash::Model(Some(spec)) => {
@@ -765,10 +767,10 @@ async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Term
             setup.keys = connect::load_keys(&config_dir()?)?;
             setup.others = None;
         }
-        Slash::Effort(Some(level)) => {
-            agent.reasoning_effort = level;
-            terminal.effort = agent.reasoning_effort.clone();
-            say!("{pad}{} reasoning effort: {}", s.green("✓"), agent.reasoning_effort.as_deref().unwrap_or("the model's default"));
+        Slash::Effort(Some(setting)) => {
+            agent.reasoning_effort = setting.level();
+            terminal.effort = agent.reasoning_effort;
+            say!("{pad}{} reasoning effort: {}", s.green("✓"), agent.reasoning_effort.map_or("the model's default", Effort::as_str));
         }
         Slash::Status => {
             let header = agent.session.as_ref().map(|session| session.header().clone());
@@ -776,7 +778,7 @@ async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal: &mut Term
             let rows = [
                 ("model", terminal.model.clone()),
                 ("provider", format!("{} · {}", setup.provider.title, agent.model.client.base_url())),
-                ("effort", agent.reasoning_effort.clone().unwrap_or_else(|| "the model's default".into())),
+                ("effort", agent.reasoning_effort.map_or("the model's default", Effort::as_str).to_owned()),
                 ("mode", mode_description(agent.permissions.mode).to_owned()),
                 ("rules", format!("{} from .rein/permissions", agent.permissions.rule_count())),
                 ("context", format!("about {} of {} tokens before compacting", thousands(agent.estimated()), thousands(agent.window.limit))),
@@ -841,27 +843,28 @@ async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Terminal, set
     let menu = |title: &str, items: Vec<(String, String)>, current: Option<usize>| Menu { title: title.to_owned(), items, current };
     Ok(match command {
         Slash::Mode(None) => {
-            let modes = [Mode::Ask, Mode::Edits, Mode::ReadOnly, Mode::Trust];
+            let modes = Mode::ALL;
             // "edits: file changes ...": the name is the item's already.
             let about = |m: Mode| mode_description(m).split_once(": ").map_or(mode_description(m), |(_, about)| about).to_owned();
-            let items = modes.iter().map(|&m| (mode_name(m).to_owned(), about(m))).collect();
+            let items = modes.iter().map(|&m| (m.to_string(), about(m))).collect();
             let current = modes.iter().position(|&m| m == agent.permissions.mode);
             terminal.input.choose(menu("what runs without asking", items, current)).await.map(|i| Slash::Mode(Some(modes[i])))
         }
         Slash::Effort(None) => {
-            let levels = [
-                (None, "the model's own"),
-                (Some("minimal"), "as little thinking as there can be"),
-                (Some("low"), "quick: for simple work"),
-                (Some("medium"), "a balance"),
-                (Some("high"), "thorough"),
-                (Some("xhigh"), "more thorough, where the model has it"),
-                (Some("max"), "the most thinking, where the model has it"),
-            ];
-            let items = levels.iter().map(|(level, about)| (level.unwrap_or("default").to_owned(), (*about).to_owned())).collect();
-            let current = levels.iter().position(|(level, _)| level.map(str::to_owned) == agent.reasoning_effort);
+            let about = |effort: Option<Effort>| match effort {
+                None => "the model's own",
+                Some(Effort::Minimal) => "as little thinking as there can be",
+                Some(Effort::Low) => "quick: for simple work",
+                Some(Effort::Medium) => "a balance",
+                Some(Effort::High) => "thorough",
+                Some(Effort::XHigh) => "more thorough, where the model has it",
+                Some(Effort::Max) => "the most thinking, where the model has it",
+            };
+            let levels: Vec<Option<Effort>> = std::iter::once(None).chain(Effort::ALL.map(Some)).collect();
+            let items = levels.iter().map(|&level| (level.map_or("default", Effort::as_str).to_owned(), about(level).to_owned())).collect();
+            let current = levels.iter().position(|&level| level == agent.reasoning_effort);
             let chosen = terminal.input.choose(menu("how hard the model thinks", items, current)).await;
-            chosen.map(|i| Slash::Effort(Some(levels[i].0.map(str::to_owned))))
+            chosen.map(|i| Slash::Effort(Some(levels[i].map_or(EffortSetting::Default, EffortSetting::Level))))
         }
         Slash::Model(None) => {
             let mut specs = Vec::new();
@@ -1066,15 +1069,6 @@ fn switch(agent: &mut Agent<Llm>, loaded: Loaded, context: Option<String>) {
     agent.tools.forget_changes();
 }
 
-fn mode_name(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Ask => "ask",
-        Mode::Edits => "edits",
-        Mode::ReadOnly => "read-only",
-        Mode::Trust => "trust",
-    }
-}
-
 fn mode_description(mode: Mode) -> &'static str {
     match mode {
         Mode::Ask => "ask: file changes and commands ask first",
@@ -1140,6 +1134,8 @@ async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time:
                     return Said::Message(text);
                 }
             },
+            // A message is typed, never picked from a menu.
+            Read::Picked(_) => {}
             Read::Interrupted => {
                 if last_interrupt.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
                     return Said::Leave;
@@ -1192,8 +1188,8 @@ struct Terminal {
     /// The project folder, for line numbers in file changes.
     root: PathBuf,
     model: String,
-    effort: Option<String>,
-    mode: &'static str,
+    effort: Option<Effort>,
+    mode: Mode,
     input: Input,
     /// Ctrl-C pressed at a question; the turn waits on this to stop.
     interrupted: std::sync::Arc<tokio::sync::Notify>,
@@ -1293,7 +1289,6 @@ const ECHO_LINES: usize = 12;
 
 impl Terminal {
     fn new(root: PathBuf, mode: Mode, pinned: bool, history: History, bell: bool) -> Terminal {
-        let mode = mode_name(mode);
         let interrupted: std::sync::Arc<tokio::sync::Notify> = Default::default();
         let input = Input::start(pinned, interrupted.clone(), history, bell, root.clone());
         Terminal {
@@ -1446,14 +1441,14 @@ impl Terminal {
         let gauge = s.blue(&"▰".repeat(cells)) + &s.dim(&"▱".repeat(10 - cells));
         let dot = s.dim("  ·  ");
         let model = match &self.effort {
-            Some(effort) => format!("{} {}", s.bold(&self.model), s.dim(effort)),
+            Some(effort) => format!("{} {}", s.bold(&self.model), s.dim(effort.as_str())),
             None => s.bold(&self.model),
         };
         // The modes that ask less stand out.
         let mode = match self.mode {
-            "trust" => s.red(self.mode),
-            "edits" => s.yellow(self.mode),
-            mode => mode.to_owned(),
+            Mode::Trust => s.red(Mode::Trust.as_str()),
+            Mode::Edits => s.yellow(Mode::Edits.as_str()),
+            mode => mode.to_string(),
         };
         let cache = (self.turn.cached * 100).checked_div(self.turn.input).or(self.last_cache);
         let cache = cache.map(|cache| format!("{dot}{} {cache}%", s.dim("cache"))).unwrap_or_default();
@@ -1514,7 +1509,7 @@ impl Terminal {
             self.gap_before_step();
             let lead = self.lead();
             let s = self.err;
-            let diff = if matches!(call.name.as_str(), "edit" | "write") { steps::diff_box(call, &self.root, s, WIDE, false) } else { Vec::new() };
+            let diff = if matches!(ToolName::of(call), Some(ToolName::Edit | ToolName::Write)) { steps::diff_box(call, &self.root, s, WIDE, false) } else { Vec::new() };
             let (call_, lead_) = (call.clone(), lead.clone());
             self.show(move |width| {
                 let mut lines = vec![steps::line(&call_, &lead_, &s.dim("○"), "", s, width)];
@@ -1631,10 +1626,10 @@ impl Ui for Terminal {
         self.end_line();
         self.input.busy(None, std::time::Instant::now());
         self.step = None;
-        let (question, always) = match call.name.as_str() {
-            "bash" => ("Allow this command?", "Yes, and don't ask again for this command"),
-            "edit" => ("Allow this edit?", "Yes, and don't ask again for file changes"),
-            "write" => ("Allow writing this file?", "Yes, and don't ask again for file changes"),
+        let (question, always) = match ToolName::of(call) {
+            Some(ToolName::Bash) => ("Allow this command?", "Yes, and don't ask again for this command"),
+            Some(ToolName::Edit) => ("Allow this edit?", "Yes, and don't ask again for file changes"),
+            Some(ToolName::Write) => ("Allow writing this file?", "Yes, and don't ask again for file changes"),
             _ => ("Allow this?", "Yes, and don't ask again"),
         };
         if !self.input.pinned() {
@@ -1649,13 +1644,13 @@ impl Ui for Terminal {
                     std::future::pending().await
                 }
                 // No answer (input has ended) means no.
-                Read::Eof | Read::NextMode => Approval::No,
+                Read::Eof | Read::NextMode | Read::Picked(_) => Approval::No,
             };
         }
         // A command is asked about in full, in the box, and its line comes
         // once it's done. A file change shows its change above first, and
         // so does a command too long for the box.
-        let command = if call.name == "bash" { steps::command(call) } else { None };
+        let command = if ToolName::of(call) == Some(ToolName::Bash) { steps::command(call) } else { None };
         let long = command.as_deref().is_some_and(|command| input::command_lines(command, self.err, self.input.text_width()).len() > input::COMMAND_LINES);
         if command.is_none() || long {
             self.show_header(call);
@@ -1673,7 +1668,7 @@ impl Ui for Terminal {
             _ => Approval::No,
         };
         if answer == Approval::Always {
-            let what = if call.name == "bash" { "this command" } else { "file changes" };
+            let what = if ToolName::of(call) == Some(ToolName::Bash) { "this command" } else { "file changes" };
             self.noted = Some(format!("won't ask again for {what} in this conversation"));
         }
         answer
@@ -1733,7 +1728,7 @@ impl Ui for Terminal {
         let s = self.err;
         let asked = step.as_ref().is_some_and(|step| step.header_shown);
         let mut outcome = steps::outcome(call, output, s);
-        if call.name == "plan" {
+        if ToolName::of(call) == Some(ToolName::Plan) {
             // The same steps as before: just say where things stand.
             let names: Vec<String> = outcome.details.iter().map(|line| strip(line).chars().skip(2).collect()).collect();
             if names == self.plan {
@@ -1766,14 +1761,14 @@ impl Ui for Terminal {
         };
         let note = self.noted.take().map(|note| format!("{}{} {}", " ".repeat(steps::INDENT), s.green("✓"), s.dim(&note)));
         // Reads in a row share a line.
-        if call.name == "read" && outcome.ok == Some(true) && note.is_none() && let Some(lead) = lead.clone() {
+        if ToolName::of(call) == Some(ToolName::Read) && outcome.ok == Some(true) && note.is_none() && let Some(lead) = lead.clone() {
             self.show_read(call, outcome.status, lead);
             self.after_step = true;
             return;
         }
         // An edit made without asking shows what it changed; a question
         // showed it already. A new file's whole text is Ctrl-O away.
-        let diff = if !asked && call.name == "edit" && outcome.ok == Some(true) { steps::diff_box(call, &self.root, s, WIDE, true) } else { Vec::new() };
+        let diff = if !asked && ToolName::of(call) == Some(ToolName::Edit) && outcome.ok == Some(true) { steps::diff_box(call, &self.root, s, WIDE, true) } else { Vec::new() };
         let (call_, viewer) = (call.clone(), self.input.pinned());
         self.show(move |width| {
             let mut lines = vec![match &lead {
@@ -1803,7 +1798,7 @@ impl Ui for Terminal {
         self.end_line();
         self.gap_before_step();
         self.step = None;
-        let reads = calls.iter().all(|call| call.name == "read");
+        let reads = calls.iter().all(|call| ToolName::of(call) == Some(ToolName::Read));
         self.doing(&if reads { format!("Reading {} files", calls.len()) } else { format!("Looking at {} things at once", calls.len()) });
     }
 
@@ -1818,7 +1813,7 @@ impl Ui for Terminal {
             self.input.keep_output(format!("{name}  {target} · {}", strip(&outcome.status)), output);
         }
         let lead = " ".repeat(GUTTER);
-        if call.name == "read" && outcome.ok == Some(true) {
+        if ToolName::of(call) == Some(ToolName::Read) && outcome.ok == Some(true) {
             self.show_read(call, outcome.status, lead);
             return;
         }
@@ -1935,11 +1930,14 @@ fn approval(answer: &str) -> Approval {
 
 /// Error text with the next step, where there's an obvious one.
 fn describe(e: rein_llm::Error) -> String {
+    if e.kind() == Some(rein_llm::ErrorKind::Refusal) {
+        return format!("the model declined: {e}. Rephrase it, or try another model with /model");
+    }
     if let rein_llm::Error::Http(http) = &e
         && http.is_connect()
     {
         let at = http.url().map(|url| url.origin().ascii_serialization()).unwrap_or_else(|| "the server".into());
-        return format!("couldn't connect to {at}: is it running? ({http})");
+        return format!("couldn't connect to {at}: is it running? ({})", with_causes(http));
     }
     match (e.code(), e.status()) {
         (Some("subscription_sharing_usage_limit_exceeded"), _) => {
@@ -1948,12 +1946,28 @@ fn describe(e: rein_llm::Error) -> String {
         (Some("subscription_sharing_user_not_eligible"), _) => {
             format!("ChatGPT plan usage isn't available for this account or workspace: {e}")
         }
-        (Some("refusal"), _) => format!("the model declined: {e}. Rephrase it, or try another model with /model"),
         (Some("authentication_error"), _) => format!("{e}. Check $ANTHROPIC_API_KEY, or save another key with `rein login anthropic`"),
         // A bad API key's message already says what to do.
         (code, Some(401)) if code != Some("invalid_api_key") => format!("{e}. Run `rein login` to sign in again."),
-        _ => e.to_string(),
+        _ => with_causes(&e),
     }
+}
+
+/// `error`'s message, then each cause underneath it that says something
+/// more: "error sending request: dns error: no such host", not just the
+/// first part.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(underneath) = cause {
+        let said = underneath.to_string();
+        if !text.contains(&said) {
+            text.push_str(": ");
+            text.push_str(&said);
+        }
+        cause = underneath.source();
+    }
+    text
 }
 
 fn config_dir() -> CliResult<PathBuf> {
@@ -2023,7 +2037,28 @@ mod tests {
         let parsed = args("--mode edits fix the bug").unwrap();
         assert_eq!((parsed.mode, parsed.prompt.as_deref()), (Mode::Edits, Some("fix the bug")));
         assert_eq!(args("--mode edits").unwrap().prompt, None, "no task: a conversation");
-        assert_eq!(args("--mode yolo hi").err().as_deref(), Some("unknown mode yolo; use ask, edits, read-only or trust"));
+        assert_eq!(args("--mode yolo hi").err().as_deref(), Some("no mode called yolo; use ask, edits, read-only or trust"));
+    }
+
+    #[test]
+    fn says_what_went_wrong_underneath() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let wrapped = std::io::Error::other(io);
+        assert_eq!(with_causes(&rein_llm::Error::from(wrapped)), "connection refused");
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let outer = Outer(std::io::Error::other("dns error: no such host"));
+        assert_eq!(with_causes(&outer), "error sending request: dns error: no such host");
     }
 
     #[test]
@@ -2055,7 +2090,8 @@ mod tests {
     fn flags_win_over_the_settings() {
         let settings = Settings::parse("mode = edits\nmodel = from-file\neffort = low").unwrap();
         let parsed = AskArgs::parse(vec!["hi".into()], &settings).unwrap();
-        assert_eq!((parsed.mode, parsed.effort.as_deref()), (Mode::Edits, Some("low")));
+        assert_eq!((parsed.mode, parsed.effort), (Mode::Edits, Some(Effort::Low)));
+        assert_eq!(args("--effort loud hi").err().as_deref(), Some("no effort called loud; use minimal, low, medium, high, xhigh or max"));
         let parsed = AskArgs::parse(["--mode", "trust", "-m", "flagged", "hi"].map(str::to_owned).to_vec(), &settings).unwrap();
         assert_eq!((parsed.mode, parsed.model.as_deref()), (Mode::Trust, Some("flagged")));
     }

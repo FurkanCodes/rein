@@ -3,7 +3,7 @@
 //! the network:
 //!
 //! ```sh
-//! REIN_E2E=1 cargo test --test e2e -- --nocapture --test-threads 1
+//! cargo test --test e2e -- --ignored --nocapture --test-threads 1
 //! ```
 //!
 //! A provider rein has nothing to pay with is skipped, and says so; Ollama
@@ -19,14 +19,6 @@ use std::process::Command;
 use rein_llm::serde_json::{self, Value};
 
 const WORD: &str = "kestrel-7031";
-
-fn enabled() -> bool {
-    let on = std::env::var("REIN_E2E").is_ok_and(|v| v == "1");
-    if !on {
-        eprintln!("skipped: set REIN_E2E=1 to run rein against real providers");
-    }
-    on
-}
 
 /// The providers tried, and a cheap model of each that calls tools.
 const PROVIDERS: [(&str, &str); 5] = [
@@ -142,10 +134,8 @@ fn usages(record: &Path) -> Vec<(u64, u64)> {
 }
 
 #[test]
+#[ignore = "talks to real providers with your keys: cargo test --test e2e -- --ignored"]
 fn every_provider_answers_and_calls_a_tool() {
-    if !enabled() {
-        return;
-    }
     for spec in usable() {
         let project = Project::new(&spec.replace(['/', ':', '.'], "-"));
         let record = project.dir.join("stream.sse");
@@ -164,10 +154,8 @@ fn every_provider_answers_and_calls_a_tool() {
 }
 
 #[test]
+#[ignore = "talks to real providers with your keys: cargo test --test e2e -- --ignored"]
 fn a_conversation_moves_between_real_providers() {
-    if !enabled() {
-        return;
-    }
     let specs = usable();
     let [first, second, ..] = specs.as_slice() else {
         eprintln!("skipped: needs two providers");
@@ -181,10 +169,8 @@ fn a_conversation_moves_between_real_providers() {
 }
 
 #[test]
+#[ignore = "talks to real providers with your keys: cargo test --test e2e -- --ignored"]
 fn claude_takes_the_thinking_rein_sends_back_through_a_compaction() {
-    if !enabled() {
-        return;
-    }
     let Some(spec) = usable().into_iter().find(|s| s.starts_with("anthropic/")) else {
         eprintln!("skipped: no Anthropic key");
         return;

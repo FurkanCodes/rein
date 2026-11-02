@@ -1355,9 +1355,10 @@ fn a_menu_is_chosen_from_with_the_arrows_and_enter() {
     let mut term = Term::start(&model, "menu", 30, 100);
     term.wait_for(IDLE);
     term.keys("/mode\r");
-    term.wait_for("what runs without asking");
+    // It starts on the mode in use, marked. (Waited for, not looked at
+    // once: the title can be drawn before the list is.)
+    term.wait_for("› ask•");
     let screen = term.text();
-    assert!(screen.contains("› ask•"), "it starts on the mode in use, marked:\n{screen}");
     assert!(!screen.contains("edits: file"), "each says what it is once:\n{screen}");
     // Down, and down again from the last comes back to the first.
     term.keys("\x1b[B");

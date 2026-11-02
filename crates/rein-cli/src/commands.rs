@@ -2,6 +2,7 @@
 //! The same names as Claude Code and Codex where they have one.
 
 use rein_agent::permissions::Mode;
+use rein_llm::Effort;
 
 /// Every command: its name, what it takes, and what it does.
 pub const COMMANDS: &[(&str, &str, &str)] = &[
@@ -10,7 +11,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/model", "[id]", "list the models, or switch to one"),
     ("/login", "[provider]", "sign in to a provider, or see what pays for each"),
     ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
-    ("/effort", "[low|medium|high|default]", "show or change how hard the model thinks"),
+    ("/effort", "[level|default]", "change how hard the model thinks"),
     ("/status", "", "the model, mode, context and conversation"),
     ("/compact", "[focus]", "make room in the conversation now"),
     ("/copy", "", "copy rein's last answer, as it wrote it"),
@@ -33,8 +34,8 @@ pub enum Slash {
     Login(Option<String>),
     /// `None` asks which.
     Logout(Option<String>),
-    /// `Some(None)` goes back to the model's default.
-    Effort(Option<Option<String>>),
+    /// `None` asks which.
+    Effort(Option<EffortSetting>),
     Status,
     Compact(Option<String>),
     Copy,
@@ -42,6 +43,23 @@ pub enum Slash {
     New,
     Resume,
     Exit,
+}
+
+/// What `/effort` sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortSetting {
+    /// Whatever the model does when not told.
+    Default,
+    Level(Effort),
+}
+
+impl EffortSetting {
+    pub fn level(self) -> Option<Effort> {
+        match self {
+            Self::Default => None,
+            Self::Level(effort) => Some(effort),
+        }
+    }
 }
 
 /// What `line` asks for: `None` when it's a message, not a command. A
@@ -62,16 +80,15 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
         "/help" => Ok(Slash::Help),
         "/mode" => match &arg {
             None => Ok(Slash::Mode(None)),
-            Some(name) => Mode::parse(name).map(|m| Slash::Mode(Some(m))).ok_or_else(|| format!("no mode called {name}; use ask, edits, read-only or trust")),
+            Some(name) => name.parse().map(|m| Slash::Mode(Some(m))),
         },
         "/model" => Ok(Slash::Model(arg)),
         "/login" => Ok(Slash::Login(arg)),
         "/logout" => Ok(Slash::Logout(arg)),
         "/effort" => match arg.as_deref() {
             None => Ok(Slash::Effort(None)),
-            Some("default") => Ok(Slash::Effort(Some(None))),
-            Some(level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max")) => Ok(Slash::Effort(Some(Some(level.to_owned())))),
-            Some(other) => Err(format!("no effort called {other}; use low, medium, high, xhigh, max or default")),
+            Some("default") => Ok(Slash::Effort(Some(EffortSetting::Default))),
+            Some(level) => level.parse().map(|e| Slash::Effort(Some(EffortSetting::Level(e)))).map_err(|e| format!("{e}, or default")),
         },
         "/status" => Ok(Slash::Status),
         "/compact" => Ok(Slash::Compact(arg)),
@@ -114,7 +131,9 @@ mod tests {
         assert_eq!(parse("/mode edits"), Some(Ok(Slash::Mode(Some(Mode::Edits)))));
         assert_eq!(parse("  /permissions  "), Some(Ok(Slash::Mode(None))));
         assert_eq!(parse("/model gpt-6.1-terra"), Some(Ok(Slash::Model(Some("gpt-6.1-terra".into())))));
-        assert_eq!(parse("/effort default"), Some(Ok(Slash::Effort(Some(None)))));
+        assert_eq!(parse("/effort default"), Some(Ok(Slash::Effort(Some(EffortSetting::Default)))));
+        assert_eq!(parse("/effort xhigh"), Some(Ok(Slash::Effort(Some(EffortSetting::Level(Effort::XHigh))))));
+        assert_eq!(parse("/effort extreme"), Some(Err("no effort called extreme; use minimal, low, medium, high, xhigh or max, or default".into())));
         assert_eq!(parse("/compact keep the test output"), Some(Ok(Slash::Compact(Some("keep the test output".into())))));
         assert_eq!(parse("/clear"), Some(Ok(Slash::New)));
         assert_eq!(parse("/quit"), Some(Ok(Slash::Exit)));

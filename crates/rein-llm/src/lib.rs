@@ -161,8 +161,8 @@ pub struct Request {
     pub input: Vec<Item>,
     /// The tools the model may call.
     pub tools: Vec<Tool>,
-    /// For example "low", "medium" or "high". `None` uses the model default.
-    pub reasoning_effort: Option<String>,
+    /// How hard the model thinks. `None` uses the model's default.
+    pub reasoning_effort: Option<Effort>,
     /// Ask for short summaries of the model's reasoning as it thinks
     /// ([`Event::Thought`]). Only for models that reason.
     pub reasoning_summary: bool,
@@ -173,6 +173,56 @@ pub struct Request {
     /// The most the answer may take, where the format needs a number
     /// (Anthropic's does). `None` lets rein pick.
     pub max_output_tokens: Option<u64>,
+}
+
+/// How hard a model thinks, in rein's words. Each format says it its own
+/// way, and every one of them has to decide what each level means: a
+/// `match` on this is exhaustive, so a new level can't be forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Effort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    /// Beyond `High`, where the model has it.
+    XHigh,
+    /// The most there is, where the model has it.
+    Max,
+}
+
+impl Effort {
+    pub const ALL: [Effort; 6] = [Self::Minimal, Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// The levels, for messages: `minimal, low, medium, high, xhigh or max`.
+    pub fn choices() -> String {
+        let names: Vec<&str> = Self::ALL.iter().map(|e| e.as_str()).collect();
+        format!("{} or {}", names[..names.len() - 1].join(", "), names[names.len() - 1])
+    }
+}
+
+impl std::str::FromStr for Effort {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        Self::ALL.into_iter().find(|e| e.as_str() == name.trim()).ok_or_else(|| format!("no effort called {name}; use {}", Self::choices()))
+    }
+}
+
+impl fmt::Display for Effort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A fresh ID for one conversation, for [`Request::session_id`].
@@ -197,14 +247,25 @@ pub struct ModelInfo {
     pub max_output: Option<u64>,
 }
 
-/// What [`Error::code`] says when the conversation no longer fits the
-/// model's window, whatever words the provider used.
-pub const CONTEXT_FULL: &str = "context_length_exceeded";
-
-/// What [`Error::code`] says when the provider turned Claude's thinking
-/// away because the conversation before it changed. Dropping that thinking
-/// and asking again works.
-pub const STALE_THINKING: &str = "stale_thinking";
+/// What kind of failure an [`Error::Api`] is, whoever sent it and in
+/// whatever words: what rein acts on. The provider's own code stays as it
+/// was, next to it, for messages and support.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The conversation no longer fits the model's window: compact, and
+    /// ask again.
+    ContextFull,
+    /// The provider turned Claude's thinking away because the conversation
+    /// before it changed: drop that thinking, and ask again.
+    StaleThinking,
+    /// The model, or a filter in front of it, declined to answer.
+    Refusal,
+    /// The plan or account has no usage left: waiting a few seconds won't
+    /// help.
+    UsageLimit,
+    Other,
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -214,6 +275,8 @@ pub enum Error {
     /// The provider rejected the request, or failed while answering.
     Api {
         status: Option<u16>,
+        kind: ErrorKind,
+        /// The provider's own code, as it sent it.
         code: Option<String>,
         message: String,
         request_id: Option<String>,
@@ -227,9 +290,8 @@ pub enum Error {
 }
 
 impl Error {
-    /// An error a provider sent. Where its words say which kind it is, the
-    /// code becomes rein's own ([`CONTEXT_FULL`], [`STALE_THINKING`]), so
-    /// the agent can act on it whoever sent it.
+    /// An error a provider sent: its kind comes from its code, or where
+    /// that says nothing rein knows, from its words.
     pub fn api(status: Option<u16>, code: Option<String>, message: String, request_id: Option<String>) -> Error {
         let lower = message.to_lowercase();
         let rejected = status.is_none_or(|s| matches!(s, 400 | 413 | 422));
@@ -242,17 +304,39 @@ impl Error {
             "input token count",
             "too many input tokens",
         ];
-        let code = if rejected && lower.contains("signature") && lower.contains("thinking") {
-            Some(STALE_THINKING.to_owned())
-        } else if rejected && full.iter().any(|words| lower.contains(words)) {
-            Some(CONTEXT_FULL.to_owned())
+        let named = code.as_deref().unwrap_or_default();
+        let kind = if named == "context_length_exceeded" || rejected && full.iter().any(|words| lower.contains(words)) {
+            ErrorKind::ContextFull
+        } else if rejected && lower.contains("signature") && lower.contains("thinking") {
+            ErrorKind::StaleThinking
+        } else if named.contains("usage_limit") || named.contains("quota") {
+            ErrorKind::UsageLimit
         } else {
-            code
+            ErrorKind::Other
         };
-        Error::Api { status, code, message, request_id }
+        Error::Api { status, kind, code, message, request_id }
     }
 
-    /// The provider's machine-readable error code, if it sent one.
+    /// The model declined to answer, saying `why`.
+    pub fn refusal(why: impl Into<String>) -> Error {
+        Error::Api { status: None, kind: ErrorKind::Refusal, code: None, message: why.into(), request_id: None }
+    }
+
+    /// The conversation doesn't fit: `why`, in the provider's words.
+    pub fn context_full(why: impl Into<String>) -> Error {
+        Error::Api { status: None, kind: ErrorKind::ContextFull, code: None, message: why.into(), request_id: None }
+    }
+
+    /// What kind of failure this is, where a provider said; `None` for the
+    /// network, files and the like.
+    pub fn kind(&self) -> Option<ErrorKind> {
+        match self {
+            Error::Api { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// The provider's own machine-readable code, if it sent one.
     pub fn code(&self) -> Option<&str> {
         match self {
             Error::Api { code, .. } => code.as_deref(),
@@ -265,11 +349,8 @@ impl Error {
     /// (5xx). Not when you've run out of usage: waiting a few seconds won't
     /// change that.
     pub fn retryable(&self) -> bool {
-        let code = self.code().unwrap_or_default();
-        if code.contains("usage_limit") || code.contains("quota") {
-            return false;
-        }
         match self {
+            Error::Api { kind: ErrorKind::UsageLimit, .. } => false,
             Error::Http(e) => e.is_connect() || e.is_timeout() || e.is_request() || e.status().is_some_and(|s| s.is_server_error()),
             Error::Api { status: Some(status), .. } => *status == 429 || (500..600).contains(status),
             _ => false,
@@ -292,7 +373,7 @@ impl fmt::Display for Error {
             Error::Http(e) => write!(f, "network error: {e}"),
             Error::Io(e) => write!(f, "{e}"),
             Error::Json(e) => write!(f, "unexpected response: {e}"),
-            Error::Api { status, code, message, request_id } => {
+            Error::Api { status, code, message, request_id, .. } => {
                 write!(f, "{message}")?;
                 let details: Vec<String> = [
                     status.map(|s| format!("HTTP {s}")),
@@ -314,7 +395,18 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    /// What went wrong underneath, so the whole chain can be shown: the
+    /// network error under "error sending request" says DNS or TLS.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Http(e) => Some(e),
+            Error::Io(e) => Some(e),
+            Error::Json(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
@@ -341,7 +433,7 @@ mod tests {
     use super::*;
 
     fn api(status: u16, code: Option<&str>) -> Error {
-        Error::Api { status: Some(status), code: code.map(str::to_owned), message: String::new(), request_id: None }
+        Error::api(Some(status), code.map(str::to_owned), String::new(), None)
     }
 
     #[test]
@@ -357,12 +449,24 @@ mod tests {
     #[test]
     fn names_the_errors_the_agent_acts_on_whoever_sent_them() {
         let api = |status, message: &str| Error::api(Some(status), Some("invalid_request_error".into()), message.into(), None);
-        assert_eq!(api(400, "prompt is too long: 210000 tokens > 200000 maximum").code(), Some(CONTEXT_FULL));
-        assert_eq!(api(400, "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).").code(), Some(CONTEXT_FULL));
+        assert_eq!(api(400, "prompt is too long: 210000 tokens > 200000 maximum").kind(), Some(ErrorKind::ContextFull));
+        assert_eq!(api(400, "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).").kind(), Some(ErrorKind::ContextFull));
         let stale = "messages.5.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.";
-        assert_eq!(api(400, stale).code(), Some(STALE_THINKING));
-        assert_eq!(api(400, "max_tokens: field required").code(), Some("invalid_request_error"));
-        assert_eq!(api(500, "context window service down").code(), Some("invalid_request_error"), "only a rejected request");
+        assert_eq!(api(400, stale).kind(), Some(ErrorKind::StaleThinking));
+        assert_eq!(api(400, stale).code(), Some("invalid_request_error"), "the provider's own code stays");
+        assert_eq!(api(400, "max_tokens: field required").kind(), Some(ErrorKind::Other));
+        assert_eq!(api(500, "context window service down").kind(), Some(ErrorKind::Other), "only a rejected request");
+        let openai = Error::api(Some(400), Some("context_length_exceeded".into()), "too long".into(), None);
+        assert_eq!(openai.kind(), Some(ErrorKind::ContextFull));
+        assert_eq!(Error::refusal("no").kind(), Some(ErrorKind::Refusal));
+    }
+
+    #[test]
+    fn the_cause_underneath_can_be_had() {
+        use std::error::Error as _;
+        let io = Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        assert_eq!(io.source().map(ToString::to_string).as_deref(), Some("gone"));
+        assert!(Error::Interrupted.source().is_none());
     }
 
     #[test]

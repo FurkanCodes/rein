@@ -353,7 +353,7 @@ moved from one provider to another, and Claude through a compaction. It's
 off unless asked, since it costs a little:
 
 ```sh
-REIN_E2E=1 cargo test --test e2e -- --nocapture --test-threads 1
+cargo test --test e2e -- --ignored --nocapture --test-threads 1
 ```
 
 Record a real stream with

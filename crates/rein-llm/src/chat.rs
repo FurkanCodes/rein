@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use crate::client::{Client, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
 
 /// What a provider needs that it can't say in an error.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -96,11 +96,16 @@ pub(crate) fn request_body(request: &Request, omitted: &[&str], quirks: Quirks) 
             .collect();
         body["tools"] = json!(tools);
     }
-    if let Some(effort) = &request.reasoning_effort
+    if let Some(effort) = request.reasoning_effort
         && !omitted.contains(&"effort")
     {
         // The levels the format knows; beyond them, its highest.
-        let effort = if matches!(effort.as_str(), "xhigh" | "max") { "high" } else { effort };
+        let effort = match effort {
+            Effort::Minimal => "minimal",
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High | Effort::XHigh | Effort::Max => "high",
+        };
         if quirks.effort_object {
             body["reasoning"] = json!({ "effort": effort });
         } else {
@@ -322,7 +327,7 @@ impl Completions {
     fn end(&mut self, out: &mut Vec<Result<Event>>) {
         match self.finish.as_deref() {
             Some("length") => return out.push(Err(Error::Incomplete("the answer reached its length limit".into()))),
-            Some("content_filter") => return out.push(Err(Error::api(None, Some("refusal".into()), "the provider's filter stopped the answer".into(), None))),
+            Some("content_filter") => return out.push(Err(Error::refusal("the provider's filter stopped the answer"))),
             _ => {}
         }
         let mut replay = Map::new();
@@ -358,7 +363,7 @@ mod tests {
             instructions: Some("be brief".into()),
             input,
             tools: vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }],
-            reasoning_effort: Some("max".into()),
+            reasoning_effort: Some(Effort::Max),
             reasoning_summary: true,
             session_id: None,
             max_output_tokens: None,

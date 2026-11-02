@@ -37,6 +37,8 @@ pub enum Read {
     /// Ctrl-C while typing. In a real terminal the box turns it into a
     /// keypress, so it arrives here instead of as a signal.
     Interrupted,
+    /// The item of a menu that was picked, by its place in the list.
+    Picked(usize),
     /// Ctrl-D, or input ended.
     Eof,
     /// Shift-Tab: on to the next mode.
@@ -524,7 +526,7 @@ impl Boxed {
         let chosen = match key {
             Key::Esc | Key::CtrlC => Some(Read::Interrupted),
             // Nothing matches: Enter waits for typing that does.
-            Key::Enter => matching.get(picking.picked).map(|i| Read::Line(i.to_string())),
+            Key::Enter => matching.get(picking.picked).map(|&i| Read::Picked(i)),
             Key::Up | Key::BackTab => {
                 picking.picked = if picking.picked == 0 { last } else { picking.picked - 1 };
                 None
@@ -1249,7 +1251,7 @@ impl Input {
         let read = self.replies.recv().await.unwrap_or(Read::Eof);
         self.pending = false;
         match read {
-            Read::Line(i) => i.parse().ok(),
+            Read::Picked(i) => Some(i),
             _ => None,
         }
     }

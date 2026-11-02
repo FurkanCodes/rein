@@ -112,13 +112,20 @@ pub struct PendingSignIn {
 /// Starts a sign-in. Pass this account's previous credentials, if any, so
 /// OpenAI reuses the existing registration instead of creating a new one.
 pub async fn begin(host_id: &str, agent_name: &str, previous: Option<&Credentials>) -> Result<PendingSignIn> {
-    let listener = TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).await.map_err(|e| {
+    begin_on(CALLBACK_PORT, host_id, agent_name, previous).await
+}
+
+/// `begin`, with the callback on `port`: OpenAI's registered one for real
+/// sign-ins, any free one (0) for tests, so they can't collide with one.
+async fn begin_on(port: u16, host_id: &str, agent_name: &str, previous: Option<&Credentials>) -> Result<PendingSignIn> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| {
         Error::Auth(format!(
-            "can't listen on 127.0.0.1:{CALLBACK_PORT} for the sign-in callback ({e}). Another sign-in, \
+            "can't listen on 127.0.0.1:{port} for the sign-in callback ({e}). Another sign-in, \
              maybe from the Codex CLI, is using it; finish or cancel that one and try again."
         ))
     })?;
-    let redirect_uri = format!("http://127.0.0.1:{CALLBACK_PORT}{CALLBACK_PATH}");
+    let port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
     let state = random_token()?;
     let nonce = random_token()?;
     let verifier = random_token()?;
@@ -424,8 +431,8 @@ mod tests {
     }
 
     /// Sends one HTTP GET to the callback port, like a browser would.
-    async fn browser_get(target: &str) -> String {
-        let mut socket = TcpStream::connect(("127.0.0.1", CALLBACK_PORT)).await.unwrap();
+    async fn browser_get(port: u16, target: &str) -> String {
+        let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         socket.write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes()).await.unwrap();
         let mut response = String::new();
         socket.read_to_string(&mut response).await.unwrap();
@@ -434,17 +441,19 @@ mod tests {
 
     #[tokio::test]
     async fn callback_server_survives_idle_and_stale_connections() {
-        let pending = begin("urn:uuid:00000000-0000-4000-8000-000000000000", "rein-test", None).await.unwrap();
+        // Any free port: a real sign-in on 1455 can't get in the way.
+        let pending = begin_on(0, "urn:uuid:00000000-0000-4000-8000-000000000000", "rein-test", None).await.unwrap();
+        let port = pending.listener.local_addr().unwrap().port();
         let state = Url::parse(&pending.url).unwrap().query_pairs().find(|(k, _)| k == "state").unwrap().1.into_owned();
 
         let browser = async {
             // A spare connection that never sends a request mustn't block the server...
-            let _idle = TcpStream::connect(("127.0.0.1", CALLBACK_PORT)).await.unwrap();
+            let _idle = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             // ...a tab left over from an earlier attempt gets turned away...
-            let stale = browser_get(&format!("{CALLBACK_PATH}?code=old&state=stale&client_id=oaiapp_0")).await;
+            let stale = browser_get(port, &format!("{CALLBACK_PATH}?code=old&state=stale&client_id=oaiapp_0")).await;
             assert!(stale.starts_with("HTTP/1.1 400"), "{stale}");
             // ...and the real callback is accepted.
-            let ok = browser_get(&format!("{CALLBACK_PATH}?code=c1&state={state}&client_id=oaiapp_1")).await;
+            let ok = browser_get(port, &format!("{CALLBACK_PATH}?code=c1&state={state}&client_id=oaiapp_1")).await;
             assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
         };
         let (result, ()) = tokio::join!(pending.wait_for_callback(), browser);

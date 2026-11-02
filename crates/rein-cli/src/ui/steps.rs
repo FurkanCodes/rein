@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use rein_agent::tools::ToolName;
 use rein_llm::ToolCall;
 use rein_llm::serde_json::{self, Value};
 
@@ -33,8 +34,8 @@ const DIFF_LINES: usize = 12;
 pub fn describe(call: &ToolCall) -> (&'static str, String) {
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     let path = args["path"].as_str().unwrap_or_default().to_owned();
-    match call.name.as_str() {
-        "read" => {
+    match ToolName::of(call) {
+        Some(ToolName::Read) => {
             let range = match (args["start_line"].as_u64(), args["line_count"].as_u64()) {
                 (None, None) => String::new(),
                 (start, Some(count)) => {
@@ -45,7 +46,7 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             };
             ("Read", path + &range)
         }
-        "grep" => {
+        Some(ToolName::Grep) => {
             let mut target = format!("\"{}\"", args["pattern"].as_str().unwrap_or_default());
             if !path.is_empty() && path != "." {
                 target += &format!(" in {path}");
@@ -55,23 +56,23 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             }
             ("Search", target)
         }
-        "glob" => {
+        Some(ToolName::Glob) => {
             let mut target = args["pattern"].as_str().unwrap_or_default().to_owned();
             if !path.is_empty() && path != "." {
                 target += &format!(" in {path}");
             }
             ("Find", target)
         }
-        "write" => ("Write", path),
-        "edit" => ("Edit", path),
-        "bash" => {
+        Some(ToolName::Write) => ("Write", path),
+        Some(ToolName::Edit) => ("Edit", path),
+        Some(ToolName::Bash) => {
             let command = args["command"].as_str().unwrap_or_default();
             let first = command.lines().next().unwrap_or_default();
             let more = if command.trim_end().contains('\n') { " …" } else { "" };
             ("Run", format!("{first}{more}"))
         }
-        "recall" => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
-        "plan" => {
+        Some(ToolName::Recall) => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
+        Some(ToolName::Plan) => {
             let steps = args["steps"].as_array().map_or(0, Vec::len);
             let done = args["steps"].as_array().into_iter().flatten().filter(|step| step["status"] == "done").count();
             ("Plan", format!("{done} of {steps} done"))
@@ -181,8 +182,8 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
     if output.starts_with("Not run: the user sent a message") {
         return plain(None, style.dim("skipped"));
     }
-    match call.name.as_str() {
-        "bash" => {
+    match ToolName::of(call) {
+        Some(ToolName::Bash) => {
             let mut lines: Vec<&str> = output.lines().collect();
             let code = lines.last().and_then(|last| last.strip_prefix("[exit code ")?.strip_suffix(']')).map(str::to_owned);
             let stopped = lines.last().is_some_and(|last| last.starts_with("[stopped"));
@@ -208,8 +209,8 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             }
             Outcome { ok: Some(!failed), status, more: body.len() - shown.len(), details: shown.into_iter().map(str::to_owned).collect(), unit: "line" }
         }
-        "read" if output.starts_with("[unchanged:") => plain(Some(true), style.dim("unchanged: already in the conversation")),
-        "read" => {
+        Some(ToolName::Read) if output.starts_with("[unchanged:") => plain(Some(true), style.dim("unchanged: already in the conversation")),
+        Some(ToolName::Read) => {
             // A partial read ends with a note saying which lines it holds.
             let note = output.lines().last().filter(|line| line.starts_with("[lines "));
             match note {
@@ -228,7 +229,7 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             }
         }
         // The checklist itself, a line per step.
-        "plan" => {
+        Some(ToolName::Plan) => {
             let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
             let details = args["steps"]
                 .as_array()
@@ -246,10 +247,10 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             Outcome { ok: Some(true), status: String::new(), details, more: 0, unit: "line" }
         }
         // The summary, and which files: the first few, then how many more.
-        "grep" | "glob" => {
+        Some(ToolName::Grep | ToolName::Glob) => {
             let summary = first_line(output);
             if summary.starts_with("No ") {
-                return plain(Some(true), style.dim(if call.name == "grep" { "nothing found" } else { "no files" }));
+                return plain(Some(true), style.dim(if ToolName::of(call) == Some(ToolName::Grep) { "nothing found" } else { "no files" }));
             }
             let mut files = found_files(output);
             // A search of one file: its line names it already.
@@ -261,7 +262,7 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             let status = style.dim(summary.split(';').next().unwrap_or_default());
             Outcome { ok: Some(true), status, more: files.len() - shown.len(), details: shown, unit: "file" }
         }
-        "recall" => {
+        Some(ToolName::Recall) => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
             if found == 0 {
                 plain(Some(true), style.dim("nothing found"))
@@ -275,7 +276,7 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             let said = first_line(output);
             // `created a.rs (30 lines)` → `30 lines`.
             let short = match said.rsplit_once(" (") {
-                Some((_, rest)) if call.name == "write" => rest.trim_end_matches(')').to_owned(),
+                Some((_, rest)) if ToolName::of(call) == Some(ToolName::Write) => rest.trim_end_matches(')').to_owned(),
                 _ => said.split_once(": ").map_or(said.as_str(), |(_, rest)| rest).to_owned(),
             };
             plain(Some(true), style.dim(&short))
@@ -320,14 +321,14 @@ pub fn detail_lines(outcome: &Outcome, style: Style, columns: usize, viewer: boo
 /// come from where the new text is rather than the old.
 pub fn diff_box(call: &ToolCall, root: &Path, style: Style, columns: usize, applied: bool) -> Vec<String> {
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
-    let (old, new) = match call.name.as_str() {
-        "edit" => (args["old_text"].as_str().unwrap_or_default(), args["new_text"].as_str().unwrap_or_default()),
-        "write" => ("", args["content"].as_str().unwrap_or_default()),
+    let (old, new) = match ToolName::of(call) {
+        Some(ToolName::Edit) => (args["old_text"].as_str().unwrap_or_default(), args["new_text"].as_str().unwrap_or_default()),
+        Some(ToolName::Write) => ("", args["content"].as_str().unwrap_or_default()),
         _ => return Vec::new(),
     };
     // Where the change starts in the file, for the line numbers.
-    let first = match call.name.as_str() {
-        "edit" => args["path"]
+    let first = match ToolName::of(call) {
+        Some(ToolName::Edit) => args["path"]
             .as_str()
             .and_then(|path| std::fs::read_to_string(root.join(path)).ok())
             .and_then(|text| text.find(if applied { new } else { old }).map(|at| text[..at].matches('\n').count() + 1)),
