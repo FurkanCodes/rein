@@ -1,4 +1,5 @@
 #!/bin/sh
+if [ -n "${PIDFILE:-}" ]; then echo $$ > "$PIDFILE"; fi
 answer() { printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$1"; }
 said() { answer "{\"content\":[{\"type\":\"text\",\"text\":\"$1\"}]}"; }
 while IFS= read -r line; do

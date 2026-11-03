@@ -111,10 +111,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     };
     let (client, models) = connected.models().await;
     let secrets = rein_agent::redact::Secrets::new(known_secrets(&keys).into_iter().chain(mcp.secrets()));
-    let mut tools = Tools::new(root.clone()).with_sandbox(sandbox.clone()).with_secrets(secrets);
-    if let Some(servers) = &mcp.servers {
-        tools = tools.with_mcp(servers.clone());
-    }
+    let tools = Tools::new(root.clone()).with_sandbox(sandbox.clone()).with_secrets(secrets).with_mcp(mcp.servers.clone());
     let mut setup = Setup {
         folder,
         personal: dir.join("AGENTS.md"),
@@ -494,10 +491,9 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
         match crate::commands::parse(line) {
             Some(Ok(Slash::Exit)) => break,
             Some(parsed) => {
-                // A line that may hold a key isn't shown again.
-                let hidden = crate::commands::hides(line);
-                if terminal.input.pinned() && !hidden {
-                    say!("\n{}", you_said(line, terminal.err, terminal.wrap_width().unwrap_or(80)));
+                // A line that may hold a key is shown again without it.
+                if terminal.input.pinned() {
+                    say!("\n{}", you_said(&crate::commands::shown(line), terminal.err, terminal.wrap_width().unwrap_or(80)));
                 }
                 let done = match parsed {
                     Ok(command) => run_command(command, agent, terminal, setup).await,
@@ -649,7 +645,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 say!("{pad}{}  {value}", s.dim(&format!("{name:<8}")));
             }
         }
-        Slash::Mcp => crate::mcp::show(&setup.mcp, terminal),
+        Slash::Mcp(command) => crate::mcp::command(command, &mut setup.mcp, agent, terminal).await?,
         Slash::Compact(focus) => compact_now(agent, focus.as_deref(), terminal).await?,
         Slash::Copy => {
             let last = agent.full().iter().rev().find_map(|item| match item {

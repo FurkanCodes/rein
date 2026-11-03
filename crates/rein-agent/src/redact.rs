@@ -31,6 +31,11 @@ impl Secrets {
         Secrets(values.into())
     }
 
+    /// These and `more`: a new list, which clones of this one don't share.
+    pub fn and(&self, more: impl IntoIterator<Item = String>) -> Self {
+        Secrets::new(self.0.iter().cloned().chain(more))
+    }
+
     /// `text` with every key in it replaced by [`HIDDEN`].
     pub fn hide(&self, text: String) -> String {
         if !self.0.iter().any(|value| text.contains(value.as_str())) {
@@ -58,5 +63,8 @@ mod tests {
         assert_eq!(said, format!("a={HIDDEN} b={HIDDEN} c={HIDDEN} short"), "too short to be a key: left");
         assert_eq!(secrets.hide("nothing here".to_owned()), "nothing here");
         assert_eq!(format!("{secrets:?}"), "Secrets(3 hidden)");
+        let more = secrets.and(["FAKE-server-key".to_owned()]);
+        assert_eq!(more.hide("FAKE-server-key gh-FAKE-token".to_owned()), format!("{HIDDEN} {HIDDEN}"));
+        assert_eq!(secrets.hide("FAKE-server-key".to_owned()), "FAKE-server-key", "a new list");
     }
 }

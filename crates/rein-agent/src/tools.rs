@@ -307,6 +307,12 @@ impl Tools {
         self.mcp.as_deref()
     }
 
+    /// Hides these values too, from now on: a server's keys, once you've
+    /// added it.
+    pub fn hide_too(&mut self, values: impl IntoIterator<Item = String>) {
+        self.secrets = self.secrets.and(values);
+    }
+
     /// Hides `secrets` in what the tools say: see [`redact`].
     pub fn with_secrets(mut self, secrets: Secrets) -> Self {
         self.secrets = secrets;

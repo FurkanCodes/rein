@@ -233,6 +233,18 @@ finding. Each says why in a line.
 - Visual checks in tmux use a throwaway `REIN_HOME`, so they don't add to your
   history or saved conversations.
 
+## Slash commands
+
+- What you can set in a file, you can set with a slash command too, in the
+  conversation: `/mcp add` rather than editing `mcp.json`, `/login` rather
+  than `keys.json`. Asked how to connect an MCP server, rein's answer was
+  "edit this JSON", which meant leaving the conversation and getting the
+  JSON right by hand. The file stays the record, and you can still edit it:
+  the command writes it whole, and keeps whatever else it holds.
+- A command's line that may hold a key isn't shown again or kept for ↑
+  (`commands::hides`): `/login <provider> <key>`, or `/mcp add` with a
+  value written in as it is.
+
 ## Docs
 
 - Doc comments say what and why in plain words, and stay true: when the code

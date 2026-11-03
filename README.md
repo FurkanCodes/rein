@@ -565,9 +565,23 @@ sandbox, so `deny rm` doesn't stop `/bin/rm`.
 ## MCP servers
 
 MCP servers give the model more tools: an issue tracker's, a browser's, a
-database's. rein reads them from `~/.config/rein/mcp.json` and from a
-project's `.mcp.json`, in the shape Claude Code and Cursor use, so the
-snippet in a server's README works as it is:
+database's. Add one in the conversation, as you'd start it in a shell:
+
+```
+/mcp add github GITHUB_PERSONAL_ACCESS_TOKEN=$GITHUB_TOKEN npx -y @modelcontextprotocol/server-github
+/mcp allow github get_issue search_issues
+/mcp remove github
+```
+
+Or paste the JSON a server's README gives after `/mcp add`, as it is.
+`--access outside` before the command gives it other walls (see below).
+rein starts it at once and says how it did, and the model is offered its
+tools from your next message. `/mcp allow` lets a server's tools run
+without asking, or `*` all of them.
+
+These write `~/.config/rein/mcp.json`, which you can edit too. rein also
+reads a project's `.mcp.json`. Both have the shape Claude Code and Cursor
+use:
 
 ```json
 { "mcpServers": {
@@ -578,6 +592,10 @@ snippet in a server's README works as it is:
       "allow": ["get_issue", "search_issues"]
 } } }
 ```
+
+A line that writes a key in as it is (`TOKEN=ghp_…` rather than
+`$GITHUB_TOKEN`) isn't shown again or kept for ↑. The key is kept in your
+`mcp.json`, which only you can read.
 
 A server is someone else's code, often fetched as it starts, so it runs in
 the sandbox the way a command with `network` access does. It reaches the
@@ -594,16 +612,18 @@ A project's `.mcp.json` came with the project and may be anyone's. So rein
 asks before it starts one of its servers, showing exactly what it runs, and
 keeps your yes for the server as it is: a changed command, argument or
 variable asks again. A task run with `-p` doesn't start one you haven't said
-yes to.
+yes to. `/mcp remove` on one of a project's servers stops it and takes back
+your yes.
 
 The model sees a server's tools as `mcp__<server>__<tool>`. They're listed
 in a conversation's first request, once the servers have started (each gets
-30 s), and stay as they are until `/new`. So a server can't change what the
-model was told mid-conversation, and the prompt cache isn't lost. A call
+30 s), and stay as they are until `/new`, or until you add or remove a
+server. So a server can't change what the model was told mid-conversation,
+and the prompt cache isn't lost. A call
 asks first in `ask` and `edits`: a server's tool may do anything wherever
 the server reaches, and what a server says of a tool (that it only reads,
-say) is only its word. `allow` in your own file lets tools run without
-asking, and `"*"` allows all of one server's. `auto` runs only those, and
+say) is only its word. `/mcp allow`, or `allow` in your own file, lets
+tools run without asking, and `"*"` allows all of one server's. `auto` runs only those, and
 `read-only` none. Neither a project's `.mcp.json` nor its
 `.rein/permissions` can allow one.
 

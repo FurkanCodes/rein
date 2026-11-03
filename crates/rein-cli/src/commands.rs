@@ -13,7 +13,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
     ("/effort", "[level|default]", "change how hard the model thinks"),
     ("/status", "", "the model, mode, context and conversation"),
-    ("/mcp", "", "the MCP servers: their tools, and how each is doing"),
+    ("/mcp", "[add|remove|allow …]", "the MCP servers; add or remove one, or let its tools run without asking"),
     ("/compact", "[focus]", "make room in the conversation now"),
     ("/copy", "", "copy rein's last answer, as it wrote it"),
     ("/undo", "", "put back the files rein changed in its last turn"),
@@ -48,7 +48,7 @@ pub enum Slash {
     /// `None` asks which.
     Effort(Option<EffortSetting>),
     Status,
-    Mcp,
+    Mcp(Mcp),
     Compact(Option<String>),
     Copy,
     Undo,
@@ -65,6 +65,43 @@ pub enum Slash {
     Workspace(Option<String>),
     Exit,
 }
+
+/// What `/mcp` does.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Mcp {
+    /// Says how each server is doing.
+    Show,
+    /// `/mcp add`: these servers, as yours, and those that can't be, with
+    /// why.
+    Add(rein_mcp::Named),
+    /// `/mcp remove <name>`.
+    Remove(String),
+    /// `/mcp allow <name> <tool …>`: these of its tools, or `*` for all,
+    /// run without asking.
+    Allow(String, Vec<String>),
+}
+
+impl Mcp {
+    /// `add github npx -y …`, `remove github`, `allow github get_issue`.
+    fn parse(rest: &str) -> Result<Mcp, Refused> {
+        let (word, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let words: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
+        match (word, words.as_slice()) {
+            ("", _) => Ok(Mcp::Show),
+            ("add", []) => Err(Refused::Said(ADD.into())),
+            // What follows may hold a key, even when it can't be read.
+            ("add", _) => rein_mcp::config::added(rest).map(Mcp::Add).map_err(|e| Refused::MayHoldKey(format!("can't add that: {e}"))),
+            ("remove", [name]) => Ok(Mcp::Remove(name.clone())),
+            ("remove", _) => Err(Refused::Said("/mcp remove takes a server's name".into())),
+            ("allow", [name, tools @ ..]) if !tools.is_empty() => Ok(Mcp::Allow(name.clone(), tools.to_vec())),
+            ("allow", _) => Err(Refused::Said("/mcp allow takes a server's name and its tools to run without asking, or * for all of them".into())),
+            (other, _) => Err(Refused::Said(format!("/mcp takes add, remove or allow, not {other}; alone, it lists the servers"))),
+        }
+    }
+}
+
+/// How `/mcp add` is used.
+pub const ADD: &str = "/mcp add <name> [NAME=value …] <command> [args …], or a server's JSON as its README gives it";
 
 /// What `/spawn` asks for: what's not given is asked for.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -111,6 +148,9 @@ pub enum Refused {
     /// `/logout` with more than a name. What follows may be a key: the
     /// line isn't shown again or kept for ↑, and this doesn't say it back.
     TooManyWords(Account),
+    /// Said in words, of a line that may hold a key, like `/mcp add`'s:
+    /// it isn't shown again or kept, and this doesn't say what's in it.
+    MayHoldKey(String),
     /// Anything else, said in words.
     Said(String),
 }
@@ -126,7 +166,7 @@ impl Refused {
     /// The line it was typed in may hold a secret, so it's never shown
     /// again or kept.
     pub fn hides_the_line(&self) -> bool {
-        matches!(self, Self::TooManyWords(_))
+        matches!(self, Self::TooManyWords(_) | Self::MayHoldKey(_))
     }
 }
 
@@ -135,7 +175,7 @@ impl std::fmt::Display for Refused {
         match self {
             Self::TooManyWords(Account::Login) => f.write_str("/login takes a provider's name and, if you like, its key"),
             Self::TooManyWords(Account::Logout) => f.write_str("/logout takes only a provider's name"),
-            Self::Said(words) => f.write_str(words),
+            Self::Said(words) | Self::MayHoldKey(words) => f.write_str(words),
         }
     }
 }
@@ -214,7 +254,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
             Some(level) => level.parse().map(|e| Slash::Effort(Some(EffortSetting::Level(e)))).map_err(|e| Refused::Said(format!("{e}, or default"))),
         },
         "/status" => Ok(Slash::Status),
-        "/mcp" => Ok(Slash::Mcp),
+        "/mcp" => Mcp::parse(rest).map(Slash::Mcp),
         "/compact" => Ok(Slash::Compact(arg)),
         "/copy" => Ok(Slash::Copy),
         "/undo" => Ok(Slash::Undo),
@@ -239,10 +279,13 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
 }
 
 /// Whether `line` may hold a secret, like a key typed after `/login`'s
-/// provider: then it's never shown again, or kept for ↑.
+/// provider, or a server's added with its key: then it's never shown
+/// again, or kept for ↑.
 pub fn hides(line: &str) -> bool {
     match parse(line) {
         Some(Ok(Slash::LoginWith(..))) => true,
+        // A server rein can't start may hold one where rein didn't look.
+        Some(Ok(Slash::Mcp(Mcp::Add(named)))) => !named.skipped.is_empty() || named.servers.iter().any(rein_mcp::Server::may_hold_keys),
         Some(Err(refused)) => refused.hides_the_line(),
         _ => false,
     }
@@ -253,6 +296,7 @@ pub fn hides(line: &str) -> bool {
 pub fn shown(line: &str) -> std::borrow::Cow<'_, str> {
     match parse(line) {
         Some(Ok(Slash::LoginWith(provider, _))) => format!("/login {provider} (key hidden)").into(),
+        _ if hides(line) => format!("{} … (what may be a key hidden)", line.split_whitespace().take(2).collect::<Vec<_>>().join(" ")).into(),
         _ => line.into(),
     }
 }
@@ -340,6 +384,40 @@ mod tests {
             assert!(hides(line), "{line} is neither shown again nor kept");
         }
         for line in ["/login openrouter", "/login", "/logout anthropic", "/model gpt-6.1-terra extra", "/frobnicate sk-FAKE", "fix it"] {
+            assert!(!hides(line), "{line} is shown and kept as usual");
+        }
+    }
+
+    #[test]
+    fn mcp_adds_removes_and_allows() {
+        let Some(Ok(Slash::Mcp(Mcp::Add(named)))) = parse("/mcp add github GITHUB_TOKEN=$GITHUB_TOKEN npx -y gh") else { panic!("a server to add") };
+        assert_eq!((named.servers[0].name.as_str(), named.servers[0].args.as_slice()), ("github", ["-y".to_owned(), "gh".to_owned()].as_slice()));
+        assert_eq!(parse("/mcp"), Some(Ok(Slash::Mcp(Mcp::Show))));
+        assert_eq!(parse("/mcp remove github"), Some(Ok(Slash::Mcp(Mcp::Remove("github".into())))));
+        assert_eq!(parse("/mcp allow github get_issue *"), Some(Ok(Slash::Mcp(Mcp::Allow("github".into(), vec!["get_issue".into(), "*".into()])))));
+        for (line, why) in [("/mcp add", "/mcp add <name>"), ("/mcp remove", "a server's name"), ("/mcp allow github", "its tools"), ("/mcp start x", "not start")] {
+            let refused = parse(line).and_then(Result::err).unwrap_or_else(|| panic!("{line} is turned down"));
+            assert!(refused.to_string().contains(why), "{line}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_server_added_with_its_key_is_neither_shown_again_nor_kept() {
+        for line in [
+            "/mcp add github GITHUB_TOKEN=ghp_FAKE npx -y gh",
+            "/mcp add s npx s --api-key sk-FAKE",
+            r#"/mcp add {"mcpServers": {"gh": {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_FAKE"}}}}"#,
+            r#"/mcp add {"mcpServers": {"linear": {"url": "https://x.dev/mcp", "headers": {"Authorization": "Bearer FAKE"}}}}"#,
+            "/mcp add gh GITHUB_TOKEN='ghp_FAKE",
+        ] {
+            assert!(hides(line), "{line}");
+            assert!(!shown(line).contains("FAKE"), "{}", shown(line));
+            assert!(!format!("{:?}", parse(line)).contains("FAKE"), "{:?}", parse(line));
+            if let Some(Err(refused)) = parse(line) {
+                assert!(!refused.to_string().contains("FAKE"), "{refused}");
+            }
+        }
+        for line in ["/mcp add github GITHUB_TOKEN=$GITHUB_TOKEN npx -y gh", "/mcp add docs uvx docs-mcp", "/mcp remove github", "/mcp"] {
             assert!(!hides(line), "{line} is shown and kept as usual");
         }
     }

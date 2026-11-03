@@ -314,7 +314,8 @@ pub struct Agent<M> {
     /// The tools offered: the same in every request, so built once.
     specs: Vec<Tool>,
     /// Whether `specs` has this conversation's MCP tools: they're added
-    /// before its first request, and stay as they are after.
+    /// before its first request, and stay as they are after, until you
+    /// change the servers.
     listed: bool,
     /// The system prompt, the same for the whole conversation.
     instructions: Option<String>,
@@ -372,9 +373,10 @@ impl<M: Model> Agent<M> {
     /// on the tools stay as they are, though a server starts late or lists
     /// others: a changed list would lose the prompt cache, and a server
     /// mustn't be able to change what the model was told mid-conversation.
+    /// Only you do, adding or removing one ([`Agent::servers_changed`]).
     /// What each server came to is said.
     async fn offer_servers_tools(&mut self, ui: &mut impl Ui) {
-        let Some(servers) = self.tools.mcp().filter(|servers| !self.listed && !servers.is_empty()) else { return };
+        let Some(servers) = self.tools.mcp().filter(|_| !self.listed) else { return };
         if servers.starting() {
             ui.starting_servers();
         }
@@ -387,6 +389,13 @@ impl<M: Model> Agent<M> {
         if let Some(note) = listing.note {
             ui.note(&note);
         }
+    }
+
+    /// You added or removed an MCP server, or let its tools run without
+    /// asking: the model is offered the servers' tools as they are now
+    /// with the next message.
+    pub fn servers_changed(&mut self) {
+        self.listed = false;
     }
 
     /// Works until the model is done, the turn is stopped, or it's stuck.
@@ -1278,6 +1287,40 @@ mod tests {
         assert!(names(&requests[0]).contains(&"mcp__fake__echo".to_owned()), "{:?}", names(&requests[0]));
         assert!(requests.iter().all(|seen| names(seen) == names(&requests[0])), "the same tools all conversation");
         assert!(requests[0].tools.iter().filter(|tool| rein_mcp::is_mcp(&tool.name)).all(|tool| !tool.strict));
+    }
+
+    /// A server you add or remove as rein runs changes the tools from the
+    /// next message on, and only then.
+    #[tokio::test]
+    async fn the_servers_tools_change_with_the_next_message_once_you_change_the_servers() {
+        let says = |text: &str| vec![Item::Assistant(text.into())];
+        let mut agent = agent("mcp-changed", vec![says("One."), says("Two."), says("Three."), says("Four.")]);
+        let root = agent.tools.root().to_owned();
+        std::fs::write(root.join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
+        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches") };
+        let servers = std::sync::Arc::new(rein_mcp::Servers::start(Vec::new(), launch));
+        agent.tools = Tools::new(&root).with_mcp(servers.clone());
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("one".into(), &mut person).await.unwrap();
+        let server = rein_mcp::Server {
+            name: "fake".into(),
+            origin: rein_mcp::Origin::Yours,
+            command: "sh".into(),
+            args: vec!["server.sh".into()],
+            env: Default::default(),
+            access: crate::sandbox::Access::Outside,
+            allow: Vec::new(),
+        };
+        servers.add(server);
+        agent.send("two".into(), &mut person).await.unwrap();
+        agent.servers_changed();
+        agent.send("three".into(), &mut person).await.unwrap();
+        servers.remove("fake");
+        agent.servers_changed();
+        agent.send("four".into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        let servers_tools = |seen: &Seen| seen.tools.iter().filter(|tool| rein_mcp::is_mcp(&tool.name)).count();
+        assert_eq!(requests.iter().map(servers_tools).collect::<Vec<_>>(), [0, 0, 5, 0], "added: not until you said so; then in; removed: out");
     }
 
     #[tokio::test]

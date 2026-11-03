@@ -7,8 +7,9 @@
 //! internet, but not your home folder, other programs' sockets, or rein's
 //! keys. What it says is cleaned before you or the model see it, and the
 //! tools it lists are offered under names of their own
-//! (`mcp__github__get_issue`), fixed for the conversation, so a server that
-//! starts late or changes its list can't change what the model was told.
+//! (`mcp__github__get_issue`), fixed for the conversation unless you add or
+//! remove a server, so a server that starts late or changes its list can't
+//! change what the model was told.
 
 mod clean;
 pub mod config;
@@ -95,7 +96,7 @@ impl Launch {
             }
             Some(walls) => {
                 if !self.sandbox.available() {
-                    return Err(Error::Start(r#"there's no sandbox here to start it in; with "access": "outside" it starts with your full access"#.into()));
+                    return Err(Error::Start("there's no sandbox here to start it in; with --access outside it starts with your full access".into()));
                 }
                 let own = self.caches.join(&server.name);
                 std::fs::create_dir_all(&own).map_err(|e| Error::Start(format!("can't make its folder {}: {e}", own.display())))?;
@@ -128,7 +129,7 @@ impl Launch {
         };
         let walls = match server.access.walls() {
             Some(walls) if self.sandbox.available() => format!(
-                " (it ran in the sandbox with {} access{}: if that's why, give it more in mcp.json, like \"access\": \"outside\")",
+                " (it ran in the sandbox with {} access{}: if that's why, /mcp add it again with --access outside)",
                 server.access,
                 if walls.network { "" } else { ", without the internet" }
             ),
@@ -246,27 +247,42 @@ enum State {
     Failed(String),
 }
 
+impl State {
+    /// How a server in this state is doing.
+    fn status(&self) -> Status {
+        match self {
+            State::Starting => Status::Starting,
+            State::Ready(connection) if connection.rpc.alive() => Status::Ready(connection.tools.iter().map(|tool| tool.name.clone()).collect()),
+            State::Ready(_) => Status::Stopped,
+            State::Failed(why) => Status::Failed(why.clone()),
+        }
+    }
+}
+
 struct Entry {
     server: Server,
     /// Held while it starts, so whoever wants it waits until it has.
     state: Arc<tokio::sync::Mutex<State>>,
+    /// Its start, stopped if it's removed before it's done.
+    start: tokio::task::AbortHandle,
 }
 
 /// The servers rein started, and the tools of theirs the model is offered.
 pub struct Servers {
-    entries: Vec<Entry>,
+    /// Each lock is held only to look or change, never across an `.await`.
+    entries: Mutex<Vec<Arc<Entry>>>,
     launch: Launch,
     /// The tools last offered, by the names the model knows them by: which
     /// server's, and its own name for it.
-    offered: Mutex<HashMap<String, (usize, String)>>,
+    offered: Mutex<HashMap<String, (Arc<Entry>, String)>>,
     /// The starts going on, stopped if rein lets the servers go first.
-    _starts: tokio::task::JoinSet<()>,
+    starts: Mutex<tokio::task::JoinSet<()>>,
 }
 
 /// Never what the servers' environments hold.
 impl std::fmt::Debug for Servers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.entries.iter().map(|entry| &entry.server.name)).finish()
+        f.debug_list().entries(self.entries().iter().map(|entry| entry.server.name.clone())).finish()
     }
 }
 
@@ -296,38 +312,85 @@ impl Servers {
     /// Starts each of `servers` at once, in the background. Inside a
     /// runtime: the starts are its tasks.
     pub fn start(servers: Vec<Server>, launch: Launch) -> Servers {
-        let mut starts = tokio::task::JoinSet::new();
-        let entries = servers
-            .into_iter()
-            .map(|server| {
-                let state = Arc::new(tokio::sync::Mutex::new(State::Starting));
-                // Taken before the start runs, so nobody sees it before.
-                let mut held = state.clone().try_lock_owned().expect("a new lock is free");
-                let (launch, starting) = (launch.clone(), server.clone());
-                starts.spawn(async move {
-                    *held = match launch.start(&starting).await {
-                        Ok(connection) => State::Ready(Arc::new(connection)),
-                        Err(why) => State::Failed(why),
-                    };
-                });
-                Entry { server, state }
+        let started = Servers { entries: Mutex::default(), launch, offered: Mutex::default(), starts: Mutex::default() };
+        for server in servers {
+            started.add(server);
+        }
+        started
+    }
+
+    /// Starts `server` in the background, in place of one of its name.
+    /// Its tools are offered from the next [`Servers::list`].
+    pub fn add(&self, server: Server) {
+        self.remove(&server.name);
+        let state = Arc::new(tokio::sync::Mutex::new(State::Starting));
+        // Taken before the start runs, so nobody sees it before.
+        let mut held = state.clone().try_lock_owned().expect("a new lock is free");
+        let (launch, starting) = (self.launch.clone(), server.clone());
+        let start = {
+            let mut starts = lock(&self.starts);
+            while starts.try_join_next().is_some() {}
+            starts.spawn(async move {
+                *held = match launch.start(&starting).await {
+                    Ok(connection) => State::Ready(Arc::new(connection)),
+                    Err(why) => State::Failed(why),
+                };
             })
-            .collect();
-        Servers { entries, launch, offered: Mutex::default(), _starts: starts }
+        };
+        lock(&self.entries).push(Arc::new(Entry { server, state, start }));
+    }
+
+    /// Stops the server called `name`, and its tools aren't called from
+    /// now on: whether there was one. A call to it going on finishes.
+    pub fn remove(&self, name: &str) -> bool {
+        let gone: Vec<Arc<Entry>> = {
+            let mut entries = lock(&self.entries);
+            let (gone, kept) = entries.drain(..).partition(|entry| entry.server.name == name);
+            *entries = kept;
+            gone
+        };
+        lock(&self.offered).retain(|_, (entry, _)| entry.server.name != name);
+        for entry in &gone {
+            entry.start.abort();
+        }
+        !gone.is_empty()
+    }
+
+    /// Lets the tools `allow` names of the server called `name` run
+    /// without asking, from the next [`Servers::list`].
+    pub fn allow(&self, name: &str, allow: &[String]) {
+        for entry in lock(&self.entries).iter_mut().filter(|entry| entry.server.name == name) {
+            let server = Server { allow: allow.to_vec(), ..entry.server.clone() };
+            *entry = Arc::new(Entry { server, state: entry.state.clone(), start: entry.start.clone() });
+        }
+    }
+
+    /// The servers now, each for as long as it's needed: the lock isn't
+    /// held while one is waited for.
+    fn entries(&self) -> Vec<Arc<Entry>> {
+        lock(&self.entries).clone()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        lock(&self.entries).is_empty()
     }
 
     /// The servers, as their files name them.
-    pub fn servers(&self) -> impl Iterator<Item = &Server> {
-        self.entries.iter().map(|entry| &entry.server)
+    pub fn servers(&self) -> Vec<Server> {
+        self.entries().iter().map(|entry| entry.server.clone()).collect()
     }
 
     /// Whether any is still starting.
     pub fn starting(&self) -> bool {
-        self.entries.iter().any(|entry| !matches!(entry.state.try_lock().as_deref(), Ok(State::Ready(_) | State::Failed(_))))
+        self.entries().iter().any(|entry| !matches!(entry.state.try_lock().as_deref(), Ok(State::Ready(_) | State::Failed(_))))
+    }
+
+    /// How the server called `name` is doing once it has started, or failed
+    /// to: `None` if there's none of that name.
+    pub async fn started(&self, name: &str) -> Option<Status> {
+        let entry = self.entries().into_iter().find(|entry| entry.server.name == name)?;
+        let state = entry.state.lock().await;
+        Some(state.status())
     }
 
     /// The tools to offer the model, once every server has started or
@@ -335,7 +398,7 @@ impl Servers {
     /// too long or taken. They're what the conversation offers from now on.
     pub async fn list(&self) -> Listing {
         let (mut listing, mut offered, mut said) = (Listing::default(), HashMap::new(), Vec::new());
-        for (index, entry) in self.entries.iter().enumerate() {
+        for entry in self.entries() {
             let state = entry.state.lock().await;
             let connection = match &*state {
                 State::Ready(connection) => connection.clone(),
@@ -361,7 +424,7 @@ impl Servers {
                     listing.allowed.push(name.clone());
                 }
                 listing.tools.push(Tool { name: name.clone(), description: tool.description.clone(), parameters: tool.schema.clone() });
-                offered.insert(name, (index, tool.name.clone()));
+                offered.insert(name, (entry.clone(), tool.name.clone()));
             }
             let count = connection.tools.len() - left_out;
             let tools = format!("{count} tool{}", if count == 1 { "" } else { "s" });
@@ -377,13 +440,12 @@ impl Servers {
     /// it gave, or why it failed. A server that stopped is started again
     /// first, and the model is told.
     pub async fn call(&self, name: &str, arguments: &str) -> Result<String, String> {
-        let Some((index, tool)) = lock(&self.offered).get(name).cloned() else { return Err(format!("there is no tool called {name}")) };
+        let Some((entry, tool)) = lock(&self.offered).get(name).cloned() else { return Err(format!("there is no tool called {name}")) };
         let arguments: Value = match serde_json::from_str(arguments) {
             Ok(Value::Object(arguments)) => Value::Object(arguments),
             Ok(_) => return Err("bad arguments: they should be an object".into()),
             Err(e) => return Err(format!("bad arguments: {e}")),
         };
-        let entry = &self.entries[index];
         let (connection, again) = {
             let mut state = entry.state.lock().await;
             let again = !matches!(&*state, State::Ready(connection) if connection.rpc.alive());
@@ -405,19 +467,9 @@ impl Servers {
     }
 
     /// Each server, and how it's doing now, without waiting for any.
-    pub fn statuses(&self) -> Vec<(&Server, Status)> {
-        self.entries
-            .iter()
-            .map(|entry| {
-                let status = match entry.state.try_lock().as_deref() {
-                    Err(_) | Ok(State::Starting) => Status::Starting,
-                    Ok(State::Ready(connection)) if connection.rpc.alive() => Status::Ready(connection.tools.iter().map(|tool| tool.name.clone()).collect()),
-                    Ok(State::Ready(_)) => Status::Stopped,
-                    Ok(State::Failed(why)) => Status::Failed(why.clone()),
-                };
-                (&entry.server, status)
-            })
-            .collect()
+    pub fn statuses(&self) -> Vec<(Server, Status)> {
+        let status = |entry: &Entry| entry.state.try_lock().map_or(Status::Starting, |state| state.status());
+        self.entries().iter().map(|entry| (entry.server.clone(), status(entry))).collect()
     }
 }
 

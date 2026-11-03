@@ -2694,3 +2694,92 @@ fn a_projects_mcp_server_starts_only_once_you_say_yes_to_it_as_it_is() {
     term.wait_for("Start fake, an MCP server");
     term.wait_for("sh server.sh --changed");
 }
+
+/// The names of the servers' tools a request offered.
+fn servers_tools(request: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut stack = vec![&request["tools"]];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Array(items) => stack.extend(items),
+            Value::Object(fields) => {
+                names.extend(fields.get("name").and_then(Value::as_str).filter(|name| name.starts_with("mcp__")).map(str::to_owned));
+                stack.extend(fields.get("tools"));
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// `/mcp add` writes your mcp.json and starts the server, saying how it
+/// did; `/mcp allow` lets a tool run without asking, and `/mcp remove`
+/// stops it: each from the next message on, with nothing to edit by hand.
+#[cfg(target_os = "macos")]
+#[test]
+fn mcp_add_allow_and_remove_change_the_servers_without_editing_a_file() {
+    let model = Model::start(vec![Turn { out: vec![Out::Call("mcp__fake__echo", json!({ "text": "hi" }))] }, says("Echoed."), says("No tools now.")]);
+    let mut term = Term::start_with(&model, "mcp-add", 30, 130, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("/mcp\r");
+    term.wait_for("No MCP servers yet. To add one: /mcp add <name>");
+    term.keys("/mcp add fake sh server.sh\r");
+    term.wait_for("✓ fake added to ~/mcp.json");
+    term.wait_for("fake  5 tools: echo, peek, given, has, quit");
+    term.wait_for(IDLE);
+    term.keys("/mcp allow fake nope\r");
+    term.wait_for("fake has no tool called nope; its tools are echo, peek, given, has, quit");
+    term.keys("/mcp allow fake echo\r");
+    term.wait_for("✓ these of fake's tools run: echo without asking now");
+    let path = term.dir.join("home/mcp.json");
+    let file = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(file(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "allow": ["echo"] } } }));
+
+    term.keys("use it\r");
+    term.wait_for("Echoed.");
+    assert!(!term.text().contains("Let fake's echo run?"), "allowed: not asked\n{}", term.text());
+    assert_eq!(results(&model), ["hi"]);
+    term.wait_for(IDLE);
+    term.keys("/mcp remove fake\r");
+    term.wait_for("✓ fake is stopped, and out of ~/mcp.json");
+    term.keys("and now?\r");
+    term.wait_for("No tools now.");
+    let requests = model.requests();
+    assert!(servers_tools(&requests[0]).contains(&"mcp__fake__echo".to_owned()), "{:?}", servers_tools(&requests[0]));
+    assert_eq!(servers_tools(&requests[2]), Vec::<String>::new(), "removed: offered no more");
+    assert_eq!(file(), json!({ "mcpServers": {} }));
+}
+
+/// A server added with a key written in is kept in your mcp.json and
+/// nowhere else: the line isn't shown again or kept for ↑, and what the
+/// server says has the key hidden.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_server_added_with_its_key_keeps_it_out_of_the_screen_history_and_conversation() {
+    let model = Model::start(vec![Turn { out: vec![Out::Call("mcp__fake__given", json!({}))] }, says("Got it.")]);
+    let mut term = Term::start_with(&model, "mcp-add-key", 30, 130, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("/mcp\r");
+    term.wait_for("No MCP servers yet");
+    term.keys("/mcp add fake GIVEN=postgres://me:FAKE-mcp-pw@db/x sh server.sh\r");
+    term.wait_for("fake  5 tools");
+    term.wait_for(IDLE);
+    assert!(term.text().contains("you    /mcp add … (what may be a key hidden)"), "said again, without it:\n{}", term.text());
+    term.keys("\x1b[A");
+    term.wait_until("the line before it in the box", |_| term.in_box() == "/mcp");
+    term.keys("\x15");
+    term.keys("what's given?\r");
+    term.wait_for("Let fake's given run?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Got it.");
+    assert_eq!(results(&model), ["[a key rein hides]"]);
+    assert!(!term.text().contains("FAKE-mcp-pw"), "{}", term.text());
+    term.keys("\x04");
+    term.wait_exit();
+    assert!(!model.requests().iter().any(|request| request.to_string().contains("FAKE-mcp-pw")), "the model never saw it");
+    for file in every_file(&term.dir) {
+        let has = std::fs::read_to_string(&file).unwrap_or_default().contains("FAKE-mcp-pw");
+        assert_eq!(has, file == term.dir.join("home/mcp.json"), "{} {} the key", file.display(), if has { "has" } else { "doesn't have" });
+    }
+}

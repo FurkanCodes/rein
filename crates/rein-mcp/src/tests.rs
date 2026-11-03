@@ -109,6 +109,71 @@ async fn without_a_sandbox_one_meant_for_it_doesnt_start() {
     assert!(note.contains("there's no sandbox here to start it in"), "{note}");
 }
 
+/// Whether the process `pid` is still there.
+fn running(pid: &str) -> bool {
+    std::process::Command::new("kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().is_ok_and(|status| status.success())
+}
+
+/// Whether the process `pid` is gone within a few seconds: until it's
+/// reaped, one that was killed is still there.
+async fn gone(pid: &str) -> bool {
+    let start = std::time::Instant::now();
+    while running(pid) && start.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    !running(pid)
+}
+
+#[tokio::test]
+async fn a_server_added_or_removed_as_rein_runs_is_in_the_next_listing_or_stopped() {
+    let (mut server, launch, _) = fake("changes", Access::Outside).await;
+    let pidfile = launch.root.join("pid");
+    server.env.insert("PIDFILE".into(), pidfile.display().to_string());
+    let servers = Servers::start(Vec::new(), launch);
+    assert!(servers.list().await.tools.is_empty() && servers.list().await.note.is_none());
+    servers.add(server.clone());
+    let all = ["echo", "peek", "given", "has", "quit"].map(String::from).to_vec();
+    assert_eq!(servers.started("fake").await, Some(Status::Ready(all.clone())));
+    assert_eq!(servers.started("other").await, None);
+    let listing = servers.list().await;
+    assert_eq!((listing.tools.len(), listing.allowed.as_slice()), (5, ["mcp__fake__echo".to_owned()].as_slice()));
+    servers.allow("fake", &["*".into()]);
+    assert_eq!(servers.list().await.allowed.len(), 5, "all of its tools, from the next listing");
+    assert_eq!(servers.call("mcp__fake__given", "{}").await, Ok("hello there".into()), "the same server, still running");
+    let first = std::fs::read_to_string(&pidfile).unwrap().trim().to_owned();
+
+    let mut other = server.clone();
+    other.env.insert("GIVEN".into(), "the other one".into());
+    servers.add(other);
+    assert!(servers.call("mcp__fake__given", "{}").await.unwrap_err().contains("no tool"), "the old one's tools aren't called once it's replaced");
+    servers.list().await;
+    assert_eq!(servers.call("mcp__fake__given", "{}").await, Ok("the other one".into()));
+    let second = std::fs::read_to_string(&pidfile).unwrap().trim().to_owned();
+    assert_ne!(first, second);
+    assert!(gone(&first).await, "the one it replaced was stopped");
+
+    assert!(servers.remove("fake") && !servers.remove("fake"));
+    assert!(servers.call("mcp__fake__echo", r#"{"text":"hi"}"#).await.unwrap_err().contains("no tool"));
+    assert!(servers.list().await.tools.is_empty() && servers.statuses().is_empty());
+    assert!(gone(&second).await, "a removed server is stopped");
+}
+
+#[tokio::test]
+async fn a_server_removed_while_it_starts_isnt_left_running() {
+    let (mut server, launch, _) = fake("slow", Access::Outside).await;
+    let pidfile = launch.root.join("pid");
+    // It starts, and never answers.
+    (server.command, server.args) = ("sh".into(), vec!["-c".into(), format!("echo $$ > {}; exec sleep 600", pidfile.display())]);
+    let servers = Servers::start(vec![server], launch);
+    while !pidfile.exists() || std::fs::read_to_string(&pidfile).unwrap().trim().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_owned();
+    assert!(running(&pid));
+    assert!(servers.remove("fake"));
+    assert!(gone(&pid).await, "its start was stopped, and the server with it");
+}
+
 #[test]
 fn names_say_whose_tool_it_is() {
     assert!(is_mcp("mcp__github__get_issue") && !is_mcp("read"));
