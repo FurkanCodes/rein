@@ -99,7 +99,11 @@ service, configure its PATH to include `claude`; shell profiles aren't loaded.
 This is independent of the API-key path. rein
 invokes `claude -p`, never sends this token through its HTTP provider, and
 strips inherited API keys, endpoint overrides and alternate-provider switches
-from the subprocess environment. It does not use `--bare`. A recent CLI with
+from the subprocess environment. The token goes to the CLI on a pipe, not in
+its environment, where other programs could read it. Each run is in an empty
+private folder of its own, with `--setting-sources user`: a project's own
+`.claude/settings.json` could otherwise send your token to another server, or
+run a command of its choosing. It does not use `--bare`. A recent CLI with
 `--safe-mode` and `--json-schema` support is required. Customizations, MCP
 servers and built-in tools are disabled: structured responses request rein's
 tools, which still go through rein's approvals and sandbox. Each step starts a
@@ -477,13 +481,19 @@ asks to run one:
 | `outside` | do anything you can: no sandbox |
 
 Even with `write` or `network`, a command can't change files outside this
-folder, read the keys and logins in your home folder (`~/.ssh`, `~/.aws`,
-`~/.config/gh`, rein's own keys and the like), or change what runs code later
+folder, or read your home folder beyond this folder, git's settings, the
+toolchains and caches builds need, and the folders on your `PATH`: not
+`~/.zshrc` or `~/.env`, where keys are often kept, `~/.ssh`, `~/.aws`, other
+tools' settings or rein's own keys, nor such folders when a variable like
+`CLAUDE_CONFIG_DIR` or `AWS_SHARED_CREDENTIALS_FILE` moves them elsewhere. Nor
+can it change what runs code later
 without anyone choosing to run it: `.git/hooks`, `.git/config`, where
 `core.hooksPath` points, `.rein`, `.envrc`, editors' and other agents'
-settings. Renaming the folder that holds one doesn't get round it. Keys and
-tokens in rein's environment (`*_API_KEY`, `*_TOKEN`, an SSH agent) don't
-reach the command, and with `network` it reaches the internet but not other
+settings. Renaming the folder that holds one doesn't get round it. Keys,
+tokens and passwords in rein's environment (`*_API_KEY`, `*_TOKEN`, a
+database URL with a password in it, the variables your providers file names,
+an SSH agent) don't reach the command, nor do other programs' arguments and
+environments, and with `network` it reaches the internet but not other
 programs on this computer: not Docker's socket, which would let it start a
 container with your home folder in it, and not apps, which could do things
 for it outside.
@@ -503,10 +513,16 @@ it later). Where there's no sandbox (Windows, older kernels), or with
 `sandbox = off`, commands ask before they run: rein never runs one
 unconfined when it meant to confine it.
 
-Other programs of yours can read the environment rein was started with,
-and on macOS a command in the sandbox can too. So rein takes the keys and
-tokens out of it when it starts, keeping them where only it can read them;
-commands you let run outside the sandbox still get them.
+Other programs of yours can read the environment rein was started with
+(a command in the sandbox can't). So rein takes the keys and tokens out of
+it when it starts, keeping them where only it can read them; commands you
+let run outside the sandbox still get them. Whatever a command or a tool
+says has the keys rein knows replaced with `[a key rein hides]` before the
+model or the saved conversation sees it, and `write` and `edit` won't put
+that in a file in place of your key. rein sends a key only over https, or
+plain http to this computer, and never on through a redirect to another
+server. A crash doesn't dump rein's memory to a file, and on Linux other
+programs can't read it.
 
 ### Modes
 
@@ -525,7 +541,7 @@ commands you let run outside the sandbox still get them.
 go past the sandbox is refused, so the model makes do or tells you what it
 needs. File changes to the protected paths above ask in every mode but
 `trust`, even in `edits`. Without a sandbox, commands ask in `ask` and
-`edits`, and `auto` and `read-only` run only what rules allow.
+`edits`, and `auto` and `read-only` run none.
 
 Rules in `.rein/permissions` refine this for commands:
 
@@ -535,8 +551,10 @@ ask   git commit
 deny  git push
 ```
 
-Deny beats ask beats allow. An allow rule lets a command past the sandbox
-without asking only if every part of it is allowed, so `allow cargo fetch`
+Deny beats ask beats allow. The file comes with the project, which may be
+anyone's, so an allow rule only spares asking about a command that stays in
+the sandbox: one that needs `outside` gets your keys, and always asks you.
+It counts only if every part of a command is allowed, so `allow cargo fetch`
 doesn't cover `cargo fetch && rm -rf x`; anything rein can't take apart, like
 `$(...)`, redirects or globs, no allow rule covers. Deny and ask rules still
 find the commands in it. An answer of "always" is for that command with as
@@ -593,6 +611,15 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C linker-flavor=ld.ll
 cargo test -p rein-sandbox --target aarch64-unknown-linux-musl --no-run
 docker run --rm -e REIN_TEST_DIR=/work -v "$PWD/target/aarch64-unknown-linux-musl/debug/deps:/t:ro" \
   <an image with python3 and git, a user, and /work> /t/rein_sandbox-<hash>
+```
+
+When the sandbox changes, stress it: hundreds of commands at once in every
+kind of access, each checked to work or to be walled in. Add
+`REIN_STRESS_RUNS=5000 REIN_STRESS_AT_ONCE=64` for more, and the same
+arguments after `/t/rein_sandbox-<hash>` to run it on Linux:
+
+```sh
+cargo test -p rein-sandbox -- --ignored --nocapture many_commands
 ```
 
 Record a real stream with

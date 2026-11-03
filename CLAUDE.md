@@ -145,7 +145,9 @@ finding. Each says why in a line.
   `.rein` (the sandbox resolves this itself; rein's own checks lower-case).
 - Keys stay out of rein's environment (`secrets::keep`, first in `main`):
   macOS hands any process of yours another's environment (`KERN_PROCARGS2`),
-  sandbox or not, and a sandboxed command read rein's key from it.
+  and a sandboxed command once read rein's key from it. Seatbelt stops that
+  only with `process-info` denied in so many words: `(deny default)` doesn't
+  count for it, and no `sysctl-read` rule alone blocks the call.
 - Seatbelt rules never name syscalls by number, not even in a quick
   experiment: a profile allowing numbers 0 to 599 crashed macOS (its kernel
   takes 560), and the Mac restarted. An older macOS has fewer syscalls, so a
