@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use rein_llm::openai::signin::{self, Credentials};
+use rein_llm::openai::signin::Credentials;
 use rein_llm::provider::{self, Provider};
 use rein_llm::{Auth, Client, ModelInfo, store};
 
@@ -158,17 +158,13 @@ fn no_key(provider: &Provider) -> String {
 /// A client on your ChatGPT plan, which you've signed in to with `rein login`.
 async fn chatgpt(http: &rein_llm::reqwest::Client) -> CliResult<Client> {
     let path = config_dir()?.join(CREDENTIALS_FILE);
-    let Some(mut credentials) = store::read_json::<Credentials>(&path).map_err(describe)? else {
+    let Some(credentials) = store::read_json::<Credentials>(&path).map_err(describe)? else {
         return Err("you're not signed in with ChatGPT any more; run `rein login`".into());
     };
     if !credentials.plan_enabled() {
         return Err("your ChatGPT sign-in doesn't allow using your plan; run `rein login` and allow it".into());
     }
-    if credentials.needs_refresh() {
-        credentials = signin::refresh(http, &credentials).await.map_err(|e| format!("couldn't renew your ChatGPT sign-in ({}); run `rein login` to sign in again", describe(e)))?;
-        store::write_json_private(&path, &credentials).map_err(describe)?;
-    }
-    Ok(Client::openai(http.clone(), credentials.access_token))
+    Client::chatgpt(http.clone(), path).await.map_err(describe)
 }
 
 /// A model, and the client that reaches it.

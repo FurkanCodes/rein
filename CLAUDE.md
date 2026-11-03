@@ -111,6 +111,11 @@ finding. Each says why in a line.
   terminal is put back even on Ctrl-C.
 - Never sign in as another app: no borrowed OAuth client IDs, no spoofed
   headers or system prompts. Official sign-ins and API keys only.
+- A token that runs out is asked for before each request, never kept from
+  the start: rein kept the ChatGPT token it started with, and every
+  conversation stopped after an hour. Renew under a lock every rein window
+  shares, and read the file again under it: a refresh token works once, and
+  two windows spending the same one sign you out.
 
 ## The sandbox
 

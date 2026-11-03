@@ -14,7 +14,8 @@
 //! Spec: <https://developers.openai.com/siwc/token-sharing-open-source/sign-in>
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -26,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::oauth::{new_uuid, pkce_challenge, random_token, read_request_target, respond};
-use crate::{Error, Result};
+use crate::{Error, Result, store};
 
 const AUTHORIZE_URL: &str = "https://auth.openai.com/api/accounts/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/api/accounts/oauth/token";
@@ -45,6 +46,10 @@ const CALLBACK_PATH: &str = "/auth/callback";
 /// Refresh this long before expiry, so no request starts with a token that
 /// expires mid-stream.
 const REFRESH_MARGIN_SECS: u64 = 180;
+/// How long a token request may take.
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a window waits for another one renewing the sign-in.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Everything kept after signing in. Store it so only the user can read it.
 /// Its `Debug` leaves the tokens out.
@@ -83,8 +88,95 @@ impl Credentials {
         self.scopes.iter().any(|s| s == PLAN_SCOPE)
     }
 
-    pub fn needs_refresh(&self) -> bool {
+    fn needs_refresh(&self) -> bool {
         now() + REFRESH_MARGIN_SECS >= self.expires_at
+    }
+}
+
+/// A ChatGPT sign-in that renews itself, shared by a client's clones.
+///
+/// The access token lasts an hour, and a conversation can go on for longer.
+/// So every request asks for the token, which is read from the file each
+/// time, so that `rein login`, `/logout` and other windows' renewals all
+/// count. It's renewed when it's about to run out. A refresh token works only
+/// once, so renewing takes a lock that every rein window shares, and reads
+/// the file again under it: two windows spending the same refresh token
+/// would sign you out.
+#[derive(Debug)]
+pub struct Session {
+    path: PathBuf,
+    /// One renewal at a time within this window.
+    lock: tokio::sync::Mutex<()>,
+    token_url: String,
+}
+
+impl Session {
+    /// The sign-in saved at `path`.
+    pub fn new(path: PathBuf) -> Self {
+        Self::at(path, TOKEN_URL)
+    }
+
+    /// `new`, renewing at `token_url`: OpenAI's for real, a fake for tests.
+    pub(crate) fn at(path: PathBuf, token_url: &str) -> Self {
+        Self { path, lock: tokio::sync::Mutex::new(()), token_url: token_url.to_owned() }
+    }
+
+    /// An access token good for a request starting now.
+    pub async fn token(&self, http: &reqwest::Client) -> Result<String> {
+        self.fresh(http, None).await
+    }
+
+    /// A new access token after the server turned `rejected` away: the one
+    /// on file if another window has renewed it since, or a renewed one.
+    pub async fn renew(&self, http: &reqwest::Client, rejected: &str) -> Result<String> {
+        self.fresh(http, Some(rejected)).await
+    }
+
+    async fn fresh(&self, http: &reqwest::Client, rejected: Option<&str>) -> Result<String> {
+        let stale = |c: &Credentials| c.needs_refresh() || rejected == Some(c.access_token.as_str());
+        let _this_window = self.lock.lock().await;
+        let credentials = self.load()?;
+        if !stale(&credentials) {
+            return Ok(credentials.access_token);
+        }
+        let _every_window = lock_file(&self.path.with_extension("lock")).await?;
+        // Another window may have renewed it while this one waited.
+        let credentials = self.load()?;
+        if !stale(&credentials) {
+            return Ok(credentials.access_token);
+        }
+        let renewed = match refresh(http, &self.token_url, &credentials).await {
+            // OpenAI turned the refresh token down. Network trouble and
+            // server errors pass through as they are, to be tried again.
+            Err(Error::Auth(why)) => return Err(Error::Auth(format!("couldn't renew your ChatGPT sign-in ({why}); run `rein login` to sign in again"))),
+            renewed => renewed?,
+        };
+        store::write_json_private(&self.path, &renewed)?;
+        Ok(renewed.access_token)
+    }
+
+    fn load(&self) -> Result<Credentials> {
+        store::read_json(&self.path)?.ok_or_else(|| auth_error("you're not signed in with ChatGPT any more; run `rein login`"))
+    }
+}
+
+/// Takes the lock on renewing that every rein window shares, waiting a while
+/// for a window that holds it. It's let go when the file is dropped, or when
+/// its process ends however it ends.
+async fn lock_file(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path)?;
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(std::fs::TryLockError::WouldBlock) => return Err(auth_error("another rein window is still renewing your ChatGPT sign-in; try again in a moment")),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
     }
 }
 
@@ -169,6 +261,7 @@ impl PendingSignIn {
         let (code, client_id) = self.wait_for_callback().await?;
         let token = request_token(
             http,
+            TOKEN_URL,
             &[
                 ("grant_type", "authorization_code"),
                 ("client_id", client_id.as_str()),
@@ -259,11 +352,12 @@ fn callback_result(query: &HashMap<String, String>, saved_client_id: Option<&str
     Ok((code.clone(), client_id))
 }
 
-/// Gets a new access token. Refresh tokens rotate: the old one stops working,
-/// so save the returned credentials right away.
-pub async fn refresh(http: &reqwest::Client, credentials: &Credentials) -> Result<Credentials> {
+/// Gets a new access token at `token_url`. Refresh tokens rotate: the old one
+/// stops working, so save the returned credentials right away.
+async fn refresh(http: &reqwest::Client, token_url: &str, credentials: &Credentials) -> Result<Credentials> {
     let token = request_token(
         http,
+        token_url,
         &[("grant_type", "refresh_token"), ("client_id", credentials.client_id.as_str()), ("refresh_token", credentials.refresh_token.as_str()), ("resource", RESOURCE)],
     )
     .await?;
@@ -291,8 +385,8 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
-async fn request_token(http: &reqwest::Client, form: &[(&str, &str)]) -> Result<TokenResponse> {
-    let response = http.post(TOKEN_URL).header(reqwest::header::ACCEPT, "application/json").form(form).send().await?;
+async fn request_token(http: &reqwest::Client, url: &str, form: &[(&str, &str)]) -> Result<TokenResponse> {
+    let response = http.post(url).header(reqwest::header::ACCEPT, "application/json").form(form).timeout(TOKEN_TIMEOUT).send().await?;
     let status = response.status();
     let text = response.text().await?;
     if !status.is_success() {
@@ -300,7 +394,12 @@ async fn request_token(http: &reqwest::Client, form: &[(&str, &str)]) -> Result<
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let code = v["error"].as_str().unwrap_or("unknown_error");
         let description = v["error_description"].as_str().unwrap_or_default();
-        return Err(auth_error(format!("token request failed (HTTP {status}): {code} {description}").trim_end()));
+        let message = format!("token request failed (HTTP {status}): {code} {description}");
+        // A server having trouble hasn't turned anything down: tried again.
+        if status.is_server_error() {
+            return Err(Error::api(Some(status.as_u16()), Some(code.to_owned()), message.trim_end().to_owned(), None));
+        }
+        return Err(auth_error(message.trim_end()));
     }
     Ok(serde_json::from_str(&text)?)
 }
@@ -351,9 +450,136 @@ fn now() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server on a free port that answers the requests it gets in turn with
+    /// `replies` (status and JSON), the last one again once they run out, a
+    /// little slowly, as a real one would. It keeps each request's head and
+    /// body, as they came.
+    pub(crate) async fn serve(replies: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            for n in 0.. {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                let split = loop {
+                    let read = socket.read(&mut buf).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&buf[..read]);
+                    if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&bytes[..split]).to_lowercase();
+                let length: usize = head.lines().find_map(|l| l.strip_prefix("content-length: ").map(|n| n.parse().unwrap())).unwrap_or(0);
+                while bytes.len() < split + length {
+                    let read = socket.read(&mut buf).await.unwrap();
+                    assert!(read > 0);
+                    bytes.extend_from_slice(&buf[..read]);
+                }
+                log.lock().unwrap().push(String::from_utf8_lossy(&bytes).into_owned());
+                let (status, body) = replies[n.min(replies.len() - 1)];
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let reply = format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (url, seen)
+    }
+
+    pub(crate) const RENEWED: &str = r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#;
+    const USED_UP: &str = r#"{"error":"invalid_grant","error_description":"refresh token already used"}"#;
+
+    fn credentials(access: &str, refresh: &str, expires_at: u64) -> Credentials {
+        Credentials {
+            email: None,
+            subject: "user-1".into(),
+            client_id: "oaiapp_1".into(),
+            ext_agent_host_id: "urn:uuid:x".into(),
+            id_token: "id".into(),
+            access_token: access.into(),
+            refresh_token: refresh.into(),
+            scopes: vec![PLAN_SCOPE.into()],
+            expires_at,
+        }
+    }
+
+    /// A sign-in saved in a folder of its own, whose access token is
+    /// `access` and lasts until `expires_at`.
+    pub(crate) fn signed_in(name: &str, access: &str, expires_at: u64) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rein-chatgpt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("chatgpt.json");
+        store::write_json_private(&path, &credentials(access, "old-refresh", expires_at)).unwrap();
+        path
+    }
+
+    pub(crate) fn in_an_hour() -> u64 {
+        now() + 3600
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_renews_itself_as_its_token_runs_out() {
+        let path = signed_in("renews", "old-access", now() + 60);
+        let (url, seen) = serve(vec![(200, RENEWED)]).await;
+        let session = Session::at(path.clone(), &format!("{url}/token"));
+        let http = reqwest::Client::new();
+        assert_eq!(session.token(&http).await.unwrap(), "new-access", "a minute left is too little for a request to start with");
+        let sent = seen.lock().unwrap()[0].clone();
+        assert!(sent.contains("grant_type=refresh_token") && sent.contains("refresh_token=old-refresh"), "{sent}");
+        let saved: Credentials = store::read_json(&path).unwrap().unwrap();
+        assert_eq!(saved.refresh_token, "new-refresh", "a refresh token works once: the new one is kept");
+        assert_eq!(session.token(&http).await.unwrap(), "new-access");
+        assert_eq!(seen.lock().unwrap().len(), 1, "a token with time left is used as it is");
+    }
+
+    #[tokio::test]
+    async fn two_windows_whose_token_runs_out_together_renew_it_once() {
+        let path = signed_in("two-windows", "old-access", 0);
+        // As OpenAI does, a refresh token spent twice is turned down.
+        let (url, seen) = serve(vec![(200, RENEWED), (400, USED_UP)]).await;
+        let token_url = format!("{url}/token");
+        let (one, other) = (Session::at(path.clone(), &token_url), Session::at(path, &token_url));
+        let http = reqwest::Client::new();
+        let (a, b) = tokio::join!(one.token(&http), other.token(&http));
+        assert_eq!((a.unwrap(), b.unwrap()), ("new-access".to_owned(), "new-access".to_owned()));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_token_turned_away_is_renewed_unless_another_window_already_has() {
+        let path = signed_in("turned-away", "first", in_an_hour());
+        let (url, seen) = serve(vec![(200, RENEWED)]).await;
+        let session = Session::at(path.clone(), &format!("{url}/token"));
+        let http = reqwest::Client::new();
+        assert_eq!(session.token(&http).await.unwrap(), "first");
+        assert_eq!(session.renew(&http, "first").await.unwrap(), "new-access");
+        store::write_json_private(&path, &credentials("from-another-window", "newer-refresh", in_an_hour())).unwrap();
+        assert_eq!(session.renew(&http, "new-access").await.unwrap(), "from-another-window");
+        assert_eq!(seen.lock().unwrap().len(), 1, "what another window renewed isn't renewed again");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_that_cant_be_renewed_says_so_and_trouble_is_tried_again() {
+        let path = signed_in("dead", "old-access", 0);
+        let (url, _) = serve(vec![(400, USED_UP), (503, r#"{"error":"temporarily_unavailable"}"#)]).await;
+        let session = Session::at(path.clone(), &format!("{url}/token"));
+        let http = reqwest::Client::new();
+        let dead = session.token(&http).await.unwrap_err();
+        assert!(matches!(dead, Error::Auth(_)) && dead.to_string().contains("rein login") && !dead.to_string().contains("old-refresh"), "{dead}");
+        let busy = session.token(&http).await.unwrap_err();
+        assert!(busy.retryable(), "a server in trouble hasn't turned anything down: {busy}");
+        std::fs::remove_file(&path).unwrap();
+        let signed_out = session.token(&http).await.unwrap_err();
+        assert!(signed_out.to_string().contains("rein login"), "{signed_out}");
+    }
 
     #[test]
     fn tokens_never_show_in_debug_output() {

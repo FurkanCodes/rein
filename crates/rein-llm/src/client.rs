@@ -62,6 +62,8 @@ pub struct Client {
     wire: Arc<Wire>,
     /// Present only for explicitly opted-in Claude subscription clients.
     claude_oauth: Option<Arc<anthropic::oauth::Session>>,
+    /// Your ChatGPT plan's sign-in, which renews itself.
+    chatgpt: Option<Arc<openai::signin::Session>>,
 }
 
 /// How long a streaming answer may send nothing at all. Providers send
@@ -114,7 +116,21 @@ impl Client {
     /// which speaks `api`.
     pub fn new(http: reqwest::Client, api: Api, base_url: impl Into<String>, auth: Auth) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
-        Client { http, api, base_url, auth, quirks: Quirks::default(), idle: IDLE, wire: Arc::default(), claude_oauth: None }
+        Client { http, api, base_url, auth, quirks: Quirks::default(), idle: IDLE, wire: Arc::default(), claude_oauth: None, chatgpt: None }
+    }
+
+    /// OpenAI on your ChatGPT plan, signed in to with `rein login` and saved
+    /// at `credentials`. The sign-in renews itself as its token runs out; one
+    /// that can't be renewed shows now, not at your first message.
+    pub async fn chatgpt(http: reqwest::Client, credentials: std::path::PathBuf) -> Result<Self> {
+        Self::chatgpt_at(http, openai::API_BASE, openai::signin::Session::new(credentials)).await
+    }
+
+    pub(crate) async fn chatgpt_at(http: reqwest::Client, base_url: &str, session: openai::signin::Session) -> Result<Self> {
+        session.token(&http).await?;
+        let mut client = Self::new(http, Api::Responses, base_url, Auth::None);
+        client.chatgpt = Some(Arc::new(session));
+        Ok(client)
     }
 
     /// Unofficial Claude subscription authentication. The caller must first
@@ -137,8 +153,7 @@ impl Client {
         self
     }
 
-    /// OpenAI itself: `bearer` is an API key or a Sign in with ChatGPT
-    /// access token, which go in the same header; only who pays differs.
+    /// OpenAI itself, with `bearer` as the API key.
     pub fn openai(http: reqwest::Client, bearer: impl Into<String>) -> Self {
         Client::new(http, Api::Responses, openai::API_BASE, Auth::Bearer(bearer.into()))
     }
@@ -185,11 +200,27 @@ impl Client {
 
     /// `GET`s `path` (after the base URL) as this client, as JSON.
     pub(crate) async fn get(&self, path: &str) -> Result<Value> {
-        let mut builder = self.authorize(self.http.get(format!("{}/{path}", self.base_url))).await?;
+        let mut builder = self.http.get(format!("{}/{path}", self.base_url));
         for (name, value) in self.headers(None) {
             builder = builder.header(name, value);
         }
-        Ok(check(builder.send().await?).await?.json().await?)
+        Ok(check(self.send_as(builder).await?).await?.json().await?)
+    }
+
+    /// Sends `builder` as this client. When the server turns a ChatGPT
+    /// sign-in's token away, the sign-in is renewed and the request goes
+    /// once more: a token can stop working before the time it gave.
+    async fn send_as(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let Some(session) = &self.chatgpt else {
+            return Ok(self.authorize(builder).await?.send().await?);
+        };
+        let again = builder.try_clone();
+        let token = session.token(&self.http).await?;
+        let response = builder.bearer_auth(&token).send().await?;
+        match again {
+            Some(again) if response.status() == reqwest::StatusCode::UNAUTHORIZED => Ok(again.bearer_auth(session.renew(&self.http, &token).await?).send().await?),
+            _ => Ok(response),
+        }
     }
 
     async fn authorize(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
@@ -309,11 +340,7 @@ impl Client {
 
     /// Posts `body`, or `gzipped` in its place when there is one.
     async fn post(&self, request: &Request<'_>, headers: &[(&'static str, String)], body: &[u8], gzipped: Option<Vec<u8>>) -> Result<reqwest::Response> {
-        let mut builder = self
-            .authorize(self.http.post(self.endpoint(request)))
-            .await?
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let mut builder = self.http.post(self.endpoint(request)).header(reqwest::header::ACCEPT, "text/event-stream").header(reqwest::header::CONTENT_TYPE, "application/json");
         for (name, value) in headers {
             builder = builder.header(*name, value);
         }
@@ -326,7 +353,7 @@ impl Client {
         };
         self.wire.json.fetch_add(body.len() as u64, Ordering::Relaxed);
         self.wire.sent.fetch_add(sent.len() as u64, Ordering::Relaxed);
-        Ok(builder.body(sent).send().await?)
+        self.send_as(builder.body(sent)).await
     }
 }
 
@@ -469,6 +496,43 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(stream.next().await.is_none(), "nothing after giving up");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_conversation_on_chatgpt_outlives_its_token() {
+        use crate::openai::signin::{Session, tests::*};
+        let path = signed_in("outlives", "first", in_an_hour());
+        let (tokens, renewals) = serve(vec![(200, RENEWED)]).await;
+        let (api, seen) = serve(vec![(200, "{}")]).await;
+        let client = Client::chatgpt_at(reqwest::Client::new(), &api, Session::at(path.clone(), &format!("{tokens}/token"))).await.unwrap();
+        // An hour on, the token the conversation started with has run out.
+        let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        saved["expires_at"] = json!(0);
+        std::fs::write(&path, saved.to_string()).unwrap();
+        let request =
+            Request { model: "m", instructions: None, input: &[], tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        assert!(client.stream(&request).await.is_ok());
+        assert_eq!(renewals.lock().unwrap().len(), 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "renewed before sending, not after being turned away");
+        assert!(seen[0].to_lowercase().contains("authorization: bearer new-access\r\n"), "{}", seen[0]);
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_token_the_server_turns_away_is_renewed_and_the_request_sent_again() {
+        use crate::openai::signin::{Session, tests::*};
+        let path = signed_in("turned-away-mid-turn", "first", in_an_hour());
+        let (tokens, _) = serve(vec![(200, RENEWED)]).await;
+        let expired = r#"{"error":{"message":"Provided authentication token is expired.","code":"token_expired"}}"#;
+        let (api, seen) = serve(vec![(401, expired), (200, "{}")]).await;
+        let client = Client::chatgpt_at(reqwest::Client::new(), &api, Session::at(path, &format!("{tokens}/token"))).await.unwrap();
+        let request =
+            Request { model: "m", instructions: None, input: &[], tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        assert!(client.stream(&request).await.is_ok());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].to_lowercase().contains("authorization: bearer first\r\n"), "{}", seen[0]);
+        assert!(seen[1].to_lowercase().contains("authorization: bearer new-access\r\n") && seen[1].contains(r#""model":"m""#), "{}", seen[1]);
     }
 
     #[tokio::test]
