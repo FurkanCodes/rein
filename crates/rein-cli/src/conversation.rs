@@ -69,7 +69,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     // What you sent from this folder before, for ↑ and Ctrl-R: only a
     // conversation has a box to bring it back in.
     let sent = if args.prompt.is_none() { History::load(history::file(&dir, &root)) } else { History::default() };
-    let mut terminal = Terminal::new(root.clone(), args.mode, args.prompt.is_none(), sent, args.bell);
+    let mut terminal = Terminal::new(root.clone(), sandbox.clone(), args.mode, args.prompt.is_none(), sent, args.bell);
     terminal.sandboxed = sandbox.available();
     // The box goes up now, so typing can start while the model list loads.
     terminal.model = connected.as_ref().map(|c| provider::shown(&c.provider, &c.model)).unwrap_or_default();
@@ -107,6 +107,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         }
     };
     let (client, models) = connected.models().await;
+    let secrets = rein_agent::redact::Secrets::new(known_secrets(&keys));
     let mut setup = Setup {
         folder,
         personal: dir.join("AGENTS.md"),
@@ -121,6 +122,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         providers,
         keys,
         compress: args.compress,
+        sandbox: sandbox.clone(),
     };
     let (mut loaded, context) = setup.open(saved, &spec)?;
     if theirs.is_some_and(|theirs| theirs != spec) {
@@ -134,7 +136,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.tab_command.clone_from(&args.tab_command);
     terminal.input.set_bar(terminal.bar());
     let max_output = setup.max_output(&model_name);
-    let mut agent = Agent::new(Llm { client, record }, Tools::new(root.clone()).with_sandbox(sandbox), permissions, model_name, limit, loaded, context);
+    let mut agent = Agent::new(Llm { client, record }, Tools::new(root.clone()).with_sandbox(sandbox).with_secrets(secrets), permissions, model_name, limit, loaded, context);
     // Only a conversation joins the others: a task done on its own has no
     // one to answer what they send.
     let child = args.child.as_ref().map(|(pid, id)| (*pid, id.as_str()));
@@ -182,6 +184,19 @@ fn say_pays(pays: &str, quiet: bool) {
     }
 }
 
+/// The keys and tokens rein knows, for its tools to hide: those it took
+/// out of its environment, the keys you saved, and the saved Claude Code
+/// token. ChatGPT's tokens change as they're renewed, and their file is out
+/// of every tool's reach.
+fn known_secrets(keys: &crate::connect::Keys) -> Vec<String> {
+    let kept = sandbox::secrets::all().iter().filter_map(|(_, value)| value.to_str().map(str::to_owned));
+    let code = config_dir()
+        .ok()
+        .and_then(|dir| rein_llm::store::read_json::<crate::claude::CodeCredentials>(&dir.join(crate::claude::CODE_FILE)).ok().flatten())
+        .and_then(|saved| saved.token);
+    kept.chain(keys.values().cloned()).chain(code).collect()
+}
+
 /// What it takes to start or reopen a conversation in this folder, kept
 /// for `/new`, `/resume` and `/model`.
 pub(crate) struct Setup {
@@ -209,6 +224,9 @@ pub(crate) struct Setup {
     keys: crate::connect::Keys,
     /// Gzip request bodies.
     compress: bool,
+    /// What commands can't reach, which the project's instruction files
+    /// can't bring into the conversation either.
+    sandbox: std::sync::Arc<Sandbox>,
 }
 
 impl Setup {
@@ -229,7 +247,7 @@ impl Setup {
             instructions: Some(prompt::system(self.system.as_deref())),
         };
         let stamp = format!("{}T{:02}-{:02}-{:02}", now.date(), now.hour, now.minute, now.second);
-        let files = context::find(&self.root, Some(&self.personal));
+        let files = context::find(&self.root, Some(&self.personal), &|path: &Path| self.sandbox.places().hides(path));
         let names: Vec<String> = files.iter().map(|f| shown_path(&f.path, &self.root)).collect();
         // Beside the logo, or said where there's none.
         if !crate::ui::logo::update(|facts| facts.instructions.clone_from(&names)) && !names.is_empty() {

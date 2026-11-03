@@ -15,7 +15,7 @@ use crate::ui::wrap::Wrap;
 use rein_agent::agent::{Approval, Compacted, Heard, Ui};
 use rein_agent::compact;
 use rein_agent::permissions::Mode;
-use rein_agent::sandbox::Access;
+use rein_agent::sandbox::{Access, Sandbox};
 use rein_agent::tools::{BashCall, ToolName};
 use rein_llm::{Effort, ToolCall, Usage};
 use std::io::{IsTerminal, Write};
@@ -197,9 +197,9 @@ pub(crate) struct TurnStats {
 pub(crate) const ECHO_LINES: usize = 12;
 
 impl Terminal {
-    pub(crate) fn new(root: PathBuf, mode: Mode, pinned: bool, history: History, bell: bool) -> Terminal {
+    pub(crate) fn new(root: PathBuf, sandbox: std::sync::Arc<Sandbox>, mode: Mode, pinned: bool, history: History, bell: bool) -> Terminal {
         let interrupted: std::sync::Arc<tokio::sync::Notify> = Default::default();
-        let input = Input::start(pinned, interrupted.clone(), history, bell, root.clone());
+        let input = Input::start(pinned, interrupted.clone(), history, bell, root.clone(), sandbox);
         Terminal {
             out: Style::stdout(),
             err: Style::stderr(),

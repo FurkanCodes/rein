@@ -13,6 +13,7 @@ mod claude_code;
 pub mod client;
 pub mod decode;
 pub mod gemini;
+pub mod http;
 mod oauth;
 pub mod openai;
 pub mod openrouter;

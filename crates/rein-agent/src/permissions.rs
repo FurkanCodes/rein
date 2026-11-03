@@ -19,6 +19,11 @@
 //! Rules aren't a sandbox: `deny rm` doesn't stop `/bin/rm`, or a script
 //! that deletes files itself. They decide when rein asks you; the sandbox
 //! decides what a command can reach.
+//!
+//! The file comes with the project, which may be anyone's, so an allow
+//! rule only spares asking about a command that stays in the sandbox.
+//! Outside it a command has your keys: `allow cargo test` in a cloned repo
+//! would otherwise run its build script with them. Only you say yes to that.
 
 use rein_llm::ToolCall;
 use serde::Deserialize;
@@ -137,7 +142,7 @@ fn auto_refuses(access: Access) -> String {
 const AUTO_ASK_RULE: &str = "rein is in auto mode, where nothing asks, and a rule says to ask before this command. \
                              Do without it, or tell the user what you need it for.";
 const AUTO_NO_SANDBOX: &str = "rein is in auto mode, where nothing asks, but there's no sandbox here to hold commands in, \
-                               so only those the rules allow run.";
+                               so no command runs. Tell the user what you need to run.";
 const AUTO_PROTECTED: &str = "rein is in auto mode, where nothing asks, and this file runs code later or holds rein's rules: \
                               changing it takes the user's approval. Leave it, or tell the user what to change.";
 const READ_ONLY_CHANGES: &str = "File changes are turned off: rein is in read-only mode.";
@@ -268,7 +273,11 @@ impl Permissions {
                 Access::Write => matches!(self.mode, Mode::Edits | Mode::Auto),
                 Access::Network | Access::Outside => false,
             };
-        let rule = |part: &Vec<String>, kind: Kind| self.rules.iter().any(|r| r.kind == kind && r.matches(part));
+        // The rules come with the project, which may be anyone's: they only
+        // spare you asking about what stays in the walls. Outside them a
+        // command gets your keys, so only you say yes to that.
+        let in_walls = sandboxed && access != Access::Outside;
+        let rule = |part: &Vec<String>, kind: Kind| in_walls && self.rules.iter().any(|r| r.kind == kind && r.matches(part));
         // Without a sandbox, the access a command says it needs is only words.
         let approved = |part: &Vec<String>| self.approved.iter().any(|(words, granted)| words == part && (*granted >= access || !sandboxed));
         let allowed = parts.as_ref().is_some_and(|parts| parts.iter().all(|p| rule(p, Kind::Allow) || approved(p)));
@@ -455,13 +464,35 @@ mod tests {
 
     #[test]
     fn every_part_must_be_allowed() {
-        let p = Permissions::new(Mode::Ask, RULES).unwrap();
-        assert_eq!(p.decide(&bash("cargo test")), Decision::Allow);
-        assert_eq!(p.decide(&bash("cargo test --release && git status")), Decision::Allow);
-        assert_eq!(p.decide(&bash("cargo test && rm -rf target")), Decision::Ask);
-        assert_eq!(p.decide(&bash("cargo test > log.txt")), Decision::Ask);
+        // With the network, so the walls alone don't let it run.
+        let p = sandboxed(Mode::Ask, RULES, "parts");
+        assert_eq!(p.decide(&command("cargo test", "network")), Decision::Allow);
+        assert_eq!(p.decide(&command("cargo test --release && git status", "network")), Decision::Allow);
+        assert_eq!(p.decide(&command("cargo test && rm -rf target", "network")), Decision::Ask);
+        assert_eq!(p.decide(&command("cargo test > log.txt", "network")), Decision::Ask);
         // Whole words: `ls` doesn't cover `lsof`.
-        assert_eq!(p.decide(&bash("lsof -i")), Decision::Ask);
+        assert_eq!(p.decide(&command("lsof -i", "network")), Decision::Ask);
+    }
+
+    #[test]
+    fn a_projects_rules_never_let_a_command_out_of_the_walls() {
+        // A cloned repo's own `.rein/permissions`: outside the sandbox, its
+        // `cargo test` would run its build script with your keys.
+        let p = sandboxed(Mode::Edits, "allow cargo test\n", "out");
+        assert_eq!(p.decide(&command("cargo test", "network")), Decision::Allow, "inside the walls, the rule counts");
+        assert_eq!(p.decide(&command("cargo test", "outside")), Decision::Ask);
+        assert_eq!(p.how(&command("cargo test", "outside")), Run::Unsandboxed, "what it would be, once you say yes");
+        let auto = sandboxed(Mode::Auto, "allow cargo test\n", "out-auto");
+        assert!(matches!(auto.decide(&command("cargo test", "outside")), Decision::Deny(_)), "auto never asks, so it refuses");
+        // Without a sandbox nothing is walled in, so rules let nothing run.
+        let bare = Permissions::new(Mode::Ask, "allow cargo test\n").unwrap();
+        assert_eq!(bare.decide(&bash("cargo test")), Decision::Ask);
+        let bare_auto = Permissions::new(Mode::Auto, "allow cargo test\n").unwrap();
+        assert!(matches!(bare_auto.decide(&bash("cargo test")), Decision::Deny(_)));
+        // What you said yes to yourself still counts.
+        let mut yours = sandboxed(Mode::Ask, "", "out-yours");
+        yours.remember(&command("cargo test", "outside"));
+        assert_eq!(yours.decide(&command("cargo test", "outside")), Decision::Allow);
     }
 
     #[test]
@@ -572,11 +603,11 @@ mod tests {
         // the splitter gives up.
         assert_eq!(p.decide(&command("git commit -m x", "write")), Decision::Ask);
         assert_eq!(p.decide(&command("echo $X && git commit -m x", "write")), Decision::Ask);
-        // An allow rule lets a command past the walls without asking.
-        assert_eq!(p.decide(&command("cargo fetch", "outside")), Decision::Allow);
+        // An allow rule spares asking about the network, inside the walls.
+        assert_eq!(p.decide(&command("cargo fetch", "network")), Decision::Allow);
         let auto = sandboxed(Mode::Auto, "ask git commit\nallow cargo fetch\n", "auto-rules");
         assert!(matches!(auto.decide(&command("git commit -m x", "write")), Decision::Deny(_)), "auto never asks");
-        assert_eq!(auto.decide(&command("cargo fetch", "outside")), Decision::Allow);
+        assert_eq!(auto.decide(&command("cargo fetch", "network")), Decision::Allow);
         // Read-only changes nothing, whatever a rule allows.
         let read_only = sandboxed(Mode::ReadOnly, "allow cargo fetch\n", "read-only-rules");
         assert!(matches!(read_only.decide(&command("cargo fetch", "network")), Decision::Deny(_)));

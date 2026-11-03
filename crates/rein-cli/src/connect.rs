@@ -130,6 +130,18 @@ fn auth(provider: &Provider, key: String) -> Auth {
     }
 }
 
+/// A client that sends a key to `base`, unless the key would cross the
+/// network where anyone can read it: plain http to another computer.
+fn keyed(http: &rein_llm::reqwest::Client, provider: &Provider, base: &str, auth: Auth) -> CliResult<Client> {
+    if !rein_llm::http::may_carry_a_key(base) {
+        return Err(format!(
+            "rein won't send your {} key to {base}: that's plain http, which anyone on the network in between can read. Use https, or plain http only to this computer (localhost)",
+            provider.title
+        ));
+    }
+    Ok(Client::new(http.clone(), provider.api, base.to_owned(), auth).with_quirks(provider.quirks))
+}
+
 /// A client for `provider`, with the first way to pay there is, and a line
 /// saying which, so it's always clear who pays.
 pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, keys: &Keys) -> CliResult<(Client, String)> {
@@ -147,9 +159,9 @@ pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, k
             let token = env("CLAUDE_CODE_OAUTH_TOKEN").or_else(|| saved.and_then(|c| c.token));
             Ok((Client::claude_code(http.clone(), token), "Using Claude Code CLI subscription login (subprocess; rein handles tools)".into()))
         }
-        Some(Payment::Key { var, key }) => Ok((client(auth(provider, key)), pays(&var))),
-        Some(Payment::Token { var, token }) => Ok((client(Auth::Bearer(token)), pays(&var))),
-        Some(Payment::Saved(key)) => Ok((client(auth(provider, key)), pays(&format!("your saved {} key", provider.title)))),
+        Some(Payment::Key { var, key }) => Ok((keyed(http, provider, &base, auth(provider, key))?, pays(&var))),
+        Some(Payment::Token { var, token }) => Ok((keyed(http, provider, &base, Auth::Bearer(token))?, pays(&var))),
+        Some(Payment::Saved(key)) => Ok((keyed(http, provider, &base, auth(provider, key))?, pays(&format!("your saved {} key", provider.title)))),
         Some(Payment::Free) => Ok((client(Auth::None), format!("Using {} at {base}", provider.title))),
         None => Err(no_key(provider)),
     }
@@ -277,7 +289,7 @@ pub async fn save_key(http: &rein_llm::reqwest::Client, provider: &Provider, key
         return Err("no key given; nothing was saved".into());
     }
     let key = key.trim().to_owned();
-    let client = Client::new(http.clone(), provider.api, base_url(provider).0, auth(provider, key.clone())).with_quirks(provider.quirks);
+    let client = keyed(http, provider, &base_url(provider).0, auth(provider, key.clone()))?;
     let didnt = |e| format!("that key didn't work ({}); nothing was saved", describe(e));
     client.check_key(&provider.key_check).await.map_err(didnt)?;
     let models = client.list_models().await.unwrap_or_default();

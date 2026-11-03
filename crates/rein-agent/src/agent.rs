@@ -1575,16 +1575,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rules_run_or_block_without_asking() {
+    async fn deny_rules_block_without_asking_and_allow_rules_need_the_walls() {
         let turns = vec![vec![bash("c1", "echo allowed"), bash("c2", "git push")], vec![Item::Assistant("Done.".into())]];
         let mut agent = agent("rules", turns);
         agent.permissions = Permissions::new(Mode::Ask, "allow echo\ndeny git push").unwrap();
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("go".into(), &mut person).await.unwrap();
 
-        // Nothing was asked: one rule allowed, the other blocked.
-        assert!(!person.log.iter().any(|l| l.starts_with("asked")), "{:?}", person.log);
+        // A deny rule blocks without asking. With no sandbox here, an
+        // allow rule, which came with the project, doesn't spare asking.
+        assert!(person.log.iter().any(|l| l == "asked {\"command\":\"echo allowed\"}"), "{:?}", person.log);
         assert!(person.log.contains(&"result allowed\n[exit code 0]".to_owned()));
+        assert_eq!(person.log.iter().filter(|l| l.starts_with("asked")).count(), 1, "git push wasn't asked about: {:?}", person.log);
         assert!(agent.history.contains(&Item::ToolResult { call_id: "c2".into(), output: "Blocked by a rule: `deny git push`.".into() }));
         assert!(person.log.contains(&"blocked bash: Blocked by a rule: `deny git push`.".to_owned()));
     }

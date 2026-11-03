@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use rein_llm::{Tool, ToolCall};
 
+use crate::redact::{self, Secrets};
 use crate::sandbox::{self, Access, Run};
-use crate::search;
+use crate::{files, search};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -28,11 +29,45 @@ pub struct Tools {
     checkpoints: std::sync::Mutex<Vec<Checkpoint>>,
     /// What holds commands in: `bash` runs in it, when it's told to.
     sandbox: sandbox::Shared,
+    /// The keys rein knows, hidden from what every tool says.
+    secrets: Secrets,
 }
 
 /// Each file a turn changed, as it was before: its bytes, or `None` if the
 /// turn created it.
 type Checkpoint = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+/// A file the model named, found inside the project: the project, resolved,
+/// and the way to the file from it, also resolved, to be opened a folder at
+/// a time ([`files`]) so nothing swapped in since leads out of it.
+struct Spot {
+    root: PathBuf,
+    rel: PathBuf,
+}
+
+impl Spot {
+    fn full(&self) -> PathBuf {
+        self.root.join(&self.rel)
+    }
+
+    /// What it says, read off the loop's thread.
+    async fn read(&self) -> std::io::Result<Vec<u8>> {
+        let (root, rel) = (self.root.clone(), self.rel.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut files::open(&root, &rel)?, &mut bytes)?;
+            Ok(bytes)
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// Writes `bytes` there, making the folders on the way, off the loop's thread.
+    async fn write(&self, bytes: Vec<u8>) -> std::io::Result<()> {
+        let (root, rel) = (self.root.clone(), self.rel.clone());
+        tokio::task::spawn_blocking(move || std::io::Write::write_all(&mut files::create(&root, &rel)?, &bytes)).await.map_err(std::io::Error::other)?
+    }
+}
 
 #[derive(Deserialize)]
 struct ReadArgs {
@@ -256,7 +291,13 @@ impl Tools {
     /// Tools for the project at `root`, with no sandbox: commands told to
     /// run in one are refused until [`Tools::with_sandbox`] gives one.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Tools { root: root.into(), timeout: Duration::from_secs(60), checkpoints: Default::default(), sandbox: Default::default() }
+        Tools { root: root.into(), timeout: Duration::from_secs(60), checkpoints: Default::default(), sandbox: Default::default(), secrets: Secrets::default() }
+    }
+
+    /// Hides `secrets` in what the tools say: see [`redact`].
+    pub fn with_secrets(mut self, secrets: Secrets) -> Self {
+        self.secrets = secrets;
+        self
     }
 
     pub fn with_sandbox(mut self, sandbox: sandbox::Shared) -> Self {
@@ -289,12 +330,14 @@ impl Tools {
         let mut undone = Vec::new();
         // Newest first, so a file changed twice ends up as it was at first.
         for (path, before) in checkpoint.into_iter().rev() {
+            // Put back only where it was, never through a link swapped in since.
+            let rel = path.strip_prefix(&root).map_err(|_| format!("can't put back {}: it's outside the project", path.display()))?;
             match &before {
-                Some(bytes) => std::fs::write(&path, bytes),
-                None => std::fs::remove_file(&path),
+                Some(bytes) => files::create(&root, rel).and_then(|mut file| std::io::Write::write_all(&mut file, bytes)),
+                None => files::remove(&root, rel),
             }
             .map_err(|e| format!("can't put back {}: {e}", path.display()))?;
-            undone.push(path.strip_prefix(&root).unwrap_or(&path).display().to_string());
+            undone.push(rel.display().to_string());
         }
         undone.sort();
         undone.dedup();
@@ -305,11 +348,11 @@ impl Tools {
         self.checkpoints.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Keeps `path` as it is now, before it changes.
-    fn remember(&self, path: &Path) {
-        let before = std::fs::read(path).ok();
+    /// Keeps the file at `spot` as it is now, before it changes.
+    async fn remember(&self, spot: &Spot) {
+        let before = spot.read().await.ok();
         if let Some(checkpoint) = self.saved().last_mut() {
-            checkpoint.push((path.to_owned(), before));
+            checkpoint.push((spot.full(), before));
         }
     }
 
@@ -466,13 +509,13 @@ impl Tools {
             // peers are reached by whoever runs the agent.
             Some(ToolName::Recall | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) | None => Err(format!("there is no tool called {}", call.name)),
         };
-        truncate(result.unwrap_or_else(|e| format!("{ERROR}{e}")))
+        truncate(self.secrets.hide(result.unwrap_or_else(|e| format!("{ERROR}{e}"))))
     }
 
     async fn read(&self, arguments: &str) -> Result<String, String> {
         let args: ReadArgs = parse(arguments)?;
-        let path = self.inside_root(&args.path)?;
-        let bytes = tokio::fs::read(&path).await.map_err(|e| format!("can't read {}: {e}", args.path))?;
+        let spot = self.inside_root(&args.path)?;
+        let bytes = spot.read().await.map_err(|e| format!("can't read {}: {e}", args.path))?;
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
         lines(&text, &args)
     }
@@ -480,6 +523,7 @@ impl Tools {
     async fn grep(&self, arguments: &str) -> Result<String, String> {
         let args: GrepArgs = parse(arguments)?;
         let (root, start) = self.search_root(args.path.as_deref())?;
+        let sandbox = self.sandbox.clone();
         // A search of a big project takes a while: off the loop's thread,
         // so Esc can still stop the turn.
         tokio::task::spawn_blocking(move || {
@@ -491,7 +535,7 @@ impl Tools {
                 files_only: args.output == Some(GrepOutput::Files),
                 context: args.context.unwrap_or(0),
             };
-            search::grep(&root, &grep)
+            search::grep(&root, &grep, &|path: &Path| sandbox.places().hides(path))
         })
         .await
         .map_err(|e| format!("the search failed: {e}"))?
@@ -503,31 +547,45 @@ impl Tools {
         if !start.is_dir() {
             return Err(format!("{} isn't a folder", args.path.unwrap_or_default()));
         }
-        tokio::task::spawn_blocking(move || search::glob(&root, &args.pattern, &start)).await.map_err(|e| format!("the search failed: {e}"))?
+        let sandbox = self.sandbox.clone();
+        tokio::task::spawn_blocking(move || search::glob(&root, &args.pattern, &start, &|path: &Path| sandbox.places().hides(path)))
+            .await
+            .map_err(|e| format!("the search failed: {e}"))?
     }
 
     /// The project, resolved, and where in it to search: `path`, or all of it.
     fn search_root(&self, path: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
         let root = self.root.canonicalize().map_err(|e| format!("can't open the project directory: {e}"))?;
         let start = match path.map(str::trim).filter(|p| !p.is_empty() && *p != ".") {
-            Some(path) => self.inside_root(path)?,
+            Some(path) => self.inside_root(path)?.full(),
             None => root.clone(),
         };
         Ok((root, start))
     }
 
     /// Resolves `path`, following symlinks, and refuses anything outside the
-    /// project, so the model can't read, say, your credentials in ~/.config.
-    fn inside_root(&self, path: &str) -> Result<PathBuf, String> {
+    /// project, so the model can't read, say, your credentials in ~/.config,
+    /// or what the sandbox hides inside it: a project that is your home
+    /// folder still has your keys in it.
+    fn inside_root(&self, path: &str) -> Result<Spot, String> {
         let root = self.root.canonicalize().map_err(|e| format!("can't open the project directory: {e}"))?;
         let full = root.join(path).canonicalize().map_err(|e| format!("can't read {path}: {e}"))?;
-        if full.starts_with(&root) { Ok(full) } else { Err(format!("{path} is outside the project")) }
+        self.spot(path, root, &full)
+    }
+
+    /// Where `full`, resolved, is in `root`, unless it's outside it or hidden.
+    fn spot(&self, path: &str, root: PathBuf, full: &Path) -> Result<Spot, String> {
+        let Ok(rel) = full.strip_prefix(&root) else { return Err(format!("{path} is outside the project")) };
+        if self.sandbox.places().hides(full) {
+            return Err(format!("{path} holds keys or logins, which rein keeps out of reach: leave it"));
+        }
+        Ok(Spot { rel: rel.to_owned(), root })
     }
 
     /// Where `path` may be written: inside the project, even for a file or
     /// folders that don't exist yet. The deepest part that does exist is
     /// resolved, following symlinks, and must be inside the project.
-    fn writable(&self, path: &str) -> Result<PathBuf, String> {
+    fn writable(&self, path: &str) -> Result<Spot, String> {
         let root = self.root.canonicalize().map_err(|e| format!("can't open the project directory: {e}"))?;
         if Path::new(path).components().any(|c| c == Component::ParentDir) {
             return Err(format!("{path} contains `..`; use a path inside the project"));
@@ -546,18 +604,17 @@ impl Tools {
         if !resolved.starts_with(&root) {
             return Err(format!("{path} is outside the project"));
         }
-        Ok(missing.iter().rev().fold(resolved, |dir, name| dir.join(name)))
+        let full = missing.iter().rev().fold(resolved, |dir, name| dir.join(name));
+        self.spot(path, root, &full)
     }
 
     async fn write(&self, arguments: &str) -> Result<String, String> {
         let args: WriteArgs = parse(arguments)?;
-        let path = self.writable(&args.path)?;
-        if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await.map_err(|e| format!("can't create the folders for {}: {e}", args.path))?;
-        }
-        let existed = path.exists();
-        self.remember(&path);
-        tokio::fs::write(&path, &args.content).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
+        no_hidden_key(&args.content)?;
+        let spot = self.writable(&args.path)?;
+        let existed = spot.full().exists();
+        self.remember(&spot).await;
+        spot.write(args.content.clone().into_bytes()).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
         let verb = if existed { "replaced" } else { "created" };
         let lines = args.content.lines().count();
         Ok(format!("{verb} {} ({lines} line{})", args.path, if lines == 1 { "" } else { "s" }))
@@ -565,12 +622,13 @@ impl Tools {
 
     async fn edit(&self, arguments: &str) -> Result<String, String> {
         let args: EditArgs = parse(arguments)?;
-        let path = self.inside_root(&args.path)?;
-        let bytes = tokio::fs::read(&path).await.map_err(|e| format!("can't read {}: {e}", args.path))?;
+        no_hidden_key(&args.new_text)?;
+        let spot = self.inside_root(&args.path)?;
+        let bytes = spot.read().await.map_err(|e| format!("can't read {}: {e}", args.path))?;
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
         let edited = replace(&text, &args.old_text, &args.new_text, args.replace_all).map_err(|e| format!("{e} in {}", args.path))?;
-        self.remember(&path);
-        tokio::fs::write(&path, edited.text).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
+        self.remember(&spot).await;
+        spot.write(edited.text.into_bytes()).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
         let times = if edited.count == 1 { "1 place".to_owned() } else { format!("{} places", edited.count) };
         Ok(format!("edited {}: replaced {times}", args.path))
     }
@@ -777,6 +835,18 @@ fn truncate(mut text: String) -> String {
     text
 }
 
+/// Refuses `text` that has a hidden key's stand-in in it: written into a
+/// file, it would take the place of the key there.
+fn no_hidden_key(text: &str) -> Result<(), String> {
+    if text.contains(redact::HIDDEN) {
+        return Err(format!(
+            "the text has {} in it, which stands for a key rein kept from you; written, it would replace the key. Change the file around it, leaving that part as it is",
+            redact::HIDDEN
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +986,51 @@ mod tests {
             assert_eq!(run(&tools, &grep(json!(path), "lines")).await, format!("error: {path} is outside the project"));
         }
         assert_eq!(run(&tools, &call("glob", json!({"pattern": "*", "path": "a.rs"}))).await, "error: a.rs isn't a folder");
+    }
+
+    #[tokio::test]
+    async fn no_file_tool_reaches_what_the_sandbox_hides_even_in_your_home_folder() {
+        // The project is your home folder: your keys are inside it.
+        let home = project("home", &[("notes.txt", "mine\n")]);
+        for (dir, file) in [(".config/rein", "keys.json"), (".ssh", "id_test")] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+            std::fs::write(home.join(dir).join(file), "sk-test-FAKE\n").unwrap();
+        }
+        std::os::unix::fs::symlink(home.join(".ssh/id_test"), home.join("innocent.txt")).unwrap();
+        let places = crate::sandbox::Places::new(&home, Some(&home), Some(&home.join(".config/rein")));
+        let tools = Tools::new(&home).with_sandbox(std::sync::Arc::new(crate::sandbox::Sandbox::assume(places)));
+        for path in [".config/rein/keys.json", ".ssh/id_test", "innocent.txt"] {
+            let read = run(&tools, &call("read", json!({ "path": path }))).await;
+            assert!(read.starts_with("error: ") && read.contains("keys or logins") && !read.contains("FAKE"), "{path}: {read}");
+            let edit = run(&tools, &call("edit", json!({"path": path, "old_text": "sk", "new_text": "x", "replace_all": false}))).await;
+            assert!(edit.contains("keys or logins"), "{path}: {edit}");
+        }
+        let planted = run(&tools, &call("write", json!({"path": ".config/rein/providers", "content": "[anthropic]\nurl = http://attacker\n"}))).await;
+        assert!(planted.contains("keys or logins"), "{planted}");
+        assert!(!home.join(".config/rein/providers").exists());
+        let grep = run(&tools, &call("grep", json!({"pattern": "FAKE", "path": null, "glob": null, "ignore_case": false, "output": "files", "context": null}))).await;
+        assert!(grep.starts_with("No matches"), "{grep}");
+        let glob = run(&tools, &call("glob", json!({"pattern": "*", "path": null}))).await;
+        assert!(!glob.contains("keys.json") && !glob.contains("id_test") && glob.contains("notes.txt"), "{glob}");
+        assert_eq!(run(&tools, &call("read", json!({"path": "notes.txt"}))).await, "mine\n", "the rest of it is still yours to work in");
+    }
+
+    #[tokio::test]
+    async fn a_key_in_what_a_tool_says_is_hidden_and_never_written_back() {
+        let dir = project("secrets", &[("deploy.env", "TOKEN=sk-test-FAKE-0123\nREGION=eu\n")]);
+        let tools = Tools::new(&dir).with_secrets(Secrets::new(["sk-test-FAKE-0123".to_owned()]));
+        let read = run(&tools, &call("read", json!({"path": "deploy.env"}))).await;
+        assert_eq!(read, format!("TOKEN={}\nREGION=eu\n", redact::HIDDEN));
+        // Written back as it was read, the stand-in would replace the key.
+        let write = run(&tools, &call("write", json!({"path": "deploy.env", "content": read}))).await;
+        assert!(write.starts_with("error: the text has"), "{write}");
+        let edit = json!({"path": "deploy.env", "old_text": "REGION=eu", "new_text": format!("TOKEN={}\nREGION=us", redact::HIDDEN), "replace_all": false});
+        let edit = run(&tools, &call("edit", edit)).await;
+        assert!(edit.starts_with("error: the text has"), "{edit}");
+        // A change around it is fine, and the key stays.
+        let around = json!({"path": "deploy.env", "old_text": "REGION=eu", "new_text": "REGION=us", "replace_all": false});
+        assert_eq!(run(&tools, &call("edit", around)).await, "edited deploy.env: replaced 1 place");
+        assert_eq!(std::fs::read_to_string(dir.join("deploy.env")).unwrap(), "TOKEN=sk-test-FAKE-0123\nREGION=us\n");
     }
 
     #[tokio::test]

@@ -141,6 +141,9 @@ struct Shared {
     waiting: Option<(u64, oneshot::Sender<bool>)>,
     /// The sub-agents this rein started, by task.
     children: HashMap<String, Child>,
+    /// The tasks this rein handed to others, and the address of each one's
+    /// rein: its result was asked for, so it goes in whatever the policy.
+    handed: HashMap<String, String>,
     /// The process of the rein that started this one, if it's a sub-agent.
     parent: Option<u32>,
     sent: HashMap<String, Sender>,
@@ -241,6 +244,7 @@ impl Node {
             held: VecDeque::new(),
             waiting: None,
             children: HashMap::new(),
+            handed: HashMap::new(),
             parent: None,
             sent: HashMap::new(),
         }));
@@ -429,7 +433,20 @@ impl Node {
             Body::Answer { yes, .. } => format!("you answered {}: {}", peer.name, if *yes { "yes" } else { "no" }),
             Body::Status | Body::Changed { .. } | Body::Claim { .. } | Body::Close => String::new(),
         };
-        let reply = super::ask(&peer, body).await?;
+        // Noted before it goes: a quick rein's result may come back first.
+        let task = if let Body::Task { id, .. } = &body { Some(id.clone()) } else { None };
+        if let Some(id) = &task {
+            locked(&self.shared).handed.insert(id.clone(), peer.address());
+        }
+        let reply = match super::ask(&peer, body).await {
+            Ok(reply) => reply,
+            Err(e) => {
+                if let Some(id) = &task {
+                    locked(&self.shared).handed.remove(id);
+                }
+                return Err(e);
+            }
+        };
         if !what.is_empty() {
             self.note(what);
         }
@@ -673,6 +690,7 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
     // Who it is: a rein in the folder, by the process on the other end.
     let sender = cred.pid().and_then(|pid| u32::try_from(pid).ok()).and_then(|pid| sender(&folder, pid));
     let from = sender.as_ref().map(|info| if info.workspace == workspace { info.name.clone() } else { info.address() });
+    let address = sender.as_ref().map(Info::address);
     let incoming = match (request.body, sender, from) {
         (Body::Status, _, _) => {
             let shared = locked(shared);
@@ -727,15 +745,23 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
     }
     let what = format!("{} → you: {}", incoming.from(), preview(&incoming.text()));
     // What a sub-agent sends back for the task it was given goes in, as
-    // the rein that started it asked for it; so does its parent's word.
+    // the rein that started it asked for it; so does its parent's word,
+    // and the result of a task this rein handed to the rein sending it.
     let ours = match &incoming {
-        Incoming::Result { id, .. } => match shared.children.get_mut(id) {
-            Some(child) => {
-                child.finished = true;
-                true
+        Incoming::Result { id, .. } => {
+            let shared = &mut *shared;
+            match shared.children.get_mut(id) {
+                Some(child) => {
+                    child.finished = true;
+                    true
+                }
+                None if address.is_some() && shared.handed.get(id) == address.as_ref() => {
+                    shared.handed.remove(id);
+                    true
+                }
+                None => false,
             }
-            None => false,
-        },
+        }
         Incoming::Close { .. } => true,
         _ => false,
     };

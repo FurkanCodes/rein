@@ -26,6 +26,7 @@ mod connect;
 mod conversation;
 mod effort;
 mod format;
+mod harden;
 mod input;
 mod peers;
 mod settings;
@@ -49,6 +50,9 @@ fn main() -> ExitCode {
     // First, while rein has one thread: other programs can read the
     // environment it was started with, and the keys in it are rein's.
     rein_agent::sandbox::secrets::keep();
+    if let Err(e) = harden::harden() {
+        eprintln!("rein: a crash could write rein's memory, keys and all, to a file: {e}");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
@@ -67,8 +71,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(args: Vec<String>) -> CliResult {
-    let http =
-        rein_llm::reqwest::Client::builder().user_agent(concat!("rein/", env!("CARGO_PKG_VERSION"))).connect_timeout(Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
+    let http = rein_llm::http::client(concat!("rein/", env!("CARGO_PKG_VERSION"))).map_err(|e| e.to_string())?;
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["-h" | "--help"] => {

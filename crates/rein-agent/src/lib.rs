@@ -5,10 +5,12 @@
 pub mod agent;
 pub mod compact;
 pub mod context;
+mod files;
 pub mod mentions;
 pub mod peers;
 pub mod permissions;
 pub mod prompt;
+pub mod redact;
 pub mod search;
 pub mod session;
 pub mod tools;

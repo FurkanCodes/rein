@@ -40,8 +40,11 @@ pub struct Grep<'a> {
     pub context: usize,
 }
 
+/// What the sandbox hides, which no search finds or reads either.
+pub type Hides<'a> = &'a (dyn Fn(&Path) -> bool + Sync);
+
 /// Searches what files under `start` say. `root` is the project, resolved.
-pub fn grep(root: &Path, args: &Grep) -> Result<String, String> {
+pub fn grep(root: &Path, args: &Grep, hides: Hides) -> Result<String, String> {
     let regex = RegexBuilder::new(args.pattern)
         .case_insensitive(args.ignore_case)
         // `^` and `$` are the start and end of each line, as in grep.
@@ -54,7 +57,7 @@ pub fn grep(root: &Path, args: &Grep) -> Result<String, String> {
     let files = if args.start.is_file() {
         vec![start.clone()]
     } else {
-        let mut files = walk(root, args.start);
+        let mut files = walk(root, args.start, hides);
         if let Some(filter) = &filter {
             files.retain(|file| filter.matches(file, &start));
         }
@@ -65,7 +68,7 @@ pub fn grep(root: &Path, args: &Grep) -> Result<String, String> {
     // Most of the time goes to opening and reading files, so they're
     // searched on every core at once; only those with matches are read
     // again, to show them.
-    let found = in_parallel(&files, |file| text(&root.join(file)).map_or_else(Vec::new, |text| matching_lines(&regex, &text)));
+    let found = in_parallel(&files, |file| text(root, file).map_or_else(Vec::new, |text| matching_lines(&regex, &text)));
     let (mut matches, mut matched_files) = (0, 0);
     let mut shown = 0;
     let mut body = String::new();
@@ -85,7 +88,7 @@ pub fn grep(root: &Path, args: &Grep) -> Result<String, String> {
             body += &format!("{file} ({times})\n");
             continue;
         }
-        let Some(text) = text(&root.join(file)) else { continue };
+        let Some(text) = text(root, file) else { continue };
         let lines: Vec<&str> = text.lines().collect();
         body += &format!("\n{file}\n");
         let mut last: Option<usize> = None;
@@ -125,10 +128,10 @@ pub fn grep(root: &Path, args: &Grep) -> Result<String, String> {
 }
 
 /// Finds files under `start` by name or path. `root` is the project, resolved.
-pub fn glob(root: &Path, pattern: &str, start: &Path) -> Result<String, String> {
+pub fn glob(root: &Path, pattern: &str, start: &Path, hides: Hides) -> Result<String, String> {
     let pattern_ = Pattern::new(pattern)?;
     let from = relative(root, start);
-    let files: Vec<String> = walk(root, start).into_iter().filter(|file| pattern_.matches(file, &from)).collect();
+    let files: Vec<String> = walk(root, start, hides).into_iter().filter(|file| pattern_.matches(file, &from)).collect();
     if files.is_empty() {
         return Ok(format!("No files match {pattern:?} ({}).", IGNORED_NOTE.replace("searched", "listed")));
     }
@@ -181,13 +184,17 @@ fn relative(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
-/// A file's text, or `None` for one that's too big or binary: one with a
-/// zero byte near its start, as git decides.
-fn text(path: &Path) -> Option<String> {
-    if std::fs::metadata(path).ok()?.len() > MAX_FILE {
+/// The text of `file` in `root`, or `None` for one that's too big or
+/// binary: one with a zero byte near its start, as git decides. Opened a
+/// folder at a time, so a link swapped in since the walk found it isn't
+/// followed out of the project.
+fn text(root: &Path, file: &str) -> Option<String> {
+    let mut opened = crate::files::open(root, Path::new(file)).ok()?;
+    if opened.metadata().ok()?.len() > MAX_FILE {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut opened, &mut bytes).ok()?;
     if bytes[..bytes.len().min(8000)].contains(&0) {
         return None;
     }
@@ -384,8 +391,8 @@ fn ignored(rules: &[Rule], path: &str, name: &str, folder: bool) -> bool {
 
 /// Every file and folder in the project the `.gitignore` files don't leave
 /// out, relative to `root`, folders ending in `/`: what `@` can point at.
-pub fn paths(root: &Path) -> Vec<String> {
-    let files = walk(root, root);
+pub fn paths(root: &Path, hides: Hides) -> Vec<String> {
+    let files = walk(root, root, hides);
     let mut folders: Vec<String> = files.iter().flat_map(|file| file.match_indices('/').map(|(i, _)| file[..=i].to_owned())).collect();
     folders.sort();
     folders.dedup();
@@ -396,7 +403,7 @@ pub fn paths(root: &Path) -> Vec<String> {
 /// relative to `root`, sorted. The rules of the folders above `start` count
 /// too, from the root down, and so does the repository's own
 /// `.git/info/exclude`.
-fn walk(root: &Path, start: &Path) -> Vec<String> {
+fn walk(root: &Path, start: &Path, hides: Hides) -> Vec<String> {
     let mut all = rules(&root.join(".git/info/exclude"), "");
     all.extend(rules(&root.join(".gitignore"), ""));
     let from = relative(root, start);
@@ -406,11 +413,11 @@ fn walk(root: &Path, start: &Path) -> Vec<String> {
         all.extend(rules(&root.join(&base).join(".gitignore"), &relative(Path::new(""), &base)));
     }
     let mut files = Vec::new();
-    visit(root, &from, &mut all, &mut files);
+    visit(root, &from, &mut all, &mut files, hides);
     files
 }
 
-fn visit(root: &Path, folder: &str, rules_: &mut Vec<Rule>, files: &mut Vec<String>) {
+fn visit(root: &Path, folder: &str, rules_: &mut Vec<Rule>, files: &mut Vec<String>, hides: Hides) {
     let Ok(entries) = std::fs::read_dir(root.join(folder)) else { return };
     let mut entries: Vec<(String, std::fs::FileType)> =
         entries.filter_map(|entry| entry.ok()).filter_map(|entry| Some((entry.file_name().into_string().ok()?, entry.file_type().ok()?))).collect();
@@ -421,13 +428,13 @@ fn visit(root: &Path, folder: &str, rules_: &mut Vec<Rule>, files: &mut Vec<Stri
             continue;
         }
         let path = if folder.is_empty() { name.clone() } else { format!("{folder}/{name}") };
-        if ignored(rules_, &path, &name, kind.is_dir()) {
+        if ignored(rules_, &path, &name, kind.is_dir()) || hides(&root.join(&path)) {
             continue;
         }
         if kind.is_dir() {
             let kept = rules_.len();
             rules_.extend(rules(&root.join(&path).join(".gitignore"), &path));
-            visit(root, &path, rules_, files);
+            visit(root, &path, rules_, files, hides);
             rules_.truncate(kept);
         } else if kind.is_file() {
             files.push(path);
@@ -438,6 +445,9 @@ fn visit(root: &Path, folder: &str, rules_: &mut Vec<Rule>, files: &mut Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing hidden.
+    const NOTHING: Hides = &|_: &Path| false;
 
     fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rein-search-{}-{name}", std::process::id()));
@@ -452,7 +462,7 @@ mod tests {
     }
 
     fn grep_in(root: &Path, pattern: &str, glob: Option<&str>, files_only: bool, context: usize) -> String {
-        grep(root, &Grep { pattern, start: root, glob, ignore_case: false, files_only, context }).unwrap()
+        grep(root, &Grep { pattern, start: root, glob, ignore_case: false, files_only, context }, NOTHING).unwrap()
     }
 
     #[test]
@@ -488,15 +498,15 @@ mod tests {
                 (".git/config", ""),
             ],
         );
-        assert_eq!(walk(&root, &root), [".github/ci.yml", ".gitignore", "docs/deep/page.html", "keep.log", "src/.gitignore", "src/main.rs", "sub/only-top.txt"]);
+        assert_eq!(walk(&root, &root, NOTHING), [".github/ci.yml", ".gitignore", "docs/deep/page.html", "keep.log", "src/.gitignore", "src/main.rs", "sub/only-top.txt"]);
         // Starting further down, the rules above still count.
-        assert_eq!(walk(&root, &root.join("src")), ["src/.gitignore", "src/main.rs"]);
+        assert_eq!(walk(&root, &root.join("src"), NOTHING), ["src/.gitignore", "src/main.rs"]);
     }
 
     #[test]
     fn lists_what_can_be_pointed_at() {
         let root = project("paths", &[("Cargo.toml", ""), ("src/ui/box.rs", ""), ("src/main.rs", ""), (".gitignore", "target/\n"), ("target/x", "")]);
-        assert_eq!(paths(&root), [".gitignore", "Cargo.toml", "src/main.rs", "src/ui/box.rs", "src/", "src/ui/"]);
+        assert_eq!(paths(&root, NOTHING), [".gitignore", "Cargo.toml", "src/main.rs", "src/ui/box.rs", "src/", "src/ui/"]);
     }
 
     #[test]
@@ -505,7 +515,7 @@ mod tests {
         let outside = project("links-outside", &[("key", "secret")]);
         std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
         std::os::unix::fs::symlink(outside.join("key"), root.join("key")).unwrap();
-        assert_eq!(walk(&root, &root), ["a.txt"]);
+        assert_eq!(walk(&root, &root, NOTHING), ["a.txt"]);
         assert!(grep_in(&root, "secret$", None, false, 0).starts_with("No matches in 1 file"));
     }
 
@@ -530,10 +540,10 @@ mod tests {
             "^ is a line's start"
         );
         assert_eq!(grep_in(&root, "parse_list", Some("src/**"), true, 0), "2 files with matches (2 matching lines)\nsrc/main.rs (1 match)\nsrc/parser.rs (1 match)");
-        let one = grep(&root, &Grep { pattern: "PARSE_ITEM", start: &root.join("src/parser.rs"), glob: None, ignore_case: true, files_only: false, context: 0 }).unwrap();
+        let one = grep(&root, &Grep { pattern: "PARSE_ITEM", start: &root.join("src/parser.rs"), glob: None, ignore_case: true, files_only: false, context: 0 }, NOTHING).unwrap();
         assert_eq!(one, "1 match in 1 file\nsrc/parser.rs\n4:fn parse_item() {}");
         assert_eq!(grep_in(&root, "nowhere", None, false, 0), "No matches in 4 files (files that .gitignore leaves out aren't searched).");
-        let bad = grep(&root, &Grep { pattern: "fn (", start: &root, glob: None, ignore_case: false, files_only: false, context: 0 }).unwrap_err();
+        let bad = grep(&root, &Grep { pattern: "fn (", start: &root, glob: None, ignore_case: false, files_only: false, context: 0 }, NOTHING).unwrap_err();
         assert!(bad.starts_with("\"fn (\" isn't a regular expression rein understands: ") && bad.contains("closing"), "{bad}");
     }
 
@@ -558,10 +568,10 @@ mod tests {
     #[test]
     fn glob_finds_files_by_name_or_path() {
         let root = project("glob", &[("Cargo.toml", ""), ("src/main.rs", ""), ("src/ui/box.rs", ""), ("tests/screen.rs", ""), ("notes.md", "")]);
-        assert_eq!(glob(&root, "*.rs", &root).unwrap(), "3 files\nsrc/main.rs\nsrc/ui/box.rs\ntests/screen.rs", "a name, in any folder");
-        assert_eq!(glob(&root, "src/**/*.rs", &root).unwrap(), "2 files\nsrc/main.rs\nsrc/ui/box.rs");
-        assert_eq!(glob(&root, "ui/*.rs", &root.join("src")).unwrap(), "1 file\nsrc/ui/box.rs", "from the folder asked about");
-        assert_eq!(glob(&root, "./Cargo.toml", &root).unwrap(), "1 file\nCargo.toml");
-        assert_eq!(glob(&root, "*.py", &root).unwrap(), "No files match \"*.py\" (files that .gitignore leaves out aren't listed).");
+        assert_eq!(glob(&root, "*.rs", &root, NOTHING).unwrap(), "3 files\nsrc/main.rs\nsrc/ui/box.rs\ntests/screen.rs", "a name, in any folder");
+        assert_eq!(glob(&root, "src/**/*.rs", &root, NOTHING).unwrap(), "2 files\nsrc/main.rs\nsrc/ui/box.rs");
+        assert_eq!(glob(&root, "ui/*.rs", &root.join("src"), NOTHING).unwrap(), "1 file\nsrc/ui/box.rs", "from the folder asked about");
+        assert_eq!(glob(&root, "./Cargo.toml", &root, NOTHING).unwrap(), "1 file\nCargo.toml");
+        assert_eq!(glob(&root, "*.py", &root, NOTHING).unwrap(), "No files match \"*.py\" (files that .gitignore leaves out aren't listed).");
     }
 }

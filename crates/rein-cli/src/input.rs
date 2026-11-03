@@ -17,7 +17,7 @@
 //! otherwise it reads plain lines, so piping into rein works.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,7 @@ use crate::ui::screen::{self, Bottom, Drag, Pinned, Raw, Tone};
 use crate::ui::style::{GUTTER, Style, fit, width};
 use crate::ui::viewer::Viewer;
 use crate::ui::wrap::Wrap;
+use rein_agent::sandbox::Sandbox;
 
 /// What reading a line produced.
 pub enum Read {
@@ -162,6 +163,8 @@ pub struct Input {
     _raw: Option<Raw>,
     /// The project.
     root: PathBuf,
+    /// What it hides, `@` doesn't offer either.
+    sandbox: Arc<Sandbox>,
 }
 
 /// The box, shared by the keyboard's thread, the clock's and the rest of rein.
@@ -1030,10 +1033,11 @@ fn marked(text: &str, words: &[String], s: Style, picked: bool) -> String {
 }
 
 /// Lists what `@` can point at in `root`, on a thread of its own, as a big
-/// project takes a moment.
-fn look_for_paths(boxed: std::sync::Weak<Mutex<Boxed>>, root: PathBuf) {
+/// project takes a moment. What the sandbox hides isn't listed: rein's
+/// file tools wouldn't read it anyway.
+fn look_for_paths(boxed: std::sync::Weak<Mutex<Boxed>>, root: PathBuf, sandbox: Arc<Sandbox>) {
     std::thread::spawn(move || {
-        let paths = rein_agent::search::paths(&root);
+        let paths = rein_agent::search::paths(&root, &|path: &Path| sandbox.places().hides(path));
         if let Some(boxed) = boxed.upgrade() {
             locked(&boxed).paths = paths;
         }
@@ -1059,8 +1063,8 @@ impl Input {
     /// `pinned` asks for the input box, which needs a terminal all round.
     /// `history` is what you sent before, for ↑ and Ctrl-R, `bell` says
     /// whether to ring when rein needs you and you're away, and `root` is
-    /// the project, whose files `@` points at.
-    pub fn start(pinned: bool, interrupted: Arc<tokio::sync::Notify>, history: History, bell: bool, root: PathBuf) -> Self {
+    /// the project, whose files `@` points at, but for what `sandbox` hides.
+    pub fn start(pinned: bool, interrupted: Arc<tokio::sync::Notify>, history: History, bell: bool, root: PathBuf, sandbox: Arc<Sandbox>) -> Self {
         let (requests, asked) = std::sync::mpsc::channel::<String>();
         let (tx, replies) = tokio::sync::mpsc::unbounded_channel();
         let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
@@ -1112,7 +1116,7 @@ impl Input {
                     }
                 });
             }
-            look_for_paths(Arc::downgrade(&boxed), root.clone());
+            look_for_paths(Arc::downgrade(&boxed), root.clone(), sandbox.clone());
             let clock = Arc::downgrade(&boxed);
             std::thread::spawn(move || {
                 while let Some(boxed) = clock.upgrade() {
@@ -1132,7 +1136,7 @@ impl Input {
                     }
                 }
             });
-            return Input { requests, replies, pending: false, boxed: Some(boxed), _raw: Some(raw), root };
+            return Input { requests, replies, pending: false, boxed: Some(boxed), _raw: Some(raw), root, sandbox };
         }
         std::thread::spawn(move || {
             for prompt in asked {
@@ -1147,14 +1151,14 @@ impl Input {
                 }
             }
         });
-        Input { requests, replies, pending: false, boxed: None, _raw: None, root }
+        Input { requests, replies, pending: false, boxed: None, _raw: None, root, sandbox }
     }
 
     /// Looks again at what `@` can point at: a turn may have made or
     /// removed files.
     pub fn look_for_paths(&self) {
         if let Some(boxed) = &self.boxed {
-            look_for_paths(Arc::downgrade(boxed), self.root.clone());
+            look_for_paths(Arc::downgrade(boxed), self.root.clone(), self.sandbox.clone());
         }
     }
 

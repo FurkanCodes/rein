@@ -1105,6 +1105,106 @@ fn claude_answers_through_anthropics_own_api() {
     assert_eq!(request["system"][0]["cache_control"], json!({ "type": "ephemeral" }), "the system prompt is cached");
 }
 
+#[test]
+fn a_key_a_tool_comes_across_never_reaches_the_model_or_the_saved_conversation() {
+    // The project's own settings, with the key rein uses in them.
+    let files = [("deploy.env", "ANTHROPIC_API_KEY=test-key\nREGION=eu\n")];
+    let model = Model::claude(vec![Turn { out: vec![read("deploy.env")] }, says("Read it.")]);
+    let mut term = Term::start_with(&model, "hidden-key", 24, 90, &files);
+    term.wait_for(IDLE);
+    term.keys("what's in deploy.env?\r");
+    term.wait_for("Read it.");
+    let sent = model.requests()[1].to_string();
+    assert!(sent.contains("ANTHROPIC_API_KEY=[a key rein hides]") && sent.contains("REGION=eu"), "{sent}");
+    assert!(!sent.contains("test-key"), "{sent}");
+    let home = term.dir.join("home");
+    let saved: Vec<PathBuf> = walk(&home).into_iter().filter(|file| std::fs::read_to_string(file).is_ok_and(|text| text.contains("test-key"))).collect();
+    assert!(saved.is_empty(), "the key is in {saved:?}");
+}
+
+/// Every file under `dir`.
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().flat_map(|entry| if entry.path().is_dir() { walk(&entry.path()) } else { vec![entry.path()] }).collect()
+}
+
+#[test]
+fn what_rein_runs_starts_with_core_dumps_off() {
+    // Started where a crash would dump its memory, keys and all, to a file.
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit fills the struct, which lives for the call.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &raw mut limit) }, 0);
+    if limit.rlim_max == 0 {
+        return;
+    }
+    let on = libc::rlimit { rlim_cur: limit.rlim_max, rlim_max: limit.rlim_max };
+    let check = calls("bash", json!({ "command": "ulimit -c", "timeout_seconds": null, "access": "look", "reason": null }));
+    let model = Model::claude(vec![check, says("Checked.")]);
+    let dir = std::env::temp_dir().join(format!("rein-core-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (project, home) = (dir.join("project"), dir.join("home"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rein"));
+    command
+        .args(["--mode", "trust", "how big may a core dump be?"])
+        .current_dir(&project)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("REIN_HOME", &home)
+        .env("BROWSER", "false")
+        .env("SSH_CONNECTION", "test")
+        .envs(model.env.iter().map(|(name, value)| (name, value)))
+        .stdin(Stdio::null());
+    // SAFETY: between fork and exec, setrlimit only reads `on`, a copy the
+    // closure owns, and making an error from errno allocates nothing.
+    unsafe {
+        command.pre_exec(move || if libc::setrlimit(libc::RLIMIT_CORE, &raw const on) == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) });
+    }
+    let out = command.output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let sent = model.requests()[1].to_string();
+    assert!(sent.contains(r"0\n[exit code 0]") && !sent.contains("unlimited"), "{sent}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_key_never_goes_over_plain_http_to_another_computer() {
+    let home = std::env::temp_dir().join(format!("rein-plain-http-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let rein = |args: &[&str], key: Option<&str>, input: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rein"));
+        command
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("REIN_HOME", &home)
+            .env("BROWSER", "false")
+            .env("SSH_CONNECTION", "test")
+            // A documentation address: what's refused is never tried.
+            .env("ANTHROPIC_BASE_URL", "http://192.0.2.1/v1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(key) = key {
+            command.env("ANTHROPIC_API_KEY", key);
+        }
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+    };
+    let refused = "rein won't send your Anthropic key to http://192.0.2.1/v1: that's plain http";
+    let (ok, said) = rein(&["models", "anthropic"], Some("sk-ant-FAKE"), "");
+    assert!(!ok && said.contains(refused), "{said}");
+    let (ok, said) = rein(&["login", "anthropic", "--key"], None, "sk-ant-FAKE\n");
+    assert!(!ok && said.contains(refused) && !said.contains("FAKE"), "{said}");
+    assert!(!home.join("keys.json").exists(), "nothing was saved");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// `v` without its cache marks, which may move between requests: they
 /// aren't part of what thinking is signed with.
 fn unmarked(v: &Value) -> Value {
@@ -1968,7 +2068,8 @@ fn tabs(name: &str) -> (PathBuf, PathBuf, PathBuf) {
 #[test]
 fn a_message_from_another_tab_starts_a_turn_there() {
     let (base, project, home) = tabs("msg");
-    let api_model = Model::start(vec![says("Adding a /health endpoint now.")]);
+    // With what comes in let straight in, as you can set it.
+    let api_model = Model::start(vec![says("Adding a /health endpoint now.")]).with_env("REIN_PEERS", "accept");
     let web_model = Model::start(vec![calls("message", json!({ "to": "api", "text": "please add a /health endpoint" })), says("Asked api.")]);
     let api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
     api.wait_for(IDLE);
@@ -1993,7 +2094,7 @@ fn a_message_from_another_tab_starts_a_turn_there() {
 fn a_task_handed_to_another_tab_comes_back_with_its_result() {
     let (base, project, home) = tabs("task");
     let write = calls("write", json!({ "path": "health.txt", "content": "ok\n" }));
-    let api_model = Model::start(vec![write, says("Added the endpoint.")]);
+    let api_model = Model::start(vec![write, says("Added the endpoint.")]).with_env("REIN_PEERS", "accept");
     let web_model = Model::start(vec![calls("delegate", json!({ "to": "api", "task": "add a /health endpoint" })), says("Handed it to api."), says("api is done with it.")]);
     let api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api", "--mode", "edits"]);
     api.wait_for(IDLE);
@@ -2049,6 +2150,26 @@ fn a_sandboxed_command_cant_read_who_the_other_reins_are() {
     web.wait_for("Looked.");
     let result = model.requests()[1].to_string();
     assert!(!result.contains("token") && !result.contains(".sock"), "the peers' files stay out of a command's reach: {result}");
+}
+
+#[test]
+fn what_another_tab_sends_waits_for_you_to_let_it_in() {
+    let (base, project, home) = tabs("held");
+    let api_model = Model::start(vec![says("Looking at it.")]);
+    let mut api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
+    api.wait_for(IDLE);
+    let idle = Model::start(vec![]);
+    let mut web = Term::spawn_in(&idle, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.keys("/delegate api run the deploy script\r");
+    web.wait_for("api keeps it for its user to let in");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(api_model.requests().is_empty(), "nothing went in on its own");
+    api.keys("/inbox\r");
+    api.wait_for("A task for you, handed over by web");
+    api.keys("\r");
+    api.wait_for("Looking at it.");
+    assert!(api_model.requests()[0].to_string().contains("run the deploy script"));
 }
 
 #[test]
