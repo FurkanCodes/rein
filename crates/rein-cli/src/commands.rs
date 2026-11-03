@@ -18,6 +18,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/undo", "", "put back the files rein changed in its last turn"),
     ("/new", "", "start a fresh conversation (also /clear)"),
     ("/resume", "", "continue a saved conversation from this folder"),
+    ("/peers", "", "the reins in your other terminals, and what each is doing"),
+    ("/send", "[name] [message]", "write to another rein"),
+    ("/delegate", "[name] [task]", "hand another rein a task; its result comes back here"),
+    ("/inbox", "", "what other reins sent that waits to be let in"),
+    ("/name", "[name]", "what other reins call this one"),
+    ("/workspace", "[name]", "the group of reins this one works with"),
     ("/exit", "", "leave (also /quit, Ctrl-D)"),
 ];
 
@@ -42,6 +48,14 @@ pub enum Slash {
     Undo,
     New,
     Resume,
+    Peers,
+    /// To whom, and what; either may still be asked for.
+    Send(Option<String>, Option<String>),
+    Delegate(Option<String>, Option<String>),
+    Inbox,
+    /// `None` says what it is.
+    Name(Option<String>),
+    Workspace(Option<String>),
     Exit,
 }
 
@@ -96,9 +110,28 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
         "/undo" => Ok(Slash::Undo),
         "/new" => Ok(Slash::New),
         "/resume" => Ok(Slash::Resume),
+        "/peers" => Ok(Slash::Peers),
+        "/send" => {
+            let (to, text) = to_and_rest(rest);
+            Ok(Slash::Send(to, text))
+        }
+        "/delegate" => {
+            let (to, task) = to_and_rest(rest);
+            Ok(Slash::Delegate(to, task))
+        }
+        "/inbox" => Ok(Slash::Inbox),
+        "/name" => Ok(Slash::Name(arg)),
+        "/workspace" => Ok(Slash::Workspace(arg)),
         "/exit" => Ok(Slash::Exit),
         other => Err(format!("there's no {other} command; /help lists them")),
     })
+}
+
+/// `api fix the tests` → the rein it's for, and what to tell it.
+fn to_and_rest(rest: &str) -> (Option<String>, Option<String>) {
+    let (to, text) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let to = to.trim_start_matches('@');
+    ((!to.is_empty()).then(|| to.to_owned()), (!text.trim().is_empty()).then(|| text.trim().to_owned()))
 }
 
 /// The commands that start with what's typed so far, for the list under
@@ -141,6 +174,10 @@ mod tests {
         assert_eq!(parse("/login anthropic"), Some(Ok(Slash::Login(Some("anthropic".into())))));
         assert_eq!(parse("/logout openrouter"), Some(Ok(Slash::Logout(Some("openrouter".into())))));
         assert_eq!(parse("/logout"), Some(Ok(Slash::Logout(None))));
+        assert_eq!(parse("/send api run the tests"), Some(Ok(Slash::Send(Some("api".into()), Some("run the tests".into())))));
+        assert_eq!(parse("/delegate @web"), Some(Ok(Slash::Delegate(Some("web".into()), None))));
+        assert_eq!(parse("/send"), Some(Ok(Slash::Send(None, None))));
+        assert_eq!(parse("/name review"), Some(Ok(Slash::Name(Some("review".into())))));
     }
 
     #[test]

@@ -186,6 +186,27 @@ pub fn follow() {
     }
 }
 
+/// Names the tab, or the window, rein runs in: OSC 2, which nearly every
+/// terminal takes, and the rest ignore. Control characters are left out,
+/// so nothing in a name can reach the terminal as a sequence of its own.
+pub fn title(title: &str) {
+    let title: String = title.chars().filter(|c| !c.is_control()).collect();
+    let _guard = lock();
+    write_raw(&format!("\x1b]2;{title}\x07"));
+}
+
+/// Keeps the title the terminal had, on xterm's title stack, for
+/// [`restore_title`] to put back. Terminals without one ignore both.
+pub fn save_title() {
+    let _guard = lock();
+    write_raw("\x1b[22;2t");
+}
+
+pub fn restore_title() {
+    let _guard = lock();
+    write_raw("\x1b[23;2t");
+}
+
 /// Asks the terminal to put `encoded` (base64) on the clipboard: OSC 52.
 pub fn clipboard(encoded: &str) {
     let _guard = lock();

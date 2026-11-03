@@ -61,6 +61,20 @@ pub enum Approval {
     Stop,
 }
 
+/// Something that came in for the conversation, and from whom. Only
+/// [`Heard::You`] is the user's word: it's what `@` is read in, and the
+/// others are framed so the model knows they aren't from the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Heard {
+    /// What the user typed.
+    You(String),
+    /// What another rein sent.
+    Peer { from: String, text: String },
+    /// Another rein in this folder changed `path`. It's said only if this
+    /// conversation has read or changed that file.
+    Changed { by: String, path: String },
+}
+
 /// Whoever is at the keyboard: sees what happens, and decides what may run.
 pub trait Ui {
     fn text(&mut self, delta: &str);
@@ -89,13 +103,20 @@ pub trait Ui {
     /// through `text`.
     fn compacting(&mut self) {}
     fn compacted(&mut self, _report: &Compacted) {}
-    /// Messages the user sent while the turn went on, to steer it: taken
-    /// out, oldest first. Asked between steps.
-    fn steering(&mut self) -> Vec<String> {
+    /// What came in while the turn went on, to steer it: the user's
+    /// messages, and other reins'. Taken out, oldest first; asked between
+    /// steps.
+    fn steering(&mut self) -> Vec<Heard> {
         Vec::new()
     }
-    /// A steering message has gone into the conversation, here.
-    fn steered(&mut self, _message: &str) {}
+    /// Something heard has gone into the conversation, here.
+    fn steered(&mut self, _heard: &Heard) {}
+    /// Does what the model asked of another rein (`peers`, `message`,
+    /// `delegate`), and says how it went. Only offered where there are
+    /// other reins to reach; see [`Agent::with_peer_tools`].
+    fn peer(&mut self, call: &ToolCall) -> impl Future<Output = String> {
+        std::future::ready(format!("{}there are no other reins to reach from here: {}", crate::tools::ERROR, call.name))
+    }
     /// What the user's message pointed at with `@`, read for them.
     fn attached(&mut self, call: &ToolCall, output: &str) {
         self.tool_started(call);
@@ -303,6 +324,24 @@ impl<M: Model> Agent<M> {
     /// Dropping the future cancels the turn; [`Agent::repair`] then makes
     /// the history valid again, and `send` calls it first anyway.
     pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
+        self.begin()?;
+        self.record(Item::User(prompt.clone()))?;
+        self.attach(&prompt, ui).await?;
+        self.work(ui).await
+    }
+
+    /// Works on what another rein, `from`, sent, as [`Agent::send`] does
+    /// on the user's message: framed as not the user's, and nothing it
+    /// points at with `@` is read.
+    pub async fn hear(&mut self, from: &str, text: &str, ui: &mut impl Ui) -> Result<Outcome> {
+        self.begin()?;
+        self.record(Item::User(crate::peers::heard(from, text)))?;
+        self.work(ui).await
+    }
+
+    /// What every turn starts with: the history made valid again, a
+    /// checkpoint for `/undo`, and the context, before the first message.
+    fn begin(&mut self) -> Result<()> {
         self.repair();
         self.tools.checkpoint();
         if let Some(context) = self.context.take() {
@@ -312,8 +351,11 @@ impl<M: Model> Agent<M> {
             self.window.full.push(Item::User(context.clone()));
             self.history.push(Item::User(context));
         }
-        self.record(Item::User(prompt.clone()))?;
-        self.attach(&prompt, ui).await?;
+        Ok(())
+    }
+
+    /// Works until the model is done, the turn is stopped, or it's stuck.
+    async fn work(&mut self, ui: &mut impl Ui) -> Result<Outcome> {
         // Compact when the conversation gets too long, as often as a long turn
         // needs, but only after a step since the last time, and never again
         // after one that didn't make room: a summary that is itself too big
@@ -430,6 +472,16 @@ impl<M: Model> Agent<M> {
             }
             let call = calls[next].clone();
             next += 1;
+            // Other reins are reached by whoever runs the agent. Nothing
+            // runs here: what the other rein does, it asks its own user about.
+            if ToolName::of(&call).is_some_and(ToolName::reaches_peers) {
+                ui.tool_started(&call);
+                let output = ui.peer(&call).await;
+                if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
+                    return self.stop_stuck(stuck, &calls[next..], ui);
+                }
+                continue;
+            }
             // Searching the conversation is rein's own business: no
             // permission needed, nothing outside is touched.
             if ToolName::of(&call) == Some(ToolName::Recall) {
@@ -499,16 +551,43 @@ impl<M: Model> Agent<M> {
         Ok(stuck)
     }
 
-    /// Adds the messages the user sent to steer the turn, where it is now,
-    /// with what they point at. Says whether there were any.
-    async fn steer(&mut self, messages: Vec<String>, ui: &mut impl Ui) -> Result<bool> {
-        let any = !messages.is_empty();
-        for message in messages {
-            ui.steered(&message);
-            self.record(Item::User(message.clone()))?;
-            self.attach(&message, ui).await?;
+    /// Adds what came in to steer the turn, where it is now: the user's
+    /// messages with what they point at, other reins' framed as theirs, and
+    /// notes of files changed by others that this conversation has seen.
+    /// Says whether there was a message, which keeps the turn going.
+    async fn steer(&mut self, heard: Vec<Heard>, ui: &mut impl Ui) -> Result<bool> {
+        let mut any = false;
+        for heard in heard {
+            match &heard {
+                Heard::You(message) => {
+                    any = true;
+                    ui.steered(&heard);
+                    self.record(Item::User(message.clone()))?;
+                    self.attach(message, ui).await?;
+                }
+                Heard::Peer { from, text } => {
+                    any = true;
+                    ui.steered(&heard);
+                    self.record(Item::User(crate::peers::heard(from, text)))?;
+                }
+                // Only what matters here: a file this conversation knows.
+                Heard::Changed { by, path } if self.has_seen(path) => {
+                    ui.steered(&heard);
+                    self.record(Item::User(crate::peers::changed(by, path)))?;
+                }
+                Heard::Changed { .. } => {}
+            }
         }
         Ok(any)
+    }
+
+    /// This conversation has read, written or edited `path`.
+    fn has_seen(&self, path: &str) -> bool {
+        let path = path.trim_start_matches("./");
+        self.window.full.iter().any(|item| match item {
+            Item::ToolCall(call) => matches!(ToolName::of(call), Some(ToolName::Read | ToolName::Write | ToolName::Edit)) && read_path(&call.arguments).as_deref() == Some(path),
+            _ => false,
+        })
     }
 
     /// Reads what `message` points at with `@`, as steps of the user's: a
@@ -734,6 +813,14 @@ impl<M> Agent<M> {
     pub fn with_model<N>(self, model: N) -> Agent<N> {
         let Agent { model: _, tools, permissions, model_name, reasoning_effort, max_output, step_limit, specs, instructions, session_id, history, session, context, window } = self;
         Agent { model, tools, permissions, model_name, reasoning_effort, max_output, step_limit, specs, instructions, session_id, history, session, context, window }
+    }
+
+    /// Also offers the tools that reach other reins: `peers`, `message` and
+    /// `delegate`, which [`Ui::peer`] does. Before the first request, so
+    /// the tools stay the same all conversation, for the cache.
+    pub fn with_peer_tools(mut self) -> Self {
+        self.specs.extend(crate::peers::specs());
+        self
     }
 
     /// Compact once a request would carry more than this many tokens.
@@ -1034,7 +1121,7 @@ mod tests {
 
     /// Approves everything, and writes `message` once `after` steps are done.
     struct Steerer {
-        message: Option<String>,
+        message: Option<Heard>,
         after: usize,
         finished: usize,
         log: Vec<String>,
@@ -1054,11 +1141,14 @@ mod tests {
             self.log.push(format!("result of {}: {output}", call.call_id));
         }
         fn usage(&mut self, _: &Usage) {}
-        fn steering(&mut self) -> Vec<String> {
+        fn steering(&mut self) -> Vec<Heard> {
             if self.finished < self.after { Vec::new() } else { self.message.take().into_iter().collect() }
         }
-        fn steered(&mut self, message: &str) {
-            self.log.push(format!("steered {message}"));
+        fn steered(&mut self, heard: &Heard) {
+            self.log.push(match heard {
+                Heard::You(message) => format!("steered {message}"),
+                other => format!("steered {other:?}"),
+            });
         }
     }
 
@@ -1066,7 +1156,7 @@ mod tests {
     async fn a_message_sent_mid_turn_skips_the_steps_not_started() {
         let mut agent = agent("steer", vec![vec![bash("c1", "touch one"), bash("c2", "touch two")], vec![Item::Assistant("Using the helper.".into())]]);
         let root = std::env::temp_dir().join(format!("rein-agent-{}-steer", std::process::id()));
-        let mut steerer = Steerer { message: Some("stop, use the helper".into()), after: 1, finished: 0, log: Vec::new() };
+        let mut steerer = Steerer { message: Some(Heard::You("stop, use the helper".into())), after: 1, finished: 0, log: Vec::new() };
         assert_eq!(agent.send("make two files".into(), &mut steerer).await.unwrap(), Outcome::Done);
         assert!(root.join("one").exists() && !root.join("two").exists(), "the second step never ran");
         assert_eq!(
@@ -1092,12 +1182,55 @@ mod tests {
     #[tokio::test]
     async fn a_message_sent_as_the_model_finishes_keeps_the_turn_going() {
         let mut agent = agent("steer-end", vec![vec![Item::Assistant("Done.".into())], vec![Item::Assistant("Also renamed it.".into())]]);
-        let mut steerer = Steerer { message: Some("and rename it".into()), after: 0, finished: 0, log: Vec::new() };
+        let mut steerer = Steerer { message: Some(Heard::You("and rename it".into())), after: 0, finished: 0, log: Vec::new() };
         assert_eq!(agent.send("fix it".into(), &mut steerer).await.unwrap(), Outcome::Done);
         let requests = agent.model.requests.borrow();
         assert_eq!(requests.len(), 2, "one turn, carried on");
         assert_eq!(requests[1].input.last(), Some(&Item::User("and rename it".into())));
         assert_eq!(agent.history.last(), Some(&Item::Assistant("Also renamed it.".into())));
+    }
+
+    #[tokio::test]
+    async fn another_reins_message_is_framed_and_what_it_points_at_isnt_read() {
+        let mut agent = agent("peer-heard", vec![vec![Item::Assistant("On it.".into())]]);
+        std::fs::write(root_of("peer-heard").join("secret.txt"), "not for peers\n").unwrap();
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        assert_eq!(agent.hear("api", "look at @secret.txt", &mut person).await.unwrap(), Outcome::Done);
+        assert_eq!(agent.history[0], Item::User(crate::peers::heard("api", "look at @secret.txt")));
+        assert!(matches!(&agent.history[0], Item::User(text) if text.contains("It's not from the user")));
+        assert!(!agent.history.iter().any(|item| matches!(item, Item::ToolCall(_) | Item::ToolResult { .. })), "nothing was read for it: {:?}", agent.history);
+    }
+
+    #[tokio::test]
+    async fn a_peers_change_is_noted_only_for_a_file_this_conversation_has_seen() {
+        let read =
+            Item::ToolCall(ToolCall { call_id: "r".into(), name: "read".into(), arguments: json!({ "path": "src/a.rs", "start_line": null, "line_count": null }).to_string() });
+        let turns = vec![vec![read], vec![Item::Assistant("Done.".into())]];
+        let mut first = agent("peer-changed", turns);
+        let mut seen = Steerer { message: Some(Heard::Changed { by: "api".into(), path: "./src/a.rs".into() }), after: 1, finished: 0, log: Vec::new() };
+        first.send("read it".into(), &mut seen).await.unwrap();
+        assert!(first.history.contains(&Item::User(crate::peers::changed("api", "./src/a.rs"))), "{:?}", first.history);
+
+        let mut agent = agent("peer-unseen", vec![vec![Item::Assistant("Done.".into())]]);
+        let mut unseen = Steerer { message: Some(Heard::Changed { by: "api".into(), path: "src/b.rs".into() }), after: 0, finished: 0, log: Vec::new() };
+        agent.send("hi".into(), &mut unseen).await.unwrap();
+        assert_eq!(agent.history.len(), 2, "a file it never saw isn't mentioned, nor does it keep the turn going: {:?}", agent.history);
+        assert_eq!(agent.model.requests.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reaching_another_rein_is_the_uis_and_never_asks() {
+        let message = Item::ToolCall(ToolCall { call_id: "m".into(), name: "message".into(), arguments: json!({ "to": "api", "text": "hi" }).to_string() });
+        let mut agent = agent("peer-tool", vec![vec![message], vec![Item::Assistant("Sent.".into())]]).with_peer_tools();
+        let mut person = Person { answer: Approval::No, log: Vec::new() };
+        agent.send("tell api hi".into(), &mut person).await.unwrap();
+        assert!(!person.log.iter().any(|line| line.starts_with("asked")), "{:?}", person.log);
+        let result = result_of(&agent, "m");
+        assert!(result.contains("no other reins"), "the default ui has no peers: {result}");
+        let offered: Vec<String> = agent.model.requests.borrow()[0].tools.iter().map(|tool| tool.name.clone()).collect();
+        for name in ["peers", "message", "delegate"] {
+            assert!(offered.iter().any(|tool| tool == name), "{name} is offered: {offered:?}");
+        }
     }
 
     fn root_of(dir: &str) -> std::path::PathBuf {

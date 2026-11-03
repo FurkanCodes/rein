@@ -26,6 +26,7 @@ mod connect;
 mod conversation;
 mod format;
 mod input;
+mod peers;
 mod settings;
 use settings::Settings;
 mod terminal;
@@ -82,6 +83,7 @@ async fn run(args: Vec<String>) -> CliResult {
         ["providers"] => connect::list(),
         ["models"] => connect::models(&http, None).await,
         ["models", provider] => connect::models(&http, Some(provider)).await,
+        ["peers"] => peers::dashboard::run(&peers::folder(&config_dir()?)).await,
         _ => {
             let settings = Settings::load(&config_dir()?.join(settings::FILE))?;
             let compact_at = settings.get("compact_at", "REIN_COMPACT_AT");

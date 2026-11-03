@@ -3,13 +3,15 @@
 
 use crate::format::thousands;
 use crate::input::{Input, Question, Read};
+use crate::peers::node::Incoming;
+use crate::peers::{Node, State};
 use crate::ui::history::History;
 use crate::ui::markdown::Markdown;
 use crate::ui::spinner::Spinner;
 use crate::ui::steps;
 use crate::ui::style::{GUTTER, Style, strip};
 use crate::ui::wrap::Wrap;
-use rein_agent::agent::{Approval, Compacted, Ui};
+use rein_agent::agent::{Approval, Compacted, Heard, Ui};
 use rein_agent::compact;
 use rein_agent::permissions::Mode;
 use rein_agent::sandbox::Access;
@@ -111,6 +113,16 @@ pub(crate) struct Terminal {
     /// The key the next run of reads is shown under.
     next_key: u64,
     pub(crate) turn: TurnStats,
+    /// This rein among the others on this computer, when it joined them.
+    pub(crate) peers: Option<Node>,
+    /// Tasks other reins handed over in this turn: where each one's
+    /// result goes, and its ID.
+    pub(crate) tasks: Vec<(String, String)>,
+    /// The files this turn changed, for a task's result.
+    pub(crate) changed: Vec<String>,
+    /// What came in while no turn ran that isn't a message: notes of files
+    /// other reins changed, for the next turn.
+    pub(crate) notes: Vec<Heard>,
 }
 
 /// A run of reads, shown as one line.
@@ -195,6 +207,51 @@ impl Terminal {
             reads: None,
             next_key: 0,
             turn: TurnStats::default(),
+            peers: None,
+            tasks: Vec::new(),
+            changed: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// What another rein sent, as the agent hears it. A task's result is
+    /// owed to its sender at the end of the turn it goes into.
+    pub(crate) fn heard_of(&mut self, incoming: Incoming) -> Heard {
+        let text = incoming.text();
+        match incoming {
+            Incoming::Changed { from, path } => Heard::Changed { by: from, path },
+            Incoming::Task { from, reply_to, id, .. } => {
+                self.tasks.push((reply_to, id));
+                Heard::Peer { from, text }
+            }
+            Incoming::Message { from, .. } | Incoming::Result { from, .. } => Heard::Peer { from, text },
+        }
+    }
+
+    /// Says how this rein is doing, to the others and on its tab.
+    pub(crate) fn state(&self, state: State) {
+        if let Some(peers) = &self.peers {
+            peers.set_state(state, None);
+        }
+    }
+
+    /// The question is answered: the others stop showing it.
+    fn answered(&self, answer: Approval) -> Approval {
+        if let Some(peers) = &self.peers {
+            peers.answered();
+        }
+        answer
+    }
+
+    /// `call` changed a file: the others in this folder hear which.
+    fn changed_file(&mut self, call: &ToolCall) {
+        let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).unwrap_or_default();
+        let Some(path) = args["path"].as_str().map(|path| path.trim_start_matches("./").to_owned()) else { return };
+        if !self.changed.contains(&path) {
+            self.changed.push(path.clone());
+        }
+        if let Some(peers) = &mut self.peers {
+            peers.changed(&path);
         }
     }
 
@@ -256,6 +313,8 @@ impl Terminal {
     /// A new turn: your message under its label, then a blank line.
     pub(crate) fn start_turn(&mut self, echo: Option<&str>) {
         self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
+        self.changed.clear();
+        self.state(State::Working);
         self.last = Last::You;
         self.labeled = false;
         if self.fancy
@@ -281,6 +340,7 @@ impl Terminal {
     /// ```
     pub(crate) fn end_turn(&mut self) {
         self.end_line();
+        self.state(State::Idle);
         self.input.busy(None, std::time::Instant::now());
         self.input.look_for_paths();
         self.turn.took = self.turn.started.map(|t| t.elapsed());
@@ -415,6 +475,20 @@ pub(crate) const WIDE: usize = 400;
 
 /// Your message as the conversation shows it: under your label, wrapped,
 /// and only its first lines if it's long, like a big paste.
+/// What another rein said, as the conversation shows it: who from, then
+/// its words, under the gutter, as long as your message would be shown.
+pub(crate) fn peer_said(from: &str, message: &str, s: Style, columns: usize) -> String {
+    let lines: Vec<&str> = message.lines().collect();
+    let shown = if lines.len() > ECHO_LINES { &lines[..ECHO_LINES - 1] } else { &lines[..] };
+    let mut wrap = Wrap::new(columns, GUTTER, GUTTER);
+    let text = wrap.push(&shown.join("\n")) + &wrap.finish();
+    let mut out = format!("{}{}\n{}{text}", " ".repeat(GUTTER), s.yellow(&format!("✉ from {from}")), " ".repeat(GUTTER));
+    if lines.len() > shown.len() {
+        out += &format!("\n{}{}", " ".repeat(GUTTER), s.dim(&format!("… {} more lines", lines.len() - shown.len())));
+    }
+    out
+}
+
 pub(crate) fn you_said(message: &str, s: Style, columns: usize) -> String {
     let lines: Vec<&str> = message.lines().collect();
     let shown = if lines.len() > ECHO_LINES { &lines[..ECHO_LINES - 1] } else { &lines[..] };
@@ -550,15 +624,47 @@ impl Ui for Terminal {
             });
         }
         let answers = vec![("y", "Yes".to_owned()), ("a", always.to_owned()), ("n", "No".to_owned()), ("esc", "No, and tell rein what to do instead".to_owned())];
-        let answer = match self.input.ask(Question { title: question.to_owned(), detail: reason, command, answers }).await {
-            Read::Line(key) => approval(&key),
+        // The other reins see it's waiting, and you can answer from another tab.
+        let asked = format!("{question} {}", command.clone().unwrap_or_else(|| command_line(call)));
+        let elsewhere = self.peers.as_mut().map(|peers| peers.question(&shorten_line(&asked)));
+        let here = self.input.ask(Question { title: question.to_owned(), detail: reason, command, answers });
+        let answer = match elsewhere {
+            Some(there) => {
+                // Never answered elsewhere if nothing over there can answer.
+                let there = async {
+                    match there.await {
+                        Ok(yes) => yes,
+                        Err(_) => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    read = here => Some(read),
+                    yes = there => {
+                        self.input.drop_question();
+                        self.noted = Some(format!("answered {} from another tab", if yes { "yes" } else { "no" }));
+                        return self.answered(if yes { Approval::Yes } else { Approval::No });
+                    }
+                }
+            }
+            None => Some(here.await),
+        };
+        let answer = match answer {
+            Some(Read::Line(key)) => approval(&key),
             _ => Approval::No,
         };
+        let answer = self.answered(answer);
         if answer == Approval::Always {
             let what = if ToolName::of(call) == Some(ToolName::Bash) { "this command" } else { "file changes" };
             self.noted = Some(format!("won't ask again for {what} in this conversation"));
         }
         answer
+    }
+
+    async fn peer(&mut self, call: &ToolCall) -> String {
+        match &self.peers {
+            Some(peers) => peers.tool(call).await,
+            None => format!("{}this rein isn't among the others: start it in a conversation, with peers on", rein_agent::tools::ERROR),
+        }
     }
 
     fn tool_started(&mut self, call: &ToolCall) {
@@ -570,6 +676,9 @@ impl Ui for Terminal {
             self.gap_before_step();
             let lead = self.lead();
             self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: false, done: false });
+        }
+        if let Some(peers) = &self.peers {
+            peers.doing(&steps::doing(call));
         }
         if self.input.pinned() {
             self.doing(&steps::doing(call));
@@ -615,6 +724,9 @@ impl Ui for Terminal {
         let s = self.err;
         let asked = step.as_ref().is_some_and(|step| step.header_shown);
         let mut outcome = steps::outcome(call, output, s);
+        if ToolName::of(call).is_some_and(ToolName::changes_files) && outcome.ok == Some(true) {
+            self.changed_file(call);
+        }
         if ToolName::of(call) == Some(ToolName::Plan) {
             // The same steps as before: just say where things stand.
             let names: Vec<String> = outcome.details.iter().map(|line| strip(line).chars().skip(2).collect()).collect();
@@ -675,6 +787,9 @@ impl Ui for Terminal {
     }
 
     fn usage(&mut self, usage: &Usage) {
+        if let Some(peers) = &self.peers {
+            peers.add_tokens(usage.input_tokens.saturating_add(usage.output_tokens));
+        }
         self.turn.input += usage.input_tokens;
         self.turn.cached += usage.cached_input_tokens;
         self.context_used = usage.input_tokens;
@@ -717,17 +832,36 @@ impl Ui for Terminal {
         });
     }
 
-    fn steering(&mut self) -> Vec<String> {
-        self.input.steering()
+    /// Your messages, then what came in from other reins.
+    fn steering(&mut self) -> Vec<Heard> {
+        let mut heard: Vec<Heard> = self.input.steering().into_iter().map(Heard::You).collect();
+        heard.append(&mut self.notes);
+        let mut incoming = Vec::new();
+        if let Some(peers) = &mut self.peers {
+            while let Ok(one) = peers.inbox.try_recv() {
+                incoming.push(one);
+            }
+        }
+        heard.extend(incoming.into_iter().map(|one| self.heard_of(one)));
+        heard
     }
 
-    /// Your message, where it went into the turn: between the steps it came
-    /// between, so the screen reads as the model saw it.
-    fn steered(&mut self, message: &str) {
+    /// What was heard, where it went into the turn: between the steps it
+    /// came between, so the screen reads as the model saw it.
+    fn steered(&mut self, heard: &Heard) {
         self.end_line();
-        if self.fancy {
-            let shown = self.input.shown(message);
-            say!("\n{}", you_said(&shown, self.err, self.wrap_width().unwrap_or(80)));
+        let columns = self.wrap_width().unwrap_or(80);
+        match heard {
+            Heard::You(message) if self.fancy => {
+                let shown = self.input.shown(message);
+                say!("\n{}", you_said(&shown, self.err, columns));
+            }
+            Heard::Peer { from, text } if self.fancy => say!("\n{}", peer_said(from, text, self.err, columns)),
+            Heard::Changed { by, path } => {
+                say!("{}{}", " ".repeat(GUTTER), self.err.dim(&format!("↳ {by} changed {path}, which this conversation has seen")));
+                return;
+            }
+            _ => {}
         }
         // What rein does next starts under its label again, after a gap.
         self.labeled = false;
@@ -775,6 +909,17 @@ pub(crate) fn headlines(thoughts: &str) -> Vec<String> {
         rest = &after[end + 2..];
     }
     found
+}
+
+/// A command's whole text, for saying what a question is about.
+fn command_line(call: &ToolCall) -> String {
+    let (name, target) = steps::describe(call);
+    format!("{name} {target}")
+}
+
+/// `text` on one line, short enough for a tab or the dashboard.
+fn shorten_line(text: &str) -> String {
+    crate::peers::node::preview(text)
 }
 
 /// Reads a typed answer: y or a; anything else, including nothing, is no.

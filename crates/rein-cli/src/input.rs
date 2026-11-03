@@ -1220,6 +1220,40 @@ impl Input {
         read
     }
 
+    /// Stops waiting for your message: rein starts on something else, like
+    /// another rein's. What's typed stays in the box, and a message sent
+    /// just as it started steers the turn instead. Without the box the
+    /// line asked for is still read, and the next read gets it.
+    pub fn stop_reading(&mut self) {
+        let Some(boxed) = &self.boxed else { return };
+        if !self.pending {
+            return;
+        }
+        self.pending = false;
+        let mut boxed = locked(boxed);
+        if boxed.waiting == Waiting::Message {
+            boxed.waiting = Waiting::Nothing;
+        }
+        while let Ok(read) = self.replies.try_recv() {
+            if let Read::Line(line) = read {
+                boxed.steering.push(line);
+            }
+        }
+        boxed.draw();
+    }
+
+    /// The question on screen was answered in another tab: it goes.
+    pub fn drop_question(&mut self) {
+        let Some(boxed) = &self.boxed else { return };
+        self.pending = false;
+        let mut boxed = locked(boxed);
+        boxed.asking = None;
+        boxed.waiting = Waiting::Nothing;
+        // A key pressed here at the same moment answers nothing now.
+        while self.replies.try_recv().is_ok() {}
+        boxed.draw();
+    }
+
     /// Reads a secret, like an API key, in the box: it shows as dots and
     /// isn't kept, and Esc cancels. `None` without a box, where it would
     /// show as it's typed.

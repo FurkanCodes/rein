@@ -10,6 +10,7 @@
 //! bell = off
 //! compress = off
 //! sandbox = on
+//! peers = hold
 //! ```
 //!
 //! Plain `key = value` lines; quotes are optional. A flag wins over an
@@ -20,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub const FILE: &str = "config";
-const KEYS: [&str; 8] = ["model", "effort", "mode", "compact_at", "max_steps", "bell", "compress", "sandbox"];
+const KEYS: [&str; 9] = ["model", "effort", "mode", "compact_at", "max_steps", "bell", "compress", "sandbox", "peers"];
 
 #[derive(Debug, Default)]
 pub struct Settings {
@@ -78,7 +79,7 @@ mod tests {
 
     #[test]
     fn says_what_is_wrong() {
-        assert_eq!(Settings::parse("colour = blue").unwrap_err(), "line 1: unknown setting colour; use model, effort, mode, compact_at, max_steps, bell, compress, sandbox");
+        assert_eq!(Settings::parse("colour = blue").unwrap_err(), "line 1: unknown setting colour; use model, effort, mode, compact_at, max_steps, bell, compress, sandbox, peers");
         assert_eq!(Settings::parse("model").unwrap_err(), "line 1: write it as key = value");
     }
 }

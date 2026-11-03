@@ -1,6 +1,7 @@
 //! The command line: rein's help, and what its flags and settings say.
 
 use crate::CliResult;
+use crate::peers::node::{Joining, Policy};
 use crate::settings::Settings;
 use rein_agent::agent::DEFAULT_MAX_STEPS;
 use rein_agent::permissions::Mode;
@@ -26,6 +27,8 @@ Usage:
   rein logout <provider>         Forget it (rein logout chatgpt signs out)
   rein providers                 List the providers rein can reach, and what pays
   rein models [<provider>]       List the models you can use
+  rein peers                     Watch the reins running in your other terminals,
+                                 and answer what they ask (y/n)
 
 rein can read, write and edit files in this folder and run commands. In a
 conversation, type /exit or press Ctrl-D to leave. Conversations are saved in
@@ -67,6 +70,10 @@ Options:
                         watching (auto mode, a one-shot task), or off;
                         default 200. While you watch there's no limit
       --record <file>   Also save the raw response stream, for tests
+      --name <name>     What other reins call this one (default: the folder's)
+      --workspace <ws>  The group of reins it works with (default: the git branch)
+      --worktree        Work in the workspace's own git worktree, beside this
+                        repository, made on first use on a branch of its name
 
 Rules in .rein/permissions refine the mode for commands, one per line:
   allow cargo test
@@ -87,11 +94,21 @@ A turn goes on until the model is done, or you press Esc. One that keeps
 making the same call with the same result is told, then stopped, and a turn
 nobody watches stops at max_steps, with the model saying where it got to.
 
+Every conversation joins the other reins on this computer: start rein in
+another terminal tab and they can talk. Each tab's title says what its rein
+is doing, and needs you: ⚠. /peers shows them all, /send and /delegate write
+to one or hand it a task, /name and /workspace say who this one is, and
+/inbox holds what's waiting to be let in. The model can do the same with its
+peers, message and delegate tools. Another rein's message is never yours: it
+can't approve anything, and everything it leads to asks as usual. Set
+peers = hold to let each message in yourself (trust mode always does),
+refuse to take none, or off to stay out.
+
 Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
-compact_at, max_steps, and bell, compress and sandbox (on or off), like
+compact_at, max_steps, peers, and bell, compress and sandbox (on or off), like
 `mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE,
-$REIN_COMPACT_AT, $REIN_MAX_STEPS, $REIN_BELL, $REIN_COMPRESS and
-$REIN_SANDBOX, which win over the file.
+$REIN_COMPACT_AT, $REIN_MAX_STEPS, $REIN_BELL, $REIN_COMPRESS, $REIN_SANDBOX
+and $REIN_PEERS, which win over the file.
 
 Each request carries the whole conversation, so rein gzips it on the way:
 about three times fewer bytes, and the same text for the model. A server that
@@ -135,6 +152,14 @@ pub(crate) struct AskArgs {
     pub(crate) max_steps: Option<usize>,
     /// `None` starts a conversation instead of doing one task.
     pub(crate) prompt: Option<String>,
+    /// What other reins call this one; `None`: the folder's name.
+    pub(crate) name: Option<String>,
+    /// Its group of reins; `None`: the git branch.
+    pub(crate) workspace: Option<String>,
+    /// Work in the workspace's own git worktree.
+    pub(crate) worktree: bool,
+    /// Whether it joins the other reins, and what it lets in.
+    pub(crate) joining: Joining,
 }
 
 impl AskArgs {
@@ -154,6 +179,11 @@ impl AskArgs {
             Some(other) => Err(format!("{key} should be on or off, not {other}")),
         };
         let (bell, compress, sandbox) = (switch("bell", "REIN_BELL")?, switch("compress", "REIN_COMPRESS")?, switch("sandbox", "REIN_SANDBOX")?);
+        let joining = match settings.get("peers", "REIN_PEERS") {
+            Some(value) => value.parse::<Joining>()?,
+            None => Joining::On(Policy::Accept),
+        };
+        let (mut name, mut workspace, mut worktree) = (None, None, false);
         let mut max_steps = match settings.get("max_steps", "REIN_MAX_STEPS") {
             Some(value) => steps(&value)?,
             None => Some(DEFAULT_MAX_STEPS),
@@ -176,6 +206,9 @@ impl AskArgs {
                 "-s" | "--system" => system = Some(value(&mut args, &arg)?),
                 "--max-steps" => max_steps = steps(&value(&mut args, &arg)?)?,
                 "--record" => record = Some(PathBuf::from(value(&mut args, &arg)?)),
+                "--name" => name = Some(crate::peers::clean_name(&value(&mut args, &arg)?)?),
+                "--workspace" => workspace = Some(value(&mut args, &arg)?),
+                "--worktree" => worktree = true,
                 "--" => words.extend(args.by_ref()),
                 flag if flag.starts_with('-') && flag.len() > 1 => {
                     return Err(format!("unknown option {flag}; see `rein --help`"));
@@ -184,7 +217,10 @@ impl AskArgs {
             }
         }
         let prompt = if words.is_empty() { None } else { Some(words.join(" ")) };
-        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, sandbox, max_steps, prompt })
+        if worktree && workspace.is_none() {
+            return Err("--worktree needs --workspace <name>: the worktree is the workspace's".into());
+        }
+        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, sandbox, max_steps, prompt, name, workspace, worktree, joining })
     }
 }
 
@@ -244,6 +280,16 @@ mod tests {
         for wrong in ["0", "many", "-3"] {
             assert_eq!(args(&format!("--max-steps {wrong} hi")).err(), Some(format!("max_steps should be a number of steps, or off, not {wrong}")));
         }
+    }
+
+    #[test]
+    fn who_this_rein_is_among_the_others() {
+        let parsed = args("--name Web --workspace health").unwrap();
+        assert_eq!((parsed.name.as_deref(), parsed.workspace.as_deref(), parsed.joining), (Some("web"), Some("health"), Joining::On(Policy::Accept)));
+        assert_eq!(args("--worktree").err().as_deref(), Some("--worktree needs --workspace <name>: the worktree is the workspace's"));
+        assert!(args("--name a/b").is_err());
+        let held = AskArgs::parse(vec![], &Settings::parse("peers = hold").unwrap()).unwrap();
+        assert_eq!(held.joining, Joining::On(Policy::Hold));
     }
 
     #[test]

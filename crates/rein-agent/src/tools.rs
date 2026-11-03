@@ -185,10 +185,15 @@ pub enum ToolName {
     Bash,
     /// Searching the conversation: rein's own, see `compact::recall`.
     Recall,
+    /// The other reins on this computer, and reaching them: the user's
+    /// side of rein does these, see [`crate::peers`].
+    Peers,
+    Message,
+    Delegate,
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 8] = [Self::Read, Self::Grep, Self::Glob, Self::Write, Self::Edit, Self::Plan, Self::Bash, Self::Recall];
+    pub const ALL: [ToolName; 11] = [Self::Read, Self::Grep, Self::Glob, Self::Write, Self::Edit, Self::Plan, Self::Bash, Self::Recall, Self::Peers, Self::Message, Self::Delegate];
 
     /// The name the model knows it by.
     pub const fn as_str(self) -> &'static str {
@@ -201,6 +206,9 @@ impl ToolName {
             Self::Plan => "plan",
             Self::Bash => "bash",
             Self::Recall => "recall",
+            Self::Peers => "peers",
+            Self::Message => "message",
+            Self::Delegate => "delegate",
         }
     }
 
@@ -218,6 +226,11 @@ impl ToolName {
     /// Changes files: undone with `/undo`, and allowed by file-change modes.
     pub const fn changes_files(self) -> bool {
         matches!(self, Self::Write | Self::Edit)
+    }
+
+    /// Reaches another rein, which the user's side of rein does.
+    pub const fn reaches_peers(self) -> bool {
+        matches!(self, Self::Peers | Self::Message | Self::Delegate)
     }
 }
 
@@ -445,8 +458,9 @@ impl Tools {
                 let done = plan.steps.iter().filter(|step| step.status == StepStatus::Done).count();
                 format!("Plan updated: {done} of {} done.", plan.steps.len())
             }),
-            // `recall` is the agent's own: it searches the conversation.
-            Some(ToolName::Recall) | None => Err(format!("there is no tool called {}", call.name)),
+            // `recall` is the agent's own: it searches the conversation. The
+            // peers are reached by whoever runs the agent.
+            Some(ToolName::Recall | ToolName::Peers | ToolName::Message | ToolName::Delegate) | None => Err(format!("there is no tool called {}", call.name)),
         };
         truncate(result.unwrap_or_else(|e| format!("{ERROR}{e}")))
     }
@@ -700,7 +714,7 @@ fn parse<T: DeserializeOwned>(arguments: &str) -> Result<T, String> {
 
 /// A JSON Schema object in the form strict mode wants: every property
 /// required, nothing extra allowed.
-fn object(properties: Value) -> Value {
+pub(crate) fn object(properties: Value) -> Value {
     let required: Vec<String> = properties.as_object().map(|p| p.keys().cloned().collect()).unwrap_or_default();
     json!({ "type": "object", "properties": properties, "required": required, "additionalProperties": false })
 }

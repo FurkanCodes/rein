@@ -272,6 +272,56 @@ tool searches the whole conversation, including what was compacted away.
 With Claude, its thinking from after the point compaction changed goes with
 it (see above); the words stay.
 
+## Reins in other tabs
+
+Open another terminal tab, start `rein` there, and the two can talk. It
+works in any terminal: rein needs nothing from it but a tab.
+
+```text
+ [ ● api · working ]  [ ⚠ web · needs you ]  [ ✓ review · done ]  [ ○ tests · idle ]
+```
+
+Each tab's title says which rein it is and what it's doing, and ⚠ means it's
+waiting for you. In a conversation:
+
+- `/send api add a /health endpoint` writes to another rein. If it's idle,
+  it starts on it; if it's working, it reads it at its next step.
+- `/delegate api add a /health endpoint` hands it a task. When it's done,
+  its result comes back to this tab, with the files it changed.
+- `/peers` shows them all: model, state, current step, what each is
+  editing, and what went between them. Pick one to write to it, hand it a
+  task, or answer the question it's waiting on.
+- `/name` and `/workspace` say who this rein is: `--name` and
+  `--workspace` at the start. A workspace is a group of tabs on one piece
+  of work: by default the git branch, so tabs on one feature are together.
+  A name is found in your own workspace first, `checkout/api` elsewhere.
+- `--workspace health --worktree` works in the workspace's own git worktree
+  beside the repository, on a branch of its name, so two workspaces never
+  touch each other's files.
+- `/inbox` holds what's waiting to be let in.
+
+`rein peers` keeps the same table up in a tab of its own, refreshed every
+second. Pick a rein with ↑↓ and press y or n to answer what it asks, without
+going to its tab.
+
+The model can do it too, with its `peers`, `message` and `delegate` tools,
+so "ask the review tab to check this" works. Each tab can run its own model:
+a cheap one for tests, another provider's to review what the first wrote.
+When a rein changes a file, the others working in the same folder hear of
+it, and a conversation that has read that file is told before its next step.
+
+What another rein sends is never your word. It reaches the model marked as
+another rein's message: it can't approve anything, `@` in it reads nothing,
+and everything it leads to asks you as usual. A rein lets in only processes
+of yours that send its token, which sits in a file only you can read, and,
+for anything but asking how it's doing, that are reins themselves. Sandboxed
+commands can't reach the sockets or read the files at all. A sender that
+writes too often or repeats itself is turned away, and once other reins
+have started 12 turns in a row without you, what they send waits in
+`/inbox`. A rein in trust mode, where nothing asks you, always holds what
+comes in; `peers = hold` does that in every mode, `refuse` takes nothing,
+and `off` keeps a rein out of it.
+
 ## Settings
 
 Defaults go in `~/.config/rein/config`, one per line:
@@ -285,11 +335,12 @@ max_steps = 200
 bell = off
 compress = off
 sandbox = on
+peers = hold
 ```
 
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
-`$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS` and
-`$REIN_SANDBOX`, which win over the file.
+`$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS`,
+`$REIN_SANDBOX` and `$REIN_PEERS`, which win over the file.
 
 ## Small things that matter
 

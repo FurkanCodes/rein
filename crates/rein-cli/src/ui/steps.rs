@@ -79,6 +79,14 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             ("Run", format!("{first}{more}{past}"))
         }
         Some(ToolName::Recall) => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
+        // To another rein: who to, then the first line of what.
+        Some(tool @ (ToolName::Message | ToolName::Delegate)) => {
+            let what = args[if tool == ToolName::Message { "text" } else { "task" }].as_str().unwrap_or_default();
+            let first = what.lines().next().unwrap_or_default();
+            let more = if what.trim_end().contains('\n') { " …" } else { "" };
+            (if tool == ToolName::Message { "Message" } else { "Delegate" }, format!("{}: {first}{more}", args["to"].as_str().unwrap_or_default()))
+        }
+        Some(ToolName::Peers) => ("Peers", "the other reins".to_owned()),
         Some(ToolName::Plan) => {
             let steps = args["steps"].as_array().map_or(0, Vec::len);
             let done = args["steps"].as_array().into_iter().flatten().filter(|step| step["status"] == "done").count();
@@ -107,6 +115,9 @@ pub fn doing(call: &ToolCall) -> String {
         "Search" => "Searching for",
         "Find" => "Finding",
         "Plan" => return "Updating the plan".to_owned(),
+        "Message" => "Writing to",
+        "Delegate" => "Handing over to",
+        "Peers" => return "Looking at the other reins".to_owned(),
         _ => "Using",
     };
     format!("{verb} {target}")
@@ -422,6 +433,14 @@ fn fit(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_to_another_rein_says_who_to_and_what() {
+        let call = |name: &str, args: Value| ToolCall { call_id: "c".into(), name: name.into(), arguments: args.to_string() };
+        assert_eq!(describe(&call("message", serde_json::json!({ "to": "api", "text": "is it done?\nno rush" }))), ("Message", "api: is it done? …".to_owned()));
+        assert_eq!(doing(&call("delegate", serde_json::json!({ "to": "web", "task": "add /health" }))), "Handing over to web: add /health");
+        assert_eq!(doing(&call("peers", serde_json::json!({}))), "Looking at the other reins");
+    }
     use rein_llm::serde_json::json;
 
     fn call(name: &str, args: Value) -> ToolCall {

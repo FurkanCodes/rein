@@ -390,6 +390,8 @@ struct Seen {
     bells: usize,
     /// What was put on the clipboard (OSC 52), decoded.
     copied: Vec<String>,
+    /// Each title the tab was given (OSC 2).
+    titles: Vec<String>,
 }
 
 impl vt100::Callbacks for Seen {
@@ -399,6 +401,10 @@ impl vt100::Callbacks for Seen {
 
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, _: &[u8], data: &[u8]) {
         self.copied.push(String::from_utf8(unbase64(data)).unwrap());
+    }
+
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.titles.push(String::from_utf8_lossy(title).into_owned());
     }
 }
 
@@ -464,6 +470,13 @@ impl Term {
 
     fn spawn_with(model: &Model, dir: PathBuf, rows: u16, cols: u16, args: &[&str]) -> Term {
         let (project, home) = (dir.join("project"), dir.join("home"));
+        Term::spawn_in(model, dir, &project, &home, rows, cols, args)
+    }
+
+    /// rein in `project` with `home` as its own folder, which other reins
+    /// may share: tabs side by side. `dir` goes when it's done.
+    fn spawn_in(model: &Model, dir: PathBuf, project: &std::path::Path, home: &std::path::Path, rows: u16, cols: u16, args: &[&str]) -> Term {
+        let (project, home) = (project.to_owned(), home.to_owned());
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         for (name, text) in &model.home {
@@ -560,6 +573,22 @@ impl Term {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("timed out waiting for {what}. The screen:\n{}", self.text());
+    }
+
+    /// The tab's titles so far.
+    fn titles(&self) -> Vec<String> {
+        self.screen.lock().unwrap().callbacks().titles.clone()
+    }
+
+    fn wait_title(&self, wanted: &str) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if self.titles().last().is_some_and(|title| title == wanted) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the title never became {wanted:?}: {:?}", self.titles());
     }
 
     fn bells(&self) -> usize {
@@ -1819,4 +1848,137 @@ fi
     assert!(input.contains("subprocess fixture contents"), "{input}");
     assert!(model.requests.lock().unwrap().is_empty(), "no native HTTP requests");
     assert!(!term.text().contains("subscription-test"));
+}
+
+/// A project and a home for reins in several tabs, as one user's terminals
+/// share them. Under /tmp, short: a socket's path can't be long.
+fn tabs(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let base = PathBuf::from(format!("/tmp/rp-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    (base.clone(), base.join("project"), base.join("home"))
+}
+
+#[test]
+fn a_message_from_another_tab_starts_a_turn_there() {
+    let (base, project, home) = tabs("msg");
+    let api_model = Model::start(vec![says("Adding a /health endpoint now.")]);
+    let web_model = Model::start(vec![calls("message", json!({ "to": "api", "text": "please add a /health endpoint" })), says("Asked api.")]);
+    let api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
+    api.wait_for("You're api in project · no other rein is running yet");
+    api.wait_for(IDLE);
+    api.wait_title("○ api · idle");
+    let mut web = Term::spawn_in(&web_model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for("You're web in project · 1 other rein is running");
+    web.wait_for(IDLE);
+    web.keys("ask api for a health endpoint\r");
+    web.wait_for("Asked api.");
+    api.wait_for("✉ from web");
+    api.wait_for("Adding a /health endpoint now.");
+    let heard = api_model.requests()[0].to_string();
+    assert!(heard.contains("please add a /health endpoint") && heard.contains("not from the user"), "framed as another rein's: {heard}");
+    assert!(web_model.requests()[1].to_string().contains("Sent to api."), "the model heard it went");
+    assert!(api.titles().iter().any(|title| title == "● api · working"), "the tab said it was working: {:?}", api.titles());
+    api.wait_title("○ api · idle");
+}
+
+#[test]
+fn a_task_handed_to_another_tab_comes_back_with_its_result() {
+    let (base, project, home) = tabs("task");
+    let write = calls("write", json!({ "path": "health.txt", "content": "ok\n" }));
+    let api_model = Model::start(vec![write, says("Added the endpoint.")]);
+    let web_model = Model::start(vec![calls("delegate", json!({ "to": "api", "task": "add a /health endpoint" })), says("Handed it to api."), says("api is done with it.")]);
+    let api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api", "--mode", "edits"]);
+    api.wait_for(IDLE);
+    let mut web = Term::spawn_in(&web_model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.keys("hand it to api\r");
+    web.wait_for("Handed it to api.");
+    api.wait_for("Added the endpoint.");
+    api.wait_for("the result went back to web");
+    web.wait_for("api is done with it.");
+    let result = web_model.requests()[2].to_string();
+    assert!(result.contains("is done") && result.contains("health.txt") && result.contains("Added the endpoint."), "{result}");
+    assert!(api_model.requests()[0].to_string().contains("A task for you"), "{}", api_model.requests()[0]);
+    assert_eq!(std::fs::read_to_string(project.join("health.txt")).unwrap(), "ok\n");
+}
+
+#[test]
+fn a_question_can_be_answered_from_the_dashboard_in_another_tab() {
+    let (base, project, home) = tabs("ask");
+    let api_model = Model::start(vec![runs("touch made.txt"), says("Made it.")]);
+    let mut api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
+    api.wait_for(IDLE);
+    api.keys("make a file\r");
+    api.wait_for("Allow this command");
+    api.wait_title("⚠ api · needs you");
+    let idle = Model::start(vec![]);
+    let mut dashboard = Term::spawn_in(&idle, base.clone(), &project, &home, 30, 120, &["peers"]);
+    dashboard.wait_for("1 needs you");
+    dashboard.wait_for("touch made.txt");
+    dashboard.keys("y");
+    dashboard.wait_for("told api yes");
+    api.wait_for("answered yes from another tab");
+    api.wait_for("Made it.");
+    assert!(project.join("made.txt").exists(), "it ran once answered");
+    dashboard.keys("q");
+    dashboard.wait_exit();
+}
+
+#[test]
+fn a_sandboxed_command_cant_read_who_the_other_reins_are() {
+    let (base, project, home) = tabs("wall");
+    let peek = format!("cat {}/peers/*.json", home.display());
+    let model = Model::start(vec![calls("bash", json!({ "command": peek, "timeout_seconds": null, "access": "look", "reason": null })), says("Looked.")]);
+    let other = Model::start(vec![]);
+    let api = Term::spawn_in(&other, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
+    api.wait_for(IDLE);
+    let mut web = Term::spawn_in(&model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    if web.text().contains("Sandbox: none") {
+        return;
+    }
+    web.keys("peek\r");
+    web.wait_for("Looked.");
+    let result = model.requests()[1].to_string();
+    assert!(!result.contains("token") && !result.contains(".sock"), "the peers' files stay out of a command's reach: {result}");
+}
+
+#[test]
+fn a_rein_in_trust_mode_holds_what_another_tab_sends_until_you_let_it_in() {
+    let (base, project, home) = tabs("inbox");
+    let api_model = Model::start(vec![says("Hello, front.")]);
+    let mut api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api", "--mode", "trust"]);
+    api.wait_for(IDLE);
+    let idle = Model::start(vec![]);
+    let mut web = Term::spawn_in(&idle, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.keys("/name front\r");
+    web.wait_for("other reins call this one front now");
+    web.wait_title("○ front · idle");
+    web.keys("/send api hello there\r");
+    web.wait_for("api keeps it for its user to let in");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(api_model.requests().is_empty(), "nothing went in on its own");
+    api.keys("/inbox\r");
+    api.wait_for("let which in");
+    api.wait_for("hello there");
+    api.keys("\r");
+    api.wait_for("✉ from front");
+    api.wait_for("Hello, front.");
+    assert!(api_model.requests()[0].to_string().contains("hello there"));
+}
+
+#[test]
+fn closing_the_tab_takes_the_rein_out_of_the_peers_folder() {
+    let (base, project, home) = tabs("hangup");
+    let model = Model::start(vec![]);
+    let mut api = Term::spawn_in(&model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
+    api.wait_for(IDLE);
+    let peers = home.join("peers");
+    let files = || std::fs::read_dir(&peers).map(|dir| dir.count()).unwrap_or(0);
+    assert_eq!(files(), 2, "its socket and who it is");
+    // SAFETY: kill only sends a signal to the rein this test started.
+    unsafe { libc::kill(api.child.id() as i32, libc::SIGHUP) };
+    api.wait_exit();
+    assert_eq!(files(), 0, "nothing is left of it");
 }
