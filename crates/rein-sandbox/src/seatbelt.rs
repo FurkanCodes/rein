@@ -19,8 +19,49 @@ const BASE: &str = r#"(version 1)
 ; Running programs, and signalling the ones it started.
 (allow process-exec process-fork)
 (allow signal (target same-sandbox))
+
+; What other programs run with, their arguments and environments, only for
+; what this command started. The kernel hands out another's
+; (`KERN_PROCARGS2`, checked as `kern.procargs2.<pid>`) unless both of these
+; say no: the sysctl isn't among the names below, and `process-info` is
+; denied in so many words, since the default doesn't count for it there.
+; launchd goes by it too, and won't print your session's `launchctl setenv`
+; values to a command denied it.
+(deny process-info*)
 (allow process-info* (target same-sandbox))
-(allow sysctl-read)
+
+; What the system is and runs on, by name, and the process table (ids and
+; names, as `kern.proc.*` gives them, not arguments or environments).
+(allow sysctl-read
+  (sysctl-name-prefix "hw.")
+  (sysctl-name-prefix "machdep.")
+  (sysctl-name-prefix "sysctl.")
+  (sysctl-name-prefix "kern.proc.")
+  (sysctl-name-prefix "net.routetable.")
+  (sysctl-name "kern.argmax")
+  (sysctl-name "kern.bootargs")
+  (sysctl-name "kern.boottime")
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.hv_vmm_present")
+  (sysctl-name "kern.iossupportversion")
+  (sysctl-name "kern.maxfiles")
+  (sysctl-name "kern.maxfilesperproc")
+  (sysctl-name "kern.maxproc")
+  (sysctl-name "kern.ngroups")
+  (sysctl-name "kern.osproductversion")
+  (sysctl-name "kern.osproductversioncompat")
+  (sysctl-name "kern.osrelease")
+  (sysctl-name "kern.osrevision")
+  (sysctl-name "kern.ostype")
+  (sysctl-name "kern.osvariant_status")
+  (sysctl-name "kern.osversion")
+  (sysctl-name "kern.secure_kernel")
+  (sysctl-name "kern.singleuser")
+  (sysctl-name "kern.usrstack64")
+  (sysctl-name "kern.version")
+  (sysctl-name "kern.willshutdown")
+  (sysctl-name "security.mac.lockdown_mode_state")
+  (sysctl-name "vm.loadavg"))
 
 ; Reading files, and loading programs and libraries from them.
 (allow file-read* file-map-executable)
@@ -102,13 +143,29 @@ pub(super) fn profile(places: &Places, walls: Walls) -> (String, Vec<OsString>) 
     let hidden = subpaths(places.hidden(), &mut param);
     kept.extend(hidden.iter().cloned());
     rule(&mut text, "deny file-write*", &kept);
-    text.push_str("\n; Never read: keys, logins and tokens.\n");
+    if let Some(home) = places.home() {
+        text.push_str("\n; Not read: your home folder, but for the project, toolchains, caches and settings,\n; and what leads to them, as a path, not a list of what's in it.\n");
+        rule(&mut text, "deny file-read*", &[format!("(subpath {})", param(home))]);
+        let ways: Vec<String> = leading(places.readable(), home).iter().map(|path| format!("(literal {})", param(path))).collect();
+        rule(&mut text, "allow file-read-metadata", &ways);
+        rule(&mut text, "allow file-read*", &subpaths(places.readable(), &mut param));
+    }
+    text.push_str("\n; Never read: keys, logins and tokens, wherever they are.\n");
     rule(&mut text, "deny file-read*", &hidden);
 
     if walls.network {
         text.push_str(NETWORK);
     }
     (text, params)
+}
+
+/// The folders from `home` down to each of `places`, not counting the
+/// places themselves: what a path to them goes through.
+fn leading(places: &[std::path::PathBuf], home: &Path) -> Vec<std::path::PathBuf> {
+    let mut ways: Vec<std::path::PathBuf> = places.iter().flat_map(|place| place.ancestors().skip(1).take_while(|dir| dir.starts_with(home)).map(Path::to_path_buf)).collect();
+    ways.sort();
+    ways.dedup();
+    ways
 }
 
 /// `(what filter...)`, if there's any filter: a rule with none would apply
@@ -164,6 +221,26 @@ mod tests {
         // Denials come last, so they win.
         assert!(write.find("(deny file-write*") > write.find("(allow file-write*"));
         assert!(!write.contains("(remote ip)") && profile(&places, NET).0.contains("(remote ip)"));
+    }
+
+    #[test]
+    fn the_home_folder_is_walled_off_but_what_tools_need_and_secrets_stay_hidden() {
+        let root = dir("home-rules");
+        let home = dir("home-rules-home");
+        let places = Places::new(&root, Some(&home), None);
+        let (text, params) = profile(&places, LOOK);
+        let home_text = home.to_str().unwrap();
+        let walled =
+            text.find(&format!("(deny file-read*\n  (subpath (param \"P{}\"))", params.iter().position(|p| p.to_str().unwrap().ends_with(&format!("={home_text}"))).unwrap()));
+        let readable = text.rfind("(allow file-read*");
+        let hidden = text.rfind("(deny file-read*");
+        assert!(walled.is_some() && walled < readable && readable < hidden, "{text}");
+        assert!(value(&params, &text, "(allow file-read*\n").iter().any(|path| path.ends_with("/.cargo")), "{text}");
+        assert!(value(&params, &text, "(allow file-read-metadata").contains(&home_text), "the way to what's readable: {text}");
+        // Other processes' details: denied in so many words, and no sysctl
+        // by a name that isn't listed.
+        assert!(text.find("(deny process-info*)") < text.find("(allow process-info* (target same-sandbox))"));
+        assert!(!text.contains("(allow sysctl-read)") && !text.contains("\"kern.procargs") && !text.contains("(sysctl-name-prefix \"kern.\")"));
     }
 
     /// A project, a home with a secret in it, and a sandbox for both.
@@ -254,10 +331,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secrets_in_the_home_folder_cant_be_read() {
+    async fn the_home_folder_cant_be_read_but_for_what_tools_need() {
         let Some(s) = setup("hidden").await else { return };
-        assert!(!run(&s, &format!("cat '{}'", s.home.join(".ssh/id_test").display()), NET).await.0);
-        assert!(run(&s, &format!("cat '{}'", s.home.join("notes.txt").display()), LOOK).await.0);
+        std::fs::create_dir_all(s.home.join(".cargo")).unwrap();
+        std::fs::write(s.home.join(".cargo/config.toml"), "[build]\n").unwrap();
+        std::fs::write(s.home.join(".cargo/credentials.toml"), "FAKE-token\n").unwrap();
+        std::fs::write(s.home.join(".zshenv"), "export FAKE_KEY=FAKE-key\n").unwrap();
+        for secret in [".ssh/id_test", "notes.txt", ".zshenv", ".cargo/credentials.toml"] {
+            assert!(!run(&s, &format!("cat '{}'", s.home.join(secret).display()), NET).await.0, "{secret}");
+        }
+        assert!(!run(&s, &format!("ls '{}'", s.home.display()), NET).await.0, "nor what's in it");
+        assert!(run(&s, &format!("cat '{}'", s.home.join(".cargo/config.toml").display()), LOOK).await.0);
+        std::fs::write(s.outside.join("notes.txt"), "theirs\n").unwrap();
+        assert!(run(&s, &format!("cat '{}'", s.outside.join("notes.txt").display()), LOOK).await.0, "outside it, as before");
+    }
+
+    #[tokio::test]
+    async fn a_project_in_the_home_folder_is_reached_through_it() {
+        let home = dir("deep-home");
+        let root = home.join("work/app");
+        std::fs::create_dir_all(&root).unwrap();
+        let sandbox = Sandbox::detect(Places::new(&root, Some(&home), None)).await;
+        if !cfg!(target_os = "macos") || !sandbox.available() {
+            return;
+        }
+        let s = Setup { root: root.clone(), home: home.clone(), outside: home.clone(), sandbox };
+        // npm, cargo and Python's venv look at the folders on the way
+        // (`stat`), and stop if they can't.
+        for folder in [&home, &home.join("work")] {
+            let (worked, said) = run(&s, &format!("/usr/bin/stat '{}'", folder.display()), LOOK).await;
+            assert!(worked, "{}: {said}", folder.display());
+        }
+        assert!(!run(&s, &format!("ls '{}'", home.join("work").display()), LOOK).await.0, "though not what's in them");
+    }
+
+    /// The shell line that runs this test binary for only the ignored test
+    /// `name`, with `vars` set.
+    #[cfg(target_os = "macos")]
+    fn this_binary(vars: &str, name: &str) -> String {
+        format!("{vars} '{}' --exact seatbelt::tests::{name} --ignored --nocapture --test-threads 1", std::env::current_exe().unwrap().display())
+    }
+
+    // `KERN_PROCARGS2` is macOS's; Linux's `/proc` has its own test.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn other_processes_environments_are_out_of_reach() {
+        let Some(s) = setup("processes").await else { return };
+        // Not one of Apple's programs, which hide their environment anyway:
+        // this test binary, waiting.
+        let mut other = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "seatbelt::tests::wait_for_a_test", "--ignored", "--test-threads", "1"])
+            .env("REIN_TEST_WAIT", "1")
+            .env("REIN_TEST_SECRET", "FAKE-hunter2")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let read = this_binary(&format!("REIN_TEST_READ_PID={}", other.id()), "read_another_environment");
+        // Read until it's there, from outside: the probe works, and the
+        // process has started.
+        let wait = format!("for i in $(seq 100); do out=$({read}); case $out in *FAKE-hunter2*) echo \"$out\"; break;; esac; sleep 0.1; done");
+        let outside = std::process::Command::new("/bin/sh").args(["-c", &wait]).output().unwrap();
+        let outside = String::from_utf8_lossy(&outside.stdout).into_owned();
+        let (_, inside) = run(&s, &read, NET).await;
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(outside.contains("FAKE-hunter2"), "the probe reads it from outside: {outside}");
+        assert!(!inside.contains("FAKE-hunter2"), "{inside}");
+        // What it started itself, it may still look at.
+        let start = this_binary("REIN_TEST_WAIT=1 REIN_TEST_SECRET=FAKE-own", "wait_for_a_test");
+        let read = this_binary("REIN_TEST_READ_PID=$child", "read_another_environment");
+        let own =
+            format!("{start} >/dev/null & child=$!; for i in $(seq 100); do out=$({read}); case $out in *FAKE-own*) echo \"$out\"; break;; esac; sleep 0.1; done; kill $child");
+        let (_, own) = run(&s, &own, NET).await;
+        assert!(own.contains("FAKE-own"), "{own}");
+        // launchd's copy of `launchctl setenv` values, where there's a
+        // session to print. Only read: nothing is set.
+        // SAFETY: getuid can't fail, and touches no memory of ours.
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
+        let printed = std::process::Command::new("/bin/launchctl").args(["print", &domain]).output().is_ok_and(|o| o.status.success());
+        if printed {
+            assert!(!run(&s, &format!("/bin/launchctl print {domain} >/dev/null"), NET).await.0, "launchctl printed the session's environment");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by other_processes_environments_are_out_of_reach, as the process it reads"]
+    fn wait_for_a_test() {
+        if std::env::var_os("REIN_TEST_WAIT").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run by other_processes_environments_are_out_of_reach, inside the sandbox and out"]
+    fn read_another_environment() {
+        let Some(pid) = std::env::var("REIN_TEST_READ_PID").ok().and_then(|pid| pid.parse::<i32>().ok()) else { return };
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size: libc::size_t = 0;
+        // SAFETY: asks only for the size; `mib` holds three ints.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+            println!("refused: {}", std::io::Error::last_os_error());
+            return;
+        }
+        let mut buf = vec![0u8; size];
+        // SAFETY: `buf` holds `size` bytes, as the kernel was told.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+            println!("refused: {}", std::io::Error::last_os_error());
+            return;
+        }
+        buf.truncate(size);
+        println!("{}", String::from_utf8_lossy(&buf).replace('\0', "\n"));
     }
 
     #[tokio::test]

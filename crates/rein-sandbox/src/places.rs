@@ -1,7 +1,8 @@
 //! Where a sandboxed command's walls go, worked out once when rein starts:
 //! the project and what in it is protected, git's own folders, the temp
-//! folders, and what in your home folder is hidden.
+//! folders, and what it may read of your home folder.
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// What in a project runs code later without anyone choosing to run it,
@@ -37,8 +38,55 @@ const PROTECTED: &[&str] = &[
 /// more to run (`core.fsmonitor`, `core.hooksPath`, aliases, filters).
 const IN_GIT: &[&str] = &["hooks", "config", "config.worktree"];
 
+/// In your home folder, what a command in the sandbox may read besides the
+/// project, git's folders and the temp folders: the toolchains, package
+/// caches and settings that builds and everyday tools need. The rest of
+/// your home folder is out of its reach, since what's secret there can't
+/// all be listed: keys exported in shell settings, histories, `.env`
+/// files, other apps' logins. What [`HIDDEN`] names stays hidden in these.
+const READABLE: &[&str] = &[
+    // Rust.
+    ".cargo",
+    ".rustup",
+    // JavaScript.
+    ".nvm",
+    ".npm",
+    ".bun",
+    ".deno",
+    ".volta",
+    ".yarn",
+    "Library/pnpm",
+    ".local/share/pnpm",
+    // Python: user installs, and what pyenv, pipx and uv install.
+    ".pyenv",
+    ".local/bin",
+    ".local/lib",
+    ".local/pipx",
+    ".local/share/uv",
+    "Library/Python",
+    // Others, and the version managers for many.
+    "go",
+    ".rbenv",
+    ".gem",
+    ".gradle",
+    ".m2",
+    ".sdkman",
+    ".asdf",
+    ".local/share/mise",
+    // Caches.
+    ".cache",
+    // Git's and Go's own settings, and the text encoding macOS programs
+    // read at start.
+    ".gitconfig",
+    ".config/git",
+    ".config/go",
+    "Library/Application Support/go",
+    ".CFUserTextEncoding",
+];
+
 /// In your home folder: keys, logins and tokens. A command in the sandbox
-/// can neither read nor change these.
+/// can neither read nor change these, even inside what it may read
+/// (`.cargo`, or a project that is your home folder).
 const HIDDEN: &[&str] = &[
     ".ssh",
     ".gnupg",
@@ -51,20 +99,36 @@ const HIDDEN: &[&str] = &[
     ".git-credentials",
     ".config/git/credentials",
     ".config/gh",
+    ".config/github-copilot",
     ".npmrc",
     ".pypirc",
+    ".gem/credentials",
     ".cargo/credentials",
     ".cargo/credentials.toml",
+    ".gradle/gradle.properties",
+    ".m2/settings.xml",
+    ".m2/settings-security.xml",
+    ".local/share/uv/credentials",
+    ".cache/huggingface/token",
+    ".cache/huggingface/stored_tokens",
     ".config/rein",
     ".claude",
     ".claude.json",
     ".codex",
+    ".gemini",
     ".password-store",
     ".local/share/keyrings",
+    ".env",
+    ".zsh_history",
+    ".bash_history",
     ".mozilla",
     ".config/google-chrome",
     ".config/chromium",
     ".config/BraveSoftware",
+    ".cache/mozilla",
+    ".cache/google-chrome",
+    ".cache/chromium",
+    ".cache/BraveSoftware",
     "Library/Keychains",
     "Library/Cookies",
     "Library/Safari",
@@ -74,6 +138,43 @@ const HIDDEN: &[&str] = &[
     "Library/Application Support/Microsoft Edge",
     "Library/Application Support/Arc",
 ];
+
+/// Variables that move something [`READABLE`] or [`HIDDEN`] names, maybe
+/// out of your home folder, and what each stands for there: wherever one
+/// points, what's inside is readable or hidden as it would be at home.
+/// Some take a list (`KUBECONFIG`, `GOPATH`).
+const MOVED: &[(&str, &str)] = &[
+    ("XDG_CONFIG_HOME", ".config"),
+    ("XDG_CACHE_HOME", ".cache"),
+    ("XDG_DATA_HOME", ".local/share"),
+    ("CARGO_HOME", ".cargo"),
+    ("RUSTUP_HOME", ".rustup"),
+    ("NVM_DIR", ".nvm"),
+    ("BUN_INSTALL", ".bun"),
+    ("PYENV_ROOT", ".pyenv"),
+    ("GOPATH", "go"),
+    ("GRADLE_USER_HOME", ".gradle"),
+    ("HF_HOME", ".cache/huggingface"),
+    ("CLAUDE_CONFIG_DIR", ".claude"),
+    ("CODEX_HOME", ".codex"),
+    ("GNUPGHOME", ".gnupg"),
+    ("DOCKER_CONFIG", ".docker"),
+    ("GH_CONFIG_DIR", ".config/gh"),
+    ("CLOUDSDK_CONFIG", ".config/gcloud"),
+    ("AZURE_CONFIG_DIR", ".azure"),
+    ("PASSWORD_STORE_DIR", ".password-store"),
+    ("AWS_SHARED_CREDENTIALS_FILE", ".aws/credentials"),
+    ("AWS_CONFIG_FILE", ".aws/config"),
+    ("KUBECONFIG", ".kube/config"),
+    ("NPM_CONFIG_USERCONFIG", ".npmrc"),
+    ("npm_config_userconfig", ".npmrc"),
+];
+
+/// How many of git's settings files rein follows `include`s through.
+const MAX_GIT_FILES: usize = 32;
+
+/// Where rein reads its environment from: a variable's value by name.
+type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 
 /// In your home folder: what your shell, git and your login run. Out of
 /// a command's reach anyway, unless the project is your home folder.
@@ -100,14 +201,27 @@ pub struct Places {
     locked: Vec<PathBuf>,
     /// Temp folders every command may write.
     temp: Vec<PathBuf>,
-    /// Never read or written.
+    /// Never read or written, wherever they are.
     hidden: Vec<PathBuf>,
+    /// Your home folder: none of it is read but what `readable` names.
+    home: Option<PathBuf>,
+    /// In your home folder, what may be read all the same, but for what's
+    /// hidden in it: the project, git's folders, the temp folders, and
+    /// toolchains, caches and settings.
+    readable: Vec<PathBuf>,
 }
 
 impl Places {
     /// For the project at `root`, with your home folder at `home`, and
-    /// rein's own (keys, history, sessions) at `rein`.
+    /// rein's own (keys, history, sessions) at `rein`. The environment says
+    /// where toolchains and secrets are when they're not where they usually
+    /// are, and which folders in your home hold programs (`PATH`).
     pub fn new(root: &Path, home: Option<&Path>, rein: Option<&Path>) -> Places {
+        Places::with(root, home, rein, &crate::secrets::var_os)
+    }
+
+    /// The same, with the environment from `env`.
+    pub(crate) fn with(root: &Path, home: Option<&Path>, rein: Option<&Path>, env: Env) -> Places {
         let root = resolve(root);
         let mut places = Places { root: root.clone(), writable: vec![root.clone()], ..Places::default() };
         let mut gits = git_dirs(&root);
@@ -135,18 +249,23 @@ impl Places {
             }
         }
         places.locked.push(root.join(".git"));
-        for hooks in hooks_paths(&root, &gits, home) {
+        for hooks in hooks_paths(&root, &gits, home, env) {
             places.protect(&hooks);
         }
-        if let Some(home) = home {
-            let home = resolve(home);
-            places.hidden.extend(HIDDEN.iter().map(|name| resolve(&home.join(name))));
-            places.protected.extend(RUN_AT_LOGIN.iter().map(|name| resolve(&home.join(name))));
-        }
+        // Not the root folder as a home: walling it off would leave nothing.
+        let home = home.map(resolve).filter(|home| home.parent().is_some());
+        places.hidden.extend(HIDDEN.iter().flat_map(|name| locations(home.as_deref(), name, env)));
         if let Some(rein) = rein {
             places.hidden.push(resolve(rein));
         }
         places.temp = temp_dirs();
+        if let Some(home) = home {
+            places.protected.extend(RUN_AT_LOGIN.iter().map(|name| resolve(&home.join(name))));
+            places.readable = readable(&places, &home, env);
+            places.home = Some(home);
+        }
+        places.hidden.sort();
+        places.hidden.dedup();
         places.protected.dedup();
         places.locked.sort();
         places.locked.dedup();
@@ -177,6 +296,14 @@ impl Places {
         &self.hidden
     }
 
+    pub(crate) fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    pub(crate) fn readable(&self) -> &[PathBuf] {
+        &self.readable
+    }
+
     /// Whether `path`, relative to the project as the model gives it, is
     /// one rein's file tools must ask about: protected, or a folder that
     /// holds what is. Letter case doesn't count, as it doesn't on macOS:
@@ -195,11 +322,24 @@ impl Places {
 
     /// Whether `path`, absolute, is out of a sandboxed command's reach:
     /// what it can't read, it's not for rein's own file tools to read for
-    /// the model either. Symlinks are followed as far as the path exists,
-    /// and letter case doesn't count, as on macOS.
+    /// the model either. That's what's hidden, and what's in your home
+    /// folder but not readable there; a folder that only leads to a
+    /// readable place (the project's, say) is out of reach too, as its
+    /// list of files is. Symlinks are followed as far as the path exists.
+    /// Letter case doesn't count for what's hidden, as on macOS; for the
+    /// rest it counts as the system counts it, so this never says yes to
+    /// what the sandbox would refuse. On Linux a command can list any
+    /// folder, hidden or not, since Landlock lets it list `/` only by
+    /// letting it list all that's in it; this says no to such a folder all
+    /// the same, as on macOS, where it can't.
     pub fn hides(&self, path: &Path) -> bool {
-        let full = lower(&resolve(path));
-        self.hidden.iter().any(|hidden| full.starts_with(lower(hidden)))
+        let full = resolve(path);
+        let hidden = self.hidden.iter().any(|hidden| lower(&full).starts_with(lower(hidden)));
+        let walled = self.home.as_ref().is_some_and(|home| {
+            let full = as_compared(&full);
+            full.starts_with(as_compared(home)) && !self.readable.iter().any(|place| full.starts_with(as_compared(place)))
+        });
+        hidden || walled
     }
 
     /// Protects `path`, and locks the folders between it and the writable
@@ -239,6 +379,84 @@ pub(crate) fn resolve(path: &Path) -> PathBuf {
 
 fn lower(path: &Path) -> PathBuf {
     PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+/// `path` as this system's files compare it: letter case doesn't count on
+/// macOS, and does elsewhere.
+fn as_compared(path: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") { lower(path) } else { path.to_path_buf() }
+}
+
+/// Where `name`, as it would be in your home folder, is: there, and where
+/// a variable in [`MOVED`] puts it. Resolved, so each compares with what
+/// the sandbox sees.
+fn locations(home: Option<&Path>, name: &str, env: Env) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = home.map(|home| home.join(name)).into_iter().collect();
+    for (variable, stands_for) in MOVED {
+        let Some(value) = env(variable) else { continue };
+        for moved in std::env::split_paths(&value).filter(|path| path.is_absolute()) {
+            match Path::new(name).strip_prefix(stands_for) {
+                Ok(rest) if rest.as_os_str().is_empty() => found.push(moved),
+                Ok(rest) => found.push(moved.join(rest)),
+                // What the variable points to is part of `name`: `.aws`'s
+                // credentials, wherever they're kept.
+                Err(_) if Path::new(stands_for).starts_with(name) => found.push(moved),
+                Err(_) => {}
+            }
+        }
+    }
+    found.iter().map(|path| resolve(path)).collect()
+}
+
+/// What a command may read in `home`, besides what `places` makes it
+/// write: toolchains and caches wherever they are, the folders on `PATH`,
+/// and the files git's settings there name. None is the home folder itself
+/// or holds it, and none is inside what's hidden.
+fn readable(places: &Places, home: &Path, env: Env) -> Vec<PathBuf> {
+    let mut readable: Vec<PathBuf> = READABLE.iter().flat_map(|name| locations(Some(home), name, env)).collect();
+    if let Some(path) = env("PATH") {
+        readable.extend(std::env::split_paths(&path).filter(|dir| dir.is_absolute()).map(|dir| resolve(&dir)));
+    }
+    readable.extend(git_files(home, env));
+    readable.retain(|place| !home.starts_with(place));
+    // The project may be your home folder, or hold it.
+    readable.push(places.root.clone());
+    readable.extend(places.writable.iter().chain(&places.temp).cloned());
+    readable.retain(|place| place.starts_with(home) && !places.hidden.iter().any(|hidden| place.starts_with(hidden)));
+    readable.sort();
+    readable.dedup();
+    readable
+}
+
+/// The files git reads from your home folder: its settings, what they
+/// include, and the ignore and attributes files they name. Git stops when
+/// it can't read one, so a command needs them all. Absolute, or from `~/`.
+fn git_files(home: &Path, env: Env) -> Vec<PathBuf> {
+    let config = env("XDG_CONFIG_HOME").map_or_else(|| home.join(".config"), PathBuf::from);
+    let mut files = vec![home.join(".gitconfig"), config.join("git/config")];
+    files.extend(env("GIT_CONFIG_GLOBAL").map(PathBuf::from));
+    let mut named = Vec::new();
+    let mut next = 0;
+    while let Some(file) = files.get(next).cloned() {
+        next += 1;
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        let folder = file.parent().unwrap_or(home);
+        for value in config_values(&text, &["include", "includeif"], "path") {
+            let path = from_home(&value, home).unwrap_or_else(|| folder.join(&value));
+            if !files.contains(&path) && files.len() < MAX_GIT_FILES {
+                files.push(path);
+            }
+        }
+        let others = [config_values(&text, &["core"], "excludesfile"), config_values(&text, &["core"], "attributesfile")];
+        named.extend(others.iter().flatten().filter_map(|value| from_home(value, home).or_else(|| Path::new(value).is_absolute().then(|| PathBuf::from(value)))));
+    }
+    files.extend(named);
+    files.iter().map(|file| resolve(file)).collect()
+}
+
+/// `value` in `home`, if it starts `~/`.
+fn from_home(value: &str, home: &Path) -> Option<PathBuf> {
+    value.strip_prefix("~/").map(|rest| home.join(rest))
 }
 
 /// The project's git folders: `.git`, or the one a `.git` file points to
@@ -287,39 +505,41 @@ fn submodules(git: &Path) -> Vec<PathBuf> {
 }
 
 /// Where `core.hooksPath` sends git for hooks, by the project's settings
-/// and yours. A relative one is relative to the project, from any of them.
-fn hooks_paths(root: &Path, gits: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
+/// and yours, and what yours include. A relative one is relative to the
+/// project, from any of them.
+fn hooks_paths(root: &Path, gits: &[PathBuf], home: Option<&Path>, env: Env) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = gits.iter().flat_map(|git| [git.join("config"), git.join("config.worktree")]).collect();
     if let Some(home) = home {
-        files.push(home.join(".gitconfig"));
-        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
-        files.push(xdg.join("git/config"));
+        files.extend(git_files(home, env));
     }
     files
         .iter()
         .filter_map(|file| std::fs::read_to_string(file).ok())
-        .flat_map(|text| core_hooks_path(&text))
-        .map(|value| match (value.strip_prefix("~/"), home) {
-            (Some(rest), Some(home)) => home.join(rest),
-            _ => root.join(value),
-        })
+        .flat_map(|text| config_values(&text, &["core"], "hookspath"))
+        .map(|value| home.and_then(|home| from_home(&value, home)).unwrap_or_else(|| root.join(&value)))
         .collect()
 }
 
-/// The `hooksPath` values in a git config file's `[core]` sections.
-fn core_hooks_path(text: &str) -> Vec<String> {
-    let mut in_core = false;
+/// The values of `key` in a git config file's sections named one of
+/// `sections`, in lower case: `[includeIf "gitdir:~/work/"]` is named
+/// `includeif`. Keys don't count letter case either, as in git, and a
+/// value may follow its section's name on the same line.
+fn config_values(text: &str, sections: &[&str], key: &str) -> Vec<String> {
+    let mut inside = false;
     let mut found = Vec::new();
     for line in text.lines().map(str::trim) {
+        let mut line = line;
         if let Some(section) = line.strip_prefix('[') {
-            in_core = section.trim_end_matches(']').trim().eq_ignore_ascii_case("core");
+            let (header, rest) = section.split_once(']').unwrap_or((section, ""));
+            let name = header.split(|c: char| c.is_whitespace() || c == '"' || c == '.').next().unwrap_or_default();
+            inside = sections.iter().any(|wanted| name.eq_ignore_ascii_case(wanted));
+            line = rest.trim();
+        }
+        if !inside {
             continue;
         }
-        if !in_core {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=')
-            && key.trim().eq_ignore_ascii_case("hookspath")
+        if let Some((name, value)) = line.split_once('=')
+            && name.trim().eq_ignore_ascii_case(key)
         {
             let value = value.split(['#', ';']).next().unwrap_or_default().trim().trim_matches('"');
             if !value.is_empty() {
@@ -427,7 +647,10 @@ mod tests {
 
     #[test]
     fn reads_hooks_path_only_from_core() {
-        assert_eq!(core_hooks_path("[core]\nhooksPath = \"x y\"\n[user]\nhooksPath = z\n[Core]\nHOOKSPATH=w ; why\n"), ["x y", "w"]);
+        let text = "[core]\nhooksPath = \"x y\"\n[user]\nhooksPath = z\n[Core]\nHOOKSPATH=w ; why\n[core] hooksPath = v\n";
+        assert_eq!(config_values(text, &["core"], "hookspath"), ["x y", "w", "v"]);
+        let text = "[include]\n\tpath = ~/.gitconfig.local\n[includeIf \"gitdir:~/work/\"]\n\tpath = work.inc\n[user]\n\tpath = no\n";
+        assert_eq!(config_values(text, &["include", "includeif"], "path"), ["~/.gitconfig.local", "work.inc"]);
     }
 
     #[test]
@@ -453,6 +676,82 @@ mod tests {
         assert!(places.hides(&root.join("keys/id_ed25519")), "nor a symlink on the way");
         assert!(places.hides(&home.join("rein-home/keys.json")));
         assert!(!places.hides(&root.join("src/main.rs")));
-        assert!(!places.hides(&home.join(".sshd_config")), "a name that only starts the same isn't hidden");
+        assert!(!places.hides(&home.join(".cargo/credentials.d/x")), "a name that only starts the same isn't hidden");
+    }
+
+    /// An environment with only `vars` in it.
+    fn env(vars: &[(&str, PathBuf)]) -> impl Fn(&str) -> Option<OsString> {
+        let vars: Vec<(String, OsString)> = vars.iter().map(|(name, value)| ((*name).to_owned(), value.clone().into_os_string())).collect();
+        move |name| vars.iter().find(|(n, _)| n == name).map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn of_the_home_folder_only_the_project_and_what_tools_need_is_read() {
+        let home = project("readable-home");
+        let inside = home.join("work/app");
+        std::fs::create_dir_all(&inside).unwrap();
+        let path = std::env::join_paths([home.join(".opencode/bin"), home.clone(), PathBuf::from("/usr/bin")]).unwrap();
+        let places = Places::with(&inside, Some(&home), None, &env(&[("PATH", PathBuf::from(path))]));
+        for walled in [".zshrc", ".zshenv", ".bash_history", ".env", "notes.txt", ".config/github-copilot/apps.json", "Library/Application Support/App/login", "work", "work/other"]
+        {
+            assert!(places.hides(&home.join(walled)), "{walled}");
+        }
+        for readable in [".cargo/config.toml", ".rustup/settings.toml", ".gitconfig", ".config/git/config", ".opencode/bin/opencode", "work/app/src/main.rs"] {
+            assert!(!places.hides(&home.join(readable)), "{readable}");
+        }
+        assert!(places.hides(&home.join(".cargo/credentials.toml")), "what's hidden stays hidden in what's readable");
+        assert!(!places.readable().contains(&home), "not by being on PATH: {:?}", places.readable());
+        assert!(!places.hides(Path::new("/usr/bin/env")), "outside the home folder, as before");
+        // A project that is the home folder reads it all, but what's hidden.
+        let places = Places::with(&home, Some(&home), None, &env(&[]));
+        assert!(!places.hides(&home.join("notes.txt")) && places.hides(&home.join(".ssh/id_ed25519")));
+    }
+
+    #[test]
+    fn what_a_variable_moves_is_hidden_or_readable_wherever_it_goes() {
+        let root = project("moved");
+        let home = project("moved-home");
+        let away = project("moved-away");
+        let kube = std::env::join_paths([away.join("kube/one"), away.join("kube/two")]).unwrap();
+        let vars = [
+            ("CLAUDE_CONFIG_DIR", away.join("claude")),
+            ("XDG_CONFIG_HOME", home.join("cfg")),
+            ("CARGO_HOME", home.join("tools/cargo")),
+            ("AWS_SHARED_CREDENTIALS_FILE", away.join("aws-credentials")),
+            ("KUBECONFIG", PathBuf::from(kube)),
+            ("GNUPGHOME", away.join("gnupg")),
+        ];
+        let places = Places::with(&root, Some(&home), None, &env(&vars));
+        for hidden in [
+            away.join("claude/.credentials.json"),
+            away.join("aws-credentials"),
+            away.join("kube/one"),
+            away.join("kube/two"),
+            away.join("gnupg/x"),
+            home.join("cfg/gh/hosts.yml"),
+            home.join("cfg/git/credentials"),
+            home.join("tools/cargo/credentials.toml"),
+        ] {
+            assert!(places.hides(&hidden), "{}", hidden.display());
+        }
+        for readable in [home.join("cfg/git/config"), home.join("tools/cargo/config.toml"), away.join("notes.txt")] {
+            assert!(!places.hides(&readable), "{}", readable.display());
+        }
+        assert!(places.hides(&home.join(".config/gh/hosts.yml")), "and where it usually is");
+    }
+
+    #[test]
+    fn what_git_reads_from_the_home_folder_is_readable() {
+        let root = project("git-files");
+        let home = project("git-files-home");
+        std::fs::write(home.join(".gitconfig"), "[include]\n\tpath = ~/.gitconfig.local\n[core]\n\texcludesFile = ~/.gitignore_global\n").unwrap();
+        std::fs::write(home.join(".gitconfig.local"), "[includeIf \"gitdir:~/work/\"]\n\tpath = work/.gitconfig\n[core]\n\thooksPath = ~/hooks\n").unwrap();
+        let places = Places::with(&root, Some(&home), None, &env(&[]));
+        for name in [".gitconfig.local", ".gitignore_global", "work/.gitconfig"] {
+            assert!(!places.hides(&home.join(name)), "{name}");
+        }
+        assert!(places.hides(&home.join("work/notes.txt")));
+        // An included file's hooksPath is where git runs hooks from too.
+        assert!(places.protected().contains(&home.join("hooks")), "{:?}", places.protected());
     }
 }

@@ -1964,7 +1964,8 @@ fn a_command_cant_read_what_you_type() {
 #[test]
 fn a_command_cant_read_reins_keys_from_its_environment() {
     // macOS gives any process of yours another's environment (sysctl
-    // KERN_PROCARGS2), sandbox or not: rein mustn't have its keys there.
+    // KERN_PROCARGS2), and rein mustn't have its keys there; the sandbox
+    // doesn't let a command ask for rein's at all.
     let probe = r#"import ctypes, sys
 libc = ctypes.CDLL(None)
 mib = (ctypes.c_int * 3)(1, 49, int(sys.argv[1]))
@@ -1982,7 +1983,7 @@ print("leaked" if b"OPENAI_API_KEY=test" in buf.raw[: size.value] else ("kept" i
     if results[0].starts_with("no-python") {
         return;
     }
-    assert_eq!(results[0], "kept\n[exit code 0]", "{results:?}");
+    assert_eq!(results[0], "unread\n[exit code 0]", "{results:?}");
     // rein itself still has its key: the next request goes out with it.
     term.wait_for(IDLE);
     term.keys("again\r");

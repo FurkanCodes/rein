@@ -115,10 +115,18 @@ pub(super) fn ruleset(places: &Places, walls: Walls, version: u32) -> io::Result
     // SAFETY: the kernel just gave us this descriptor, and nothing else has it.
     let ruleset = unsafe { OwnedFd::from_raw_fd(fd) };
 
-    // Reading: everything but what's hidden, and devices one by one.
+    // Reading: everything but your home folder and what's hidden, and
+    // devices one by one. Then what's readable in your home folder, but not
+    // what's hidden there: Landlock allows only whole folders, so around it.
     let mut except = places.hidden().to_vec();
+    except.extend(places.home().map(Path::to_path_buf));
     except.push(PathBuf::from("/dev"));
-    let (whole, listed) = cover(Path::new("/"), &except);
+    let (mut whole, mut listed) = cover(Path::new("/"), &except);
+    for place in places.readable() {
+        let (more, more_listed) = cover(place, places.hidden());
+        whole.extend(more);
+        listed.extend(more_listed);
+    }
     for path in &whole {
         allow(&ruleset, path, READ & fs)?;
     }
@@ -136,8 +144,10 @@ pub(super) fn ruleset(places: &Places, walls: Walls, version: u32) -> io::Result
     // Writing: the temp folders, and with write access the project, but not
     // what's hidden in it, should the project be your home. Without write
     // access, not a project in a temp folder either: a rule on a folder
-    // reaches all that's in it.
+    // reaches all that's in it. Nor a home folder in one, which this would
+    // make readable.
     let mut not_temp = places.hidden().to_vec();
+    not_temp.extend(places.home().map(Path::to_path_buf));
     if !walls.write {
         not_temp.extend(places.writable().iter().cloned());
     }
@@ -148,7 +158,8 @@ pub(super) fn ruleset(places: &Places, walls: Walls, version: u32) -> io::Result
         }
     }
     if walls.write {
-        for writable in places.writable() {
+        // Not a project inside what's hidden: writing it would read it too.
+        for writable in places.writable().iter().filter(|w| !places.hidden().iter().any(|hidden| w.starts_with(hidden))) {
             let (whole, _) = cover(writable, places.hidden());
             for path in &whole {
                 allow(&ruleset, path, (READ | WRITE) & fs)?;
@@ -400,10 +411,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secrets_in_the_home_folder_cant_be_read() {
+    async fn the_home_folder_cant_be_read_but_for_what_tools_need() {
         let Some(s) = setup("hidden").await else { return };
-        assert!(!run(&s, &format!("cat '{}'", s.home.join(".ssh/id_test").display()), NET).await.0);
-        assert!(run(&s, &format!("cat '{}'", s.home.join("notes.txt").display()), LOOK).await.0);
+        std::fs::create_dir_all(s.home.join(".cargo")).unwrap();
+        std::fs::write(s.home.join(".cargo/config.toml"), "[build]\n").unwrap();
+        std::fs::write(s.home.join(".cargo/credentials.toml"), "FAKE-token\n").unwrap();
+        std::fs::write(s.home.join(".bashrc"), "export FAKE_KEY=FAKE-key\n").unwrap();
+        for secret in [".ssh/id_test", "notes.txt", ".bashrc", ".cargo/credentials.toml"] {
+            assert!(!run(&s, &format!("cat '{}'", s.home.join(secret).display()), NET).await.0, "{secret}");
+        }
+        // Its folders can still be listed: Landlock lets a command list `/`
+        // only by letting it list every folder in it.
+        assert!(run(&s, &format!("cat '{}'", s.home.join(".cargo/config.toml").display()), LOOK).await.0);
+        std::fs::write(s.outside.join("notes.txt"), "theirs\n").unwrap();
+        assert!(run(&s, &format!("cat '{}'", s.outside.join("notes.txt").display()), LOOK).await.0, "outside it, as before");
     }
 
     #[tokio::test]

@@ -260,7 +260,7 @@ impl Sandbox {
                     command.arg("-D").arg(param);
                 }
                 command.arg("/bin/sh").arg("-c").arg(line);
-                command.env_clear().envs(std::env::vars_os().filter(|(name, _)| passes(&name.to_string_lossy())));
+                command.env_clear().envs(passed());
                 Ok(command)
             }
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -270,7 +270,7 @@ impl Sandbox {
                 let filter = landlock::filter(walls);
                 let mut command = tokio::process::Command::new("/bin/sh");
                 command.arg("-c").arg(line);
-                command.env_clear().envs(std::env::vars_os().filter(|(name, _)| passes(&name.to_string_lossy())));
+                command.env_clear().envs(passed());
                 // SAFETY: `confine` makes only system calls, on the ruleset
                 // and filter made here, which the closure keeps alive: safe
                 // between fork and exec.
@@ -305,18 +305,135 @@ impl Sandbox {
 /// which decide what needs asking by it.
 pub type Shared = Arc<Sandbox>;
 
-/// Whether a variable in rein's environment is passed to a command in the
-/// sandbox. Keys, tokens and passwords aren't, by name, nor what reaches
-/// an SSH or GPG agent, which would sign or log in for it.
-pub(crate) fn passes(name: &str) -> bool {
+/// rein's environment as a command in the sandbox gets it: without what's
+/// secret, or was taken out as secret.
+fn passed() -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os().filter(|(name, value)| !secrets::withheld(&name.to_string_lossy(), value))
+}
+
+/// Parts of a variable's name that say it holds a secret wherever they are
+/// in it, even run together with another word (`APIKEY`, `AUTHTOKEN`).
+const SECRET_PARTS: &[&str] = &["KEY", "SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "ASKPASS", "WEBHOOK", "COOKIE"];
+
+/// Words that say so only as a whole word between `_`s, being short:
+/// inside other words they mean something else (`PATH`, `AUTHOR`,
+/// `COMPASS`). `PWD` alone is the working folder, and `SESSION` is a
+/// secret only as a login (`BW_SESSION`, `OP_SESSION_me`), not when it
+/// names one ([`SESSION_FACTS`]).
+const SECRET_WORDS: &[&str] = &["PAT", "PASS", "PWD", "AUTH", "CREDS", "DSN", "SESSION"];
+
+/// What follows `SESSION` in the names of variables that say which session
+/// this is rather than log in to one: `TERM_SESSION_ID`, `XDG_SESSION_TYPE`,
+/// `DBUS_SESSION_BUS_ADDRESS`.
+const SESSION_FACTS: &[&str] = &["ID", "TYPE", "CLASS", "DESKTOP", "BUS"];
+
+/// Whether a variable in rein's environment, `name` at `value`, is passed
+/// to a command in the sandbox. Not a key, token or password, which goes
+/// by its name ([`SECRET_PARTS`], [`SECRET_WORDS`]) or, whatever its name,
+/// a value with a URL that has a password in it (`scheme://user:pass@host`,
+/// as in `DATABASE_URL`). Nor what reaches an SSH or GPG agent, which would
+/// sign or log in for it.
+pub(crate) fn passes(name: &str, value: &std::ffi::OsStr) -> bool {
     let upper = name.to_ascii_uppercase();
-    let secret = ["KEY", "SECRET", "TOKEN", "PASSWORD", "PASSWD", "CREDENTIAL", "ASKPASS"].iter().any(|word| upper.contains(word));
-    !secret && !matches!(upper.as_str(), "SSH_AUTH_SOCK" | "GPG_AGENT_INFO")
+    let words: Vec<&str> = upper.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+    let part = SECRET_PARTS.iter().any(|part| upper.contains(part));
+    let word = words.iter().enumerate().any(|(i, word)| match *word {
+        "PWD" => words.len() > 1,
+        "SESSION" => !words.get(i + 1).is_some_and(|next| SESSION_FACTS.contains(next)),
+        word => SECRET_WORDS.contains(&word),
+    });
+    let agent = matches!(upper.as_str(), "SSH_AUTH_SOCK" | "GPG_AGENT_INFO");
+    !part && !word && !agent && !has_password(&value.to_string_lossy())
+}
+
+/// Whether `text` has a URL in it with a password: `postgres://me:pw@host`.
+fn has_password(text: &str) -> bool {
+    text.match_indices("://").any(|(at, _)| {
+        let rest = &text[at + 3..];
+        let authority = &rest[..rest.find(['/', '?', '#', ' ', ',', ';']).unwrap_or(rest.len())];
+        authority.rsplit_once('@').is_some_and(|(user, _)| user.split_once(':').is_some_and(|(_, password)| !password.is_empty()))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// A folder for a test, outside the temp folders, which every command
+    /// may read and write, as a real home folder or project isn't.
+    fn dir(name: &str) -> PathBuf {
+        let base = std::env::var_os("REIN_TEST_DIR").map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/rein-tests"), PathBuf::from);
+        let dir = base.join(format!("lib-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        places::resolve(&dir)
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// rein's own file tools refuse what `hides` says is hidden, so it must
+    /// be exactly what a command in the sandbox can't read.
+    #[tokio::test]
+    async fn what_hides_says_is_what_the_sandbox_cant_read() {
+        let (root, home, away) = (dir("tie"), dir("tie-home"), dir("tie-away"));
+        let files = [
+            home.join(".zshrc"),
+            home.join("notes.txt"),
+            home.join(".cargo/config.toml"),
+            home.join(".cargo/credentials.toml"),
+            home.join(".ssh/id_test"),
+            home.join(".config/git/config"),
+            home.join(".config/git/credentials"),
+            home.join(".config/other/token"),
+            home.join("bin/tool"),
+            home.join("work/notes.txt"),
+            away.join("claude/.credentials.json"),
+            away.join("notes.txt"),
+            root.join("readme.txt"),
+        ];
+        for file in &files {
+            write(file, "FAKE\n");
+        }
+        std::os::unix::fs::symlink(home.join(".zshrc"), root.join("link")).unwrap();
+        let path = std::env::join_paths([home.join("bin")]).unwrap();
+        let claude = away.join("claude").into_os_string();
+        let env = move |name: &str| match name {
+            "PATH" => Some(path.clone()),
+            "CLAUDE_CONFIG_DIR" => Some(claude.clone()),
+            _ => None,
+        };
+        let places = Places::with(&root, Some(&home), None, &env);
+        let sandbox = Sandbox::detect(places.clone()).await;
+        if !sandbox.available() {
+            return;
+        }
+        let mut paths: Vec<PathBuf> = files.to_vec();
+        paths.extend([root.join("link"), home.clone(), home.join(".cargo"), home.join(".config"), home.join("work"), away.clone(), root.clone()]);
+        if cfg!(target_os = "macos") {
+            paths.extend([home.join(".ZSHRC"), home.join(".CARGO/config.toml"), home.join(".SSH/id_test")]);
+        }
+        let mut hidden = 0;
+        for path in &paths {
+            let line = if path.is_dir() { format!("ls '{}'", path.display()) } else { format!("cat '{}'", path.display()) };
+            let mut command = sandbox.wrap(&line, Walls { write: false, network: false }).unwrap();
+            let status =
+                command.current_dir(&root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().await.unwrap();
+            if path.is_dir() && cfg!(target_os = "linux") {
+                // Landlock lists every folder (see `hides`); what's in their
+                // files is what it keeps.
+                assert!(status.success(), "{}", path.display());
+                continue;
+            }
+            assert_eq!(places.hides(path), !status.success(), "{}", path.display());
+            hidden += usize::from(!status.success());
+        }
+        // Both ways: some it can read, and some it can't.
+        assert!(hidden > 0 && hidden < paths.len());
+    }
 
     #[test]
     fn each_access_reaches_further_than_the_one_before() {
@@ -330,12 +447,59 @@ mod tests {
 
     #[test]
     fn keys_and_tokens_stay_out_of_a_sandboxed_command() {
-        for name in ["OPENAI_API_KEY", "anthropic_api_key", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "PGPASSWORD", "GOOGLE_APPLICATION_CREDENTIALS", "SSH_AUTH_SOCK", "GIT_ASKPASS"]
-        {
-            assert!(!passes(name), "{name}");
+        let plain = std::ffi::OsStr::new("x");
+        for name in [
+            "OPENAI_API_KEY",
+            "anthropic_api_key",
+            "GITHUB_TOKEN",
+            "NGROK_AUTHTOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "PGPASSWORD",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "SSH_AUTH_SOCK",
+            "GIT_ASKPASS",
+            "DB_PASS",
+            "MYSQL_PWD",
+            "GITHUB_PAT",
+            "BW_SESSION",
+            "OP_SESSION_my_team",
+            "GPG_PASSPHRASE",
+            "SLACK_WEBHOOK_URL",
+            "NPM_CONFIG__AUTH",
+            "AWS_CREDS",
+            "SENTRY_DSN",
+        ] {
+            assert!(!passes(name, plain), "{name}");
         }
-        for name in ["PATH", "HOME", "LANG", "TERM", "CARGO_HOME", "GIT_AUTHOR_NAME", "TMPDIR"] {
-            assert!(passes(name), "{name}");
+        for name in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "TERM",
+            "CARGO_HOME",
+            "GIT_AUTHOR_NAME",
+            "TMPDIR",
+            "PWD",
+            "OLDPWD",
+            "TERM_SESSION_ID",
+            "XDG_SESSION_TYPE",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SECURITYSESSIONID",
+            "XAUTHORITY",
+            "DATABASE_URL",
+        ] {
+            assert!(passes(name, plain), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_url_with_a_password_stays_out_whatever_its_name() {
+        let passes = |value: &str| passes("DATABASE_URL", std::ffi::OsStr::new(value));
+        for value in ["postgres://me:FAKE-pw@localhost:5432/db", "http://user:FAKE@proxy:8080", "redis://:FAKE@cache", "a=1 mysql://u:FAKE@h/x"] {
+            assert!(!passes(value), "{value}");
+        }
+        for value in ["postgres://localhost/db", "ssh://git@github.com:22/me/repo", "https://example.com/a@b:c", "user:pw@host", "https://me:@host", "plain"] {
+            assert!(passes(value), "{value}");
         }
     }
 }
