@@ -121,7 +121,9 @@ pub(crate) fn lines(me: &Status, others: &[Status], frame: u64, now: u64, colors
         let bright = status.state != State::Waiting || (frame / (FPS / 2)).is_multiple_of(2);
         let (r, g, b) = color(status.state);
         let tint = if bright { (r, g, b) } else { (r / 2, g / 2, b / 2) };
-        let name = if mine { colors.paint((230, 230, 230), true, &format!("▸ {}", status.name)) } else { colors.paint((200, 200, 200), false, &status.name) };
+        // A sub-agent shows whose it is with ↳.
+        let label = if status.parent.is_some() { format!("↳ {}", status.name) } else { status.name.clone() };
+        let name = if mine { colors.paint((230, 230, 230), true, &format!("▸ {label}")) } else { colors.paint((200, 200, 200), false, &label) };
         cells.push(format!("{name} {}", colors.paint(tint, status.state == State::Waiting, &words)));
     }
     let row = format!(" {}", cells.join("    "));
@@ -180,6 +182,7 @@ mod tests {
             editing: Vec::new(),
             question: None,
             recent: Vec::new(),
+            parent: None,
         }
     }
 

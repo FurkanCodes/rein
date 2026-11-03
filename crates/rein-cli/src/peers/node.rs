@@ -48,12 +48,17 @@ pub(crate) enum Incoming {
         from: String,
         path: String,
     },
+    /// The rein that started this one is done with it: its result was
+    /// read, or it has gone.
+    Close {
+        from: String,
+    },
 }
 
 impl Incoming {
     pub(crate) fn from(&self) -> &str {
         match self {
-            Self::Message { from, .. } | Self::Task { from, .. } | Self::Result { from, .. } | Self::Changed { from, .. } => from,
+            Self::Message { from, .. } | Self::Task { from, .. } | Self::Result { from, .. } | Self::Changed { from, .. } | Self::Close { from } => from,
         }
     }
 
@@ -69,6 +74,7 @@ impl Incoming {
                 format!("The task you handed over (task {id}) {how}. {files}\n\n{summary}")
             }
             Self::Changed { path, .. } => format!("changed {path}"),
+            Self::Close { .. } => "done with this sub-agent".to_owned(),
         }
     }
 }
@@ -133,8 +139,29 @@ struct Shared {
     held: VecDeque<Incoming>,
     /// The question you're asked now, and where an answer from another tab goes.
     waiting: Option<(u64, oneshot::Sender<bool>)>,
+    /// The sub-agents this rein started, by task.
+    children: HashMap<String, Child>,
+    /// The process of the rein that started this one, if it's a sub-agent.
+    parent: Option<u32>,
     sent: HashMap<String, Sender>,
 }
+
+/// A sub-agent this rein started.
+#[derive(Debug, Clone)]
+pub(crate) struct Child {
+    /// What it's for, which is its name.
+    #[allow(dead_code)]
+    pub(crate) role: String,
+    /// The task, until it's claimed.
+    task: Option<String>,
+    /// Its address, once it has claimed its task.
+    pub(crate) address: Option<String>,
+    /// Its result has come.
+    pub(crate) finished: bool,
+}
+
+/// The most sub-agents one rein may have at once.
+pub(crate) const MOST_CHILDREN: usize = 4;
 
 /// What one sender sent lately.
 #[derive(Default)]
@@ -202,6 +229,7 @@ impl Node {
             editing: Vec::new(),
             question: None,
             recent: Vec::new(),
+            parent: None,
         };
         let shared = Arc::new(Mutex::new(Shared {
             status,
@@ -212,6 +240,8 @@ impl Node {
             inbox: tx,
             held: VecDeque::new(),
             waiting: None,
+            children: HashMap::new(),
+            parent: None,
             sent: HashMap::new(),
         }));
         let mut tasks = JoinSet::new();
@@ -397,13 +427,62 @@ impl Node {
             Body::Task { text, .. } => format!("you → {}: task: {}", peer.name, preview(text)),
             Body::Result { done, .. } => format!("you → {}: result ({})", peer.name, if *done { "done" } else { "not done" }),
             Body::Answer { yes, .. } => format!("you answered {}: {}", peer.name, if *yes { "yes" } else { "no" }),
-            Body::Status | Body::Changed { .. } => String::new(),
+            Body::Status | Body::Changed { .. } | Body::Claim { .. } | Body::Close => String::new(),
         };
         let reply = super::ask(&peer, body).await?;
         if !what.is_empty() {
             self.note(what);
         }
         Ok((peer, reply))
+    }
+
+    /// Keeps `task` for the sub-agent that claims `id`; how many are running
+    /// with it, or why it can't have one more.
+    pub(crate) fn expect_child(&self, id: &str, role: &str, task: &str) -> Result<usize, String> {
+        let mut shared = locked(&self.shared);
+        let running = shared.children.values().filter(|child| !child.finished).count();
+        if running >= MOST_CHILDREN {
+            return Err(format!("{running} sub-agents are running, the most at once: wait for one to finish"));
+        }
+        shared.children.insert(id.to_owned(), Child { role: role.to_owned(), task: Some(task.to_owned()), address: None, finished: false });
+        Ok(running + 1)
+    }
+
+    /// A sub-agent that never claimed its task: its tab didn't open.
+    pub(crate) fn forget_child(&self, id: &str) {
+        locked(&self.shared).children.remove(id);
+    }
+
+    /// The sub-agents whose results have come, taken out: their tabs may go.
+    pub(crate) fn finished_children(&self) -> Vec<Child> {
+        let mut shared = locked(&self.shared);
+        let done: Vec<String> = shared.children.iter().filter(|(_, child)| child.finished).map(|(id, _)| id.clone()).collect();
+        done.iter().filter_map(|id| shared.children.remove(id)).collect()
+    }
+
+    /// This rein is the sub-agent `parent` started for task `id`: it
+    /// claims the task, which comes in as a task from it.
+    pub(crate) async fn claim(&self, parent: u32, id: &str) -> Result<String, String> {
+        let peers = self.peers().await;
+        let Some(info) = peers.iter().find(|p| p.pid == parent) else { return Err("the rein that started this one isn't running anymore".into()) };
+        let text = match super::ask(info, Body::Claim { id: id.to_owned() }).await? {
+            Reply::Task { text } => text,
+            Reply::Refused { why } => return Err(format!("{} didn't hand over the task: {why}", info.name)),
+            _ => return Err(format!("{} answered with something else", info.name)),
+        };
+        let mut shared = locked(&self.shared);
+        shared.parent = Some(parent);
+        shared.status.parent = Some(info.name.clone());
+        let from = if info.workspace == shared.status.workspace { info.name.clone() } else { info.address() };
+        let task = Incoming::Task { from: from.clone(), reply_to: info.address(), id: id.to_owned(), text };
+        shared.inbox.try_send(task).map_err(|_| "too much is waiting already".to_owned())?;
+        Ok(from)
+    }
+
+    /// The rein that started this one, while it's running: `None` once
+    /// it has gone, or for a rein nobody started.
+    pub(crate) fn parent(&self) -> Option<u32> {
+        locked(&self.shared).parent
     }
 
     /// What's waiting in `/inbox`, oldest first.
@@ -470,7 +549,7 @@ fn said(sent: Result<(Info, Reply), String>, task: Option<&str>) -> String {
         },
         Ok((peer, Reply::Held)) => format!("{} keeps messages for its user to let in; it'll see it once they do.", peer.name),
         Ok((peer, Reply::Refused { why })) => format!("{error}{} turned it away: {why}", peer.name),
-        Ok((peer, Reply::Status(_))) => format!("{error}{} answered with something else", peer.name),
+        Ok((peer, Reply::Status(_) | Reply::Task { .. })) => format!("{error}{} answered with something else", peer.name),
         Err(e) => format!("{error}{e}"),
     }
 }
@@ -511,6 +590,17 @@ async fn present(shared: Arc<Mutex<Shared>>, show: Show, colors: super::strip::C
     let (mut frame, mut others, mut shown_title, mut shown_state) = (0u64, Vec::new(), String::new(), None);
     loop {
         ticks.tick().await;
+        // A sub-agent whose rein has gone: nobody will read its result.
+        if frame.is_multiple_of(fps) {
+            let mut shared = locked(&shared);
+            if let Some(pid) = shared.parent
+                && !shared.folder.join(format!("{pid}.json")).exists()
+            {
+                shared.parent = None;
+                let from = shared.status.parent.clone().unwrap_or_default();
+                let _ = shared.inbox.try_send(Incoming::Close { from });
+            }
+        }
         if show.strip && frame.is_multiple_of(fps) {
             let folder = locked(&shared).folder.clone();
             others = super::dashboard::gather(super::list(&folder).await).await.into_iter().filter_map(|(_, status)| status).collect();
@@ -577,7 +667,7 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
     let incoming = match (request.body, sender, from) {
         (Body::Status, _, _) => {
             let shared = locked(shared);
-            return Some(Reply::Status(shared.status.clone()));
+            return Some(Reply::Status(Box::new(shared.status.clone())));
         }
         // Your answer, from the dashboard or another tab.
         (Body::Answer { question, yes }, _, _) => {
@@ -594,6 +684,24 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
             };
         }
         (_, None, _) | (_, _, None) => return refused("only another rein can send that"),
+        // A sub-agent this rein started, for its task, once.
+        (Body::Claim { id }, Some(info), Some(_)) => {
+            let mut shared = locked(shared);
+            return match shared.children.get_mut(&id).and_then(|child| child.task.take().map(|task| (child, task))) {
+                Some((child, task)) => {
+                    child.address = Some(info.address());
+                    Some(Reply::Task { text: task })
+                }
+                None => refused("there's no task waiting under that id"),
+            };
+        }
+        // Only from the rein that started this one.
+        (Body::Close, Some(info), Some(from)) => {
+            if locked(shared).parent != Some(info.pid) {
+                return refused("only the rein that started this one can close it");
+            }
+            Incoming::Close { from }
+        }
         (Body::Message { text }, Some(_), Some(from)) => Incoming::Message { from, text },
         (Body::Task { id, text }, Some(info), Some(from)) => Incoming::Task { from, reply_to: info.address(), id, text },
         (Body::Result { id, done, summary, files }, Some(_), Some(from)) => Incoming::Result { from, id, done, summary, files },
@@ -609,10 +717,27 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
         return refused(why);
     }
     let what = format!("{} → you: {}", incoming.from(), preview(&incoming.text()));
+    // What a sub-agent sends back for the task it was given goes in, as
+    // the rein that started it asked for it; so does its parent's word.
+    let ours = match &incoming {
+        Incoming::Result { id, .. } => match shared.children.get_mut(id) {
+            Some(child) => {
+                child.finished = true;
+                true
+            }
+            None => false,
+        },
+        Incoming::Close { .. } => true,
+        _ => false,
+    };
     let reply = match (shared.policy, &incoming) {
         // A change is only a fact about a file: it never starts anything.
         (_, Incoming::Changed { .. }) => match shared.inbox.try_send(incoming) {
             Ok(()) => return Some(Reply::Delivered),
+            Err(_) => return refused("it has too much waiting already"),
+        },
+        _ if ours => match shared.inbox.try_send(incoming) {
+            Ok(()) => Reply::Delivered,
             Err(_) => return refused("it has too much waiting already"),
         },
         (Policy::Refuse, _) => return refused("it doesn't take messages from other reins"),
@@ -730,6 +855,25 @@ mod tests {
         node.follow_mode(rein_agent::permissions::Mode::Ask);
         locked(&node.shared).policy = Policy::Refuse;
         assert!(matches!(super::super::ask(&me, Body::Message { text: "hi".into() }).await, Ok(Reply::Refused { .. })));
+        drop(node);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_task_goes_to_one_sub_agent_once_and_only_its_parent_can_close_it() {
+        let folder = PathBuf::from(format!("/tmp/rein-child-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let node = Node::start(&folder, Some("web"), Some("w"), Path::new("/p"), "m", Policy::Accept, Show { title: false, strip: false }).await.unwrap();
+        let me = node.info().clone();
+        assert!(matches!(super::super::ask(&me, Body::Claim { id: "nope".into() }).await, Ok(Reply::Refused { .. })), "no task under an unknown id");
+        node.expect_child("t1", "tests", "run them").unwrap();
+        assert_eq!(super::super::ask(&me, Body::Claim { id: "t1".into() }).await, Ok(Reply::Task { text: "run them".into() }));
+        assert!(matches!(super::super::ask(&me, Body::Claim { id: "t1".into() }).await, Ok(Reply::Refused { .. })), "handed out once");
+        assert_eq!(super::super::ask(&me, Body::Close).await, Ok(Reply::Refused { why: "only the rein that started this one can close it".into() }));
+        for n in 2..=MOST_CHILDREN {
+            node.expect_child(&format!("t{n}"), "x", "y").unwrap();
+        }
+        assert!(node.expect_child("one-more", "x", "y").unwrap_err().contains("the most at once"));
         drop(node);
         std::fs::remove_dir_all(folder).unwrap();
     }

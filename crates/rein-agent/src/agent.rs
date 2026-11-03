@@ -850,6 +850,12 @@ impl<M> Agent<M> {
         self
     }
 
+    /// The peer tools for a sub-agent: no `spawn`, so it stays one level deep.
+    pub fn with_child_peer_tools(mut self) -> Self {
+        self.specs.extend(crate::peers::child_specs());
+        self
+    }
+
     /// Compact once a request would carry more than this many tokens.
     pub fn limit(&self) -> u64 {
         self.window.limit

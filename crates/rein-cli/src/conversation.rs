@@ -126,13 +126,19 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     let limit = setup.limit(&model_name)?;
     terminal.context_limit = limit;
     terminal.model = provider::shown(&setup.provider, &model_name);
+    terminal.spec.clone_from(&spec);
+    terminal.tab_command.clone_from(&args.tab_command);
     terminal.input.set_bar(terminal.bar());
     let max_output = setup.max_output(&model_name);
     let mut agent = Agent::new(Llm { client, record }, Tools::new(root.clone()).with_sandbox(sandbox), permissions, model_name, limit, loaded, context);
     // Only a conversation joins the others: a task done on its own has no
     // one to answer what they send.
-    if args.prompt.is_none() && crate::peers::talk::join(args.joining, args.name.as_deref(), args.workspace.as_deref(), args.strip, &dir, &root, args.mode, &mut terminal).await {
-        agent = agent.with_peer_tools();
+    let child = args.child.as_ref().map(|(pid, id)| (*pid, id.as_str()));
+    if args.prompt.is_none()
+        && crate::peers::talk::join(args.joining, args.name.as_deref(), args.workspace.as_deref(), child, args.strip, &dir, &root, args.mode, &mut terminal).await
+    {
+        // A sub-agent doesn't start sub-agents: one level, no further.
+        agent = if child.is_some() { agent.with_child_peer_tools() } else { agent.with_peer_tools() };
     }
     agent.max_output = max_output;
     agent.reasoning_effort = args.effort;
@@ -407,11 +413,16 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
         let line = match message(terminal, &mut last_interrupt).await {
             Said::Message(line) => {
                 in_a_row = 0;
+                // Typed into a sub-agent: it's yours now, and stays open.
+                terminal.adopted = true;
                 line
             }
             Said::Peer(incoming) => {
                 if let Err(e) = crate::peers::talk::take_in(incoming, &mut in_a_row, agent, terminal).await {
                     say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&format!("✗ {e}")));
+                }
+                if leaves(terminal) {
+                    break;
                 }
                 continue;
             }
@@ -456,6 +467,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 let outcome = turn(agent, Start::You(line.to_owned()), terminal).await;
                 // A task that came in during the turn gets its result.
                 crate::peers::talk::report(agent, terminal, outcome.as_ref().ok()).await;
+                crate::peers::talk::close_finished(terminal).await;
                 if let Err(e) = outcome {
                     say!("{pad}{}", terminal.err.red(&format!("✗ {e}")));
                 }
@@ -468,6 +480,20 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
         say!("\n{}", terminal.err.dim("rein -c continues this conversation"));
     }
     Ok(())
+}
+
+/// A sub-agent whose rein is done with it goes, its tab with it, unless
+/// you've typed into it: then it says so, and stays.
+fn leaves(terminal: &mut Terminal) -> bool {
+    if !std::mem::take(&mut terminal.closing) {
+        return false;
+    }
+    if terminal.adopted {
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(the rein that started this one is done with it; it's yours now)"));
+        return false;
+    }
+    say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(its result was read: this sub-agent is done)"));
+    true
 }
 
 /// Shift-Tab's order: asking about everything, then about commands only,
@@ -522,6 +548,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 peers.set_model(&terminal.model);
             }
             let current = setup.current(agent);
+            terminal.spec.clone_from(&current);
             agent.save_model(&current).map_err(describe)?;
             say!("{pad}{} now using {shown}", s.green("✓"));
             if let Some(why) = crate::effort::unlike_chosen(agent) {
@@ -613,7 +640,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             agent.resume(loaded, context);
             (terminal.context_used, terminal.last_cache) = (agent.estimated(), None);
         }
-        peers @ (Slash::Peers | Slash::Send(..) | Slash::Delegate(..) | Slash::Inbox | Slash::Name(_) | Slash::Workspace(_)) => {
+        peers @ (Slash::Peers | Slash::Send(..) | Slash::Delegate(..) | Slash::Inbox | Slash::Spawn(_) | Slash::Name(_) | Slash::Workspace(_)) => {
             crate::peers::talk::command(peers, agent, terminal).await?
         }
         Slash::Exit => {}

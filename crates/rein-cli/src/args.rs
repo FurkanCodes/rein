@@ -102,7 +102,10 @@ you, ✓ and how long once it's done. Across the top of each, a strip shows
 them all live, in colour (strip = off hides it). /peers shows them all, /send and /delegate write
 to one or hand it a task, /name and /workspace say who this one is, and
 /inbox holds what's waiting to be let in. The model can do the same with its
-peers, message and delegate tools. Another rein's message is never yours: it
+peers, message and delegate tools, and start a sub-agent in a new tab of its
+own with spawn: you're asked first, it shows as ↳ in the strip, and its result
+comes back. rein opens the tab in tmux, kitty, WezTerm, iTerm2, Ghostty and
+Terminal; elsewhere it gives you the command to paste, or set tab_command. Another rein's message is never yours: it
 can't approve anything, and everything it leads to asks as usual. Set
 peers = hold to let each message in yourself (trust mode always does),
 refuse to take none, or off to stay out.
@@ -165,6 +168,11 @@ pub(crate) struct AskArgs {
     pub(crate) joining: Joining,
     /// The strip of all the reins across the top of the screen.
     pub(crate) strip: bool,
+    /// This rein is a sub-agent: the rein that started it, and its task's id.
+    pub(crate) child: Option<(u32, String)>,
+    /// How to open a tab here, where rein doesn't know: a command with
+    /// `{command}` in it.
+    pub(crate) tab_command: Option<String>,
 }
 
 impl AskArgs {
@@ -185,6 +193,8 @@ impl AskArgs {
         };
         let (bell, compress, sandbox) = (switch("bell", "REIN_BELL")?, switch("compress", "REIN_COMPRESS")?, switch("sandbox", "REIN_SANDBOX")?);
         let strip = switch("strip", "REIN_STRIP")?;
+        let tab_command = settings.get("tab_command", "REIN_TAB_COMMAND");
+        let mut child = None;
         let joining = match settings.get("peers", "REIN_PEERS") {
             Some(value) => value.parse::<Joining>()?,
             None => Joining::On(Policy::Accept),
@@ -215,6 +225,12 @@ impl AskArgs {
                 "--name" => name = Some(crate::peers::clean_name(&value(&mut args, &arg)?)?),
                 "--workspace" => workspace = Some(value(&mut args, &arg)?),
                 "--worktree" => worktree = true,
+                // Not for typing: a rein starts its sub-agents with it.
+                "--child" => {
+                    let value = value(&mut args, &arg)?;
+                    let (pid, id) = value.split_once(':').ok_or("--child takes <pid>:<id>")?;
+                    child = Some((pid.parse().map_err(|_| "--child takes <pid>:<id>")?, id.to_owned()));
+                }
                 "--" => words.extend(args.by_ref()),
                 flag if flag.starts_with('-') && flag.len() > 1 => {
                     return Err(format!("unknown option {flag}; see `rein --help`"));
@@ -226,7 +242,27 @@ impl AskArgs {
         if worktree && workspace.is_none() {
             return Err("--worktree needs --workspace <name>: the worktree is the workspace's".into());
         }
-        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, sandbox, max_steps, prompt, name, workspace, worktree, joining, strip })
+        Ok(AskArgs {
+            model,
+            model_given,
+            resume,
+            effort,
+            system,
+            mode,
+            record,
+            bell,
+            compress,
+            sandbox,
+            max_steps,
+            prompt,
+            name,
+            workspace,
+            worktree,
+            joining,
+            strip,
+            child,
+            tab_command,
+        })
     }
 }
 

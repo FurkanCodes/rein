@@ -2203,3 +2203,127 @@ fn a_level_the_model_turns_down_is_said_once_and_not_offered_again() {
     assert!(!rows.lines().any(|row| row.trim_start_matches(['›', ' ']).starts_with("minimal")), "not offered again:\n{rows}");
     term.keys("\x1b");
 }
+
+/// The words of a sub-agent's start script's last line, after `exec env
+/// NAME=value`: rein's arguments, as a new tab would run them.
+fn child_args(script: &str) -> Vec<String> {
+    let last = script.lines().last().unwrap_or_default();
+    let mut words = Vec::new();
+    let mut rest = last;
+    while let Some(start) = rest.find('\'') {
+        let after = &rest[start + 1..];
+        let end = after.find('\'').unwrap_or(after.len());
+        words.push(after[..end].to_owned());
+        rest = &after[(end + 1).min(after.len())..];
+    }
+    // The first quoted word is REIN_HOME's value, then the program.
+    words.into_iter().skip(2).collect()
+}
+
+#[test]
+fn a_sub_agent_starts_in_a_new_tab_works_where_you_see_it_and_reports_back() {
+    let (base, project, home) = tabs("spawn");
+    let opened = base.join("opened");
+    let spawn = calls("spawn", json!({ "role": "tests", "task": "run the test suite", "model": null, "edits": false }));
+    let parent_model = Model::start(vec![spawn, says("Started tests."), says("tests is done: all of them pass.")])
+        .with_env("REIN_TAB_COMMAND", &format!("echo {{command}} >> {}", opened.display()));
+    let mut web = Term::spawn_in(&parent_model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.keys("get the tests run\r");
+    web.wait_for("Start a sub-agent in a new tab?");
+    web.wait_for("tests ·");
+    std::thread::sleep(Duration::from_millis(700));
+    web.keys("y");
+    web.wait_for("sub-agent tests started in a new tab");
+    web.wait_for("Started tests.");
+    // What the "terminal" was asked to run: a script, with no task in it.
+    let line = std::fs::read_to_string(&opened).unwrap();
+    let script_path = line.trim().strip_prefix("/bin/sh ").unwrap().to_owned();
+    let script = std::fs::read_to_string(&script_path).unwrap();
+    assert!(!script.contains("run the test suite"), "the task isn't on its command line:\n{script}");
+    let args = child_args(&script);
+    assert_eq!(&args[..2], ["--name", "tests"], "{args:?}");
+    assert!(args.contains(&"--child".to_owned()), "{args:?}");
+
+    let child_model = Model::start(vec![says("All of them pass.")]);
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut tests = Term::spawn_in(&child_model, base.clone(), &project, &home, 30, 100, &words);
+    tests.wait_for("A sub-agent of web");
+    tests.wait_for("All of them pass.");
+    let asked = child_model.requests()[0].to_string();
+    assert!(asked.contains("run the test suite") && asked.contains("A task for you"), "{asked}");
+    let tools = child_model.requests()[0]["tools"].to_string();
+    assert!(tools.contains("\"delegate\"") && !tools.contains("\"spawn\""), "a sub-agent can't start sub-agents: {tools}");
+    web.wait_for("tests is done: all of them pass.");
+    assert!(parent_model.requests()[2].to_string().contains("All of them pass."), "the result came back");
+    // Its result read, the sub-agent goes, and its tab with it.
+    tests.wait_exit();
+}
+
+#[test]
+fn a_sub_agent_you_say_no_to_never_opens() {
+    let (base, project, home) = tabs("decline");
+    let opened = base.join("opened");
+    let spawn = calls("spawn", json!({ "role": "docs", "task": "write the docs", "model": null, "edits": false }));
+    let parent_model = Model::start(vec![spawn, says("Started docs."), says("docs is done.")]).with_env("REIN_TAB_COMMAND", &format!("echo {{command}} >> {}", opened.display()));
+    let mut web = Term::spawn_in(&parent_model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.keys("write docs\r");
+    web.wait_for("Start a sub-agent in a new tab?");
+    std::thread::sleep(Duration::from_millis(700));
+    web.keys("n");
+    web.wait_for("Started docs.");
+    assert!(!opened.exists(), "no means no tab");
+    assert!(parent_model.requests()[1].to_string().contains("The user declined to start this sub-agent."));
+}
+
+#[test]
+fn a_sub_agent_you_typed_into_stays_when_its_parent_is_done_with_it() {
+    let (base, project, home) = tabs("adopt");
+    std::fs::create_dir_all(project.join(".rein")).unwrap();
+    std::fs::write(project.join(ALLOWED.0), ALLOWED.1).unwrap();
+    let opened = base.join("opened");
+    let spawn = calls("spawn", json!({ "role": "lint", "task": "lint it", "model": null, "edits": false }));
+    let parent_model = Model::start(vec![spawn, says("Started lint."), says("lint is done.")]).with_env("REIN_TAB_COMMAND", &format!("echo {{command}} >> {}", opened.display()));
+    let mut web = Term::spawn_in(&parent_model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.keys("lint it\r");
+    web.wait_for("Start a sub-agent in a new tab?");
+    std::thread::sleep(Duration::from_millis(700));
+    web.keys("y");
+    web.wait_for("Started lint.");
+    let script = std::fs::read_to_string(std::fs::read_to_string(&opened).unwrap().trim().strip_prefix("/bin/sh ").unwrap()).unwrap();
+    let args = child_args(&script);
+    let child_model =
+        Model::start(vec![calls("bash", json!({ "command": "sleep 1", "timeout_seconds": null, "access": "write", "reason": null })), says("Linted, and the tests too.")]);
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut lint = Term::spawn_in(&child_model, base.clone(), &project, &home, 30, 100, &words);
+    lint.wait_for("Running sleep 1");
+    lint.keys("run the tests too\r");
+    lint.wait_for("Linted, and the tests too.");
+    web.wait_for("lint is done.");
+    lint.wait_for("it's yours now");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(lint.child.try_wait().unwrap().is_none(), "it stays: you typed into it");
+}
+
+#[test]
+fn spawn_starts_a_sub_agent_you_name_without_asking() {
+    let (base, project, home) = tabs("slash-spawn");
+    let opened = base.join("opened");
+    let lead_model = Model::start(vec![says("tests says they pass.")]).with_env("REIN_TAB_COMMAND", &format!("echo {{command}} >> {}", opened.display()));
+    let mut lead = Term::spawn_in(&lead_model, base.clone(), &project, &home, 30, 100, &["--name", "lead"]);
+    lead.wait_for(IDLE);
+    lead.keys("/spawn tests run the test suite\r");
+    lead.wait_for("sub-agent tests started in a new tab");
+    assert!(!lead.text().contains("Start a sub-agent in a new tab?"), "you asked for it: nothing to ask");
+    let script = std::fs::read_to_string(std::fs::read_to_string(&opened).unwrap().trim().strip_prefix("/bin/sh ").unwrap()).unwrap();
+    let args = child_args(&script);
+    let child_model = Model::start(vec![says("They pass.")]);
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut tests = Term::spawn_in(&child_model, base.clone(), &project, &home, 30, 100, &words);
+    tests.wait_for("They pass.");
+    assert!(child_model.requests()[0].to_string().contains("run the test suite"));
+    lead.wait_for("tests says they pass.");
+    tests.wait_exit();
+}

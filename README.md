@@ -300,8 +300,14 @@ strip across the top shows all of them live, in colour, with a line under
 it that runs with light while any of them works, turns amber while one needs
 you, and settles green when they're done (`strip = off` hides it). iTerm2
 3.6 and later, Ghostty, WezTerm and Windows Terminal also show a progress
-bar on the tab, and iTerm2 3.7 a coloured status under the title. In a
-conversation:
+bar on the tab, and iTerm2 3.7 a coloured status under the title.
+Terminal.app's tabs are plain text, and it adds the folder, the process,
+its arguments and the window size to each title, which can crowd rein's
+out. To see only rein's, go to Terminal → Settings → Profiles, pick your
+profile, and on both its Window and Tab panes uncheck Active process name,
+Arguments, Working directory or document, Path, Shell command name, TTY
+name, Dimensions, Command key and Profile name (whichever each pane has).
+In a conversation:
 
 - `/send api add a /health endpoint` writes to another rein. If it's idle,
   it starts on it; if it's working, it reads it at its next step.
@@ -318,6 +324,31 @@ conversation:
   beside the repository, on a branch of its name, so two workspaces never
   touch each other's files.
 - `/inbox` holds what's waiting to be let in.
+
+### Sub-agents in tabs of their own
+
+When the model wants help, its `spawn` tool starts a sub-agent: rein asks
+you first, then opens a new tab, names it for its role (`tests`, `docs`),
+and starts a rein there that's already working. It shows in your strip as
+`↳ tests`, you can watch it, type into it, answer what it asks, or stop it,
+and its result comes back to the tab that started it, with the files it
+changed. Once that result is read, the sub-agent goes and its tab closes,
+unless you've typed into it: then it's yours, and stays.
+
+rein opens the tab itself in tmux (a new window, in the background), kitty
+(`allow_remote_control yes`), WezTerm, iTerm2 and Ghostty (macOS asks you
+once whether that's allowed), and Terminal.app, as a window: its scripting can't make a tab, but macOS
+can, with System Settings → Desktop & Dock → Prefer tabs when opening
+documents → Always. Inside tmux it
+always uses tmux, whatever terminal is around it. Anywhere else, or over
+ssh, rein shows the command to paste into a new tab, and copies it; or set
+`tab_command` to your terminal's own, with `{command}` and `{title}` in it.
+
+Nothing is ever typed into a terminal: the new tab runs `rein --child`, and
+the sub-agent fetches its task from the rein that started it. At most four
+run at once, a sub-agent can't start sub-agents of its own, it runs in the
+same mode as its parent, and one that changes files (`edits`) works in a git
+worktree of its own. A sub-agent whose parent has gone stops.
 
 `rein peers` keeps the same table up in a tab of its own, refreshed every
 second. Pick a rein with ↑↓ and press y or n to answer what it asks, without
@@ -356,6 +387,7 @@ compress = off
 sandbox = on
 peers = hold
 strip = off
+tab_command = "my-term --new-tab --title {title} -- {command}"
 ```
 
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,

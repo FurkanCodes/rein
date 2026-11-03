@@ -190,10 +190,13 @@ pub enum ToolName {
     Peers,
     Message,
     Delegate,
+    /// A new rein in a tab of its own, for a task: a sub-agent you can see.
+    Spawn,
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 11] = [Self::Read, Self::Grep, Self::Glob, Self::Write, Self::Edit, Self::Plan, Self::Bash, Self::Recall, Self::Peers, Self::Message, Self::Delegate];
+    pub const ALL: [ToolName; 12] =
+        [Self::Read, Self::Grep, Self::Glob, Self::Write, Self::Edit, Self::Plan, Self::Bash, Self::Recall, Self::Peers, Self::Message, Self::Delegate, Self::Spawn];
 
     /// The name the model knows it by.
     pub const fn as_str(self) -> &'static str {
@@ -209,6 +212,7 @@ impl ToolName {
             Self::Peers => "peers",
             Self::Message => "message",
             Self::Delegate => "delegate",
+            Self::Spawn => "spawn",
         }
     }
 
@@ -230,7 +234,7 @@ impl ToolName {
 
     /// Reaches another rein, which the user's side of rein does.
     pub const fn reaches_peers(self) -> bool {
-        matches!(self, Self::Peers | Self::Message | Self::Delegate)
+        matches!(self, Self::Peers | Self::Message | Self::Delegate | Self::Spawn)
     }
 }
 
@@ -460,7 +464,7 @@ impl Tools {
             }),
             // `recall` is the agent's own: it searches the conversation. The
             // peers are reached by whoever runs the agent.
-            Some(ToolName::Recall | ToolName::Peers | ToolName::Message | ToolName::Delegate) | None => Err(format!("there is no tool called {}", call.name)),
+            Some(ToolName::Recall | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) | None => Err(format!("there is no tool called {}", call.name)),
         };
         truncate(result.unwrap_or_else(|e| format!("{ERROR}{e}")))
     }

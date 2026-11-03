@@ -16,6 +16,7 @@
 
 pub(crate) mod dashboard;
 pub(crate) mod node;
+pub(crate) mod spawn;
 pub(crate) mod strip;
 pub(crate) mod talk;
 pub(crate) mod worktree;
@@ -136,6 +137,8 @@ pub(crate) struct Status {
     pub(crate) question: Option<Question>,
     /// What went between it and other reins lately, newest first.
     pub(crate) recent: Vec<String>,
+    /// The rein that started it, if it's a sub-agent.
+    pub(crate) parent: Option<String>,
 }
 
 /// What a request asks for.
@@ -162,6 +165,15 @@ pub(crate) enum Body {
     Changed {
         path: String,
     },
+    /// The sender is the sub-agent this rein started for task `id`, and
+    /// wants it. A task is handed out once, to a rein, never typed into a
+    /// terminal.
+    Claim {
+        id: String,
+    },
+    /// From the rein that started this one: its result has been read, and
+    /// its tab may go.
+    Close,
     /// Your answer to `question`, given in another tab.
     Answer {
         question: u64,
@@ -186,7 +198,11 @@ pub(crate) enum Reply {
     Refused {
         why: String,
     },
-    Status(Status),
+    Status(Box<Status>),
+    /// The task a sub-agent claimed.
+    Task {
+        text: String,
+    },
 }
 
 /// Where the peers are: in rein's own folder, which only you can open.

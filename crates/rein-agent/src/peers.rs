@@ -31,6 +31,20 @@ pub struct DelegateArgs {
     pub task: String,
 }
 
+/// `spawn`'s arguments.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnArgs {
+    /// What it's for, which is also its name: `tests`, `docs`.
+    pub role: String,
+    pub task: String,
+    /// Its model, if not this one's.
+    pub model: Option<String>,
+    /// It changes files: it gets a git worktree of its own, so it doesn't
+    /// change the ones this rein is working on.
+    pub edits: bool,
+}
+
 /// What the model is told about each tool for reaching other reins.
 pub fn specs() -> Vec<Tool> {
     let to = json!({ "type": "string", "description": "The other rein's name, as `peers` lists it, or `workspace/name` for one in another workspace." });
@@ -59,7 +73,28 @@ pub fn specs() -> Vec<Tool> {
                 .into(),
             parameters: object(json!({ "to": to, "task": { "type": "string", "description": "The task, complete in itself." } })),
         },
+        Tool {
+            name: ToolName::Spawn.as_str().into(),
+            description: "Start a sub-agent: a new rein in a terminal tab of its own, which the user can watch and steer, \
+                          working on a task. The user is asked first. It returns at once; the sub-agent's result comes back \
+                          to you as a message when it's done, with the files it changed. Use it for work that can go on \
+                          alongside yours, or that's better done by another model. Give it everything it needs: it hasn't \
+                          seen this conversation. At most four run at once."
+                .into(),
+            parameters: object(json!({
+                "role": { "type": "string", "description": "What it's for, in a word or two, which is also its name: tests, docs, review." },
+                "task": { "type": "string", "description": "The task, complete in itself." },
+                "model": { "type": ["string", "null"], "description": "Another model for it, like claude-opus-5-5; null for this one's." },
+                "edits": { "type": "boolean", "description": "It will change files: it then works in a git worktree of its own." }
+            })),
+        },
     ]
+}
+
+/// The tools a sub-agent is offered: all but `spawn`, as sub-agents don't
+/// start sub-agents of their own.
+pub fn child_specs() -> Vec<Tool> {
+    specs().into_iter().filter(|tool| tool.name != ToolName::Spawn.as_str()).collect()
 }
 
 /// What another rein said, as the model reads it.

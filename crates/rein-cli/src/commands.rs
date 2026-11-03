@@ -21,6 +21,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/peers", "", "the reins in your other terminals, and what each is doing"),
     ("/send", "[name] [message]", "write to another rein"),
     ("/delegate", "[name] [task]", "hand another rein a task; its result comes back here"),
+    ("/spawn", "[name] [-m model] [--edits] [task]", "start a sub-agent in a new tab; its result comes back here"),
     ("/inbox", "", "what other reins sent that waits to be let in"),
     ("/name", "[name]", "what other reins call this one"),
     ("/workspace", "[name]", "the group of reins this one works with"),
@@ -53,10 +54,49 @@ pub enum Slash {
     Send(Option<String>, Option<String>),
     Delegate(Option<String>, Option<String>),
     Inbox,
+    Spawn(Spawn),
     /// `None` says what it is.
     Name(Option<String>),
     Workspace(Option<String>),
     Exit,
+}
+
+/// What `/spawn` asks for: what's not given is asked for.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Spawn {
+    pub role: Option<String>,
+    pub task: Option<String>,
+    pub model: Option<String>,
+    /// It changes files: a worktree of its own.
+    pub edits: bool,
+}
+
+impl Spawn {
+    /// `tests -m claude-opus-5-5 --edits run the suite`: a name first, then
+    /// any of the options, then the task.
+    fn parse(rest: &str) -> Result<Spawn, String> {
+        let mut spawn = Spawn::default();
+        let mut words = rest.split_whitespace().peekable();
+        if let Some(role) = words.next_if(|word| !word.starts_with('-')) {
+            spawn.role = Some(role.trim_start_matches('@').to_owned());
+        }
+        while let Some(&word) = words.peek() {
+            match word {
+                "-m" | "--model" => {
+                    words.next();
+                    spawn.model = Some(words.next().ok_or("-m needs a model")?.to_owned());
+                }
+                "--edits" => {
+                    words.next();
+                    spawn.edits = true;
+                }
+                _ => break,
+            }
+        }
+        let task = words.collect::<Vec<_>>().join(" ");
+        spawn.task = (!task.is_empty()).then_some(task);
+        Ok(spawn)
+    }
 }
 
 /// What `/effort` sets.
@@ -120,6 +160,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
             Ok(Slash::Delegate(to, task))
         }
         "/inbox" => Ok(Slash::Inbox),
+        "/spawn" => Spawn::parse(rest).map(Slash::Spawn),
         "/name" => Ok(Slash::Name(arg)),
         "/workspace" => Ok(Slash::Workspace(arg)),
         "/exit" => Ok(Slash::Exit),
@@ -178,6 +219,14 @@ mod tests {
         assert_eq!(parse("/delegate @web"), Some(Ok(Slash::Delegate(Some("web".into()), None))));
         assert_eq!(parse("/send"), Some(Ok(Slash::Send(None, None))));
         assert_eq!(parse("/name review"), Some(Ok(Slash::Name(Some("review".into())))));
+        let spawn = |role: Option<&str>, model: Option<&str>, edits, task: Option<&str>| {
+            Some(Ok(Slash::Spawn(Spawn { role: role.map(Into::into), task: task.map(Into::into), model: model.map(Into::into), edits })))
+        };
+        assert_eq!(parse("/spawn tests run the suite"), spawn(Some("tests"), None, false, Some("run the suite")));
+        assert_eq!(parse("/spawn review -m claude-opus-5-5 --edits fix it"), spawn(Some("review"), Some("claude-opus-5-5"), true, Some("fix it")));
+        assert_eq!(parse("/spawn"), spawn(None, None, false, None));
+        assert_eq!(parse("/spawn docs"), spawn(Some("docs"), None, false, None));
+        assert_eq!(parse("/spawn x -m"), Some(Err("-m needs a model".into())));
     }
 
     #[test]

@@ -87,6 +87,9 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             (if tool == ToolName::Message { "Message" } else { "Delegate" }, format!("{}: {first}{more}", args["to"].as_str().unwrap_or_default()))
         }
         Some(ToolName::Peers) => ("Peers", "the other reins".to_owned()),
+        Some(ToolName::Spawn) => {
+            ("Sub-agent", format!("{}: {}", args["role"].as_str().unwrap_or_default(), args["task"].as_str().unwrap_or_default().lines().next().unwrap_or_default()))
+        }
         Some(ToolName::Plan) => {
             let steps = args["steps"].as_array().map_or(0, Vec::len);
             let done = args["steps"].as_array().into_iter().flatten().filter(|step| step["status"] == "done").count();
@@ -117,6 +120,7 @@ pub fn doing(call: &ToolCall) -> String {
         "Plan" => return "Updating the plan".to_owned(),
         "Message" => "Writing to",
         "Delegate" => "Handing over to",
+        "Sub-agent" => "Starting sub-agent",
         "Peers" => return "Looking at the other reins".to_owned(),
         _ => "Using",
     };

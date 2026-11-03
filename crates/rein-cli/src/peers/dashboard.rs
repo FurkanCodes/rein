@@ -27,7 +27,7 @@ pub(crate) async fn gather(peers: Vec<Info>) -> Vec<(Info, Option<Status>)> {
     let mut gathered = Vec::with_capacity(peers.len());
     for peer in peers {
         let status = match super::ask(&peer, Body::Status).await {
-            Ok(Reply::Status(status)) => Some(status),
+            Ok(Reply::Status(status)) => Some(*status),
             _ => None,
         };
         gathered.push((peer, status));
@@ -205,6 +205,7 @@ mod tests {
             editing: vec!["src/routes.rs".into()],
             question: None,
             recent: vec!["web → api: add a /health endpoint".into()],
+            parent: None,
         }
     }
 

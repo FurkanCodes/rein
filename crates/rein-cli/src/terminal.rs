@@ -124,6 +124,20 @@ pub(crate) struct Terminal {
     /// What came in while no turn ran that isn't a message: notes of files
     /// other reins changed, for the next turn.
     pub(crate) notes: Vec<Heard>,
+    /// The rein that started this one is done with it: it goes once it's
+    /// idle, unless it's been adopted.
+    pub(crate) closing: bool,
+    /// You've typed into this sub-agent: it's yours now, and stays.
+    pub(crate) adopted: bool,
+    /// You said always to opening tabs for sub-agents.
+    pub(crate) spawn_always: bool,
+    /// It's been said how Terminal can open tabs, not windows.
+    pub(crate) said_tabs: bool,
+    /// The model in use, as `provider/model`: what a sub-agent gets unless
+    /// it's given another.
+    pub(crate) spec: String,
+    /// The `tab_command` setting: how to open a tab here, if rein doesn't know.
+    pub(crate) tab_command: Option<String>,
 }
 
 impl Drop for Terminal {
@@ -219,21 +233,33 @@ impl Terminal {
             tasks: Vec::new(),
             changed: Vec::new(),
             notes: Vec::new(),
+            closing: false,
+            adopted: false,
+            spawn_always: false,
+            said_tabs: false,
+            spec: String::new(),
+            tab_command: None,
         }
     }
 
     /// What another rein sent, as the agent hears it. A task's result is
     /// owed to its sender at the end of the turn it goes into.
-    pub(crate) fn heard_of(&mut self, incoming: Incoming) -> Heard {
+    /// `None` for what isn't for the model: the rein that started this one
+    /// being done with it, which the conversation acts on after the turn.
+    pub(crate) fn heard_of(&mut self, incoming: Incoming) -> Option<Heard> {
         let text = incoming.text();
-        match incoming {
+        Some(match incoming {
             Incoming::Changed { from, path } => Heard::Changed { by: from, path },
             Incoming::Task { from, reply_to, id, .. } => {
                 self.tasks.push((reply_to, id));
                 Heard::Peer { from, text }
             }
             Incoming::Message { from, .. } | Incoming::Result { from, .. } => Heard::Peer { from, text },
-        }
+            Incoming::Close { .. } => {
+                self.closing = true;
+                return None;
+            }
+        })
     }
 
     /// Says how this rein is doing, to the others and on its tab.
@@ -676,6 +702,9 @@ impl Ui for Terminal {
     }
 
     async fn peer(&mut self, call: &ToolCall) -> String {
+        if ToolName::of(call) == Some(ToolName::Spawn) {
+            return crate::peers::talk::spawn(call, self).await;
+        }
         match &self.peers {
             Some(peers) => peers.tool(call).await,
             None => format!("{}this rein isn't among the others: start it in a conversation, with peers on", rein_agent::tools::ERROR),
@@ -850,6 +879,8 @@ impl Ui for Terminal {
     /// Your messages, then what came in from other reins.
     fn steering(&mut self) -> Vec<Heard> {
         let mut heard: Vec<Heard> = self.input.steering().into_iter().map(Heard::You).collect();
+        // Typed into a sub-agent while it works: it's yours now too.
+        self.adopted |= !heard.is_empty();
         heard.append(&mut self.notes);
         let mut incoming = Vec::new();
         if let Some(peers) = &mut self.peers {
@@ -857,7 +888,7 @@ impl Ui for Terminal {
                 incoming.push(one);
             }
         }
-        heard.extend(incoming.into_iter().map(|one| self.heard_of(one)));
+        heard.extend(incoming.into_iter().filter_map(|one| self.heard_of(one)));
         heard
     }
 
