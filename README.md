@@ -297,9 +297,8 @@ Arguments, Working directory or document, Path, Shell command name, TTY
 name, Dimensions, Command key and Profile name (whichever each pane has).
 In a conversation:
 
-- `/send api add a /health endpoint` writes to another rein. It waits in
-  that rein's `/inbox` until you let it in there; with `peers = accept`, an
-  idle rein starts on it, and a working one reads it at its next step.
+- `/send api add a /health endpoint` writes to another rein. If it's idle,
+  it starts on it; if it's working, it reads it at its next step.
 - `/delegate api add a /health endpoint` hands it a task. When it's done,
   its result comes back to this tab, with the files it changed.
 - `/peers` shows them all: model, state, current step, what each is
@@ -359,11 +358,10 @@ for anything but asking how it's doing, that are reins themselves. Sandboxed
 commands can't reach the sockets or read the files at all. A sender that
 writes too often or repeats itself is turned away, and once other reins
 have started 12 turns in a row without you, what they send waits in
-`/inbox`. What another rein sends waits in `/inbox` for you to let in,
-unless you set `peers = accept`, which lets it straight in. A rein in trust
-mode, where nothing asks you, holds it even then. What a rein's own
-sub-agents send back always goes in. `peers = refuse` takes nothing, and
-`off` keeps a rein out of it.
+`/inbox`. A rein in trust mode, where nothing asks you, always holds what
+comes in; `peers = hold` does that in every mode, `refuse` takes nothing,
+and `off` keeps a rein out of it. What a rein's own sub-agents send back,
+and the result of a task it handed out, always go in.
 
 ## Settings
 

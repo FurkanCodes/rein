@@ -2169,8 +2169,7 @@ fn tabs(name: &str) -> (PathBuf, PathBuf, PathBuf) {
 #[test]
 fn a_message_from_another_tab_starts_a_turn_there() {
     let (base, project, home) = tabs("msg");
-    // With what comes in let straight in, as you can set it.
-    let api_model = Model::start(vec![says("Adding a /health endpoint now.")]).with_env("REIN_PEERS", "accept");
+    let api_model = Model::start(vec![says("Adding a /health endpoint now.")]);
     let web_model = Model::start(vec![calls("message", json!({ "to": "api", "text": "please add a /health endpoint" })), says("Asked api.")]);
     let api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
     api.wait_for(IDLE);
@@ -2195,7 +2194,7 @@ fn a_message_from_another_tab_starts_a_turn_there() {
 fn a_task_handed_to_another_tab_comes_back_with_its_result() {
     let (base, project, home) = tabs("task");
     let write = calls("write", json!({ "path": "health.txt", "content": "ok\n" }));
-    let api_model = Model::start(vec![write, says("Added the endpoint.")]).with_env("REIN_PEERS", "accept");
+    let api_model = Model::start(vec![write, says("Added the endpoint.")]);
     let web_model = Model::start(vec![calls("delegate", json!({ "to": "api", "task": "add a /health endpoint" })), says("Handed it to api."), says("api is done with it.")]);
     let api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api", "--mode", "edits"]);
     api.wait_for(IDLE);
@@ -2254,9 +2253,9 @@ fn a_sandboxed_command_cant_read_who_the_other_reins_are() {
 }
 
 #[test]
-fn what_another_tab_sends_waits_for_you_to_let_it_in() {
+fn with_peers_on_hold_what_another_tab_sends_waits_for_you_to_let_it_in() {
     let (base, project, home) = tabs("held");
-    let api_model = Model::start(vec![says("Looking at it.")]);
+    let api_model = Model::start(vec![says("Looking at it.")]).with_env("REIN_PEERS", "hold");
     let mut api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
     api.wait_for(IDLE);
     let idle = Model::start(vec![]);

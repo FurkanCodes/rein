@@ -104,9 +104,8 @@ own with spawn: you're asked first, it shows as ↳ in the strip, and its result
 comes back. rein opens the tab in tmux, kitty, WezTerm, iTerm2, Ghostty and
 Terminal; elsewhere it gives you the command to paste, or set tab_command. Another rein's message is never yours: it
 can't approve anything, and everything it leads to asks as usual. Set
-What another rein sends waits in /inbox for you to let in: set peers = accept
-to let it straight in (never in trust mode), refuse to take none, or off to
-stay out.
+Set peers = hold to let each message in yourself (trust mode always does),
+refuse to take none, or off to stay out.
 
 Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
 compact_at, max_steps, peers, and bell, compress, sandbox and strip (on or off), like
@@ -195,9 +194,7 @@ impl AskArgs {
         let mut child = None;
         let joining = match settings.get("peers", "REIN_PEERS") {
             Some(value) => value.parse::<Joining>()?,
-            // What another rein sends is someone else's words: it waits
-            // for you to let it in, unless you say otherwise.
-            None => Joining::On(Policy::Hold),
+            None => Joining::On(Policy::Accept),
         };
         let (mut name, mut workspace, mut worktree) = (None, None, false);
         let mut max_steps = match settings.get("max_steps", "REIN_MAX_STEPS") {
@@ -329,13 +326,13 @@ mod tests {
         let parsed = args("--name Web --workspace health").unwrap();
         assert_eq!(
             (parsed.name.as_deref(), parsed.workspace.as_deref(), parsed.joining),
-            (Some("web"), Some("health"), Joining::On(Policy::Hold)),
-            "held for you, unless you say otherwise"
+            (Some("web"), Some("health"), Joining::On(Policy::Accept)),
+            "let in, unless you say otherwise"
         );
         assert_eq!(args("--worktree").err().as_deref(), Some("--worktree needs --workspace <name>: the worktree is the workspace's"));
         assert!(args("--name a/b").is_err());
-        let accepting = AskArgs::parse(vec![], &Settings::parse("peers = accept").unwrap()).unwrap();
-        assert_eq!(accepting.joining, Joining::On(Policy::Accept));
+        let held = AskArgs::parse(vec![], &Settings::parse("peers = hold").unwrap()).unwrap();
+        assert_eq!(held.joining, Joining::On(Policy::Hold));
     }
 
     #[test]
