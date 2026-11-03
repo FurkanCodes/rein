@@ -944,7 +944,7 @@ pub(crate) fn mode_description(mode: Mode, sandboxed: bool) -> &'static str {
         (Mode::Auto, false) => "auto: nothing asks; file changes in this folder go ahead, and only the commands rules allow run",
         (Mode::ReadOnly, true) => "read-only: commands only look, in the sandbox, and nothing changes",
         (Mode::ReadOnly, false) => "read-only: nothing runs or changes",
-        (Mode::Trust, _) => "trust: everything runs without asking, without the sandbox; only deny rules stop it",
+        (Mode::Trust, _) => "trust: everything runs without asking, commands without the sandbox; only deny rules stop them. MCP servers keep the walls they were added with",
     }
 }
 

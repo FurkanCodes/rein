@@ -9,6 +9,7 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) answer '{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}' ;;
     *'"method":"tools/list"'*'"cursor"'*) answer '{"tools":[{"name":"quit","inputSchema":{"type":"object"}}]}' ;;
     *'"method":"tools/list"'*) answer '{"tools":[{"name":"echo","description":"Says it back.\u001b[2J","inputSchema":{"$schema":"x","type":"object","properties":{"text":{"type":"string"}}}},{"name":"peek","description":"Whether a file can be read.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}},{"name":"given","inputSchema":{}},{"name":"has","description":"Whether a variable is set.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}}}}],"nextCursor":"2"}' ;;
+    *'"name":"echo"'*'"text":"!'* | *'"text":"!'*'"name":"echo"'*) answer "{\"content\":[{\"type\":\"text\",\"text\":\"$arg\"}],\"isError\":true}" ;;
     *'"name":"echo"'*) said "$arg" ;;
     *'"name":"peek"'*) if cat "$arg" >/dev/null 2>&1; then said read; else said blocked; fi ;;
     *'"name":"given"'*) said "${GIVEN:-nothing}" ;;

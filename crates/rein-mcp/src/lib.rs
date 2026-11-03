@@ -15,7 +15,7 @@ mod clean;
 pub mod config;
 mod rpc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -56,7 +56,8 @@ const LONGEST_NAME: usize = 64;
 const MOST_PAGES: usize = 50;
 
 /// A small MCP server in `sh`, for tests, so it runs anywhere, the sandbox
-/// too. It answers by what each line asks for: `echo` says its text back,
+/// too. It answers by what each line asks for: `echo` says its text back
+/// (as an error if it starts with `!`),
 /// `peek` whether it could read a path, `given` what `$GIVEN` is, `has`
 /// whether a variable is set, and `quit` stops it.
 #[cfg(any(test, feature = "test-support"))]
@@ -116,6 +117,12 @@ impl Launch {
         Ok(command)
     }
 
+    /// Whether `server` runs in the sandbox: then what it can't reach may
+    /// be why it fails.
+    fn walled(&self, server: &Server) -> bool {
+        server.access.walls().is_some() && self.sandbox.available()
+    }
+
     /// Starts `server`, says hello, and asks for its tools, within
     /// [`START`].
     async fn start(&self, server: &Server) -> Result<Connection, String> {
@@ -127,14 +134,7 @@ impl Launch {
             let rpc = rpc::Rpc::start(stdout, stdin, child.stderr.take());
             Connection::open(rpc, Some(Process { _group: group, _child: child })).await
         };
-        let walls = match server.access.walls() {
-            Some(walls) if self.sandbox.available() => format!(
-                " (it ran in the sandbox with {} access{}: if that's why, /mcp add it again with --access outside)",
-                server.access,
-                if walls.network { "" } else { ", without the internet" }
-            ),
-            _ => String::new(),
-        };
+        let walls = if self.walled(server) { format!(" (it ran {}. If that's why, /mcp add it again with --access outside)", walls(server.access)) } else { String::new() };
         match tokio::time::timeout(START, started).await {
             Ok(Ok(connection)) => Ok(connection),
             Ok(Err(e @ Error::Start(_))) => Err(e.to_string()),
@@ -277,6 +277,9 @@ pub struct Servers {
     offered: Mutex<HashMap<String, (Arc<Entry>, String)>>,
     /// The starts going on, stopped if rein lets the servers go first.
     starts: Mutex<tokio::task::JoinSet<()>>,
+    /// The servers whose failed calls the model was told the sandbox may
+    /// be why: once each, as most fail for reasons of their own.
+    told: Mutex<HashSet<String>>,
 }
 
 /// Never what the servers' environments hold.
@@ -312,7 +315,7 @@ impl Servers {
     /// Starts each of `servers` at once, in the background. Inside a
     /// runtime: the starts are its tasks.
     pub fn start(servers: Vec<Server>, launch: Launch) -> Servers {
-        let started = Servers { entries: Mutex::default(), launch, offered: Mutex::default(), starts: Mutex::default() };
+        let started = Servers { entries: Mutex::default(), launch, offered: Mutex::default(), starts: Mutex::default(), told: Mutex::default() };
         for server in servers {
             started.add(server);
         }
@@ -350,6 +353,7 @@ impl Servers {
             gone
         };
         lock(&self.offered).retain(|_, (entry, _)| entry.server.name != name);
+        lock(&self.told).remove(name);
         for entry in &gone {
             entry.start.abort();
         }
@@ -462,7 +466,16 @@ impl Servers {
             }
         };
         let said = connection.call(&tool, arguments).await;
-        let note = if again { format!("\n[rein: the {} server had stopped, so rein started it again for this call.]", entry.server.name) } else { String::new() };
+        let name = &entry.server.name;
+        let mut note = if again { format!("\n[rein: the {name} server had stopped, so rein started it again for this call.]") } else { String::new() };
+        // A server that can't reach what it needs says so in its own
+        // words, which may not say why: "the screen is locked".
+        if said.is_err() && self.launch.walled(&entry.server) && lock(&self.told).insert(name.clone()) {
+            note.push_str(&format!(
+                "\n[rein: the {name} server runs {}. If that's why this failed, the user can give it more with /mcp add {name} --access outside, then its command.]",
+                walls(entry.server.access)
+            ));
+        }
         said.map(|said| said + &note).map_err(|said| said + &note)
     }
 
@@ -480,10 +493,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The access a server's walls give, in words: for asking about one.
 pub fn walls(access: Access) -> &'static str {
     match access {
-        Access::Look => "in the sandbox: it reads the project, and not your home folder",
-        Access::Write => "in the sandbox: it changes the project, without the internet",
-        Access::Network => "in the sandbox: the project and the internet, not your home folder or keys",
-        Access::Outside => "outside the sandbox, with your full access: your files and keys",
+        Access::Look => "in the sandbox: it reads the project, and not your home folder, other apps or the screen",
+        Access::Write => "in the sandbox: it changes the project, without the internet, other apps or the screen",
+        Access::Network => "in the sandbox: the project and the internet, not your home folder, keys, other apps or the screen",
+        Access::Outside => "outside the sandbox, with your full access: your files, keys, apps and screen",
     }
 }
 

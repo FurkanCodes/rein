@@ -100,6 +100,29 @@ async fn a_server_in_the_sandbox_reads_the_project_but_not_your_home_folder() {
     assert!(caches.join("fake").is_dir(), "a folder of its own, for what npx fetches");
 }
 
+/// A server in the sandbox that fails may fail for what it can't reach,
+/// and say so only in its own words ("the screen is locked"): the model
+/// is told, once, what it runs in, and how you'd let it out.
+#[tokio::test]
+async fn a_walled_servers_failed_call_says_once_that_the_sandbox_may_be_why() {
+    let (server, launch, _) = fake("hint", Access::Network).await;
+    if !launch.sandbox.available() {
+        return;
+    }
+    let servers = Servers::start(vec![server.clone()], launch.clone());
+    servers.list().await;
+    let echo = |text: &str| json!({ "text": text }).to_string();
+    assert_eq!(servers.call("mcp__fake__echo", &echo("fine")).await, Ok("fine".into()), "only a failed call");
+    let first = servers.call("mcp__fake__echo", &echo("!no screen")).await.unwrap_err();
+    assert!(first.starts_with("!no screen\n[rein: the fake server runs in the sandbox: the project and the internet"), "{first}");
+    assert!(first.contains("other apps or the screen") && first.contains("/mcp add fake --access outside"), "{first}");
+    assert_eq!(servers.call("mcp__fake__echo", &echo("!no screen")).await, Err("!no screen".into()), "said once");
+
+    let outside = Servers::start(vec![Server { access: Access::Outside, ..server }], launch);
+    outside.list().await;
+    assert_eq!(outside.call("mcp__fake__echo", &echo("!no such repo")).await, Err("!no such repo".into()), "nothing walls it in");
+}
+
 #[tokio::test]
 async fn without_a_sandbox_one_meant_for_it_doesnt_start() {
     let (server, mut launch, _) = fake("nosandbox", Access::Network).await;

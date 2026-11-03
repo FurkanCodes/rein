@@ -218,6 +218,7 @@ message, so typing ahead can't answer it by accident.
 | `/mode [ask\|edits\|auto\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
+| `/mcp`, `/mcp add`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing; add one as you'd start it in a shell, or from the JSON its README gives; stop and remove one; let its tools run without asking (see [MCP servers](#mcp-servers)) |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
@@ -537,7 +538,9 @@ programs can't read it.
 | `read-only` | refused | runs | refused | refused |
 | `trust` | allowed | runs | runs | runs |
 
-`trust` runs everything without the sandbox, except what deny rules block.
+`trust` runs every command without the sandbox, except what deny rules
+block. An MCP server keeps the walls it was added with, in every mode:
+`--access outside` lets one out.
 `auto` never asks: it's for leaving rein to work on its own, and what would
 go past the sandbox is refused, so the model makes do or tells you what it
 needs. File changes to the protected paths above ask in every mode but
