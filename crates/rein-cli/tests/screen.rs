@@ -2259,7 +2259,8 @@ fn a_level_the_model_turns_down_is_said_once_and_not_offered_again() {
 }
 
 /// The words of a sub-agent's start script's last line, after `exec env
-/// NAME=value`: rein's arguments, as a new tab would run them.
+/// NAME=value…` and the program: rein's arguments, as a new tab would run
+/// them.
 fn child_args(script: &str) -> Vec<String> {
     let last = script.lines().last().unwrap_or_default();
     let mut words = Vec::new();
@@ -2270,8 +2271,8 @@ fn child_args(script: &str) -> Vec<String> {
         words.push(after[..end].to_owned());
         rest = &after[(end + 1).min(after.len())..];
     }
-    // The first quoted word is REIN_HOME's value, then the program.
-    words.into_iter().skip(2).collect()
+    // The variables' values come first, then the program.
+    words.into_iter().skip_while(|word| word != env!("CARGO_BIN_EXE_rein")).skip(1).collect()
 }
 
 #[test]
@@ -2295,6 +2296,11 @@ fn a_sub_agent_starts_in_a_new_tab_works_where_you_see_it_and_reports_back() {
     let script_path = line.trim().strip_prefix("/bin/sh ").unwrap().to_owned();
     let script = std::fs::read_to_string(&script_path).unwrap();
     assert!(!script.contains("run the test suite"), "the task isn't on its command line:\n{script}");
+    // A terminal app's tab has the app's PATH, not your shell's: without
+    // this one, the sub-agent couldn't find `claude` or `cargo`.
+    let path = std::env::var("PATH").unwrap_or_default();
+    assert!(script.contains(&format!(" PATH='{path}' ")), "the sub-agent finds programs where its parent does:\n{script}");
+    assert!(!script.contains("OPENAI_API_KEY"), "and no key goes with it:\n{script}");
     let args = child_args(&script);
     assert_eq!(&args[..2], ["--name", "tests"], "{args:?}");
     assert!(args.contains(&"--child".to_owned()), "{args:?}");

@@ -114,6 +114,14 @@ pub(crate) async fn spawn(call: &rein_llm::ToolCall, terminal: &mut Terminal) ->
     }
 }
 
+/// What a sub-agent's tab is given of this rein's environment: where rein
+/// keeps its files, and where programs and their settings are found. A
+/// tab a terminal app opens has the app's environment, not your shell's:
+/// on macOS its `PATH` is the system's alone, and a sub-agent couldn't
+/// find `claude`, or `cargo` for a command. None is a key: the script is
+/// a file, and keys never go in one.
+const CARRIED: [&str; 4] = ["REIN_HOME", "PATH", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR"];
+
 /// Starts the sub-agent `args` asks for, asking you first if `ask`: what
 /// the model is told of how it went.
 async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &mut Terminal) -> String {
@@ -150,7 +158,7 @@ async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &m
     if args.edits {
         argv.extend(["--workspace".to_owned(), format!("sub/{name}"), "--worktree".to_owned()]);
     }
-    let env: Vec<(String, String)> = ["REIN_HOME"].iter().filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_owned(), value))).collect();
+    let env: Vec<(String, String)> = CARRIED.iter().filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_owned(), value))).collect();
     let folder = super::folder(&crate::config_dir().unwrap_or_default());
     let opener = super::spawn::Opener::detect(&|key| std::env::var(key).ok(), terminal.tab_command.as_deref());
     let script = super::spawn::script(&opener, &node.info().root, &env, &argv);
