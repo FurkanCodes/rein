@@ -939,8 +939,11 @@ fn a_key_typed_after_logins_provider_is_never_shown_or_kept() {
     term.keys("make the file\r");
     term.wait_for("Running sleep 1");
     term.keys("/logout openrouter sk-or-v1-FAKE-while-working\r");
-    term.wait_until("why it can't go, or the key", |screen| screen.contains("/logout takes only a provider's name") || screen.contains("FAKE"));
-    assert!(!term.text().contains("FAKE"), "{}", term.text());
+    // While it's typed, the key is in the box, as what you type is: only
+    // outside it, above the box, is it shown when it shouldn't be.
+    let outside_the_box = |screen: &str| screen.lines().any(|line| line.contains("FAKE") && !line.contains('│'));
+    term.wait_until("why it can't go, or the key above the box", |screen| screen.contains("/logout takes only a provider's name") || outside_the_box(screen));
+    assert!(!outside_the_box(&term.text()), "{}", term.text());
     term.wait_for("Made it.");
     term.wait_for(IDLE);
     assert!(!term.text().contains("FAKE"), "{}", term.text());
