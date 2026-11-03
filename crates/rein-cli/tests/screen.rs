@@ -1470,13 +1470,60 @@ fn a_saved_key_is_checked_kept_private_used_and_forgotten() {
     let (ok, said) = run(&model, &home, &["models", "anthropic"], "");
     assert!(ok && said.contains("Using your saved Anthropic key with") && said.contains("claude-opus-5-5"), "{said}");
 
-    let (ok, said) = run(&model, &home, &["login", "nobody"], "key\n");
-    assert!(!ok && said.contains("no provider called nobody"), "{said}");
+    // A key typed where the provider's name goes isn't said back.
+    let (ok, said) = run(&model, &home, &["login", "sk-ant-FAKE-in-place-of-a-name"], "key\n");
+    assert!(!ok && said.contains("there's no provider by that name; rein knows chatgpt, openai, anthropic") && !said.contains("FAKE"), "{said}");
     let (ok, said) = run(&model, &home, &["logout", "anthropic"], "");
     assert!(ok && said.contains("Forgot your anthropic key."), "{said}");
     let (ok, said) = run(&model, &home, &["models", "anthropic"], "");
     assert!(!ok && said.contains("no key for Anthropic: set ANTHROPIC_API_KEY, or run `rein login anthropic`"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Every file under `dir`, in its folders too.
+fn every_file(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() { files.extend(every_file(&path)) } else { files.push(path) }
+    }
+    files
+}
+
+#[test]
+fn a_key_typed_after_login_is_turned_down_and_goes_nowhere() {
+    let model = Model::start(vec![says("This should never be asked for.")]);
+    let dir = std::env::temp_dir().join(format!("rein-login-more-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (home, project) = (dir.join("home"), dir.join("project"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let key = "sk-or-v1-FAKE-typed-after-the-name";
+    for args in [&["login", "openrouter", key][..], &["login", "openrouter", "--key", key], &["login", "--key", key], &["logout", "openrouter", key], &["logout"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_rein"))
+            .args(args)
+            .current_dir(&project)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("REIN_HOME", &home)
+            // A model that would answer, were anything sent to it.
+            .env("OPENAI_API_KEY", "test")
+            .env("OPENAI_BASE_URL", &model.base)
+            .env("BROWSER", "false")
+            .env("SSH_CONNECTION", "screen-test")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && said.contains("takes"), "{args:?} is turned down: {said}");
+        assert!(!said.contains("FAKE"), "and never said back: {said}");
+    }
+    assert!(model.requests().is_empty(), "nothing went to the model: {:?}", model.requests());
+    for file in every_file(&dir) {
+        assert!(!std::fs::read_to_string(&file).unwrap_or_default().contains("FAKE"), "{} has the key", file.display());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

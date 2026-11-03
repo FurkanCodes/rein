@@ -83,7 +83,11 @@ async fn run(args: Vec<String>) -> CliResult {
         ["logout", "anthropic", "--oauth"] => connect::logout(claude::NAME, &|line| say!("{line}")),
         ["login", provider] => connect::login(&http, provider, false).await,
         ["login", provider, "--key"] => connect::login(&http, provider, true).await,
+        // Anything else after `login` or `logout` may be a key: it's
+        // turned down, never sent anywhere, and never said back.
+        ["login", ..] => Err("rein login takes only a provider's name (and --key); paste the key when it asks".into()),
         ["logout", provider] => connect::logout(provider, &|line| say!("{line}")),
+        ["logout", ..] => Err("rein logout takes a provider's name, and only that, like `rein logout anthropic`".into()),
         ["providers"] => connect::list(),
         ["models"] => connect::models(&http, None).await,
         ["models", provider] => connect::models(&http, Some(provider)).await,

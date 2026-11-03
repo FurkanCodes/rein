@@ -238,11 +238,12 @@ pub async fn connect(http: &rein_llm::reqwest::Client, providers: &[Provider], k
     Ok(Connected { provider: provider.clone(), pays, model, client, models })
 }
 
-/// The provider called `name`, or what to say when there's none.
+/// The provider called `name`, to sign in to, or what to say when there's
+/// none. That doesn't say `name` back: a key typed in its place would show.
 pub fn find<'a>(providers: &'a [Provider], name: &str) -> CliResult<&'a Provider> {
     providers.iter().find(|p| p.name == name).ok_or_else(|| {
         let names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
-        format!("no provider called {name}; rein knows chatgpt, {}", names.join(", "))
+        format!("there's no provider by that name; rein knows chatgpt, {}", names.join(", "))
     })
 }
 
