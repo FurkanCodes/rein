@@ -373,7 +373,7 @@ async fn peers_view(terminal: &mut Terminal) -> CliResult {
             (info.name.clone(), about)
         })
         .collect();
-    let Some(picked) = terminal.input.choose(Menu { title: "which rein".into(), items, current: None }).await else { return Ok(()) };
+    let Some(picked) = terminal.input.choose(Menu { title: "which rein".into(), items, current: None, at: None }).await else { return Ok(()) };
     let (info, status) = &reins[picked];
     let mut actions = vec![("send it a message".to_owned(), String::new()), ("hand it a task".to_owned(), "its result comes back here".to_owned())];
     let question = status.as_ref().and_then(|st| st.question.clone());
@@ -381,7 +381,7 @@ async fn peers_view(terminal: &mut Terminal) -> CliResult {
         actions.push(("answer yes".to_owned(), preview(&question.text)));
         actions.push(("answer no".to_owned(), String::new()));
     }
-    let Some(action) = terminal.input.choose(Menu { title: format!("{}: do what", info.name), items: actions, current: None }).await else { return Ok(()) };
+    let Some(action) = terminal.input.choose(Menu { title: format!("{}: do what", info.name), items: actions, current: None, at: None }).await else { return Ok(()) };
     match action {
         0 => write_to(Some(info.address()), None, false, terminal).await,
         1 => write_to(Some(info.address()), None, true, terminal).await,
@@ -404,7 +404,9 @@ async fn write_to(to: Option<String>, text: Option<String>, task: bool, terminal
                 return Err("no other rein is running: start one in another terminal tab".into());
             }
             let items = peers.iter().map(|p| (p.name.clone(), p.workspace.clone())).collect();
-            let Some(i) = terminal.input.choose(Menu { title: if task { "hand a task to".into() } else { "send to".into() }, items, current: None }).await else { return Ok(()) };
+            let Some(i) = terminal.input.choose(Menu { title: if task { "hand a task to".into() } else { "send to".into() }, items, current: None, at: None }).await else {
+                return Ok(());
+            };
             peers[i].address()
         }
     };
@@ -441,7 +443,7 @@ async fn inbox(agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
         return Ok(());
     }
     let items = held.iter().map(|incoming| (incoming.from().to_owned(), preview(&incoming.text()))).collect();
-    let Some(i) = terminal.input.choose(Menu { title: "let which in".into(), items, current: None }).await else { return Ok(()) };
+    let Some(i) = terminal.input.choose(Menu { title: "let which in".into(), items, current: None, at: None }).await else { return Ok(()) };
     let Some(incoming) = node(terminal)?.take_held(i) else { return Ok(()) };
     work_on(incoming, agent, terminal).await
 }

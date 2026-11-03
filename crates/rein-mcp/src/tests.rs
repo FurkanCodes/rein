@@ -30,7 +30,7 @@ async fn fake(name: &str, access: Access) -> (Server, Launch, PathBuf) {
         access,
         allow: vec!["echo".into()],
     };
-    (server, Launch { sandbox, root, caches: home.join(".cache/rein/mcp") }, home)
+    (server, Launch { sandbox, root, caches: home.join(".cache/rein/mcp"), keys: Arc::default() }, home)
 }
 
 #[tokio::test]
@@ -81,7 +81,27 @@ async fn one_that_cant_start_says_why() {
     assert!(note.contains("fake didn't start: can't run rein-no-such-command"), "{note}");
     assert!(note.contains("exits didn't start: it stopped, saying: Error: no TOKEN"), "{note}");
     assert!(note.contains("missing didn't start: it needs REIN_TEST_UNSET_VARIABLE, which isn't set"), "{note}");
-    assert!(servers.statuses().iter().all(|(_, status)| matches!(status, Status::Failed(_))));
+    assert!(note.ends_with(". /mcp says what to do"), "{note}");
+    let failures: Vec<Status> = servers.statuses().into_iter().map(|(_, status)| status).collect();
+    assert_eq!(failures[2], Status::Failed(Failure::Needs("REIN_TEST_UNSET_VARIABLE".into())), "what to ask for, by name, not in words to search: {failures:?}");
+    assert!(matches!(&failures[1], Status::Failed(Failure::Other(why)) if why.contains("no TOKEN")), "outside the sandbox, the sandbox isn't why: {failures:?}");
+}
+
+/// A variable your environment hasn't is filled in from what you gave
+/// rein, which is then hidden like any key.
+#[tokio::test]
+async fn a_variable_you_gave_rein_fills_in_what_your_environment_hasnt() {
+    let (mut server, launch, _) = fake("given", Access::Outside).await;
+    server.env = [("GIVEN".to_owned(), "${REIN_TEST_GIVEN_KEY}".to_owned())].into();
+    let servers = Servers::start(Vec::new(), launch);
+    assert_eq!(server.needs(&|name| servers.keys().get(name)).as_deref(), Some("REIN_TEST_GIVEN_KEY"));
+    servers.keys().set("REIN_TEST_GIVEN_KEY", "FAKE-given-key");
+    assert_eq!(server.needs(&|name| servers.keys().get(name)), None);
+    servers.add(server);
+    servers.list().await;
+    assert_eq!(servers.call("mcp__fake__given", "{}").await, Ok("FAKE-given-key".into()));
+    assert_eq!(servers.secrets(), ["FAKE-given-key", "FAKE-given-key"], "what its environment got, and what you gave");
+    assert_eq!(format!("{:?}", servers.keys()), r#"["REIN_TEST_GIVEN_KEY"]"#, "Debug names the variable, never its value");
 }
 
 #[tokio::test]
@@ -113,10 +133,14 @@ async fn a_walled_servers_failed_call_says_once_that_the_sandbox_may_be_why() {
     servers.list().await;
     let echo = |text: &str| json!({ "text": text }).to_string();
     assert_eq!(servers.call("mcp__fake__echo", &echo("fine")).await, Ok("fine".into()), "only a failed call");
+    assert!(!servers.failed_in_walls("fake"));
     let first = servers.call("mcp__fake__echo", &echo("!no screen")).await.unwrap_err();
     assert!(first.starts_with("!no screen\n[rein: the fake server runs in the sandbox: the project and the internet"), "{first}");
-    assert!(first.contains("other apps or the screen") && first.contains("/mcp add fake --access outside"), "{first}");
+    assert!(first.contains("other apps or the screen") && first.contains("let it out of the sandbox from /mcp"), "{first}");
     assert_eq!(servers.call("mcp__fake__echo", &echo("!no screen")).await, Err("!no screen".into()), "said once");
+    assert!(servers.failed_in_walls("fake"), "for /mcp to offer to let it out");
+    servers.add(server.clone());
+    assert!(!servers.failed_in_walls("fake"), "started again, it's forgotten");
 
     let outside = Servers::start(vec![Server { access: Access::Outside, ..server }], launch);
     outside.list().await;
@@ -130,6 +154,26 @@ async fn without_a_sandbox_one_meant_for_it_doesnt_start() {
     let servers = Servers::start(vec![server], launch);
     let note = servers.list().await.note.unwrap();
     assert!(note.contains("there's no sandbox here to start it in"), "{note}");
+    assert_eq!(servers.statuses()[0].1, Status::Failed(Failure::NoSandbox));
+}
+
+/// One that fails in the sandbox may fail for what the sandbox keeps from
+/// it: that's said, so you can be offered to let it out, and outside it
+/// starts.
+#[tokio::test]
+async fn one_that_fails_in_the_sandbox_says_so_and_starts_outside() {
+    let (mut server, launch, home) = fake("inwalls", Access::Network).await;
+    if !launch.sandbox.available() {
+        return;
+    }
+    // It reads a file in your home folder as it starts, as one that keeps
+    // its settings there does.
+    (server.command, server.args) = ("sh".into(), vec!["-c".into(), format!("cat {} > /dev/null && exec sh server.sh", home.join(".ssh/id_test").display())]);
+    let servers = Servers::start(vec![server.clone()], launch);
+    let status = servers.started("fake").await;
+    assert!(matches!(&status, Some(Status::Failed(Failure::InWalls(_)))), "{status:?}");
+    servers.add(Server { access: Access::Outside, ..server });
+    assert!(matches!(servers.started("fake").await, Some(Status::Ready(_))), "outside, it starts");
 }
 
 /// Whether the process `pid` is still there.
@@ -227,7 +271,7 @@ async fn a_server_from_npm_starts_in_the_sandbox() {
         access: Access::Network,
         allow: Vec::new(),
     };
-    let servers = Servers::start(vec![server], Launch { sandbox, root: root.clone(), caches: root.join("caches") });
+    let servers = Servers::start(vec![server], Launch { sandbox, root: root.clone(), caches: root.join("caches"), keys: Arc::default() });
     let listing = servers.list().await;
     println!("{:?}", listing.note);
     assert!(listing.tools.iter().any(|tool| tool.name == "mcp__everything__echo"), "{:?}", listing.note);

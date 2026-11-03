@@ -15,7 +15,7 @@ mod clean;
 pub mod config;
 mod rpc;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub use clean::text as cleaned;
-pub use config::{Named, Origin, Server, Skipped};
+pub use config::{Named, Origin, Server, Skipped, Unfilled};
 pub use rpc::Error;
 
 /// What the names of servers' tools start with: they can't clash with
@@ -75,18 +75,89 @@ pub fn parts(name: &str) -> Option<(&str, &str)> {
 }
 
 /// How servers are started: in this sandbox, in this project, each with a
-/// folder of its own under `caches` for what `npx` or `uvx` fetch.
+/// folder of its own under `caches` for what `npx` or `uvx` fetch, and the
+/// variables they name filled in from your environment or `keys`.
 #[derive(Clone)]
 pub struct Launch {
     pub sandbox: Arc<Sandbox>,
     pub root: PathBuf,
     pub caches: PathBuf,
+    pub keys: Arc<Keys>,
+}
+
+/// The values you gave rein for the variables servers name (`${NAME}`),
+/// for when your environment hasn't one: so a server's key needn't be
+/// exported in the shell rein starts from.
+#[derive(Default)]
+pub struct Keys(Mutex<BTreeMap<String, String>>);
+
+impl Keys {
+    pub fn new(given: BTreeMap<String, String>) -> Keys {
+        Keys(Mutex::new(given))
+    }
+
+    /// Your variable `name`: your environment's value, or else the one you
+    /// gave rein. An empty one isn't a value.
+    pub fn get(&self, name: &str) -> Option<String> {
+        rein_sandbox::secrets::get(name).filter(|value| !value.is_empty()).or_else(|| lock(&self.0).get(name).cloned())
+    }
+
+    pub fn set(&self, name: &str, value: &str) {
+        lock(&self.0).insert(name.to_owned(), value.to_owned());
+    }
+
+    /// Every value you gave: each is hidden wherever it shows up.
+    pub fn values(&self) -> Vec<String> {
+        lock(&self.0).values().cloned().collect()
+    }
+}
+
+/// Only which variables there are values for.
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(lock(&self.0).keys()).finish()
+    }
+}
+
+/// Why a server didn't start, as what can be done about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// A variable of yours it names isn't set: its name. Given a value, it
+    /// can start.
+    Needs(String),
+    /// It ran in the sandbox and failed, saying this: what it couldn't
+    /// reach may be why, though it seldom says so.
+    InWalls(String),
+    /// It's meant for the sandbox, and there's none here.
+    NoSandbox,
+    /// Anything else, said in words.
+    Other(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Needs(name) => write!(f, "it needs {name}, which isn't set"),
+            Failure::InWalls(why) => write!(f, "{why} (it ran in the sandbox, which may be why)"),
+            Failure::NoSandbox => f.write_str("there's no sandbox here to start it in"),
+            Failure::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<Unfilled> for Failure {
+    fn from(unfilled: Unfilled) -> Failure {
+        match unfilled {
+            Unfilled::Needs(name) => Failure::Needs(name),
+            unended @ Unfilled::Unended(_) => Failure::Other(unended.to_string()),
+        }
+    }
 }
 
 impl Launch {
     /// The command that starts `server`, in its walls.
-    fn command(&self, server: &Server) -> Result<tokio::process::Command, Error> {
-        let filled = server.filled(&rein_sandbox::secrets::get).map_err(Error::Start)?;
+    fn command(&self, server: &Server) -> Result<tokio::process::Command, Failure> {
+        let filled = server.filled(&|name| self.keys.get(name))?;
         let mut command = match server.access.walls() {
             // Your whole environment, keys rein kept for itself included,
             // as a command outside the sandbox gets it.
@@ -97,12 +168,12 @@ impl Launch {
             }
             Some(walls) => {
                 if !self.sandbox.available() {
-                    return Err(Error::Start("there's no sandbox here to start it in; with --access outside it starts with your full access".into()));
+                    return Err(Failure::NoSandbox);
                 }
                 let own = self.caches.join(&server.name);
-                std::fs::create_dir_all(&own).map_err(|e| Error::Start(format!("can't make its folder {}: {e}", own.display())))?;
+                std::fs::create_dir_all(&own).map_err(|e| Failure::Other(format!("can't make its folder {}: {e}", own.display())))?;
                 let line = format!("exec {}", std::iter::once(&filled.command).chain(&filled.args).map(|word| config::quote(word)).collect::<Vec<_>>().join(" "));
-                let mut command = self.sandbox.with_own(&own).wrap(&line, walls).map_err(Error::Start)?;
+                let mut command = self.sandbox.with_own(&own).wrap(&line, walls).map_err(Failure::Other)?;
                 // What `npx` and `uvx` fetch goes in its own folder: the
                 // shared caches it may only read, as what's put in them
                 // runs later, outside.
@@ -125,21 +196,23 @@ impl Launch {
 
     /// Starts `server`, says hello, and asks for its tools, within
     /// [`START`].
-    async fn start(&self, server: &Server) -> Result<Connection, String> {
+    async fn start(&self, server: &Server) -> Result<Connection, Failure> {
+        let mut command = self.command(server)?;
         let started = async {
-            let mut child = self.command(server)?.spawn().map_err(|e| Error::Start(format!("can't run {}: {e}", server.command)))?;
+            let mut child = command.spawn().map_err(|e| Error::Start(format!("can't run {}: {e}", server.command)))?;
             let group = Group::new(child.id());
             let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
             let (Some(stdin), Some(stdout)) = (stdin, stdout) else { return Err(Error::Start("its input and output weren't there to talk over".into())) };
             let rpc = rpc::Rpc::start(stdout, stdin, child.stderr.take());
             Connection::open(rpc, Some(Process { _group: group, _child: child })).await
         };
-        let walls = if self.walled(server) { format!(" (it ran {}. If that's why, /mcp add it again with --access outside)", walls(server.access)) } else { String::new() };
+        // Once it runs, what it can't reach may be why it fails.
+        let failed = |why: String| if self.walled(server) { Failure::InWalls(why) } else { Failure::Other(why) };
         match tokio::time::timeout(START, started).await {
             Ok(Ok(connection)) => Ok(connection),
-            Ok(Err(e @ Error::Start(_))) => Err(e.to_string()),
-            Ok(Err(e)) => Err(format!("{e}{walls}")),
-            Err(_) => Err(format!("it didn't start within {}s{walls}", START.as_secs())),
+            Ok(Err(Error::Start(why))) => Err(Failure::Other(why)),
+            Ok(Err(e)) => Err(failed(e.to_string())),
+            Err(_) => Err(failed(format!("it didn't start within {}s", START.as_secs()))),
         }
     }
 }
@@ -238,13 +311,13 @@ pub enum Status {
     /// It stopped after it started; it starts again on its next call.
     Stopped,
     /// It didn't start, and why.
-    Failed(String),
+    Failed(Failure),
 }
 
 enum State {
     Starting,
     Ready(Arc<Connection>),
-    Failed(String),
+    Failed(Failure),
 }
 
 impl State {
@@ -384,6 +457,31 @@ impl Servers {
         self.entries().iter().map(|entry| entry.server.clone()).collect()
     }
 
+    /// The server called `name`, as its file names it.
+    pub fn server(&self, name: &str) -> Option<Server> {
+        self.entries().into_iter().find(|entry| entry.server.name == name).map(|entry| entry.server.clone())
+    }
+
+    /// The values you gave rein for servers' variables.
+    pub fn keys(&self) -> &Keys {
+        &self.launch.keys
+    }
+
+    /// What rein hides wherever it shows up: what the servers'
+    /// environments get from your variables, what's named like a key, and
+    /// every value you gave rein.
+    pub fn secrets(&self) -> Vec<String> {
+        let keys = &self.launch.keys;
+        self.entries().iter().flat_map(|entry| entry.server.secrets(&|name| keys.get(name))).chain(keys.values()).collect()
+    }
+
+    /// Whether a call to the server called `name` failed as it ran in the
+    /// sandbox: then the sandbox may be why, and letting it out may help.
+    /// Forgotten once it's started again, in other walls or the same.
+    pub fn failed_in_walls(&self, name: &str) -> bool {
+        lock(&self.told).contains(name)
+    }
+
     /// Whether any is still starting.
     pub fn starting(&self) -> bool {
         self.entries().iter().any(|entry| !matches!(entry.state.try_lock().as_deref(), Ok(State::Ready(_) | State::Failed(_))))
@@ -401,17 +499,19 @@ impl Servers {
     /// failed to: each named for its server, and left out if that name is
     /// too long or taken. They're what the conversation offers from now on.
     pub async fn list(&self) -> Listing {
-        let (mut listing, mut offered, mut said) = (Listing::default(), HashMap::new(), Vec::new());
+        let (mut listing, mut offered, mut said, mut failed) = (Listing::default(), HashMap::new(), Vec::new(), false);
         for entry in self.entries() {
             let state = entry.state.lock().await;
             let connection = match &*state {
                 State::Ready(connection) => connection.clone(),
                 State::Failed(why) => {
                     said.push(format!("{} didn't start: {why}", entry.server.name));
+                    failed = true;
                     continue;
                 }
                 State::Starting => {
                     said.push(format!("{} didn't start", entry.server.name));
+                    failed = true;
                     continue;
                 }
             };
@@ -436,7 +536,8 @@ impl Servers {
             said.push(format!("{} ({tools}{left_out})", entry.server.name));
         }
         *lock(&self.offered) = offered;
-        listing.note = (!said.is_empty()).then(|| format!("MCP servers: {}", said.join("; ")));
+        let fix = if failed { ". /mcp says what to do" } else { "" };
+        listing.note = (!said.is_empty()).then(|| format!("MCP servers: {}{fix}", said.join("; ")));
         listing
     }
 
@@ -472,7 +573,7 @@ impl Servers {
         // words, which may not say why: "the screen is locked".
         if said.is_err() && self.launch.walled(&entry.server) && lock(&self.told).insert(name.clone()) {
             note.push_str(&format!(
-                "\n[rein: the {name} server runs {}. If that's why this failed, the user can give it more with /mcp add {name} --access outside, then its command.]",
+                "\n[rein: the {name} server runs {}. If that's why this failed, the user can let it out of the sandbox from /mcp: picking {name} there offers it.]",
                 walls(entry.server.access)
             ));
         }

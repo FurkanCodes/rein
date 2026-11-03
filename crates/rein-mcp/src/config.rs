@@ -17,7 +17,8 @@
 //! runs inside, as a command's are: `network` when not said, and `outside`
 //! for one that needs your whole home folder. `allow` names tools that run
 //! without asking, or `*` for all of one server's; it counts only in your
-//! own file, never in a project's.
+//! own file, never in a project's. `"disabled": true`, as Cline writes it,
+//! keeps a server in the file without starting it.
 
 use std::collections::BTreeMap;
 
@@ -87,19 +88,22 @@ pub struct Skipped {
     pub why: String,
 }
 
-/// What files name: the servers to start, and those rein can't.
+/// What files name: the servers to start, those turned off, and those
+/// rein can't start.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Named {
     pub servers: Vec<Server>,
+    /// Your servers you turned off (`"disabled": true`): kept, not started.
+    pub off: Vec<Server>,
     pub skipped: Vec<Skipped>,
 }
 
 impl Named {
     /// Both files' servers. One of the project's with the name of one of
-    /// yours is left out: yours is the one you meant.
+    /// yours, on or off, is left out: yours is the one you meant.
     pub fn and(mut self, project: Named) -> Named {
         for server in project.servers {
-            if self.servers.iter().any(|yours| yours.name == server.name) {
+            if self.servers.iter().chain(&self.off).any(|yours| yours.name == server.name) {
                 self.skipped.push(Skipped { name: server.name, origin: server.origin, why: "your own mcp.json has a server of that name".into() });
             } else {
                 self.servers.push(server);
@@ -130,6 +134,8 @@ struct Entry {
     access: Option<Access>,
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(default)]
+    disabled: bool,
 }
 
 /// How a server is reached. rein starts commands; the others are a URL.
@@ -305,19 +311,31 @@ fn servers(entries: BTreeMap<String, Value>, origin: Origin) -> Named {
             }
         };
         let remote = entry.url.is_some() || matches!(entry.kind, Some(Kind::Http | Kind::Sse));
-        match entry.command {
-            _ if remote => named.skipped.push(skip("it's reached at a URL, and rein only starts servers on this computer so far".into())),
-            None => named.skipped.push(skip("it has no command to start".into())),
-            Some(command) => named.servers.push(Server {
-                name,
-                origin,
-                command,
-                args: entry.args,
-                env: entry.env,
-                access: entry.access.unwrap_or(Access::Network),
-                // A project doesn't decide what runs without asking you.
-                allow: if origin == Origin::Yours { entry.allow } else { Vec::new() },
-            }),
+        let command = match entry.command {
+            _ if remote => {
+                named.skipped.push(skip("it's reached at a URL, and rein only starts servers on this computer so far".into()));
+                continue;
+            }
+            None => {
+                named.skipped.push(skip("it has no command to start".into()));
+                continue;
+            }
+            Some(command) => command,
+        };
+        let server = Server {
+            name,
+            origin,
+            command,
+            args: entry.args,
+            env: entry.env,
+            access: entry.access.unwrap_or(Access::Network),
+            // A project doesn't decide what runs without asking you.
+            allow: if origin == Origin::Yours { entry.allow } else { Vec::new() },
+        };
+        match (entry.disabled, origin) {
+            (false, _) => named.servers.push(server),
+            (true, Origin::Yours) => named.off.push(server),
+            (true, Origin::Project) => named.skipped.push(Skipped { name: server.name, origin, why: "its .mcp.json turns it off".into() }),
         }
     }
     named
@@ -401,12 +419,21 @@ impl Server {
 
     /// Its command, arguments and environment with each `${NAME}` filled
     /// in from `var`; what's missing if one isn't set.
-    pub(crate) fn filled(&self, var: &dyn Fn(&str) -> Option<String>) -> Result<Filled, String> {
+    pub(crate) fn filled(&self, var: &dyn Fn(&str) -> Option<String>) -> Result<Filled, Unfilled> {
         Ok(Filled {
             command: fill(&self.command, var)?,
             args: self.args.iter().map(|arg| fill(arg, var)).collect::<Result<_, _>>()?,
-            env: self.env.iter().map(|(name, value)| Ok((name.clone(), fill(value, var)?))).collect::<Result<_, String>>()?,
+            env: self.env.iter().map(|(name, value)| Ok((name.clone(), fill(value, var)?))).collect::<Result<_, Unfilled>>()?,
         })
+    }
+
+    /// The first variable of yours it needs that `var` has no value for,
+    /// and no default stands in for: what to ask for before it can start.
+    pub fn needs(&self, var: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+        match self.filled(var) {
+            Err(Unfilled::Needs(name)) => Some(name),
+            _ => None,
+        }
     }
 
     /// The values of its environment that rein must hide wherever they
@@ -415,6 +442,24 @@ impl Server {
     /// there to hide.
     pub fn secrets(&self, var: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
         self.env.iter().filter(|(name, value)| !references(value).is_empty() || rein_sandbox::looks_secret(name, value)).filter_map(|(_, value)| fill(value, var).ok()).collect()
+    }
+}
+
+/// Why a server's `${NAME}`s can't be filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unfilled {
+    /// A variable of yours it names isn't set: its name.
+    Needs(String),
+    /// A `${` doesn't end, in this text.
+    Unended(String),
+}
+
+impl std::fmt::Display for Unfilled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unfilled::Needs(name) => write!(f, "it needs {name}, which isn't set"),
+            Unfilled::Unended(text) => write!(f, "`{text}` has a ${{ that doesn't end"),
+        }
     }
 }
 
@@ -428,20 +473,20 @@ pub(crate) struct Filled {
 /// `text` with each `${NAME}` the value of the variable `NAME`, and each
 /// `${NAME:-default}` that or `default`, as in a shell. A `$` that doesn't
 /// start one stays as it is.
-fn fill(text: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+fn fill(text: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, Unfilled> {
     let mut filled = String::new();
     let mut rest = text;
     while let Some(at) = rest.find("${") {
         filled.push_str(&rest[..at]);
         let inside = &rest[at + 2..];
-        let end = inside.find('}').ok_or_else(|| format!("`{text}` has a ${{ that doesn't end"))?;
+        let end = inside.find('}').ok_or_else(|| Unfilled::Unended(text.to_owned()))?;
         let (name, default) = match inside[..end].split_once(":-") {
             Some((name, default)) => (name, Some(default)),
             None => (&inside[..end], None),
         };
         match var(name).filter(|value| !value.is_empty()).or_else(|| default.map(str::to_owned)) {
             Some(value) => filled.push_str(&value),
-            None => return Err(format!("it needs {name}, which isn't set")),
+            None => return Err(Unfilled::Needs(name.to_owned())),
         }
         rest = &inside[end + 1..];
     }
@@ -513,6 +558,19 @@ mod tests {
     }
 
     #[test]
+    fn a_server_turned_off_is_kept_and_not_started_and_still_wins_its_name() {
+        let file = r#"{ "mcpServers": { "gh": { "command": "gh-mcp", "disabled": true }, "docs": { "command": "uvx", "disabled": false } } }"#;
+        let yours = read(file, Origin::Yours).unwrap();
+        assert_eq!((yours.servers.len(), yours.servers[0].name.as_str()), (1, "docs"));
+        assert_eq!((yours.off.len(), yours.off[0].command.as_str()), (1, "gh-mcp"), "kept, to turn on again");
+        let project = read(r#"{ "mcpServers": { "gh": { "command": "evil" }, "x": { "command": "x", "disabled": true } } }"#, Origin::Project).unwrap();
+        assert!(project.off.is_empty() && project.skipped.iter().any(|s| s.name == "x" && s.why.contains("turns it off")), "a project's is only skipped");
+        let both = yours.and(project);
+        assert!(both.servers.iter().all(|s| s.command != "evil"), "your gh, though off, is the one you meant");
+        assert!(both.skipped.iter().any(|s| s.name == "gh" && s.origin == Origin::Project));
+    }
+
+    #[test]
     fn variables_are_filled_in_as_it_starts_and_what_they_hold_is_hidden() {
         let github = read(FILE, Origin::Yours).unwrap().servers.remove(1);
         assert_eq!(github.takes(), ["GH_MODE", "GITHUB_TOKEN"]);
@@ -521,10 +579,11 @@ mod tests {
         assert_eq!(filled.env["GITHUB_PERSONAL_ACCESS_TOKEN"], "FAKE-gh-token-123");
         assert_eq!(filled.env["MODE"], "fast", "the default, as in a shell");
         assert_eq!(github.secrets(&var), ["FAKE-gh-token-123", "fast"], "what came from your variables");
-        let missing = github.filled(&|_| None).err().unwrap();
-        assert!(missing.contains("GITHUB_TOKEN"), "{missing}");
+        assert_eq!(github.filled(&|_| None).err(), Some(Unfilled::Needs("GITHUB_TOKEN".into())), "what to ask for, by name");
+        assert_eq!(github.needs(&|_| None).as_deref(), Some("GITHUB_TOKEN"));
+        assert_eq!(github.needs(&var), None, "GH_MODE has a default");
         assert_eq!(fill("cost: $5 ${A}", &|_| Some("x".into())).unwrap(), "cost: $5 x");
-        assert!(fill("${A", &|_| None).is_err());
+        assert_eq!(fill("${A", &|_| None), Err(Unfilled::Unended("${A".into())));
         let literal = Server { env: [("API_KEY".to_owned(), "FAKE-literal-key".to_owned()), ("LEVEL".to_owned(), "verbose".to_owned())].into(), ..github };
         assert_eq!(literal.secrets(&|_| None), ["FAKE-literal-key"], "a key written in as it is, by its name");
         assert!(!format!("{literal:?}").contains("FAKE-literal-key"));

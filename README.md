@@ -218,7 +218,7 @@ message, so typing ahead can't answer it by accident.
 | `/mode [ask\|edits\|auto\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
-| `/mcp`, `/mcp add`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing; add one as you'd start it in a shell, or from the JSON its README gives; stop and remove one; let its tools run without asking (see [MCP servers](#mcp-servers)) |
+| `/mcp`, `/mcp add`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one as you'd start it in a shell, or from the JSON its README gives; the same changes typed (see [MCP servers](#mcp-servers)) |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
@@ -540,7 +540,7 @@ programs can't read it.
 
 `trust` runs every command without the sandbox, except what deny rules
 block. An MCP server keeps the walls it was added with, in every mode:
-`--access outside` lets one out.
+`/mcp` lets one out.
 `auto` never asks: it's for leaving rein to work on its own, and what would
 go past the sandbox is refused, so the model makes do or tells you what it
 needs. File changes to the protected paths above ask in every mode but
@@ -571,16 +571,26 @@ MCP servers give the model more tools: an issue tracker's, a browser's, a
 database's. Add one in the conversation, as you'd start it in a shell:
 
 ```
-/mcp add github GITHUB_PERSONAL_ACCESS_TOKEN=$GITHUB_TOKEN npx -y @modelcontextprotocol/server-github
-/mcp allow github get_issue search_issues
-/mcp remove github
+/mcp add context7 npx -y @upstash/context7-mcp
 ```
 
 Or paste the JSON a server's README gives after `/mcp add`, as it is.
-`--access outside` before the command gives it other walls (see below).
 rein starts it at once and says how it did, and the model is offered its
-tools from your next message. `/mcp allow` lets a server's tools run
-without asking, or `*` all of them.
+tools from your next message.
+
+`/mcp` lists the servers, then lets you pick one and change it: choose the
+tools that run without asking, change its walls, restart it, turn it off
+(it stays in your file, `"disabled": true`) or on, or remove it. A
+project's server you said no to waits there for a yes. Typed, the same is
+`/mcp allow <name> <tool …|*>` and `/mcp remove <name>`.
+
+When a server doesn't start, rein says why and offers what would fix it,
+there and then. One that needs a variable you haven't set (`${NAME}`) has
+it asked for, in dots, as rein starts or as you add it: it's kept in
+`~/.config/rein/mcp-keys.json`, which only you can read and the sandbox
+hides, and filled in when your shell hasn't it. Your environment's value
+wins. One that fails in the sandbox is asked about running outside it,
+which a yes writes in your file. Nothing needs typing again.
 
 These write `~/.config/rein/mcp.json`, which you can edit too. rein also
 reads a project's `.mcp.json`. Both have the shape Claude Code and Cursor
@@ -598,7 +608,8 @@ use:
 
 A line that writes a key in as it is (`TOKEN=ghp_…` rather than
 `$GITHUB_TOKEN`) isn't shown again or kept for ↑. The key is kept in your
-`mcp.json`, which only you can read.
+`mcp.json`, which only you can read. Leave it out and give the variable's
+name instead (`TOKEN=$GITHUB_TOKEN`): rein asks for it in dots.
 
 A server is someone else's code, often fetched as it starts, so it runs in
 the sandbox the way a command with `network` access does. It reaches the
@@ -607,7 +618,9 @@ programs' sockets, or rein's keys. What `npx` or `uvx` fetch goes in a
 folder of the server's own, `~/.cache/rein/mcp/<server>`, which nothing else
 may write. `"access"` gives it other walls: `look`, `write`, or `outside`
 for one that needs all of your home folder, like one that reads
-`~/.config/gh`. Its environment is what `env` gives it. `${NAME}` is a
+`~/.config/gh`; `/mcp` changes it, and `--access` before the command sets
+it as you add one. A project's server is never let out from `/mcp`: the
+project doesn't decide that. Its environment is what `env` gives it. `${NAME}` is a
 variable of yours, filled in as it starts, and its value is hidden wherever
 it shows up.
 
@@ -636,6 +649,8 @@ minutes. A long result is cut, and kept whole in a file in the temp folder
 for the model to read in parts. A server that stops is started again on its
 next call. `/mcp` shows each server, its walls and its tools, or why it
 didn't start. Servers reached at a URL, and their sign-ins, come later.
+When one of a server's calls fails in the sandbox, the model is told once
+that the sandbox may be why, and that you can let it out from `/mcp`.
 
 ## Layout
 

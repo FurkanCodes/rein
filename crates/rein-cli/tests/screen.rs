@@ -2609,17 +2609,33 @@ fn spawn_starts_a_sub_agent_you_name_without_asking() {
     tests.wait_exit();
 }
 
-/// Asks `/mcp` until it shows `text`: a server takes a moment to start.
+/// Asks `/mcp` until it shows `text`, as a server takes a moment to start,
+/// leaving the list of servers to pick from each time with Esc.
 fn wait_for_mcp(term: &mut Term, text: &str) {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(10) {
         term.keys("/mcp\r");
-        std::thread::sleep(Duration::from_millis(300));
-        if term.text().contains(text) {
+        term.wait_for(PICKING);
+        let shown = term.text().contains(text);
+        term.keys("\x1b");
+        term.wait_for(IDLE);
+        if shown {
             return;
         }
+        std::thread::sleep(Duration::from_millis(300));
     }
     panic!("/mcp never showed {text:?}. The screen:\n{}", term.text());
+}
+
+/// What the box says while a list waits for a pick.
+const PICKING: &str = "type to narrow the list";
+
+/// Picks, in the list on screen, the item `typed` narrows it to.
+fn pick(term: &mut Term, typed: &str) {
+    term.wait_for(PICKING);
+    term.keys(typed);
+    term.wait_until(&format!("the list narrowed to {typed:?}"), |screen| !screen.contains(PICKING));
+    term.keys("\r");
 }
 
 /// Your own MCP server starts with rein, in the sandbox, and its tools are
@@ -2671,16 +2687,16 @@ fn a_projects_mcp_server_starts_only_once_you_say_yes_to_it_as_it_is() {
     std::thread::sleep(Duration::from_millis(700));
     term.keys("n");
     term.wait_for(IDLE);
+    // Said no, it waits in /mcp for a yes, without starting rein again.
     term.keys("/mcp\r");
-    term.wait_for("not started: you said no");
-    term.keys("/exit\r");
-
-    let mut term = term.again(&model);
+    term.wait_for("waiting for your yes: pick it to start it");
+    pick(&mut term, "fake");
+    pick(&mut term, "start");
     term.wait_for("Start fake, an MCP server");
     std::thread::sleep(Duration::from_millis(700));
     term.keys("y");
+    term.wait_for("fake  5 tools: echo");
     term.wait_for(IDLE);
-    wait_for_mcp(&mut term, "5 tools: echo");
     term.keys("/exit\r");
 
     let mut term = term.again(&model);
@@ -2731,6 +2747,7 @@ fn mcp_add_allow_and_remove_change_the_servers_without_editing_a_file() {
     term.wait_for("fake has no tool called nope; its tools are echo, peek, given, has, quit");
     term.keys("/mcp allow fake echo\r");
     term.wait_for("✓ these of fake's tools run: echo without asking now");
+    term.wait_for(IDLE);
     let path = term.dir.join("home/mcp.json");
     let file = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(file(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "allow": ["echo"] } } }));
@@ -2748,6 +2765,108 @@ fn mcp_add_allow_and_remove_change_the_servers_without_editing_a_file() {
     assert!(servers_tools(&requests[0]).contains(&"mcp__fake__echo".to_owned()), "{:?}", servers_tools(&requests[0]));
     assert_eq!(servers_tools(&requests[2]), Vec::<String>::new(), "removed: offered no more");
     assert_eq!(file(), json!({ "mcpServers": {} }));
+}
+
+/// A server that doesn't start in the sandbox is offered to run outside
+/// it, there and then: a yes writes it in your mcp.json and starts it, and
+/// nothing needs typing again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_server_that_fails_in_the_sandbox_is_offered_to_run_outside_it() {
+    let model = Model::start(Vec::new());
+    let mut term = Term::start_with(&model, "mcp-outside", 30, 130, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    std::fs::create_dir_all(term.dir.join("home/.ssh")).unwrap();
+    std::fs::write(term.dir.join("home/.ssh/id_test"), "FAKE-mcp-outside-secret").unwrap();
+    term.wait_for(IDLE);
+    // It reads its settings in your home folder as it starts.
+    let starts = format!("cat {} > /dev/null && exec sh server.sh", term.dir.join("home/.ssh/id_test").display());
+    term.keys(&format!("/mcp add fake sh -c '{starts}'\r"));
+    term.wait_for("fake  didn't start: it stopped");
+    term.wait_for("Run fake outside the sandbox?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("fake  5 tools: echo");
+    term.wait_for(IDLE);
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/mcp.json")).unwrap()).unwrap();
+    assert_eq!(file["mcpServers"]["fake"]["access"], "outside", "{file}");
+    wait_for_mcp(&mut term, "yours · outside the sandbox");
+}
+
+/// `/mcp` lists the servers to pick one and change it: which of its tools
+/// run without asking, on and off, each kept in your mcp.json.
+#[cfg(target_os = "macos")]
+#[test]
+fn mcp_lets_you_pick_a_server_and_change_it_without_typing_its_name() {
+    let mut model = Model::start(Vec::new());
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] } } }).to_string()));
+    let mut term = Term::start_with(&model, "mcp-panel", 30, 130, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    wait_for_mcp(&mut term, "5 tools: echo");
+    let path = term.dir.join("home/mcp.json");
+    let file = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap()["mcpServers"]["fake"].clone();
+
+    term.keys("/mcp\r");
+    pick(&mut term, "fake");
+    pick(&mut term, "choose the tools");
+    term.wait_for("fake: which tools run without asking");
+    pick(&mut term, "echo");
+    term.wait_until("echo marked", |screen| screen.contains("✓ echo"));
+    pick(&mut term, "has");
+    term.wait_until("has marked", |screen| screen.contains("✓ has"));
+    pick(&mut term, "done");
+    term.wait_for("✓ these of fake's tools run: echo, has without asking now");
+    term.wait_for(IDLE);
+    assert_eq!(file()["allow"], json!(["echo", "has"]));
+
+    term.keys("/mcp\r");
+    pick(&mut term, "fake");
+    pick(&mut term, "turn it off");
+    term.wait_for("✓ fake is off: it stays in ~/mcp.json, and /mcp turns it on");
+    term.wait_for(IDLE);
+    assert_eq!(file()["disabled"], true);
+    term.keys("/mcp\r");
+    term.wait_for("off: pick it to turn it on");
+    pick(&mut term, "fake");
+    pick(&mut term, "turn it on");
+    term.wait_for("fake  5 tools: echo");
+    term.wait_for(IDLE);
+    assert_eq!(file().get("disabled"), None, "on again: {}", file());
+    assert_eq!(file()["allow"], json!(["echo", "has"]), "what it let run is kept");
+}
+
+/// A server that needs a variable you haven't set asks for it as rein
+/// starts, in dots: kept in rein's folder, filled in from then on, and
+/// hidden wherever it shows up.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_key_a_server_needs_is_asked_for_kept_and_hidden() {
+    let mut model = Model::start(vec![Turn { out: vec![Out::Call("mcp__fake__given", json!({}))] }, says("Got it.")]);
+    let server = json!({ "command": "sh", "args": ["server.sh"], "env": { "GIVEN": "${REIN_SCREEN_FAKE_TOKEN}" }, "allow": ["given"] });
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": server } }).to_string()));
+    let mut term = Term::start_with(&model, "mcp-key", 30, 130, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for("fake needs REIN_SCREEN_FAKE_TOKEN to start, and it isn't set.");
+    term.wait_for("Paste REIN_SCREEN_FAKE_TOKEN");
+    term.keys("FAKE-mcp-token-456");
+    term.wait_until("the key in dots", |screen| !screen.contains("FAKE-mcp-token-456") && screen.contains("••••"));
+    term.keys("\r");
+    term.wait_for("✓ REIN_SCREEN_FAKE_TOKEN is kept for fake");
+    term.wait_for(IDLE);
+    term.keys("what's given?\r");
+    term.wait_for("Got it.");
+    assert_eq!(results(&model), ["[a key rein hides]"]);
+    term.keys("/exit\r");
+
+    let mut term = term.again(&model);
+    term.wait_for(IDLE);
+    wait_for_mcp(&mut term, "fake  yours");
+    assert!(!term.text().contains("needs REIN_SCREEN_FAKE_TOKEN"), "kept: not asked again\n{}", term.text());
+    term.keys("\x04");
+    term.wait_exit();
+    assert!(!model.requests().iter().any(|request| request.to_string().contains("FAKE-mcp-token-456")), "the model never saw it");
+    for file in every_file(&term.dir) {
+        let has = std::fs::read_to_string(&file).unwrap_or_default().contains("FAKE-mcp-token-456");
+        assert_eq!(has, file == term.dir.join("home/mcp-keys.json"), "{} {} the key", file.display(), if has { "has" } else { "doesn't have" });
+    }
 }
 
 /// A server added with a key written in is kept in your mcp.json and

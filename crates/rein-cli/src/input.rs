@@ -78,6 +78,9 @@ pub struct Menu {
     pub items: Vec<(String, String)>,
     /// The one in use: marked, and where the list starts.
     pub current: Option<usize>,
+    /// Where the list starts instead, unmarked: the item picked last in a
+    /// menu shown again, like one whose items turn on and off.
+    pub at: Option<usize>,
 }
 
 /// A menu on screen: what's typed to narrow it, and which of the matching
@@ -1317,7 +1320,7 @@ impl Input {
                 }
             }
         }
-        let picked = menu.current.unwrap_or(0);
+        let picked = menu.at.or(menu.current).filter(|at| *at < menu.items.len()).unwrap_or(0);
         self.with(|boxed| {
             boxed.waiting = Waiting::Answer;
             boxed.picking = Some(Picking { menu, filter: Editor::default(), picked });

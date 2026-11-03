@@ -416,7 +416,7 @@ pub(crate) async fn pick(folder: &Path, terminal: &mut Terminal) -> CliResult<Op
             (format!("{} {:02}:{:02}  {first}", when.date(), when.hour, when.minute), messages)
         })
         .collect();
-    let menu = Menu { title: "continue which conversation".to_owned(), items, current: None };
+    let menu = Menu { title: "continue which conversation".to_owned(), items, current: None, at: None };
     Ok(terminal.input.choose(menu).await.map(|i| saved[i].path.clone()))
 }
 
@@ -699,7 +699,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
 /// (`/model`, `/login`, `/mode`...) shows what there is to choose from.
 /// `None` when you change your mind.
 pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult<Option<Slash>> {
-    let menu = |title: &str, items: Vec<(String, String)>, current: Option<usize>| Menu { title: title.to_owned(), items, current };
+    let menu = |title: &str, items: Vec<(String, String)>, current: Option<usize>| Menu { title: title.to_owned(), items, current, at: None };
     Ok(match command {
         Slash::Mode(None) => {
             let modes = Mode::ALL;

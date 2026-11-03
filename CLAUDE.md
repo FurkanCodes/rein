@@ -244,6 +244,12 @@ finding. Each says why in a line.
 - A command's line that may hold a key isn't shown again or kept for ↑
   (`commands::hides`): `/login <provider> <key>`, or `/mcp add` with a
   value written in as it is.
+- An error you can fix offers the fix where it shows, as a question or a
+  pick, never as a command to type: rein said "/mcp add it again with
+  --access outside" of a server that failed in the sandbox, which meant
+  typing its whole command again, and "it needs GITHUB_TOKEN" meant leaving
+  rein to export it. So the failure is a type (`Failure`), not words, and
+  its fix is a key away.
 
 ## Docs
 

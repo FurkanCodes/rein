@@ -1271,7 +1271,7 @@ mod tests {
             access: crate::sandbox::Access::Outside,
             allow: vec!["echo".into()],
         };
-        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches") };
+        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default() };
         let servers = std::sync::Arc::new(rein_mcp::Servers::start(vec![server], launch));
         agent.tools = Tools::new(&root).with_mcp(servers).with_secrets(crate::redact::Secrets::new(["FAKE-mcp-key-123".to_owned()]));
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
@@ -1297,7 +1297,7 @@ mod tests {
         let mut agent = agent("mcp-changed", vec![says("One."), says("Two."), says("Three."), says("Four.")]);
         let root = agent.tools.root().to_owned();
         std::fs::write(root.join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
-        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches") };
+        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default() };
         let servers = std::sync::Arc::new(rein_mcp::Servers::start(Vec::new(), launch));
         agent.tools = Tools::new(&root).with_mcp(servers.clone());
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };

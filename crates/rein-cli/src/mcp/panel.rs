@@ -1,0 +1,323 @@
+//! `/mcp`: how each server is doing, then the one to change, and how.
+//! What would fix one that didn't start comes first.
+
+use rein_agent::agent::{Agent, Llm};
+use rein_agent::sandbox::Access;
+use rein_mcp::{Failure, Origin, Server, Skipped, Status};
+
+use super::{Fix, Mcp, allowed, edit, entry, give_keys, how, remove, restart, say_yes, set_access, set_allow, turn_off};
+use crate::CliResult;
+use crate::input::Menu;
+use crate::terminal::Terminal;
+use crate::ui::style::GUTTER;
+
+/// A server as `/mcp` shows it.
+enum Row {
+    /// Started, and how it's doing, and whether one of its calls failed in
+    /// the sandbox, which may be why.
+    Running(Server, Status, bool),
+    /// Yours, turned off.
+    Off(Server),
+    /// The project's, waiting for your yes.
+    Waiting(Server),
+    /// One rein can't start, and why.
+    Skipped(Skipped),
+}
+
+impl Row {
+    fn name(&self) -> &str {
+        match self {
+            Row::Running(server, ..) | Row::Off(server) | Row::Waiting(server) => &server.name,
+            Row::Skipped(skipped) => &skipped.name,
+        }
+    }
+
+    /// How it's doing in a few words, for the list to pick from.
+    fn about(&self) -> String {
+        match self {
+            Row::Running(_, _, true) => "● a call failed in the sandbox".into(),
+            Row::Running(_, Status::Ready(tools), _) => format!("● {} tool{}", tools.len(), if tools.len() == 1 { "" } else { "s" }),
+            Row::Running(_, Status::Starting, _) => "◌ starting".into(),
+            Row::Running(_, Status::Stopped, _) => "◌ stopped; it starts again on its next call".into(),
+            Row::Running(_, Status::Failed(Failure::Needs(name)), _) => format!("✗ needs {name}"),
+            Row::Running(_, Status::Failed(Failure::InWalls(_)), _) => "✗ didn't start in the sandbox".into(),
+            Row::Running(_, Status::Failed(Failure::NoSandbox), _) => "✗ no sandbox here to start it in".into(),
+            Row::Running(_, Status::Failed(Failure::Other(_)), _) => "✗ didn't start".into(),
+            Row::Off(_) => "– off".into(),
+            Row::Waiting(_) => "⏸ waiting for your yes".into(),
+            Row::Skipped(skipped) => format!("– can't start: {}", skipped.why),
+        }
+    }
+}
+
+/// Every server, as `/mcp` shows them: started, off, waiting, skipped.
+fn rows(mcp: &Mcp) -> Vec<Row> {
+    let running = mcp.servers.statuses().into_iter().map(|(server, status)| {
+        let failed = mcp.servers.failed_in_walls(&server.name);
+        Row::Running(server, status, failed)
+    });
+    let off = mcp.off.iter().cloned().map(Row::Off);
+    let waiting = mcp.waiting.iter().cloned().map(Row::Waiting);
+    running.chain(off).chain(waiting).chain(mcp.skipped.iter().cloned().map(Row::Skipped)).collect()
+}
+
+/// What can be done with a server, from `/mcp`.
+enum Action {
+    /// Give it the variable it needs.
+    Give(Server, String),
+    /// Run it outside the sandbox, where it didn't start.
+    Outside(Server),
+    /// Choose which of these, its tools, run without asking.
+    Tools(Server, Vec<String>),
+    /// Choose its walls.
+    Walls(Server),
+    Restart(Server),
+    Off(Server),
+    On(Server),
+    /// Stop it and take it out of your file, or take back your yes.
+    Remove(String, Origin),
+    /// Say yes to a project's server, and start it.
+    Start(Server),
+}
+
+impl Action {
+    /// What it's called in the list, and a few words about it.
+    fn shown(&self) -> (String, String) {
+        let (name, about) = match self {
+            Action::Give(_, name) => (format!("give it {name}"), "kept in rein's folder, never shown".to_owned()),
+            Action::Outside(_) => ("run it outside the sandbox".into(), "with your full access: your files, keys, apps and screen".into()),
+            Action::Tools(server, _) => ("choose the tools that run without asking".into(), format!("now: {}", allowed(&server.allow))),
+            Action::Walls(server) => ("change its walls".into(), format!("now: {}", server.access)),
+            Action::Restart(_) => ("restart it".into(), String::new()),
+            Action::Off(_) => ("turn it off".into(), "it stays in your mcp.json, to turn on later".into()),
+            Action::On(_) => ("turn it on".into(), String::new()),
+            Action::Remove(_, Origin::Yours) => ("remove it".into(), "it stops, and goes from your mcp.json".into()),
+            Action::Remove(_, Origin::Project) => ("take back your yes".into(), "it stops, and rein asks again when it starts here".into()),
+            Action::Start(_) => ("start it".into(), "you're asked first, seeing what it runs".into()),
+        };
+        (name, about)
+    }
+}
+
+/// What can be done with `row`: first what would fix it, if it didn't
+/// start.
+fn actions(row: Row) -> Vec<Action> {
+    match row {
+        Row::Running(server, status, failed_in_walls) => {
+            let mut actions = Vec::new();
+            let fix = match &status {
+                Status::Failed(failure) => Fix::of(&server, failure),
+                // It started, but a call failed where the sandbox may be why.
+                _ if failed_in_walls => Fix::of(&server, &Failure::InWalls(String::new())),
+                _ => None,
+            };
+            match fix {
+                Some(Fix::Give(name)) => actions.push(Action::Give(server.clone(), name)),
+                Some(Fix::Outside) => actions.push(Action::Outside(server.clone())),
+                None => {}
+            }
+            if server.origin == Origin::Yours {
+                if let Status::Ready(tools) = status
+                    && !tools.is_empty()
+                {
+                    actions.push(Action::Tools(server.clone(), tools));
+                }
+                actions.push(Action::Walls(server.clone()));
+            }
+            actions.push(Action::Restart(server.clone()));
+            if server.origin == Origin::Yours {
+                actions.push(Action::Off(server.clone()));
+            }
+            actions.push(Action::Remove(server.name, server.origin));
+            actions
+        }
+        Row::Off(server) => vec![Action::On(server.clone()), Action::Remove(server.name, Origin::Yours)],
+        Row::Waiting(server) => vec![Action::Start(server)],
+        Row::Skipped(skipped) if skipped.origin == Origin::Yours => vec![Action::Remove(skipped.name, Origin::Yours)],
+        Row::Skipped(_) => Vec::new(),
+    }
+}
+
+/// `/mcp`: how each server is doing, then, in a conversation's box, the one
+/// to change, and how.
+pub(super) async fn panel(mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
+    show(mcp, terminal);
+    let rows = rows(mcp);
+    if rows.is_empty() || !terminal.input.pinned() {
+        return Ok(());
+    }
+    let items = rows.iter().map(|row| (row.name().to_owned(), row.about())).collect();
+    let Some(picked) = terminal.input.choose(Menu { title: "change which server".into(), items, current: None, at: None }).await else { return Ok(()) };
+    let Some(row) = rows.into_iter().nth(picked) else { return Ok(()) };
+    let name = row.name().to_owned();
+    let mut actions = actions(row);
+    if actions.is_empty() {
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("{name} is the project's, and rein can't start it: only its .mcp.json can change that")));
+        return Ok(());
+    }
+    let items = actions.iter().map(Action::shown).collect();
+    let Some(picked) = terminal.input.choose(Menu { title: format!("{name}: do what"), items, current: None, at: None }).await else { return Ok(()) };
+    act(actions.swap_remove(picked), mcp, agent, terminal).await
+}
+
+async fn act(action: Action, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
+    match action {
+        Action::Give(server, _) => {
+            let given = give_keys(&server, mcp.servers.keys(), &mcp.dir, terminal).await;
+            if given.is_empty() {
+                return Ok(());
+            }
+            agent.tools.hide_too(given);
+            restart(server, mcp, agent, terminal).await
+        }
+        Action::Outside(server) => {
+            let server = set_access(&server, Access::Outside, mcp)?;
+            restart(server, mcp, agent, terminal).await
+        }
+        Action::Tools(server, tools) => choose_tools(&server, &tools, mcp, agent, terminal).await,
+        Action::Walls(server) => {
+            let items = Access::ALL.iter().map(|access| (access.to_string(), rein_mcp::walls(*access).to_owned())).collect();
+            let current = Access::ALL.iter().position(|access| *access == server.access);
+            let menu = Menu { title: format!("{}: run it with which walls", server.name), items, current, at: None };
+            let Some(access) = terminal.input.choose(menu).await.and_then(|i| Access::ALL.get(i).copied()).filter(|access| *access != server.access) else { return Ok(()) };
+            let server = set_access(&server, access, mcp)?;
+            restart(server, mcp, agent, terminal).await
+        }
+        Action::Restart(server) => restart(server, mcp, agent, terminal).await,
+        Action::Off(server) => turn_off(server, mcp, agent, terminal),
+        Action::On(server) => {
+            edit(&mcp.dir, |servers| {
+                entry(servers, &server.name)?.remove("disabled");
+                Ok(())
+            })?;
+            mcp.off.retain(|off| off.name != server.name);
+            restart(server, mcp, agent, terminal).await
+        }
+        Action::Remove(name, _) => remove(&name, mcp, agent, terminal),
+        Action::Start(server) => {
+            if !say_yes(&server, &mcp.dir, &mcp.project(), terminal).await {
+                return Ok(());
+            }
+            mcp.waiting.retain(|waiting| waiting.name != server.name);
+            give_keys(&server, mcp.servers.keys(), &mcp.dir, terminal).await;
+            restart(server, mcp, agent, terminal).await
+        }
+    }
+}
+
+/// Lets you turn each of `tools`, `server`'s, on and off to run without
+/// asking, until you're done: then kept in your file. Esc keeps it as it was.
+async fn choose_tools(server: &Server, tools: &[String], mcp: &Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
+    let mut allow = server.allow.clone();
+    let mut at = None;
+    loop {
+        let all = allow.iter().any(|tool| tool == "*");
+        let mark = |on: bool| if on { "✓" } else { " " };
+        let mut items = vec![("done".to_owned(), "keep these".to_owned()), (format!("{} all of them", mark(all)), "and those it lists later".to_owned())];
+        items.extend(tools.iter().map(|tool| {
+            let on = all || allow.contains(tool);
+            (format!("{} {tool}", mark(on)), if on { "runs without asking" } else { "asks first" }.to_owned())
+        }));
+        let menu = Menu { title: format!("{}: which tools run without asking", server.name), items, current: None, at };
+        let Some(picked) = terminal.input.choose(menu).await else { return Ok(()) };
+        match picked {
+            0 => break,
+            1 => allow = if all { Vec::new() } else { vec!["*".to_owned()] },
+            n => {
+                let Some(tool) = tools.get(n - 2) else { break };
+                if all {
+                    allow = tools.iter().filter(|other| *other != tool).cloned().collect();
+                } else if let Some(i) = allow.iter().position(|allowed| allowed == tool) {
+                    allow.remove(i);
+                } else {
+                    allow.push(tool.clone());
+                }
+            }
+        }
+        at = Some(picked);
+    }
+    if allow == server.allow {
+        return Ok(());
+    }
+    set_allow(&server.name, &allow, mcp, agent, terminal)
+}
+
+/// What `/mcp` says: each server, whose it is, its walls, and how it's
+/// doing, then those off, waiting for your yes, or not started, and why.
+fn show(mcp: &Mcp, terminal: &Terminal) {
+    let (pad, s) = (" ".repeat(GUTTER), terminal.err);
+    let rows = rows(mcp);
+    if rows.is_empty() {
+        say!("{pad}No MCP servers yet. To add one: {}", crate::commands::ADD);
+        say!("{pad}{}", s.dim("Like: /mcp add context7 npx -y @upstash/context7-mcp"));
+        return;
+    }
+    let shown: Vec<(&Row, String, String)> = rows
+        .iter()
+        .map(|row| {
+            let (whose, how) = match row {
+                Row::Running(server, status, failed_in_walls) => {
+                    let walls = if server.access.walls().is_some() { format!("in the sandbox ({})", server.access) } else { "outside the sandbox".to_owned() };
+                    let failed = if *failed_in_walls { s.yellow(" · a call failed in the sandbox, which may be why") } else { String::new() };
+                    (format!("{} · {walls}", server.origin.describe()), format!("{}{failed}", how(status, s)))
+                }
+                Row::Off(_) => ("yours".to_owned(), s.dim("off: pick it to turn it on")),
+                Row::Waiting(server) => (server.origin.describe().to_owned(), s.yellow("waiting for your yes: pick it to start it")),
+                Row::Skipped(skipped) => (skipped.origin.describe().to_owned(), s.dim(&format!("not started: {}", skipped.why))),
+            };
+            (row, whose, how)
+        })
+        .collect();
+    let names = rows.iter().map(|row| row.name().chars().count()).max().unwrap_or(0);
+    let whose = shown.iter().map(|(_, whose, _)| whose.chars().count()).max().unwrap_or(0);
+    for (row, said, how) in shown {
+        let line = format!("{pad}{:<names$}  {}  {how}", row.name(), s.dim(&format!("{said:<whose$}")));
+        // A long list of tools is cut to the screen; why one failed isn't.
+        match row {
+            Row::Running(_, Status::Ready(_), false) => say!("{}", crate::ui::style::fit(&line, terminal.wrap_width().unwrap_or(100))),
+            _ => say!("{line}"),
+        }
+    }
+    say!("{pad}{}", s.dim("The model sees a server's tools as mcp__<server>__<tool>. /mcp add <name> <command> [args …] adds one."));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn server(origin: Origin, access: Access) -> Server {
+        Server { name: "fake".into(), origin, command: "sh".into(), args: Vec::new(), env: BTreeMap::new(), access, allow: Vec::new() }
+    }
+
+    /// What `/mcp` offers for `row`, by name.
+    fn offered(row: Row) -> Vec<String> {
+        actions(row).iter().map(|action| action.shown().0).collect()
+    }
+
+    #[test]
+    fn what_would_fix_a_server_is_offered_first_and_a_projects_isnt_let_out() {
+        let ready = || Status::Ready(vec!["echo".into()]);
+        let yours = server(Origin::Yours, Access::Network);
+        assert_eq!(
+            offered(Row::Running(yours.clone(), ready(), false)),
+            ["choose the tools that run without asking", "change its walls", "restart it", "turn it off", "remove it"]
+        );
+        let failed = offered(Row::Running(yours.clone(), Status::Failed(Failure::InWalls("it stopped".into())), false));
+        assert_eq!(failed[0], "run it outside the sandbox", "{failed:?}");
+        assert_eq!(offered(Row::Running(yours.clone(), ready(), true))[0], "run it outside the sandbox", "a call that failed in the sandbox counts too");
+        assert_eq!(offered(Row::Running(yours.clone(), Status::Failed(Failure::Needs("TOKEN".into())), false))[0], "give it TOKEN");
+        let outside = server(Origin::Yours, Access::Outside);
+        assert!(!offered(Row::Running(outside, Status::Failed(Failure::InWalls("x".into())), true)).contains(&"run it outside the sandbox".to_owned()), "it's out already");
+        let theirs = server(Origin::Project, Access::Network);
+        assert_eq!(
+            offered(Row::Running(theirs.clone(), Status::Failed(Failure::InWalls("x".into())), true)),
+            ["restart it", "take back your yes"],
+            "the project doesn't decide its walls, nor what runs without asking"
+        );
+        assert_eq!(offered(Row::Running(theirs.clone(), Status::Failed(Failure::Needs("TOKEN".into())), false))[0], "give it TOKEN", "a key of yours it gets, as you said yes to");
+        assert_eq!(offered(Row::Off(yours)), ["turn it on", "remove it"]);
+        assert_eq!(offered(Row::Waiting(theirs)), ["start it"]);
+        assert!(offered(Row::Skipped(Skipped { name: "x".into(), origin: Origin::Project, why: String::new() })).is_empty());
+    }
+}
