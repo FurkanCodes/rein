@@ -188,8 +188,9 @@ pub fn new_host_id() -> Result<String> {
 
 /// A sign-in waiting for the browser to come back.
 pub struct PendingSignIn {
-    /// Open this in the user's browser. When signing in again it contains the
-    /// old ID token as a hint, so don't write it to logs.
+    /// Open this in the user's browser. It goes on a command line, and is
+    /// printed when no browser opens: signing in again, it names the
+    /// account by its email, never by a token.
     pub url: String,
     listener: TcpListener,
     redirect_uri: String,
@@ -235,9 +236,10 @@ async fn begin_on(port: u16, host_id: &str, agent_name: &str, previous: Option<&
         ("ext_agent_host_id", host_id),
     ];
     match previous {
+        // No `id_token_hint`: the link goes on `open`'s command line, which
+        // other users can read on Linux, and is printed when no browser opens.
         Some(p) => {
             params.push(("client_id", p.client_id.as_str()));
-            params.push(("id_token_hint", p.id_token.as_str()));
             if let Some(email) = &p.email {
                 params.push(("login_hint", email.as_str()));
             }
@@ -668,6 +670,18 @@ pub(crate) mod tests {
         };
         let (result, ()) = tokio::join!(pending.wait_for_callback(), browser);
         assert_eq!(result.unwrap(), ("c1".to_owned(), "oaiapp_1".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn signing_in_again_names_the_account_but_never_puts_a_token_in_the_link() {
+        let previous = Credentials { email: Some("a@example.com".into()), id_token: "id-token-FAKE".into(), ..credentials("access-FAKE", "refresh-FAKE", in_an_hour()) };
+        let pending = begin_on(0, "urn:uuid:00000000-0000-4000-8000-000000000000", "rein-test", Some(&previous)).await.unwrap();
+        let url = Url::parse(&pending.url).unwrap();
+        let param = |key: &str| url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned());
+        assert_eq!(param("client_id").as_deref(), Some("oaiapp_1"), "the registration it has");
+        assert_eq!(param("login_hint").as_deref(), Some("a@example.com"));
+        assert_eq!(param("id_token_hint"), None);
+        assert!(!pending.url.contains("FAKE"), "{}", pending.url);
     }
 
     #[test]
