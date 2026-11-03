@@ -13,6 +13,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
     ("/effort", "[level|default]", "change how hard the model thinks"),
     ("/status", "", "the model, mode, context and conversation"),
+    ("/mcp", "", "the MCP servers: their tools, and how each is doing"),
     ("/compact", "[focus]", "make room in the conversation now"),
     ("/copy", "", "copy rein's last answer, as it wrote it"),
     ("/undo", "", "put back the files rein changed in its last turn"),
@@ -47,6 +48,7 @@ pub enum Slash {
     /// `None` asks which.
     Effort(Option<EffortSetting>),
     Status,
+    Mcp,
     Compact(Option<String>),
     Copy,
     Undo,
@@ -212,6 +214,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
             Some(level) => level.parse().map(|e| Slash::Effort(Some(EffortSetting::Level(e)))).map_err(|e| Refused::Said(format!("{e}, or default"))),
         },
         "/status" => Ok(Slash::Status),
+        "/mcp" => Ok(Slash::Mcp),
         "/compact" => Ok(Slash::Compact(arg)),
         "/copy" => Ok(Slash::Copy),
         "/undo" => Ok(Slash::Undo),

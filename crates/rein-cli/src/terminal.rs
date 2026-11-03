@@ -589,6 +589,13 @@ impl Ui for Terminal {
         }
     }
 
+    fn starting_servers(&mut self) {
+        self.end_line();
+        if self.fancy {
+            self.doing("Starting MCP servers");
+        }
+    }
+
     /// Each headline of the model's reasoning summary, once it's complete,
     /// becomes one dim line: what the model was thinking about. (On this
     /// route they arrive when the thinking is done, not during it.)
@@ -622,11 +629,14 @@ impl Ui for Terminal {
         self.step = None;
         crate::ui::screen::progress(Progress::Waiting);
         let bash = BashCall::of(call);
-        let (question, always) = match ToolName::of(call) {
-            Some(ToolName::Bash) => (self.command_question(bash.as_ref()), "Yes, and don't ask again for this command"),
-            Some(ToolName::Edit) => ("Allow this edit?", "Yes, and don't ask again for file changes"),
-            Some(ToolName::Write) => ("Allow writing this file?", "Yes, and don't ask again for file changes"),
-            _ => ("Allow this?", "Yes, and don't ask again"),
+        // An MCP server's tool, by its server's name and its own.
+        let server_tool = rein_mcp::parts(&call.name).filter(|_| ToolName::of(call).is_none());
+        let (question, always) = match (ToolName::of(call), server_tool) {
+            (Some(ToolName::Bash), _) => (self.command_question(bash.as_ref()).to_owned(), "Yes, and don't ask again for this command"),
+            (Some(ToolName::Edit), _) => ("Allow this edit?".to_owned(), "Yes, and don't ask again for file changes"),
+            (Some(ToolName::Write), _) => ("Allow writing this file?".to_owned(), "Yes, and don't ask again for file changes"),
+            (None, Some((server, tool))) => (format!("Let {server}'s {tool} run?"), "Yes, and don't ask again for this tool"),
+            _ => ("Allow this?".to_owned(), "Yes, and don't ask again"),
         };
         // Why it needs to go past the sandbox, as the model put it.
         let reason = bash.as_ref().and_then(BashCall::reason).map(|reason| format!("Why: {reason}"));
@@ -652,7 +662,12 @@ impl Ui for Terminal {
         // A command is asked about in full, in the box, and its line comes
         // once it's done. A file change shows its change above first, and
         // so does a command too long for the box.
-        let command = if ToolName::of(call) == Some(ToolName::Bash) { steps::command(call) } else { None };
+        // A server's tool is asked about with all it's given, as a command is.
+        let command = match ToolName::of(call) {
+            Some(ToolName::Bash) => steps::command(call),
+            None if server_tool.is_some() => Some(steps::arguments(call)),
+            _ => None,
+        };
         let long = command.as_deref().is_some_and(|command| crate::input::command_lines(command, self.err, self.input.text_width()).len() > crate::input::COMMAND_LINES);
         if command.is_none() || long {
             self.show_header(call);
@@ -668,7 +683,7 @@ impl Ui for Terminal {
         // The other reins see it's waiting, and you can answer from another tab.
         let asked = format!("{question} {}", command.clone().unwrap_or_else(|| command_line(call)));
         let elsewhere = self.peers.as_mut().map(|peers| peers.question(&shorten_line(&asked)));
-        let here = self.input.ask(Question { title: question.to_owned(), detail: reason, command, answers });
+        let here = self.input.ask(Question { title: question.clone(), detail: reason, command, answers });
         let answer = match elsewhere {
             Some(there) => {
                 // Never answered elsewhere if nothing over there can answer.
@@ -695,7 +710,11 @@ impl Ui for Terminal {
         };
         let answer = self.answered(answer);
         if answer == Approval::Always {
-            let what = if ToolName::of(call) == Some(ToolName::Bash) { "this command" } else { "file changes" };
+            let what = match ToolName::of(call) {
+                Some(ToolName::Bash) => "this command",
+                None if server_tool.is_some() => "this tool",
+                _ => "file changes",
+            };
             self.noted = Some(format!("won't ask again for {what} in this conversation"));
         }
         answer

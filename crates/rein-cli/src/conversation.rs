@@ -75,6 +75,9 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.model = connected.as_ref().map(|c| provider::shown(&c.provider, &c.model)).unwrap_or_default();
     terminal.effort = args.effort;
     terminal.input.set_bar(terminal.bar());
+    // Your MCP servers and the project's start now, while the rest gets
+    // ready; the project's only once you've said yes to each as it is.
+    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), &mut terminal, args.prompt.is_none()).await;
     let saved = match args.resume {
         Resume::New => None,
         Resume::Latest => latest,
@@ -107,7 +110,11 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         }
     };
     let (client, models) = connected.models().await;
-    let secrets = rein_agent::redact::Secrets::new(known_secrets(&keys));
+    let secrets = rein_agent::redact::Secrets::new(known_secrets(&keys).into_iter().chain(mcp.secrets()));
+    let mut tools = Tools::new(root.clone()).with_sandbox(sandbox.clone()).with_secrets(secrets);
+    if let Some(servers) = &mcp.servers {
+        tools = tools.with_mcp(servers.clone());
+    }
     let mut setup = Setup {
         folder,
         personal: dir.join("AGENTS.md"),
@@ -123,6 +130,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         keys,
         compress: args.compress,
         sandbox: sandbox.clone(),
+        mcp,
     };
     let (mut loaded, context) = setup.open(saved, &spec)?;
     if theirs.is_some_and(|theirs| theirs != spec) {
@@ -136,7 +144,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.tab_command.clone_from(&args.tab_command);
     terminal.input.set_bar(terminal.bar());
     let max_output = setup.max_output(&model_name);
-    let mut agent = Agent::new(Llm { client, record }, Tools::new(root.clone()).with_sandbox(sandbox).with_secrets(secrets), permissions, model_name, limit, loaded, context);
+    let mut agent = Agent::new(Llm { client, record }, tools, permissions, model_name, limit, loaded, context);
     // Only a conversation joins the others: a task done on its own has no
     // one to answer what they send.
     let child = args.child.as_ref().map(|(pid, id)| (*pid, id.as_str()));
@@ -227,6 +235,8 @@ pub(crate) struct Setup {
     /// What commands can't reach, which the project's instruction files
     /// can't bring into the conversation either.
     sandbox: std::sync::Arc<Sandbox>,
+    /// The MCP servers rein started, and those it didn't: for `/mcp`.
+    mcp: crate::mcp::Mcp,
 }
 
 impl Setup {
@@ -639,6 +649,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 say!("{pad}{}  {value}", s.dim(&format!("{name:<8}")));
             }
         }
+        Slash::Mcp => crate::mcp::show(&setup.mcp, terminal),
         Slash::Compact(focus) => compact_now(agent, focus.as_deref(), terminal).await?,
         Slash::Copy => {
             let last = agent.full().iter().rev().find_map(|item| match item {

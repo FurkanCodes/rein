@@ -95,7 +95,18 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             let done = args["steps"].as_array().into_iter().flatten().filter(|step| step["status"] == "done").count();
             ("Plan", format!("{done} of {steps} done"))
         }
+        // An MCP server's: whose, which, and with what.
+        None if let Some((server, tool)) = rein_mcp::parts(&call.name) => ("MCP", format!("{server}: {tool} {}", arguments(call)).trim_end().to_owned()),
         _ => ("Tool", format!("{} {}", call.name, call.arguments)),
+    }
+}
+
+/// A call's arguments on one line, as JSON, with nothing for none.
+pub fn arguments(call: &ToolCall) -> String {
+    match serde_json::from_str::<Value>(&call.arguments) {
+        Ok(Value::Object(args)) if args.is_empty() => String::new(),
+        Ok(args) => args.to_string(),
+        Err(_) => call.arguments.clone(),
     }
 }
 

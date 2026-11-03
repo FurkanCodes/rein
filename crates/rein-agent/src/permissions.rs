@@ -121,6 +121,11 @@ pub struct Permissions {
     approved: Vec<(Vec<String>, Access)>,
     /// Whether you said yes to all file changes for this session.
     approved_edits: bool,
+    /// MCP servers' tools that run without asking: those your own
+    /// mcp.json allows, by the names the model knows them by.
+    allowed_tools: Vec<String>,
+    /// Those you said yes to for the rest of this session.
+    approved_tools: Vec<String>,
     /// What holds commands in, if anything does, and what's protected.
     sandbox: sandbox::Shared,
 }
@@ -145,6 +150,10 @@ const AUTO_NO_SANDBOX: &str = "rein is in auto mode, where nothing asks, but the
                                so no command runs. Tell the user what you need to run.";
 const AUTO_PROTECTED: &str = "rein is in auto mode, where nothing asks, and this file runs code later or holds rein's rules: \
                               changing it takes the user's approval. Leave it, or tell the user what to change.";
+const AUTO_MCP: &str = "rein is in auto mode, where nothing asks, and this MCP tool isn't one the user's own mcp.json allows \
+                        (\"allow\": [...]). Do without it, or tell the user what you need it for.";
+const READ_ONLY_MCP: &str = "rein is in read-only mode, and an MCP tool may change things wherever its server reaches: \
+                             they're turned off.";
 const READ_ONLY_CHANGES: &str = "File changes are turned off: rein is in read-only mode.";
 const READ_ONLY_COMMANDS: &str = "rein is in read-only mode: commands run with look access only, and change nothing.";
 const READ_ONLY_NO_SANDBOX: &str = "Commands are turned off: rein is in read-only mode, and there's no sandbox here \
@@ -191,6 +200,13 @@ impl Permissions {
     pub fn forget_approvals(&mut self) {
         self.approved.clear();
         self.approved_edits = false;
+        self.approved_tools.clear();
+    }
+
+    /// The MCP servers' tools that run without asking from now on, as your
+    /// own mcp.json allows them: what was offered before goes.
+    pub fn allow_tools(&mut self, names: Vec<String>) {
+        self.allowed_tools = names;
     }
 
     pub fn rule_count(&self) -> usize {
@@ -209,7 +225,25 @@ impl Permissions {
                 Err(e) => Decision::Deny(format!("{ERROR}bad arguments: {e}")),
             },
             // `recall` never comes here: the agent runs it itself.
-            Some(_) | None => Decision::Ask,
+            Some(_) => Decision::Ask,
+            None if rein_mcp::is_mcp(&call.name) => self.decide_tool(&call.name),
+            None => Decision::Ask,
+        }
+    }
+
+    /// An MCP server's tool: what it does, it does wherever its server
+    /// reaches (an issue tracker, a database), beyond any wall of rein's,
+    /// and what the server says of it (that it only reads, say) is its own
+    /// word. So it asks, but for what you allowed yourself, and a mode that
+    /// doesn't ask refuses it instead.
+    fn decide_tool(&self, name: &str) -> Decision {
+        let allowed = self.allowed_tools.iter().chain(&self.approved_tools).any(|allowed| allowed == name);
+        match self.mode {
+            Mode::ReadOnly => Decision::Deny(READ_ONLY_MCP.into()),
+            Mode::Trust => Decision::Allow,
+            _ if allowed => Decision::Allow,
+            Mode::Auto => Decision::Deny(AUTO_MCP.into()),
+            Mode::Ask | Mode::Edits => Decision::Ask,
         }
     }
 
@@ -295,7 +329,7 @@ impl Permissions {
 
     /// "Yes, and don't ask again this session": for a command, exactly these
     /// commands, with as much access as this time; for a file change, all
-    /// file changes but protected ones.
+    /// file changes but protected ones; for an MCP server's tool, that tool.
     pub fn remember(&mut self, call: &ToolCall) {
         match ToolName::of(call) {
             Some(ToolName::Write | ToolName::Edit) => self.approved_edits = true,
@@ -306,6 +340,7 @@ impl Permissions {
                     self.approved.extend(parts.into_iter().map(|part| (part, c.access())));
                 }
             }
+            None if rein_mcp::is_mcp(&call.name) => self.approved_tools.push(call.name.clone()),
             _ => {}
         }
     }
@@ -412,6 +447,34 @@ mod tests {
 
     fn split(line: &str) -> Option<Vec<Vec<String>>> {
         split_command(line)
+    }
+
+    /// A server's tool may do anything wherever its server reaches, so it
+    /// asks, but for what your own mcp.json allows; a project's rules
+    /// never allow one, and the modes that don't ask refuse it.
+    #[test]
+    fn an_mcp_tool_asks_but_for_what_you_allowed_and_modes_that_dont_ask_refuse_it() {
+        let call = |name: &str| ToolCall { call_id: "1".into(), name: name.into(), arguments: "{}".into() };
+        let (issue, merge) = (call("mcp__github__get_issue"), call("mcp__github__merge"));
+        let mut p = Permissions::new(Mode::Ask, "allow mcp__github__merge\nallow merge").unwrap();
+        p.allow_tools(vec!["mcp__github__get_issue".into()]);
+        assert_eq!(p.decide(&issue), Decision::Allow);
+        assert_eq!(p.decide(&merge), Decision::Ask, "a project's rules don't allow a server's tool");
+        p.remember(&merge);
+        assert_eq!(p.decide(&merge), Decision::Allow, "you said always");
+        p.forget_approvals();
+        assert_eq!(p.decide(&merge), Decision::Ask, "for one conversation");
+        p.mode = Mode::Edits;
+        assert_eq!(p.decide(&merge), Decision::Ask, "edits are files, not this");
+        p.mode = Mode::Auto;
+        assert_eq!((p.decide(&issue), p.decide(&merge)), (Decision::Allow, Decision::Deny(AUTO_MCP.into())));
+        p.mode = Mode::ReadOnly;
+        assert_eq!((p.decide(&issue), p.decide(&merge)), (Decision::Deny(READ_ONLY_MCP.into()), Decision::Deny(READ_ONLY_MCP.into())));
+        p.mode = Mode::Trust;
+        assert_eq!(p.decide(&merge), Decision::Allow);
+        p.allow_tools(Vec::new());
+        p.mode = Mode::Ask;
+        assert_eq!(p.decide(&issue), Decision::Ask, "what's allowed goes with the servers' tools it was for");
     }
 
     fn cmds(commands: &[&[&str]]) -> Option<Vec<Vec<String>>> {

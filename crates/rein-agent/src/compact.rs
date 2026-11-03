@@ -29,7 +29,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use rein_llm::{Item, Tool};
 
-use crate::agent::{DECLINED_AND_STOPPED, DECLINED_CHANGE, DECLINED_COMMAND, INTERRUPTED};
+use crate::agent::{DECLINED_AND_STOPPED, DECLINED_CALL, DECLINED_CHANGE, DECLINED_COMMAND, INTERRUPTED};
 use crate::tools::{ERROR, ToolName};
 use serde_json::{Value, json};
 
@@ -243,7 +243,7 @@ pub fn record(full: &[Item]) -> String {
     ordered.sort_by_key(|(i, _, _)| **i);
     for (_, id, call) in ordered {
         let result = results.get(id).copied().unwrap_or("");
-        let declined = [DECLINED_COMMAND, DECLINED_CHANGE, DECLINED_AND_STOPPED].contains(&result);
+        let declined = [DECLINED_COMMAND, DECLINED_CHANGE, DECLINED_CALL, DECLINED_AND_STOPPED].contains(&result);
         let worked = !result.starts_with(ERROR) && !declined;
         match (call.tool, &call.path, &call.command) {
             (Some(ToolName::Write | ToolName::Edit), Some(path), _) if worked => {
@@ -331,6 +331,7 @@ pub fn recent_start(history: &[Item], from: usize, budget: u64) -> usize {
 /// The tool for searching the conversation, offered once it's been compacted.
 pub fn recall_spec() -> Tool {
     Tool {
+        strict: true,
         name: ToolName::Recall.as_str().into(),
         description: "Search the whole conversation, including the parts compacted away, for messages and tool \
                       output containing all the given words. Use it when the summary doesn't have a detail you need."

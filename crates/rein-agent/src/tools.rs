@@ -31,6 +31,8 @@ pub struct Tools {
     sandbox: sandbox::Shared,
     /// The keys rein knows, hidden from what every tool says.
     secrets: Secrets,
+    /// The MCP servers rein started, whose tools run through them.
+    mcp: Option<std::sync::Arc<rein_mcp::Servers>>,
 }
 
 /// Each file a turn changed, as it was before: its bytes, or `None` if the
@@ -291,7 +293,18 @@ impl Tools {
     /// Tools for the project at `root`, with no sandbox: commands told to
     /// run in one are refused until [`Tools::with_sandbox`] gives one.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Tools { root: root.into(), timeout: Duration::from_secs(60), checkpoints: Default::default(), sandbox: Default::default(), secrets: Secrets::default() }
+        Tools { root: root.into(), timeout: Duration::from_secs(60), checkpoints: Default::default(), sandbox: Default::default(), secrets: Secrets::default(), mcp: None }
+    }
+
+    /// Runs the tools of these MCP servers too: see [`rein_mcp`].
+    pub fn with_mcp(mut self, servers: std::sync::Arc<rein_mcp::Servers>) -> Self {
+        self.mcp = Some(servers);
+        self
+    }
+
+    /// The MCP servers rein started, if any.
+    pub fn mcp(&self) -> Option<&rein_mcp::Servers> {
+        self.mcp.as_deref()
     }
 
     /// Hides `secrets` in what the tools say: see [`redact`].
@@ -390,6 +403,7 @@ impl Tools {
     pub fn specs(&self) -> Vec<Tool> {
         vec![
             Tool {
+                strict: true,
                 name: ToolName::Read.as_str().into(),
                 description: "Read a UTF-8 text file in the project. A long file comes back in parts: the \
                               reply ends by saying which lines it holds and where to continue."
@@ -401,6 +415,7 @@ impl Tools {
                 })),
             },
             Tool {
+                strict: true,
                 name: ToolName::Grep.as_str().into(),
                 description: "Search what the project's files say with a regular expression (Rust syntax), and \
                               get the matching lines with their numbers, grouped by file. Files that .gitignore \
@@ -417,6 +432,7 @@ impl Tools {
                 })),
             },
             Tool {
+                strict: true,
                 name: ToolName::Glob.as_str().into(),
                 description: "Find files in the project by name or path, like `*.rs`, `src/**/test_*.py` or \
                               `Cargo.toml`. Returns their paths relative to the project root, sorted. Files that \
@@ -428,6 +444,7 @@ impl Tools {
                 })),
             },
             Tool {
+                strict: true,
                 name: ToolName::Write.as_str().into(),
                 description: "Create a text file, or replace an existing file's whole contents. Missing folders \
                               are created. To change part of a file, use edit instead."
@@ -438,6 +455,7 @@ impl Tools {
                 })),
             },
             Tool {
+                strict: true,
                 name: ToolName::Edit.as_str().into(),
                 description: "Replace text in a file. old_text must match the file exactly, spaces and \
                               indentation included, and appear exactly once unless replace_all is true: add \
@@ -451,6 +469,7 @@ impl Tools {
                 })),
             },
             Tool {
+                strict: true,
                 name: ToolName::Plan.as_str().into(),
                 description: "Keep a short checklist for work with several steps, so you and the user can see \
                               where things stand. Send the whole list each time, with one step in_progress; mark \
@@ -472,6 +491,7 @@ impl Tools {
                 })),
             },
             Tool {
+                strict: true,
                 name: ToolName::Bash.as_str().into(),
                 description: self.bash_description().into(),
                 parameters: object(json!({
@@ -507,9 +527,31 @@ impl Tools {
             }),
             // `recall` is the agent's own: it searches the conversation. The
             // peers are reached by whoever runs the agent.
-            Some(ToolName::Recall | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) | None => Err(format!("there is no tool called {}", call.name)),
+            Some(ToolName::Recall | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) => Err(format!("there is no tool called {}", call.name)),
+            None => match &self.mcp {
+                Some(servers) if rein_mcp::is_mcp(&call.name) => return self.servers_said(servers.call(&call.name, &call.arguments).await),
+                _ => Err(format!("there is no tool called {}", call.name)),
+            },
         };
         truncate(self.secrets.hide(result.unwrap_or_else(|e| format!("{ERROR}{e}"))))
+    }
+
+    /// What an MCP server's tool gave, with the keys rein knows hidden. One
+    /// too long to send whole is cut, and kept whole in a file of rein's in
+    /// the temp folder, for the model to read in parts with a command.
+    fn servers_said(&self, result: Result<String, String>) -> String {
+        let text = self.secrets.hide(result.unwrap_or_else(|e| format!("{ERROR}{e}")));
+        if text.len() <= MAX_OUTPUT {
+            return text;
+        }
+        static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join("rein-mcp").join(format!("result-{}-{n}.txt", std::process::id()));
+        let note = match rein_llm::store::write_private(&path, text.as_bytes()) {
+            Ok(()) => format!("\n[rein: it's all in {}, {} bytes: read it in parts with a command, like sed -n '1,200p']", path.display(), text.len()),
+            Err(_) => String::new(),
+        };
+        truncate(text) + &note
     }
 
     async fn read(&self, arguments: &str) -> Result<String, String> {
@@ -658,7 +700,7 @@ impl Tools {
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|e| format!("can't start sh: {e}"))?;
-        let group = Group(child.id());
+        let group = sandbox::Group::new(child.id());
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let run = async { tokio::join!(read_capped(stdout), read_capped(stderr), child.wait()) };
         // Given up on, or the turn stopped: `group` is dropped, and with it
@@ -691,31 +733,6 @@ impl Tools {
             None => SIGNAL_LINE.to_owned(),
         };
         Ok(format!("{text}{status}{note}"))
-    }
-}
-
-/// A command's process group, which stops when this is dropped before the
-/// command is done: on a timeout, or when the turn's future is dropped
-/// (Esc). Killing the shell alone would leave what it started running.
-struct Group(Option<u32>);
-
-impl Group {
-    /// The command finished: nothing to stop.
-    fn disarm(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-            // SAFETY: killpg only sends a signal. The group is the one the
-            // command was started in (`process_group(0)` makes its ID the
-            // shell's), and the shell hasn't been waited for yet, so the ID
-            // can't have been reused.
-            unsafe { libc::killpg(pid, libc::SIGKILL) };
-        }
     }
 }
 
@@ -867,6 +884,24 @@ mod tests {
             let (stat, rest) = line.trim_start().split_once(' ').unwrap_or_default();
             !stat.starts_with('Z') && rest.trim() == command
         })
+    }
+
+    /// A server's long result is cut, and kept whole, keys hidden, where a
+    /// command can read it in parts; a short one is as it was.
+    #[test]
+    fn a_servers_long_result_is_cut_and_kept_whole_with_keys_hidden() {
+        let tools = Tools::new(".").with_secrets(Secrets::new(["FAKE-mcp-long-key".to_owned()]));
+        let long = format!("{}FAKE-mcp-long-key end", "x".repeat(MAX_OUTPUT));
+        let said = tools.servers_said(Ok(long));
+        let (shown, note) = said.split_once("\n[rein: it's all in ").expect("a note says where");
+        assert!(shown.len() < MAX_OUTPUT + 100 && shown.ends_with("more bytes cut]"), "{}", &shown[shown.len() - 40..]);
+        let path = note.split(", ").next().unwrap();
+        let kept = std::fs::read_to_string(path).unwrap();
+        assert!(kept.ends_with(&format!("{}{} end", "x", redact::HIDDEN)) && !kept.contains("FAKE-mcp-long-key"));
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions()) & 0o777, 0o600, "only yours to read");
+        let _ = std::fs::remove_file(path);
+        assert_eq!(tools.servers_said(Err("no such repo".into())), format!("{ERROR}no such repo"));
     }
 
     fn bash_call(command: &str, timeout: Option<u64>) -> ToolCall {

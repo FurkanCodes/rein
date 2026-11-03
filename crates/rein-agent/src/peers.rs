@@ -50,6 +50,7 @@ pub fn specs() -> Vec<Tool> {
     let to = json!({ "type": "string", "description": "The other rein's name, as `peers` lists it, or `workspace/name` for one in another workspace." });
     vec![
         Tool {
+            strict: true,
             name: ToolName::Peers.as_str().into(),
             description: "List the other reins running on this computer, each in a terminal of its own that the user \
                           opened: their names, workspaces, folders, models, and what each is doing now."
@@ -57,6 +58,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({})),
         },
         Tool {
+            strict: true,
             name: ToolName::Message.as_str().into(),
             description: "Send a short message to another rein: to tell it something, or to answer it. It reads it \
                           between its steps, or starts on it if it's idle. Don't send the same thing twice, and don't \
@@ -65,6 +67,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({ "to": to, "text": { "type": "string", "description": "What to say." } })),
         },
         Tool {
+            strict: true,
             name: ToolName::Delegate.as_str().into(),
             description: "Hand a task to another rein, which works on it in its own terminal with its own model and \
                           permissions. This returns at once; when it's done, its result comes back to you as a message, \
@@ -74,6 +77,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({ "to": to, "task": { "type": "string", "description": "The task, complete in itself." } })),
         },
         Tool {
+            strict: true,
             name: ToolName::Spawn.as_str().into(),
             description: "Start a sub-agent: a new rein in a terminal tab of its own, which the user can watch and steer, \
                           working on a task. The user is asked first. It returns at once; the sub-agent's result comes back \

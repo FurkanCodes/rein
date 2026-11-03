@@ -125,8 +125,9 @@ pub(super) fn profile(places: &Places, walls: Walls) -> (String, Vec<OsString>) 
     let mut text = String::from(BASE);
     let subpaths = |paths: &[std::path::PathBuf], param: &mut dyn FnMut(&Path) -> String| paths.iter().map(|path| format!("(subpath {})", param(path))).collect::<Vec<_>>();
 
-    text.push_str("\n; Writing: the temp folders, and with write access the project.\n");
-    let temp = subpaths(places.temp(), &mut param);
+    text.push_str("\n; Writing: the temp folders and its own, and with write access the project.\n");
+    let mut temp = subpaths(places.temp(), &mut param);
+    temp.extend(subpaths(places.own(), &mut param));
     rule(&mut text, "allow file-write*", &temp);
     let project = subpaths(places.writable(), &mut param);
     let mut kept = Vec::new();
@@ -146,9 +147,10 @@ pub(super) fn profile(places: &Places, walls: Walls) -> (String, Vec<OsString>) 
     if let Some(home) = places.home() {
         text.push_str("\n; Not read: your home folder, but for the project, toolchains, caches and settings,\n; and what leads to them, as a path, not a list of what's in it.\n");
         rule(&mut text, "deny file-read*", &[format!("(subpath {})", param(home))]);
-        let ways: Vec<String> = leading(places.readable(), home).iter().map(|path| format!("(literal {})", param(path))).collect();
+        let readable: Vec<std::path::PathBuf> = places.readable().iter().chain(places.own()).cloned().collect();
+        let ways: Vec<String> = leading(&readable, home).iter().map(|path| format!("(literal {})", param(path))).collect();
         rule(&mut text, "allow file-read-metadata", &ways);
-        rule(&mut text, "allow file-read*", &subpaths(places.readable(), &mut param));
+        rule(&mut text, "allow file-read*", &subpaths(&readable, &mut param));
     }
     text.push_str("\n; Never read: keys, logins and tokens, wherever they are.\n");
     rule(&mut text, "deny file-read*", &hidden);

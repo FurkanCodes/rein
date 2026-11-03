@@ -810,6 +810,7 @@ dependencies = [
  "libc",
  "regex-lite",
  "rein-llm",
+ "rein-mcp",
  "rein-sandbox",
  "serde",
  "serde_json",
@@ -824,6 +825,7 @@ dependencies = [
  "libc",
  "rein-agent",
  "rein-llm",
+ "rein-mcp",
  "serde",
  "serde_json",
  "tokio",
@@ -843,6 +845,16 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "rein-mcp"
+version = "0.1.0"
+dependencies = [
+ "rein-sandbox",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

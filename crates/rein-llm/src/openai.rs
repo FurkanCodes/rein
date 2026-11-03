@@ -53,7 +53,7 @@ pub(crate) fn request_body(request: &Request<'_>) -> Value {
     }
     if !request.tools.is_empty() {
         let tools: Vec<Value> =
-            request.tools.iter().map(|t| json!({ "type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": true })).collect();
+            request.tools.iter().map(|t| json!({ "type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": t.strict })).collect();
         body["tools"] = json!([{ "type": "namespace", "name": NAMESPACE, "description": "rein's tools for working in the user's project.", "tools": tools }]);
     }
     body
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn tools_go_in_a_namespace_and_calls_round_trip() {
         let call = ToolCall { call_id: "call_1".into(), name: "read".into(), arguments: r#"{"path":"a.rs"}"#.into() };
-        let tools = [Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }];
+        let tools = [Tool { strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }];
         let input = [
             Item::User("open a.rs".into()),
             Item::Opaque(Opaque::new(Api::Responses, json!({"type": "reasoning", "encrypted_content": "xyz"}))),

@@ -122,7 +122,7 @@ pub(super) fn ruleset(places: &Places, walls: Walls, version: u32) -> io::Result
     except.extend(places.home().map(Path::to_path_buf));
     except.push(PathBuf::from("/dev"));
     let (mut whole, mut listed) = cover(Path::new("/"), &except);
-    for place in places.readable() {
+    for place in places.readable().iter().chain(places.own()) {
         let (more, more_listed) = cover(place, places.hidden());
         whole.extend(more);
         listed.extend(more_listed);
@@ -153,6 +153,13 @@ pub(super) fn ruleset(places: &Places, walls: Walls, version: u32) -> io::Result
     }
     for temp in places.temp() {
         let (whole, _) = cover(temp, &not_temp);
+        for path in &whole {
+            allow(&ruleset, path, (READ | WRITE) & fs)?;
+        }
+    }
+    // Its own folders, whatever its walls.
+    for own in places.own() {
+        let (whole, _) = cover(own, places.hidden());
         for path in &whole {
             allow(&ruleset, path, (READ | WRITE) & fs)?;
         }

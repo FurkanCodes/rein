@@ -99,6 +99,9 @@ pub trait Ui {
     fn usage(&mut self, usage: &Usage);
     /// A request is on its way to the model; nothing to show yet.
     fn thinking(&mut self) {}
+    /// The conversation's first request waits for MCP servers still
+    /// starting: their tools go in it.
+    fn starting_servers(&mut self) {}
     /// Compaction is starting. A summary, if one is written, streams
     /// through `text`.
     fn compacting(&mut self) {}
@@ -163,6 +166,7 @@ pub const SKIPPED: &str = "Not run: the user sent a message before this step sta
 /// declined step by these, so they're said in one place.
 pub const DECLINED_COMMAND: &str = "The user declined to run this command.";
 pub const DECLINED_CHANGE: &str = "The user declined this change.";
+pub const DECLINED_CALL: &str = "The user declined this tool call.";
 pub const DECLINED_AND_STOPPED: &str = "The user declined this and stopped, to tell you what to do instead.";
 /// What a step cut short by Ctrl-C or Esc gets.
 pub const INTERRUPTED: &str = "The user interrupted this before it finished. It may have partly run.";
@@ -309,6 +313,9 @@ pub struct Agent<M> {
     pub step_limit: Option<usize>,
     /// The tools offered: the same in every request, so built once.
     specs: Vec<Tool>,
+    /// Whether `specs` has this conversation's MCP tools: they're added
+    /// before its first request, and stay as they are after.
+    listed: bool,
     /// The system prompt, the same for the whole conversation.
     instructions: Option<String>,
     /// One ID for the whole conversation, so its requests share a prompt cache.
@@ -329,6 +336,7 @@ impl<M: Model> Agent<M> {
     /// the history valid again, and `send` calls it first anyway.
     pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
         self.begin()?;
+        self.offer_servers_tools(ui).await;
         self.record(Item::User(prompt.clone()))?;
         self.attach(&prompt, ui).await?;
         self.work(ui).await
@@ -339,6 +347,7 @@ impl<M: Model> Agent<M> {
     /// points at with `@` is read.
     pub async fn hear(&mut self, from: &str, text: &str, ui: &mut impl Ui) -> Result<Outcome> {
         self.begin()?;
+        self.offer_servers_tools(ui).await;
         self.record(Item::User(crate::peers::heard(from, text)))?;
         self.work(ui).await
     }
@@ -356,6 +365,28 @@ impl<M: Model> Agent<M> {
             self.history.push(Item::User(context));
         }
         Ok(())
+    }
+
+    /// Offers the MCP servers' tools, once in a conversation, before its
+    /// first request: once each server has started, or failed to. From then
+    /// on the tools stay as they are, though a server starts late or lists
+    /// others: a changed list would lose the prompt cache, and a server
+    /// mustn't be able to change what the model was told mid-conversation.
+    /// What each server came to is said.
+    async fn offer_servers_tools(&mut self, ui: &mut impl Ui) {
+        let Some(servers) = self.tools.mcp().filter(|servers| !self.listed && !servers.is_empty()) else { return };
+        if servers.starting() {
+            ui.starting_servers();
+        }
+        let listing = servers.list().await;
+        self.specs.retain(|tool| !rein_mcp::is_mcp(&tool.name));
+        // A server's schema is as it wrote it, not to strict mode's rules.
+        self.specs.extend(listing.tools.into_iter().map(|tool| Tool { name: tool.name, description: tool.description, parameters: tool.parameters, strict: false }));
+        self.permissions.allow_tools(listing.allowed);
+        self.listed = true;
+        if let Some(note) = listing.note {
+            ui.note(&note);
+        }
     }
 
     /// Works until the model is done, the turn is stopped, or it's stuck.
@@ -510,7 +541,8 @@ impl<M: Model> Agent<M> {
                     }
                     Approval::No => Err(match ToolName::of(&call) {
                         Some(ToolName::Bash) => DECLINED_COMMAND.to_owned(),
-                        _ => DECLINED_CHANGE.to_owned(),
+                        Some(_) => DECLINED_CHANGE.to_owned(),
+                        None => DECLINED_CALL.to_owned(),
                     }),
                     Approval::Stop => {
                         let output = DECLINED_AND_STOPPED.to_owned();
@@ -781,6 +813,7 @@ impl<M> Agent<M> {
         let header = conversation.session.header().clone();
         Agent {
             specs: tool_specs(&tools),
+            listed: false,
             model,
             tools,
             permissions,
@@ -812,6 +845,9 @@ impl<M> Agent<M> {
         self.window.measured = None;
         self.permissions.forget_approvals();
         self.tools.forget_changes();
+        // A new conversation, a new list: servers that started late, or
+        // list other tools now, are in it.
+        self.listed = false;
     }
 
     /// The same agent, in the same conversation, answered by `model`.
@@ -826,6 +862,7 @@ impl<M> Agent<M> {
             max_output,
             step_limit,
             specs,
+            listed,
             instructions,
             session_id,
             history,
@@ -833,7 +870,24 @@ impl<M> Agent<M> {
             context,
             window,
         } = self;
-        Agent { model, tools, permissions, model_name, reasoning_effort, efforts, max_output, step_limit, specs, instructions, session_id, history, session, context, window }
+        Agent {
+            model,
+            tools,
+            permissions,
+            model_name,
+            reasoning_effort,
+            efforts,
+            max_output,
+            step_limit,
+            specs,
+            listed,
+            instructions,
+            session_id,
+            history,
+            session,
+            context,
+            window,
+        }
     }
 
     /// The level the model is sent for the one you chose: the same where it
@@ -1185,6 +1239,47 @@ mod tests {
         }
     }
 
+    /// An MCP server's tools are in the conversation's first request, and
+    /// the same in every one after; a call asks, but for what your mcp.json
+    /// allows, and what it gives has the keys rein knows hidden.
+    #[tokio::test]
+    async fn an_mcp_servers_tools_are_offered_from_the_first_request_and_ask_when_called() {
+        let call = |id: &str, name: &str, arguments: Value| Item::ToolCall(ToolCall { call_id: id.into(), name: name.into(), arguments: arguments.to_string() });
+        let turns = vec![
+            vec![call("c1", "mcp__fake__echo", json!({ "text": "hello" })), call("c2", "mcp__fake__given", json!({}))],
+            vec![Item::Assistant("Done.".into())],
+            vec![Item::Assistant("Still here.".into())],
+        ];
+        let mut agent = agent("mcp", turns);
+        let root = agent.tools.root().to_owned();
+        std::fs::write(root.join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
+        let server = rein_mcp::Server {
+            name: "fake".into(),
+            origin: rein_mcp::Origin::Yours,
+            command: "sh".into(),
+            args: vec!["server.sh".into()],
+            env: [("GIVEN".to_owned(), "FAKE-mcp-key-123".to_owned())].into(),
+            access: crate::sandbox::Access::Outside,
+            allow: vec!["echo".into()],
+        };
+        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches") };
+        let servers = std::sync::Arc::new(rein_mcp::Servers::start(vec![server], launch));
+        agent.tools = Tools::new(&root).with_mcp(servers).with_secrets(crate::redact::Secrets::new(["FAKE-mcp-key-123".to_owned()]));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("use the server".into(), &mut person).await.unwrap();
+        assert_eq!(
+            person.log,
+            ["ran mcp__fake__echo", "result hello", "asked {}", "ran mcp__fake__given", &format!("result {}", crate::redact::HIDDEN), "text Done."],
+            "echo is allowed in your file; given asked"
+        );
+        agent.send("and now?".into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        let names = |seen: &Seen| seen.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
+        assert!(names(&requests[0]).contains(&"mcp__fake__echo".to_owned()), "{:?}", names(&requests[0]));
+        assert!(requests.iter().all(|seen| names(seen) == names(&requests[0])), "the same tools all conversation");
+        assert!(requests[0].tools.iter().filter(|tool| rein_mcp::is_mcp(&tool.name)).all(|tool| !tool.strict));
+    }
+
     #[tokio::test]
     async fn a_message_sent_mid_turn_skips_the_steps_not_started() {
         let mut agent = agent("steer", vec![vec![bash("c1", "touch one"), bash("c2", "touch two")], vec![Item::Assistant("Using the helper.".into())]]);
@@ -1378,6 +1473,7 @@ mod tests {
         Agent {
             model: Scripted::new(turns),
             specs: tool_specs(&tools),
+            listed: false,
             tools,
             permissions: Permissions::default(),
             model_name: "m".into(),

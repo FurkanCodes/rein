@@ -415,7 +415,8 @@ printf '%s' '{"structured_output":{"text":"ok","tool_calls":[]}}'
 
     #[test]
     fn structured_tools_preserve_names_arguments_and_history() {
-        let tools = [crate::Tool { name: "read".into(), description: "Read a file".into(), parameters: json!({"type":"object", "properties":{"path":{"type":"string"}}}) }];
+        let tools =
+            [crate::Tool { strict: true, name: "read".into(), description: "Read a file".into(), parameters: json!({"type":"object", "properties":{"path":{"type":"string"}}}) }];
         let input = [Item::User("read this".into()), Item::ToolResult { call_id: "old".into(), output: "contents".into() }];
         let request = Request { tools: &tools, input: &input, ..request() };
         let events = decode(br#"{"structured_output":{"text":"Checking","tool_calls":[{"name":"read","arguments":{"path":"a.rs"}}]}}"#, &request).unwrap();

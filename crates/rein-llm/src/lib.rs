@@ -137,6 +137,11 @@ pub struct Tool {
     pub description: String,
     /// A JSON Schema for the arguments.
     pub parameters: serde_json::Value,
+    /// The schema keeps to strict mode's rules (every property required,
+    /// none besides), so a provider may hold the model to it. rein's own
+    /// tools' schemas do; an MCP server's, as it wrote them, usually don't,
+    /// and a provider turns a request away for one that doesn't.
+    pub strict: bool,
 }
 
 /// Token counts reported when a response completes.

@@ -138,6 +138,12 @@ finding. Each says why in a line.
 - Protect what runs later, not only what runs now: hooks, git's config, rule
   files, editors' and agents' settings. A command that plants one escapes on
   your next commit.
+- An MCP server is a command, someone else's: it runs in the sandbox like
+  one, and a project's starts only once you've said yes to all of what it
+  runs (command, arguments, environment), never to its name. Cursor went by
+  the name, and a later commit swapped the command behind it
+  (CVE-2025-54136). What a server says of its tools is its own word: none
+  runs without asking for it.
 - Network access is the internet, never other programs' sockets: with all
   network allowed, a command reached Docker's socket, and Docker can mount
   your home.
@@ -201,6 +207,8 @@ finding. Each says why in a line.
 - `pub(crate)` unless something outside the crate needs it.
 - The sandbox is its own crate, `rein-sandbox`, with no C in its
   dependencies: its tests build for Linux from a Mac and run in a container.
+  So is `rein-mcp`, which runs servers in it: it once took `rein-llm` for a
+  type, and with it reqwest's C, and stopped building for Linux.
 
 ## Tests
 

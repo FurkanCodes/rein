@@ -201,6 +201,9 @@ pub struct Places {
     locked: Vec<PathBuf>,
     /// Temp folders every command may write.
     temp: Vec<PathBuf>,
+    /// Folders of this command's own, which it may always read and write,
+    /// but no other command may: an MCP server's package cache.
+    own: Vec<PathBuf>,
     /// Never read or written, wherever they are.
     hidden: Vec<PathBuf>,
     /// Your home folder: none of it is read but what `readable` names.
@@ -290,6 +293,20 @@ impl Places {
 
     pub(crate) fn temp(&self) -> &[PathBuf] {
         &self.temp
+    }
+
+    pub(crate) fn own(&self) -> &[PathBuf] {
+        &self.own
+    }
+
+    /// The same places, with `dir` one of the command's own (see `own`),
+    /// unless it's inside what's hidden, which nothing may read.
+    pub(crate) fn with_own(mut self, dir: &Path) -> Places {
+        let dir = resolve(dir);
+        if !self.hidden.iter().any(|hidden| lower(&dir).starts_with(lower(hidden))) {
+            self.own.push(dir);
+        }
+        self
     }
 
     pub(crate) fn hidden(&self) -> &[PathBuf] {

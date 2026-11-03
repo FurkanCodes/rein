@@ -28,6 +28,7 @@ mod effort;
 mod format;
 mod harden;
 mod input;
+mod mcp;
 mod peers;
 mod settings;
 use settings::Settings;

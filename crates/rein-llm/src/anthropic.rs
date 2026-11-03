@@ -447,7 +447,7 @@ mod tests {
 
     /// The tool every test request offers.
     static TOOLS: std::sync::LazyLock<Vec<Tool>> =
-        std::sync::LazyLock::new(|| vec![Tool { name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]);
+        std::sync::LazyLock::new(|| vec![Tool { strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]);
 
     fn request<'a>(model: &'a str, input: &'a [Item]) -> Request<'a> {
         Request {

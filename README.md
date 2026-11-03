@@ -562,12 +562,65 @@ find the commands in it. An answer of "always" is for that command with as
 much access as that time. Rules decide when rein asks; they aren't a
 sandbox, so `deny rm` doesn't stop `/bin/rm`.
 
+## MCP servers
+
+MCP servers give the model more tools: an issue tracker's, a browser's, a
+database's. rein reads them from `~/.config/rein/mcp.json` and from a
+project's `.mcp.json`, in the shape Claude Code and Cursor use, so the
+snippet in a server's README works as it is:
+
+```json
+{ "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" },
+      "allow": ["get_issue", "search_issues"]
+} } }
+```
+
+A server is someone else's code, often fetched as it starts, so it runs in
+the sandbox the way a command with `network` access does. It reaches the
+project and the internet, but not the rest of your home folder, other
+programs' sockets, or rein's keys. What `npx` or `uvx` fetch goes in a
+folder of the server's own, `~/.cache/rein/mcp/<server>`, which nothing else
+may write. `"access"` gives it other walls: `look`, `write`, or `outside`
+for one that needs all of your home folder, like one that reads
+`~/.config/gh`. Its environment is what `env` gives it. `${NAME}` is a
+variable of yours, filled in as it starts, and its value is hidden wherever
+it shows up.
+
+A project's `.mcp.json` came with the project and may be anyone's. So rein
+asks before it starts one of its servers, showing exactly what it runs, and
+keeps your yes for the server as it is: a changed command, argument or
+variable asks again. A task run with `-p` doesn't start one you haven't said
+yes to.
+
+The model sees a server's tools as `mcp__<server>__<tool>`. They're listed
+in a conversation's first request, once the servers have started (each gets
+30 s), and stay as they are until `/new`. So a server can't change what the
+model was told mid-conversation, and the prompt cache isn't lost. A call
+asks first in `ask` and `edits`: a server's tool may do anything wherever
+the server reaches, and what a server says of a tool (that it only reads,
+say) is only its word. `allow` in your own file lets tools run without
+asking, and `"*"` allows all of one server's. `auto` runs only those, and
+`read-only` none. Neither a project's `.mcp.json` nor its
+`.rein/permissions` can allow one.
+
+What a server says is cleaned before you or the model see it: escape codes,
+and characters a terminal doesn't draw, are taken out. A call may take 5
+minutes. A long result is cut, and kept whole in a file in the temp folder
+for the model to read in parts. A server that stops is started again on its
+next call. `/mcp` shows each server, its walls and its tools, or why it
+didn't start. Servers reached at a URL, and their sign-ins, come later.
+
 ## Layout
 
 | Crate | What it is |
 |---|---|
 | `crates/rein-llm` | Streaming LLM provider layer: one client for every provider, the Responses, Messages, Gemini and Chat Completions APIs, the providers rein knows, Sign in with ChatGPT |
 | `crates/rein-sandbox` | The walls commands run inside: macOS's Seatbelt, Linux's Landlock and seccomp, what's protected and hidden |
+| `crates/rein-mcp` | MCP servers: their files, started in the sandbox, what they say cleaned, their tools under rein's names |
 | `crates/rein-agent` | The agent loop, the tools, the permission engine, saved conversations, and what the model is told first |
 | `crates/rein-cli` | The `rein` command |
 
@@ -609,10 +662,16 @@ and run in a container:
 ```sh
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/rust-lld"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C linker-flavor=ld.lld -C link-self-contained=yes"
-cargo test -p rein-sandbox --target aarch64-unknown-linux-musl --no-run
+cargo test -p rein-sandbox -p rein-mcp --target aarch64-unknown-linux-musl --no-run
 docker run --rm -e REIN_TEST_DIR=/work -v "$PWD/target/aarch64-unknown-linux-musl/debug/deps:/t:ro" \
   <an image with python3 and git, a user, and /work> /t/rein_sandbox-<hash>
 ```
+
+`rein-mcp` has no C in its dependencies either, and its tests start a small
+MCP server written in `sh` in the sandbox, so they run there the same way
+(`/t/rein_mcp-<hash>`). One opt-in test fetches a real server from npm and
+starts it in the sandbox, with Node and the internet:
+`cargo test -p rein-mcp -- --ignored --nocapture a_server_from_npm`.
 
 When the sandbox changes, stress it: hundreds of commands at once in every
 kind of access, each checked to work or to be walled in. Add

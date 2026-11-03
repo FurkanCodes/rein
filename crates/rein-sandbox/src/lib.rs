@@ -8,6 +8,7 @@
 //! from 5.13 on. Where rein has none, commands ask before they run: rein
 //! never runs one unconfined when it meant to confine it.
 
+mod group;
 mod guard;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod landlock;
@@ -22,6 +23,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+pub use group::Group;
 pub use guard::Guard;
 pub use places::Places;
 
@@ -247,6 +249,15 @@ impl Sandbox {
         &self.places
     }
 
+    /// The same sandbox, with `own` a folder of its own: what runs in it
+    /// may always read and write there, whatever its walls. For an MCP
+    /// server's package cache, which `npx` and `uvx` fill as it starts,
+    /// and which nothing else may write: whatever's put there, the server
+    /// runs.
+    pub fn with_own(&self, own: &std::path::Path) -> Sandbox {
+        Sandbox { how: self.how.clone(), places: self.places.clone().with_own(own) }
+    }
+
     /// The command `line`, run by `sh` within `walls`, with an environment
     /// that leaves keys and tokens out; what's wrong if it can't be.
     pub fn wrap(&self, line: &str, walls: Walls) -> Result<tokio::process::Command, String> {
@@ -344,6 +355,13 @@ pub(crate) fn passes(name: &str, value: &std::ffi::OsStr) -> bool {
     });
     let agent = matches!(upper.as_str(), "SSH_AUTH_SOCK" | "GPG_AGENT_INFO");
     !part && !word && !agent && !has_password(&value.to_string_lossy())
+}
+
+/// Whether the variable `name`, at `value`, holds a key, token or
+/// password, as its name or value says (see [`passes`]): what rein hides
+/// wherever it shows up.
+pub fn looks_secret(name: &str, value: &str) -> bool {
+    !passes(name, std::ffi::OsStr::new(value))
 }
 
 /// Whether `text` has a URL in it with a password: `postgres://me:pw@host`.
@@ -500,6 +518,32 @@ mod tests {
         }
         // Both ways: some it can read, and some it can't.
         assert!(hidden > 0 && hidden < paths.len());
+    }
+
+    /// An MCP server's package cache is its own: it writes it even with
+    /// look access, where nothing else in your home folder is readable, and
+    /// no other command may write it.
+    #[tokio::test]
+    async fn a_folder_of_its_own_is_written_whatever_the_walls_and_by_nothing_else() {
+        let (root, home) = (dir("own"), dir("own-home"));
+        let (own, other) = (home.join("place/own"), home.join("place/other"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let sandbox = Sandbox::detect(Places::new(&root, Some(&home), None)).await;
+        if !sandbox.available() {
+            return;
+        }
+        let run = |sandbox: &Sandbox, line: String| {
+            let mut command = sandbox.wrap(&line, Walls { write: false, network: false }).unwrap();
+            command.current_dir(&root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            async move { command.status().await.unwrap().success() }
+        };
+        let mine = sandbox.with_own(&own);
+        let (own, other) = (own.display(), other.display());
+        assert!(run(&mine, format!("echo x > '{own}/f' && mkdir -p '{own}/a/b' && cat '{own}/f' && ls '{own}'")).await, "its own, read and written");
+        assert!(!run(&mine, format!("echo x > '{other}/f'")).await, "not another folder beside it");
+        assert!(!run(&sandbox, format!("echo x > '{own}/g'")).await, "not for a command it isn't its own");
+        assert!(!run(&sandbox, format!("cat '{own}/f'")).await, "nor read by one: it's in the home folder");
     }
 
     #[test]

@@ -2608,3 +2608,89 @@ fn spawn_starts_a_sub_agent_you_name_without_asking() {
     lead.wait_for("tests says they pass.");
     tests.wait_exit();
 }
+
+/// Asks `/mcp` until it shows `text`: a server takes a moment to start.
+fn wait_for_mcp(term: &mut Term, text: &str) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        term.keys("/mcp\r");
+        std::thread::sleep(Duration::from_millis(300));
+        if term.text().contains(text) {
+            return;
+        }
+    }
+    panic!("/mcp never showed {text:?}. The screen:\n{}", term.text());
+}
+
+/// Your own MCP server starts with rein, in the sandbox, and its tools are
+/// the model's from the first message: one your mcp.json allows runs, the
+/// rest ask, and the server can't read your home folder.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_mcp_server_of_yours_starts_in_the_sandbox_and_its_tools_ask_unless_allowed() {
+    let secret = std::env::temp_dir().join(format!("rein-screen-{}-mcp-yours", std::process::id())).join("home/.ssh/id_test");
+    let calls = Turn {
+        out: vec![
+            Out::Call("mcp__fake__echo", json!({ "text": "hi" })),
+            Out::Call("mcp__fake__has", json!({ "name": "OPENAI_API_KEY" })),
+            Out::Call("mcp__fake__peek", json!({ "path": secret })),
+        ],
+    };
+    let mut model = Model::start(vec![calls, says("Both done.")]);
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "allow": ["echo", "has"] } } }).to_string()));
+    model.home.push((".ssh/id_test".into(), "FAKE-mcp-screen-secret\n".into()));
+    let mut term = Term::start_with(&model, "mcp-yours", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("use the server\r");
+    term.wait_for("Let fake's peek run?");
+    // Keys too soon after a question still go to the box.
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Both done.");
+    let text = term.text();
+    assert!(text.contains("MCP servers: fake (5 tools)"), "{text}");
+    assert!(text.contains(r#"MCP    fake: echo {"text":"hi"}"#), "{text}");
+    assert_eq!(results(&model), ["hi", "unset", "blocked"], "echo and has ran without asking; rein's key isn't the server's; peek asked, and couldn't read yours");
+    let tools = model.requests()[0]["tools"][0]["tools"].as_array().cloned().unwrap_or_default();
+    let echo = tools.iter().find(|tool| tool["name"] == "mcp__fake__echo").expect("offered from the first request");
+    assert_eq!(echo["strict"], false, "a server's schema isn't held to strict mode");
+    wait_for_mcp(&mut term, "5 tools: echo, peek, given, has, quit");
+}
+
+/// A project's .mcp.json may be anyone's: its server starts only once
+/// you've said yes to it as it is, and is asked about again once it
+/// changes.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_projects_mcp_server_starts_only_once_you_say_yes_to_it_as_it_is() {
+    let model = Model::start(Vec::new());
+    let file = |args: Value| json!({ "mcpServers": { "fake": { "command": "sh", "args": args } } }).to_string();
+    let mut term = Term::start_with(&model, "mcp-project", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER), (".mcp.json", &file(json!(["server.sh"])))]);
+    term.wait_for("Start fake, an MCP server this project's .mcp.json names?");
+    term.wait_for("sh server.sh");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("n");
+    term.wait_for(IDLE);
+    term.keys("/mcp\r");
+    term.wait_for("not started: you said no");
+    term.keys("/exit\r");
+
+    let mut term = term.again(&model);
+    term.wait_for("Start fake, an MCP server");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for(IDLE);
+    wait_for_mcp(&mut term, "5 tools: echo");
+    term.keys("/exit\r");
+
+    let mut term = term.again(&model);
+    term.wait_for(IDLE);
+    wait_for_mcp(&mut term, "5 tools: echo");
+    assert!(!term.text().contains("Start fake"), "said yes to as it is: not asked again\n{}", term.text());
+    term.keys("/exit\r");
+
+    std::fs::write(term.dir.join("project/.mcp.json"), file(json!(["server.sh", "--changed"]))).unwrap();
+    let term = term.again(&model);
+    term.wait_for("Start fake, an MCP server");
+    term.wait_for("sh server.sh --changed");
+}
