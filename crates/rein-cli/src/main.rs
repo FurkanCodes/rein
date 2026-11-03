@@ -72,6 +72,9 @@ fn main() -> ExitCode {
 
 async fn run(args: Vec<String>) -> CliResult {
     let http = rein_llm::http::client(concat!("rein/", env!("CARGO_PKG_VERSION"))).map_err(|e| e.to_string())?;
+    if let Ok(dir) = config_dir() {
+        claude::forget_borrowed_sign_in(&dir, &|line| say!("{line}"));
+    }
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["-h" | "--help"] => {
@@ -79,8 +82,6 @@ async fn run(args: Vec<String>) -> CliResult {
             Ok(())
         }
         ["login"] | ["login", "chatgpt"] => login(&http, &|line| say!("{line}")).await,
-        ["login", "anthropic", "--oauth"] => claude::login_cli(&http).await,
-        ["logout", "anthropic", "--oauth"] => connect::logout(claude::NAME, &|line| say!("{line}")),
         ["login", provider] => connect::login(&http, provider, false).await,
         ["login", provider, "--key"] => connect::login(&http, provider, true).await,
         // Anything else after `login` or `logout` may be a key: it's

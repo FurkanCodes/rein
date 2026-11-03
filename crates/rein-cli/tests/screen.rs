@@ -1391,7 +1391,6 @@ fn claude_code_login_saves_private_tokens_or_selects_the_clis_login() {
     let home = std::env::temp_dir().join(format!("rein-login-claude-code-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(home.join("claude-oauth.json"), "legacy credentials").unwrap();
     let (ok, said) = run(&model, &home, &["login", "claude-code"], "test-subscription-token\n");
     assert!(ok && said.contains("Claude Code enabled") && !said.contains("test-subscription-token"), "{said}");
     let path = home.join("claude-code.json");
@@ -1404,12 +1403,35 @@ fn claude_code_login_saves_private_tokens_or_selects_the_clis_login() {
     let (ok, said) = run(&model, &home, &["logout", "claude-code"], "");
     assert!(ok && said.contains("does not sign the Claude CLI out"), "{said}");
     assert!(!path.exists());
-    assert_eq!(std::fs::read_to_string(home.join("claude-oauth.json")).unwrap(), "legacy credentials");
     let (ok, said) = run(&model, &home, &["login", "claude-code"], "\n");
     assert!(ok, "{said}");
     let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert!(saved["token"].is_null());
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn a_claude_sign_in_an_earlier_rein_made_as_claude_code_is_deleted_and_said_once() {
+    let mut model = Model::start(Vec::new());
+    model.home.push(("claude-oauth.json".into(), r#"{"access_token":"FAKE-access","refresh_token":"FAKE-refresh","expires_at":9999999999}"#.into()));
+    let mut term = Term::start(&model, "borrowed-sign-in", 30, 120);
+    term.wait_for("Deleted the Claude sign-in an earlier rein made as Claude Code");
+    term.wait_for(IDLE);
+    assert!(!term.dir.join("home/claude-oauth.json").exists(), "its tokens don't linger");
+    term.keys("\x04");
+    // Started again with nothing more put in its home.
+    model.home.clear();
+    let term = term.again(&model);
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("Deleted the Claude sign-in"), "said once:\n{}", term.text());
+
+    // Any other command deletes it too, and nothing pays for Claude with it.
+    let home = term.dir.join("home");
+    std::fs::write(home.join("claude-oauth.json"), "{}").unwrap();
+    let (ok, said) = run(&model, &home, &["providers"], "");
+    assert!(ok && said.contains("Deleted the Claude sign-in") && !home.join("claude-oauth.json").exists(), "{said}");
+    let anthropic = said.lines().find(|line| line.starts_with("anthropic ")).unwrap_or_default();
+    assert!(anthropic.ends_with("no key yet: $ANTHROPIC_API_KEY or `rein login anthropic`"), "{said}");
 }
 
 #[test]
@@ -1632,77 +1654,6 @@ fn openrouter_sign_in_happens_in_the_browser_and_rein_keeps_the_key_it_makes() {
     let (ok, said) = run(&model, &home, &["logout", "openrouter"], "");
     assert!(ok && said.contains("still works there until you delete it"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
-}
-
-#[test]
-fn claude_oauth_requires_consent_and_defaults_to_cancel() {
-    let model = Model::start(vec![says("Still using the original provider.")]);
-    let mut term = Term::start(&model, "claude-oauth-consent", 40, 110);
-    term.wait_for(IDLE);
-    term.keys("/login anthropic --oauth\r");
-    term.wait_for("Accept the risks of unofficial Claude OAuth?");
-    term.wait_for("› Cancel");
-    let screen = term.text();
-    assert!(screen.contains("not authorized by Anthropic"), "{screen}");
-    assert!(screen.contains("restrict your account"), "{screen}");
-    assert!(screen.contains("impersonates Claude Code"), "{screen}");
-    term.keys("\r");
-    term.wait_for("(cancelled; nothing was saved)");
-    term.wait_for(IDLE);
-    assert!(!term.dir.join("home/claude-oauth.json").exists());
-    assert!(!term.text().contains("Waiting for Claude OAuth"), "no browser flow before consent");
-    term.keys("hi\r");
-    term.wait_for("Still using the original provider.");
-    assert_eq!(model.requests().len(), 1);
-}
-
-#[test]
-fn claude_oauth_cli_decline_does_not_start_login() {
-    let model = Model::start(vec![]);
-    let dir = std::env::temp_dir().join(format!("rein-screen-{}-claude-oauth-cli", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut term = Term::spawn_with(&model, dir, 30, 110, &["login", "anthropic", "--oauth"]);
-    term.wait_for("Type 'I accept' to continue");
-    assert!(term.text().contains("not authorized by Anthropic"));
-    term.keys("no\r");
-    term.wait_exit();
-    assert!(term.text().contains("Cancelled; nothing was saved."), "{}", term.text());
-    assert!(!term.dir.join("home/claude-oauth.json").exists());
-}
-
-#[test]
-fn claude_oauth_is_lower_priority_than_keys_and_never_used_for_proxies() {
-    let dir = std::env::temp_dir().join(format!("rein-claude-oauth-priority-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let oauth = dir.join("claude-oauth.json");
-    std::fs::write(&oauth, r#"{"access_token":"secret-access","refresh_token":"secret-refresh","expires_at":9999999999}"#).unwrap();
-    let run = |args: &[&str], extra: &[(&str, &str)]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_rein"))
-            .args(args)
-            .env_clear()
-            .env("HOME", &dir)
-            .env("REIN_HOME", &dir)
-            .env("BROWSER", "false")
-            .env("SSH_CONNECTION", "test")
-            .envs(extra.iter().copied())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        String::from_utf8(output.stdout).unwrap() + &String::from_utf8(output.stderr).unwrap()
-    };
-    let row = |output: String| output.lines().find(|line| line.starts_with("anthropic ")).unwrap().to_owned();
-    assert!(row(run(&["providers"], &[])).contains("OAuth (unofficial; account risk)"));
-    assert!(row(run(&["providers"], &[("ANTHROPIC_BASE_URL", "https://example.invalid/v1")])).contains("no key yet"));
-    let keys = dir.join("keys.json");
-    std::fs::write(&keys, r#"{"anthropic":"saved-secret"}"#).unwrap();
-    assert!(row(run(&["providers"], &[])).contains("your saved key"));
-    assert!(row(run(&["providers"], &[("ANTHROPIC_API_KEY", "env-secret")])).contains("$ANTHROPIC_API_KEY"));
-    assert!(row(run(&["providers"], &[("ANTHROPIC_AUTH_TOKEN", "gateway-secret")])).contains("$ANTHROPIC_AUTH_TOKEN"));
-    assert!(run(&["logout", "anthropic", "--oauth"], &[]).contains("Signed out of Claude OAuth locally"));
-    assert!(!oauth.exists());
-    assert!(std::fs::read_to_string(keys).unwrap().contains("saved-secret"));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

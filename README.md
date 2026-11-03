@@ -45,10 +45,12 @@ OpenAI's, `gemini-*` Google's), or you name the provider first:
   settings. `--key` pastes one instead.
 - **Nothing, on your own computer.** Ollama and LM Studio need no key.
 
-Claude subscription OAuth is available only as an explicit, unofficial opt-in;
-see the warning below. Google Gemini plans aren't supported. rein prints what pays on every run. With no
-model named, it uses `gpt-6.1-sol`, or, with no way to pay OpenAI, the first
-provider you have a key for (`claude-opus-5-5`, `gemini-3.8-flash`, ...).
+rein doesn't sign in to Claude or Gemini plans itself: Anthropic and Google
+don't allow other apps to sign in with them. For a Claude plan, the
+`claude-code` provider runs Anthropic's own CLI (below). rein prints what
+pays on every run. With no model named, it uses `gpt-6.1-sol`, or, with no
+way to pay OpenAI, the first provider you have a key for (`claude-opus-5-5`,
+`gemini-3.8-flash`, ...).
 
 Add a provider, or point one of rein's elsewhere, in `~/.config/rein/providers`:
 
@@ -94,7 +96,7 @@ Use `rein -m claude-code/sonnet`, `claude-code/opus`, `claude-code/haiku`, or
 You can also supply `CLAUDE_CODE_OAUTH_TOKEN` instead of saving a token. For a
 service, configure its PATH to include `claude`; shell profiles aren't loaded.
 
-This is independent of the API-key and unofficial OAuth paths below. rein
+This is independent of the API-key path. rein
 invokes `claude -p`, never sends this token through its HTTP provider, and
 strips inherited API keys, endpoint overrides and alternate-provider switches
 from the subprocess environment. It does not use `--bare`. A recent CLI with
@@ -111,31 +113,10 @@ out, revoke a token, or unset an environment token. Subscription availability,
 limits and permitted usage are governed by Anthropic's current terms; this
 integration does not guarantee entitlement or a particular token lifetime.
 
-### Optional, unofficial Claude subscription OAuth
-
-`rein login anthropic --oauth` (or `/login anthropic --oauth` inside a
-conversation) offers browser login using a Claude subscription. API-key login
-remains unchanged: `rein login anthropic` still asks for an API key.
-
-This integration is **not authorized by Anthropic for third-party apps**. It
-uses Claude Code's public OAuth client identity, compatibility headers and
-system identity. Anthropic may block it or restrict your account without
-notice. See its [authentication policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).
-A warning and explicit acknowledgment are required before opening the browser;
-use an API key instead if you don't accept these risks. Compatibility is not
-guaranteed and no live-account validation is implied.
-
-The browser must run on the same computer; the callback uses localhost port
-54545, which must be free. Sign-in times out after ten minutes and can be
-cancelled. Credentials live in `claude-oauth.json` under rein's private config
-folder, are refreshed as needed, and are never sent to custom endpoints or
-proxies. Environment keys/tokens and saved API keys take precedence over OAuth.
-Each run using OAuth identifies it as unofficial and warns about account risk.
-
-`rein logout anthropic --oauth` (or `/logout anthropic --oauth`) deletes the
-local credentials, not your saved API key. Existing OAuth clients stop working
-once those credentials are removed. Revoke the grant in your Claude account to
-invalidate it remotely. `rein logout anthropic` still forgets only the API key.
+An earlier rein offered `rein login anthropic --oauth`, which signed in to a
+Claude plan as Claude Code: with its client ID, headers and system prompt. It
+was removed, because rein never signs in as another app. If that sign-in's
+`claude-oauth.json` is still in rein's folder, rein deletes it, and says so.
 
 ### Claude and Gemini
 

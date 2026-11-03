@@ -60,8 +60,6 @@ pub struct Client {
     idle: Duration,
     /// How requests went over the wire, shared by the client's clones.
     wire: Arc<Wire>,
-    /// Present only for explicitly opted-in Claude subscription clients.
-    claude_oauth: Option<Arc<anthropic::oauth::Session>>,
     /// Your ChatGPT plan's sign-in, which renews itself.
     chatgpt: Option<Arc<openai::signin::Session>>,
     claude_code: Option<crate::claude_code::Backend>,
@@ -124,7 +122,7 @@ impl Client {
     /// which speaks `api`.
     pub fn new(http: reqwest::Client, api: Api, base_url: impl Into<String>, auth: Auth) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
-        Client { http, api, base_url, auth, quirks: Quirks::default(), idle: IDLE, wire: Arc::default(), claude_oauth: None, chatgpt: None, claude_code: None }
+        Client { http, api, base_url, auth, quirks: Quirks::default(), idle: IDLE, wire: Arc::default(), chatgpt: None, claude_code: None }
     }
 
     /// OpenAI on your ChatGPT plan, signed in to with `rein login` and saved
@@ -139,15 +137,6 @@ impl Client {
         let mut client = Self::new(http, Api::Responses, base_url, Auth::None);
         client.chatgpt = Some(Arc::new(session));
         Ok(client)
-    }
-
-    /// Unofficial Claude subscription authentication. The caller must first
-    /// obtain consent to Anthropic's restrictions. Tokens are never sent to
-    /// provider overrides or gateways, only Anthropic's own endpoint.
-    pub fn claude_oauth(http: reqwest::Client, credentials: std::path::PathBuf) -> Self {
-        let mut client = Self::new(http, Api::Anthropic, anthropic::API_BASE, Auth::None);
-        client.claude_oauth = Some(Arc::new(anthropic::oauth::Session::new(credentials)));
-        client
     }
 
     /// Uses the official Claude Code CLI. A token, when supplied, is passed
@@ -243,7 +232,7 @@ impl Client {
     /// once more: a token can stop working before the time it gave.
     async fn send_as(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let Some(session) = &self.chatgpt else {
-            return Ok(self.authorize(builder).await?.send().await?);
+            return Ok(self.authorize(builder).send().await?);
         };
         let again = builder.try_clone();
         let token = session.token(&self.http).await?;
@@ -254,46 +243,27 @@ impl Client {
         }
     }
 
-    async fn authorize(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-        if let Some(session) = &self.claude_oauth {
-            return Ok(builder.bearer_auth(session.token(&self.http).await?));
-        }
-        Ok(match &self.auth {
+    fn authorize(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
             Auth::None => builder,
             Auth::Bearer(token) => builder.bearer_auth(token),
             Auth::Header(name, value) => builder.header(*name, value),
-        })
+        }
     }
 
     /// The format's own headers, for `body` when it's a request.
     fn headers(&self, request: Option<(&Request<'_>, &Value)>) -> Vec<(&'static str, String)> {
-        let mut headers = match self.api {
+        match self.api {
             Api::Responses => openai::headers(request),
             Api::Anthropic => anthropic::headers(request),
             Api::Chat | Api::Gemini => Vec::new(),
-        };
-        if self.claude_oauth.is_some() {
-            let mut betas = "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14".to_owned();
-            for (_, value) in headers.iter().filter(|(name, _)| *name == "anthropic-beta") {
-                betas.push(',');
-                betas.push_str(value);
-            }
-            headers.retain(|(name, _)| *name != "anthropic-beta");
-            headers.extend([("anthropic-beta", betas), ("User-Agent", anthropic::oauth::USER_AGENT.into()), ("x-app", "cli".into())]);
         }
-        headers
     }
 
     fn body(&self, request: &Request<'_>, omitted: &[&str]) -> Value {
         match self.api {
             Api::Responses => openai::request_body(request),
-            Api::Anthropic => {
-                let mut body = anthropic::request_body(request, omitted, &self.base_url);
-                if self.claude_oauth.is_some() {
-                    anthropic::oauth::shape(&mut body);
-                }
-                body
-            }
+            Api::Anthropic => anthropic::request_body(request, omitted, &self.base_url),
             Api::Chat => chat::request_body(request, omitted, self.quirks),
             Api::Gemini => gemini::request_body(request, omitted),
         }
@@ -340,15 +310,7 @@ impl Client {
             let body = self.body(&request, &omitted);
             match self.send(&request, &body, &omitted).await {
                 Ok(response) => {
-                    return Ok(ResponseStream {
-                        source: StreamSource::Http(Box::new(HttpStream {
-                            response,
-                            decoder: self.decoder(&request),
-                            record: None,
-                            idle: self.idle,
-                            claude_oauth: self.claude_oauth.is_some(),
-                        })),
-                    });
+                    return Ok(ResponseStream { source: StreamSource::Http(Box::new(HttpStream { response, decoder: self.decoder(&request), record: None, idle: self.idle })) });
                 }
                 // The server named a field it doesn't take: once more
                 // without it, and never again with it. For effort, that's
@@ -501,20 +463,9 @@ struct HttpStream {
     decoder: Box<dyn Decode>,
     record: Option<File>,
     idle: Duration,
-    claude_oauth: bool,
 }
 
 impl HttpStream {
-    fn normalize(&self, mut event: Result<Event>) -> Result<Event> {
-        if self.claude_oauth
-            && let Ok(Event::Item(crate::Item::ToolCall(call))) = &mut event
-            && let Some(name) = call.name.strip_prefix('_')
-        {
-            call.name = name.to_owned();
-        }
-        event
-    }
-
     /// Also writes the raw stream to `file`, so tests can replay it later.
     pub fn record_to(&mut self, file: File) {
         self.record = Some(file);
@@ -523,7 +474,7 @@ impl HttpStream {
     pub async fn next(&mut self) -> Option<Result<Event>> {
         loop {
             if let Some(item) = self.decoder.pop() {
-                return Some(self.normalize(item));
+                return Some(item);
             }
             if self.decoder.is_finished() {
                 return None;
@@ -541,7 +492,7 @@ impl HttpStream {
                     }
                     self.decoder.push(&bytes);
                 }
-                Ok(None) => return self.decoder.finish().map(|event| self.normalize(event)),
+                Ok(None) => return self.decoder.finish(),
                 Err(e) => {
                     self.decoder.fail();
                     return Some(Err(e.into()));
@@ -671,123 +622,6 @@ mod tests {
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert!(seen[0].to_lowercase().contains("authorization: bearer first\r\n"), "{}", seen[0]);
         assert!(seen[1].to_lowercase().contains("authorization: bearer new-access\r\n") && seen[1].contains(r#""model":"m""#), "{}", seen[1]);
-    }
-
-    #[tokio::test]
-    async fn claude_oauth_stream_uses_bearer_and_restores_tool_names() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = std::env::temp_dir().join(format!("rein-oauth-stream-{}-{}", std::process::id(), crate::oauth::random_token().unwrap()));
-        let path = dir.join("credentials.json");
-        crate::store::write_json_private(&path, &json!({ "access_token": "test-access", "refresh_token": "test-refresh", "expires_at": u64::MAX })).unwrap();
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let mut client = Client::claude_oauth(reqwest::Client::new(), path);
-        // Only a unit test can replace the private endpoint; real OAuth clients
-        // cannot send credentials to provider overrides.
-        client.base_url = format!("http://{}", listener.local_addr().unwrap());
-        let client = client.without_compression();
-        let server = async {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let (split, length) = loop {
-                let mut buf = [0; 4096];
-                let n = socket.read(&mut buf).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-                if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head = String::from_utf8_lossy(&bytes[..split]).to_lowercase();
-                    let length: usize = head.lines().find_map(|l| l.strip_prefix("content-length: ").map(|n| n.parse().unwrap())).unwrap();
-                    break (split + 4, length);
-                }
-            };
-            while bytes.len() < split + length {
-                let mut buf = [0; 4096];
-                let n = socket.read(&mut buf).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-            }
-            let head = String::from_utf8_lossy(&bytes[..split]).to_lowercase();
-            assert!(head.contains("authorization: bearer test-access"), "{head}");
-            assert!(!head.contains("x-api-key:"));
-            assert!(head.contains("user-agent: claude-cli/"));
-            assert!(head.contains("oauth-2025-04-20"));
-            let body: Value = serde_json::from_slice(&bytes[split..split + length]).unwrap();
-            assert_eq!(body["system"][0]["text"], anthropic::oauth::IDENTITY);
-            let events = [
-                json!({"type":"message_start","message":{"usage":{"input_tokens":1}}}),
-                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"_read","input":{}}}),
-                json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}),
-                json!({"type":"content_block_stop","index":0}),
-                json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}),
-                json!({"type":"message_stop"}),
-            ];
-            let sse: String = events.iter().map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap())).collect();
-            socket
-                .write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}", sse.len()).as_bytes())
-                .await
-                .unwrap();
-        };
-        let receive = async {
-            let request = Request {
-                model: "claude-opus-5-5",
-                instructions: None,
-                input: &[],
-                tools: &[],
-                reasoning_effort: None,
-                reasoning_summary: false,
-                session_id: None,
-                max_output_tokens: None,
-            };
-            let mut stream = client.stream(&request).await.unwrap();
-            let mut called = false;
-            while let Some(event) = stream.next().await {
-                if let Event::Item(crate::Item::ToolCall(call)) = event.unwrap() {
-                    assert_eq!(call.name, "read");
-                    assert_eq!(call.call_id, "t1");
-                    assert_eq!(serde_json::from_str::<Value>(&call.arguments).unwrap()["path"], "a.rs");
-                    called = true;
-                }
-            }
-            assert!(called);
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(server, receive);
-        })
-        .await
-        .unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn claude_oauth_compatibility_is_explicit_and_wire_only() {
-        let request = Request {
-            model: "claude-opus-5-5",
-            instructions: Some("rein instructions"),
-            input: &[crate::Item::ToolCall(crate::ToolCall { call_id: "c1".into(), name: "read".into(), arguments: "{}".into() })],
-            tools: &[crate::Tool { name: "read".into(), description: "read a file".into(), parameters: json!({"type":"object"}) }],
-            reasoning_effort: None,
-            reasoning_summary: false,
-            session_id: None,
-            max_output_tokens: None,
-        };
-        let normal = Client::new(reqwest::Client::new(), Api::Anthropic, anthropic::API_BASE, Auth::Bearer("gateway".into()));
-        let oauth = Client::claude_oauth(reqwest::Client::new(), "unused-test-credentials".into());
-        let plain = normal.body(&request, &[]);
-        let shaped = oauth.body(&request, &[]);
-        assert_eq!(plain["system"][0]["text"], "rein instructions");
-        assert_eq!(plain["tools"][0]["name"], "read");
-        assert_eq!(shaped["system"][0]["text"], anthropic::oauth::IDENTITY);
-        assert_eq!(shaped["system"][1]["text"], "rein instructions");
-        assert_eq!(shaped["tools"][0]["name"], "_read");
-        let call = shaped["messages"].as_array().unwrap().iter().flat_map(|m| m["content"].as_array().unwrap()).find(|b| b["type"] == "tool_use").unwrap();
-        assert_eq!(call["name"], "_read");
-        assert_eq!(request.tools[0].name, "read", "no changes to rein's tool specs");
-        assert_eq!(request.instructions, Some("rein instructions"));
-        let headers = oauth.headers(Some((&request, &shaped)));
-        let beta = headers.iter().find(|(name, _)| *name == "anthropic-beta").unwrap();
-        assert!(beta.1.contains("oauth-2025-04-20"));
-        assert!(headers.iter().any(|(name, value)| *name == "User-Agent" && value.starts_with("claude-cli/")));
-        assert!(!normal.headers(None).iter().any(|(_, value)| value.contains("oauth-2025-04-20")));
-        assert_eq!(oauth.base_url(), anthropic::API_BASE);
     }
 
     #[test]
