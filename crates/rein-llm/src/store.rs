@@ -35,12 +35,8 @@ pub fn write_json_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// directory). It writes a temporary file and renames it over the target, so
 /// a crash never leaves a half-written file behind.
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(dir)?;
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        private_dir(dir)?;
     }
     // A name of its own for each write, so two rein windows saving the same
     // file at once can't rename each other's half-written one into place.
@@ -59,6 +55,26 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     Ok(written?)
+}
+
+/// Makes `dir` a folder only you can open (0700), whether it's made now or
+/// was there: one made by hand or by another program may be 0755, and
+/// `DirBuilder`'s mode only applies to the folders it makes.
+fn private_dir(dir: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder.create(dir)?;
+        if fs::metadata(dir)?.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| std::io::Error::new(e.kind(), format!("can't make {} private: {e}", dir.display())))?;
+        }
+    }
+    #[cfg(not(unix))]
+    builder.create(dir)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -87,6 +103,20 @@ mod tests {
         assert!(saved["writer"].is_u64(), "{saved}");
         let left: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["keys.json"], "no temporary files left");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_others_can_open_is_made_private_when_written_to() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rein-store-open-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        write_json_private(&dir.join("keys.json"), &serde_json::json!({ "openrouter": "sk-or-v1-FAKE" })).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700, "only you can open it now");
+        assert_eq!(fs::metadata(dir.join("keys.json")).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_dir_all(&dir);
     }
 }
