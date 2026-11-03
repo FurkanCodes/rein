@@ -375,6 +375,73 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// Many commands at once, in every kind of access, again and again:
+    /// every one that should work does, and the walls hold under load. A
+    /// sandbox profile once crashed macOS, so this is how to see one holds
+    /// up before it ships. Opt in, with `REIN_STRESS_RUNS` commands (600 by
+    /// default), `REIN_STRESS_AT_ONCE` at a time (24):
+    /// `cargo test -p rein-sandbox -- --ignored --nocapture many_commands`.
+    #[tokio::test]
+    #[ignore = "a stress test: hundreds of sandboxed commands, run when the sandbox changes"]
+    async fn many_commands_at_once_all_run_and_stay_walled_in() {
+        let number = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let (runs, at_once) = (number("REIN_STRESS_RUNS", 600), number("REIN_STRESS_AT_ONCE", 24).max(1));
+        let (root, home) = (dir("stress"), dir("stress-home"));
+        write(&home.join(".ssh/id_test"), "FAKE-stress-secret\n");
+        write(&root.join("readme.txt"), "hello\n");
+        let sandbox = std::sync::Arc::new(Sandbox::detect(Places::new(&root, Some(&home), None)).await);
+        if !sandbox.available() {
+            return;
+        }
+        let (look, write_, network) = (Walls { write: false, network: false }, Walls { write: true, network: false }, Walls { write: true, network: true });
+        let secret = home.join(".ssh/id_test").display().to_string();
+        // What each command is, the walls it gets, and whether it should work.
+        let mixes: Vec<(String, Walls, bool)> = vec![
+            ("echo ok".into(), look, true),
+            ("uname -a >/dev/null && cat readme.txt >/dev/null && ls / >/dev/null && echo ok".into(), look, true),
+            ("(sysctl -n hw.ncpu 2>/dev/null || nproc) >/dev/null && echo ok".into(), look, true),
+            ("if command -v git >/dev/null; then git --version >/dev/null || exit 3; fi; echo ok".into(), look, true),
+            ("if command -v python3 >/dev/null; then python3 -I -c 'print(1)' >/dev/null || exit 3; fi; echo ok".into(), look, true),
+            ("for i in 1 2 3 4 5 6 7 8; do (true) & done; wait; echo ok".into(), look, true),
+            ("echo x > \"written-$$\" && rm \"written-$$\" && echo ok".into(), write_, true),
+            ("echo x > \"written-$$\" && rm \"written-$$\" && echo ok".into(), network, true),
+            // The walls, under load.
+            ("echo x > \"look-wrote-$$\"".into(), look, false),
+            (format!("cat '{secret}'"), network, false),
+        ];
+        let started = std::time::Instant::now();
+        let (mut done, mut failures) = (0usize, Vec::new());
+        while done < runs {
+            let mut batch = tokio::task::JoinSet::new();
+            for n in done..(done + at_once).min(runs) {
+                let (line, walls, works) = mixes[n % mixes.len()].clone();
+                let mut command = sandbox.wrap(&line, walls).expect("a sandbox, since one was found");
+                command.current_dir(&root).stdin(std::process::Stdio::null());
+                batch.spawn(async move {
+                    let output = command.output().await;
+                    (n, line, works, output)
+                });
+            }
+            while let Some(joined) = batch.join_next().await {
+                let (n, line, works, output) = joined.expect("the task ran");
+                done += 1;
+                let said = match &output {
+                    Ok(out) => format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+                    Err(e) => format!("didn't start: {e}"),
+                };
+                let worked = output.as_ref().is_ok_and(|out| out.status.success()) && said.trim() == "ok";
+                let ran = output.is_ok();
+                if worked != works || !ran || said.contains("FAKE-stress-secret") {
+                    failures.push(format!("#{n} {line}: {said}"));
+                }
+            }
+        }
+        let left: Vec<_> = std::fs::read_dir(&root).unwrap().filter_map(Result::ok).map(|e| e.file_name()).filter(|name| name != "readme.txt").collect();
+        println!("{runs} sandboxed commands, {at_once} at a time, in {:.1?}", started.elapsed());
+        assert!(failures.is_empty(), "{} of {runs} went wrong:\n{}", failures.len(), failures.join("\n"));
+        assert!(left.is_empty(), "left in the project: {left:?}");
+    }
+
     /// rein's own file tools refuse what `hides` says is hidden, so it must
     /// be exactly what a command in the sandbox can't read.
     #[tokio::test]

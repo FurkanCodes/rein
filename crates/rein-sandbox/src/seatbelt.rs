@@ -206,6 +206,25 @@ mod tests {
             .collect()
     }
 
+    /// A profile that names syscalls crashed the Mac once: past the number
+    /// the kernel takes, its syscall mask panics macOS (`mask size (75)
+    /// exceeds maximum (70)`), and a list that's fine on one macOS can be
+    /// past it on an older one. So no profile of rein's names any, whatever
+    /// the walls and wherever the project is. This only reads the rules: it
+    /// never runs them.
+    #[test]
+    fn no_profile_ever_names_a_syscall() {
+        let root = dir("syscalls");
+        for places in [Places::new(&root, None, None), Places::new(&root, Some(&root), Some(&root.join(".rein")))] {
+            for write in [false, true] {
+                for network in [false, true] {
+                    let (text, _) = profile(&places, Walls { write, network });
+                    assert!(!text.to_lowercase().contains("syscall"), "a profile names a syscall:\n{text}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn look_writes_only_the_temp_folders_and_write_the_project_too() {
         let root = dir("rules");
