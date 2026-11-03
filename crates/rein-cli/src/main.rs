@@ -34,6 +34,7 @@ use settings::Settings;
 mod terminal;
 mod ui;
 use args::{AskArgs, HELP};
+use connect::KeyFrom;
 use conversation::ask;
 use format::mask_email;
 
@@ -84,11 +85,14 @@ async fn run(args: Vec<String>) -> CliResult {
             Ok(())
         }
         ["login"] | ["login", "chatgpt"] => login(&http, &|line| say!("{line}")).await,
-        ["login", provider] => connect::login(&http, provider, false).await,
-        ["login", provider, "--key"] => connect::login(&http, provider, true).await,
+        ["login", provider] => connect::login(&http, provider, KeyFrom::Asked).await,
+        ["login", provider, "--key"] => connect::login(&http, provider, KeyFrom::Pasted).await,
+        // A key after the provider's name is saved, once it works: it goes
+        // nowhere else, and isn't said back.
+        ["login", provider, key] | ["login", provider, "--key", key] => connect::login(&http, provider, KeyFrom::Given((*key).to_owned())).await,
         // Anything else after `login` or `logout` may be a key: it's
         // turned down, never sent anywhere, and never said back.
-        ["login", ..] => Err("rein login takes only a provider's name (and --key); paste the key when it asks".into()),
+        ["login", ..] => Err("rein login takes a provider's name and, if you like, its key, like `rein login openrouter <key>`".into()),
         ["logout", provider] => connect::logout(provider, &|line| say!("{line}")),
         ["logout", ..] => Err("rein logout takes a provider's name, and only that, like `rein logout anthropic`".into()),
         ["providers"] => connect::list(),

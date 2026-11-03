@@ -254,16 +254,33 @@ pub fn paste_prompt(provider: &Provider) -> String {
 /// `rein login <provider>`: a key for it, made in the browser where the
 /// provider has an official sign-in (unless `paste`), or pasted; checked,
 /// then saved.
-pub async fn login(http: &rein_llm::reqwest::Client, name: &str, paste: bool) -> CliResult {
+pub async fn login(http: &rein_llm::reqwest::Client, name: &str, from: KeyFrom) -> CliResult {
     let providers = providers(&config_dir()?)?;
     let provider = find(&providers, name)?;
     let tell = |line: &str| say!("{line}");
+    let paste = match from {
+        // Checked and saved as one pasted is: never sent anywhere else.
+        KeyFrom::Given(key) => return save_key(http, provider, key, false, &tell).await,
+        KeyFrom::Asked => false,
+        KeyFrom::Pasted => true,
+    };
     let made = sign_in(provider, paste)?;
     let key = match made {
         Some(auth_url) => key_from_browser(http, provider, auth_url, &tell).await?,
         None => read_secret(&format!("{}: ", paste_prompt(provider)))?,
     };
     save_key(http, provider, key, made.is_some(), &tell).await
+}
+
+/// Where `rein login` gets the key from. No `Debug`: it may hold one.
+pub enum KeyFrom {
+    /// A sign-in in the browser, where the provider has one, or else
+    /// asked for.
+    Asked,
+    /// Asked for, to paste (`--key`).
+    Pasted,
+    /// Typed after the provider's name.
+    Given(String),
 }
 
 /// Checks `key` with `provider` and saves it, saying how that went.

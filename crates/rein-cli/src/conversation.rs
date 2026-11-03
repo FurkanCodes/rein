@@ -485,7 +485,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
             Some(Ok(Slash::Exit)) => break,
             Some(parsed) => {
                 // A line that may hold a key isn't shown again.
-                let hidden = matches!(&parsed, Err(refused) if refused.hides_the_line());
+                let hidden = crate::commands::hides(line);
                 if terminal.input.pinned() && !hidden {
                     say!("\n{}", you_said(line, terminal.err, terminal.wrap_width().unwrap_or(80)));
                 }
@@ -595,7 +595,8 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             }
             say!("{pad}{}", s.dim("The prompt cache starts over: it's kept per model."));
         }
-        Slash::Login(Some(name)) => login_here(&name, agent, terminal, setup).await?,
+        Slash::Login(Some(name)) => login_here(&name, None, agent, terminal, setup).await?,
+        Slash::LoginWith(name, key) => login_here(&name, Some(key), agent, terminal, setup).await?,
         Slash::Logout(Some(name)) => {
             crate::connect::logout(&name, &|line| say!("{pad}{line}"))?;
             setup.keys = crate::connect::load_keys(&config_dir()?)?;
@@ -816,7 +817,7 @@ pub(crate) async fn other_models(setup: &mut Setup, terminal: &mut Terminal) -> 
 /// pasted in the box, where it shows as dots; a provider with a browser
 /// sign-in, and ChatGPT, sign in there. Once done, it's ready for /model,
 /// and if it's the provider in use, its next request pays the new way.
-pub(crate) async fn login_here(name: &str, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
+pub(crate) async fn login_here(name: &str, given: Option<crate::commands::Key>, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
     let pad = " ".repeat(GUTTER);
     let s = terminal.err;
     let tell = |text: &str| {
@@ -826,6 +827,9 @@ pub(crate) async fn login_here(name: &str, agent: &mut Agent<Llm>, terminal: &mu
     };
     let cancelled = || say!("{pad}{}", s.dim("(cancelled; nothing was saved)"));
     let signed_in = if name == "chatgpt" {
+        if given.is_some() {
+            return Err("ChatGPT is signed in to in the browser: /login chatgpt takes no key".into());
+        }
         if waiting(terminal, "Waiting for you to sign in to ChatGPT in the browser", login(&setup.http, &tell)).await?.is_none() {
             cancelled();
             return Ok(());
@@ -833,23 +837,30 @@ pub(crate) async fn login_here(name: &str, agent: &mut Agent<Llm>, terminal: &mu
         "openai"
     } else {
         let provider = crate::connect::find(&setup.providers, name)?.clone();
-        let made = crate::connect::sign_in(&provider, false)?;
-        let key = match made {
-            Some(auth_url) => {
-                let what = format!("Waiting for you to sign in to {} in the browser", provider.title);
-                waiting(terminal, &what, crate::connect::key_from_browser(&setup.http, &provider, auth_url, &tell)).await?
+        // A key typed after the name is checked and saved as one pasted is.
+        let (key, made) = match given {
+            Some(key) => (Some(key.into_inner()), false),
+            None => {
+                let made = crate::connect::sign_in(&provider, false)?;
+                let key = match made {
+                    Some(auth_url) => {
+                        let what = format!("Waiting for you to sign in to {} in the browser", provider.title);
+                        waiting(terminal, &what, crate::connect::key_from_browser(&setup.http, &provider, auth_url, &tell)).await?
+                    }
+                    None => match terminal.input.read_secret(&crate::connect::paste_prompt(&provider)).await {
+                        Some(Read::Line(key)) => Some(key),
+                        Some(_) => None,
+                        None => return Err(format!("a key typed here would show; run `rein login {name}` in a terminal instead")),
+                    },
+                };
+                (key, made.is_some())
             }
-            None => match terminal.input.read_secret(&crate::connect::paste_prompt(&provider)).await {
-                Some(Read::Line(key)) => Some(key),
-                Some(_) => None,
-                None => return Err(format!("a key typed here would show; run `rein login {name}` in a terminal instead")),
-            },
         };
         let Some(key) = key else {
             cancelled();
             return Ok(());
         };
-        crate::connect::save_key(&setup.http, &provider, key, made.is_some(), &tell).await?;
+        crate::connect::save_key(&setup.http, &provider, key, made, &tell).await?;
         name
     };
     setup.keys = crate::connect::load_keys(&config_dir()?)?;

@@ -33,8 +33,10 @@ OpenAI's, `gemini-*` Google's), or you name the provider first:
   [ChatGPT settings → Usage](https://chatgpt.com/settings/usage).
 - **An API key.** The provider's variable (`OPENAI_API_KEY`,
   `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, ...), or a key
-  saved with `rein login <provider>`, which checks it first and keeps it in
-  `~/.config/rein/keys.json`, readable only by you. The variable wins over the
+  saved with `rein login <provider>`, which asks for it, or `rein login
+  <provider> <key>`, which takes it from you there (your shell keeps that line
+  in its history). Either way rein checks it first, never shows it again,
+  and keeps it in `~/.config/rein/keys.json`, readable only by you. The variable wins over the
   saved key. A gateway in front of Claude takes `ANTHROPIC_AUTH_TOKEN`.
   `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL` and `GOOGLE_GEMINI_BASE_URL` point
   rein at another server that speaks the same API, like a proxy.
@@ -161,6 +163,7 @@ was removed, because rein never signs in as another app. If that sign-in's
 ```sh
 rein login                      # continue with ChatGPT
 rein login anthropic            # save an API key, checked first
+rein login anthropic sk-ant-…   # the same, with the key given here
 rein login openrouter           # sign in in the browser; OpenRouter makes rein a key
 rein providers                  # who rein can reach, and what pays
 rein models                     # list the models you can use, by provider
@@ -214,7 +217,7 @@ message, so typing ahead can't answer it by accident.
 | Ctrl-L | draw the window again |
 | `/mode [ask\|edits\|auto\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
-| `/login [provider]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; OpenRouter and `chatgpt` sign in in the browser), or forget one |
+| `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |

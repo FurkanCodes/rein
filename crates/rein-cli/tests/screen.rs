@@ -918,43 +918,50 @@ fn tab_while_rein_works_waits_for_the_end_of_the_turn() {
 }
 
 #[test]
-fn a_key_typed_after_logins_provider_is_never_shown_or_kept() {
-    let model = Model::start(vec![says("Hi."), two_steps(), says("Made it.")]);
-    let mut term = Term::start_with(&model, "login-more", 30, 100, &[ALLOWED]);
+fn a_key_typed_after_logins_provider_is_saved_and_never_shown_or_kept() {
+    let mut model = Model::chat(vec![says("Hi."), two_steps(), says("Made it.")], None);
+    let base = model.base.clone();
+    model.home.push(("providers".into(), format!("[groq]\nurl = {base}\n\n[openrouter]\nurl = {base}\n")));
+    let mut term = Term::start_with(&model, "login-key", 30, 100, &[ALLOWED]);
     term.wait_for(IDLE);
     term.keys("hello\r");
     term.wait_for("Hi.");
     term.wait_for(IDLE);
-    term.keys("/login openrouter sk-or-v1-FAKE-in-the-box\r");
-    term.wait_for("✗ /login takes only a provider's name; paste the key when it asks");
+    // OpenRouter answers only a good key, and only that one is saved.
+    term.keys("/login openrouter good-key\r");
+    term.wait_for("Saved. Your OpenRouter key works");
     term.wait_for(IDLE);
-    assert!(!term.text().contains("FAKE"), "neither shown again nor said back:\n{}", term.text());
+    assert!(!term.text().contains("good-key"), "neither shown again nor said back:\n{}", term.text());
     // ↑ brings back what was sent before it.
     term.keys("\x1b[A");
     term.wait_until("the message before it in the box", |_| term.in_box() == "hello");
     term.keys("\x15");
+    term.keys("/login openrouter good-key and-more\r");
+    term.wait_for("/login takes a provider's name and, if you like, its key");
     term.wait_for(IDLE);
 
-    // Typed while rein works, it doesn't wait above the box either.
+    // Typed while rein works, it waits for the end of the turn, without its key.
     term.keys("make the file\r");
     term.wait_for("Running sleep 1");
-    term.keys("/logout openrouter sk-or-v1-FAKE-while-working\r");
+    term.keys("/login openrouter good-key\r");
     // While it's typed, the key is in the box, as what you type is: only
     // outside it, above the box, is it shown when it shouldn't be.
-    let outside_the_box = |screen: &str| screen.lines().any(|line| line.contains("FAKE") && !line.contains('│'));
-    term.wait_until("why it can't go, or the key above the box", |screen| screen.contains("/logout takes only a provider's name") || outside_the_box(screen));
+    let outside_the_box = |screen: &str| screen.lines().any(|line| line.contains("good-key") && !line.contains('│'));
+    term.wait_until("it waiting, or the key above the box", |screen| screen.contains("after this turn: /login openrouter (key hidden)") || outside_the_box(screen));
     assert!(!outside_the_box(&term.text()), "{}", term.text());
     term.wait_for("Made it.");
+    term.wait_until("saved again, after the turn", |screen| screen.matches("Saved. Your OpenRouter key works").count() == 2);
     term.wait_for(IDLE);
-    assert!(!term.text().contains("FAKE"), "{}", term.text());
+    assert!(!term.text().contains("good-key"), "{}", term.text());
     term.keys("\x04");
     term.wait_exit();
 
-    assert!(!model.requests().iter().any(|request| request.to_string().contains("FAKE")), "the model never saw it");
+    assert!(!model.requests().iter().any(|request| request.to_string().contains("good-key")), "the model never saw it");
     let files = every_file(&term.dir);
     assert!(files.iter().any(|file| file.starts_with(term.dir.join("home/history"))), "what was sent is kept: {files:?}");
     for file in files {
-        assert!(!std::fs::read_to_string(&file).unwrap_or_default().contains("FAKE"), "{} has the key", file.display());
+        let has = std::fs::read_to_string(&file).unwrap_or_default().contains("good-key");
+        assert_eq!(has, file.ends_with("keys.json"), "{} {} the key", file.display(), if has { "has" } else { "doesn't have" });
     }
 }
 
@@ -1569,15 +1576,15 @@ fn every_file(dir: &std::path::Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn a_key_typed_after_login_is_turned_down_and_goes_nowhere() {
-    let model = Model::start(vec![says("This should never be asked for.")]);
-    let dir = std::env::temp_dir().join(format!("rein-login-more-{}", std::process::id()));
+fn a_key_typed_after_logins_provider_is_saved_once_it_works_and_goes_nowhere_else() {
+    let model = Model::chat(vec![says("This should never be asked for.")], None);
+    let dir = std::env::temp_dir().join(format!("rein-login-key-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let (home, project) = (dir.join("home"), dir.join("project"));
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&project).unwrap();
-    let key = "sk-or-v1-FAKE-typed-after-the-name";
-    for args in [&["login", "openrouter", key][..], &["login", "openrouter", "--key", key], &["login", "--key", key], &["logout", "openrouter", key], &["logout"]] {
+    std::fs::write(home.join("providers"), format!("[openrouter]\nurl = {}\n", model.base)).unwrap();
+    let rein = |args: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_rein"))
             .args(args)
             .current_dir(&project)
@@ -1586,20 +1593,33 @@ fn a_key_typed_after_login_is_turned_down_and_goes_nowhere() {
             .env("HOME", &home)
             .env("REIN_HOME", &home)
             // A model that would answer, were anything sent to it.
-            .env("OPENAI_API_KEY", "test")
-            .env("OPENAI_BASE_URL", &model.base)
+            .env("GROQ_API_KEY", "test")
             .env("BROWSER", "false")
             .env("SSH_CONNECTION", "screen-test")
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success() && said.contains("takes"), "{args:?} is turned down: {said}");
-        assert!(!said.contains("FAKE"), "and never said back: {said}");
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+    };
+    // OpenRouter answers only a good key: another isn't saved.
+    let (ok, said) = rein(&["login", "openrouter", "sk-or-v1-FAKE-bad"]);
+    assert!(!ok && said.contains("that key didn't work") && said.contains("nothing was saved") && !said.contains("FAKE"), "{said}");
+    assert!(!home.join("keys.json").exists());
+    for args in [&["login", "openrouter", "good-key"][..], &["login", "openrouter", "--key", "good-key"]] {
+        let (ok, said) = rein(args);
+        assert!(ok && said.contains("Saved. Your OpenRouter key works") && !said.contains("good-key"), "{args:?}: {said}");
+    }
+    assert!(std::fs::read_to_string(home.join("keys.json")).unwrap().contains("good-key"));
+    // More than a name and a key is turned down, and never said back.
+    for args in [&["login", "openrouter", "good-key", "and-more"][..], &["login", "--key", "good-key"], &["logout", "openrouter", "good-key"], &["logout"]] {
+        let (ok, said) = rein(args);
+        assert!(!ok && !said.contains("good-key"), "{args:?} is turned down: {said}");
     }
     assert!(model.requests().is_empty(), "nothing went to the model: {:?}", model.requests());
     for file in every_file(&dir) {
-        assert!(!std::fs::read_to_string(&file).unwrap_or_default().contains("FAKE"), "{} has the key", file.display());
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(!text.contains("FAKE"), "{} has the bad key", file.display());
+        assert_eq!(text.contains("good-key"), file.ends_with("keys.json"), "{}", file.display());
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

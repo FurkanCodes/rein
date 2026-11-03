@@ -39,6 +39,9 @@ pub enum Slash {
     Model(Option<String>),
     /// `None` lists the providers and what pays for each.
     Login(Option<String>),
+    /// `/login openrouter <key>`: that key, for that provider. The line
+    /// it came in is never shown again or kept.
+    LoginWith(String, Key),
     /// `None` asks which.
     Logout(Option<String>),
     /// `None` asks which.
@@ -102,10 +105,10 @@ impl Spawn {
 /// Why a command can't be done as typed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// `/login` or `/logout` with more than a provider's name after it.
-    /// What follows may be a key: the line isn't shown again or kept for
-    /// ↑, and this doesn't say it back.
-    MoreThanAName(Account),
+    /// `/login` with more than a provider's name and a key after it, or
+    /// `/logout` with more than a name. What follows may be a key: the
+    /// line isn't shown again or kept for ↑, and this doesn't say it back.
+    TooManyWords(Account),
     /// Anything else, said in words.
     Said(String),
 }
@@ -121,17 +124,34 @@ impl Refused {
     /// The line it was typed in may hold a secret, so it's never shown
     /// again or kept.
     pub fn hides_the_line(&self) -> bool {
-        matches!(self, Self::MoreThanAName(_))
+        matches!(self, Self::TooManyWords(_))
     }
 }
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MoreThanAName(Account::Login) => f.write_str("/login takes only a provider's name; paste the key when it asks"),
-            Self::MoreThanAName(Account::Logout) => f.write_str("/logout takes only a provider's name"),
+            Self::TooManyWords(Account::Login) => f.write_str("/login takes a provider's name and, if you like, its key"),
+            Self::TooManyWords(Account::Logout) => f.write_str("/logout takes only a provider's name"),
             Self::Said(words) => f.write_str(words),
         }
+    }
+}
+
+/// A key typed after `/login`'s provider. It's never shown, `Debug`
+/// included, which could put it in a log or a panic message.
+#[derive(PartialEq, Eq)]
+pub struct Key(String);
+
+impl Key {
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Key(hidden)")
     }
 }
 
@@ -167,7 +187,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
     let rest = rest.trim();
     let arg = (!rest.is_empty()).then(|| rest.to_owned());
     // A provider's name is one word: whatever comes after it may be a key.
-    let account = |account: Account| if rest.split_whitespace().nth(1).is_some() { Err(Refused::MoreThanAName(account)) } else { Ok(arg.clone()) };
+    let words: Vec<&str> = rest.split_whitespace().collect();
     Some(match word {
         "/help" => Ok(Slash::Help),
         "/mode" => match &arg {
@@ -175,8 +195,17 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
             Some(name) => name.parse().map(|m| Slash::Mode(Some(m))).map_err(Refused::Said),
         },
         "/model" => Ok(Slash::Model(arg)),
-        "/login" => account(Account::Login).map(Slash::Login),
-        "/logout" => account(Account::Logout).map(Slash::Logout),
+        "/login" => match words.as_slice() {
+            [] => Ok(Slash::Login(None)),
+            [provider] => Ok(Slash::Login(Some((*provider).to_owned()))),
+            [provider, key] | [provider, "--key", key] => Ok(Slash::LoginWith((*provider).to_owned(), Key((*key).to_owned()))),
+            _ => Err(Refused::TooManyWords(Account::Login)),
+        },
+        "/logout" => match words.as_slice() {
+            [] => Ok(Slash::Logout(None)),
+            [provider] => Ok(Slash::Logout(Some((*provider).to_owned()))),
+            _ => Err(Refused::TooManyWords(Account::Logout)),
+        },
         "/effort" => match arg.as_deref() {
             None => Ok(Slash::Effort(None)),
             Some("default") => Ok(Slash::Effort(Some(EffortSetting::Default))),
@@ -209,7 +238,20 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
 /// Whether `line` may hold a secret, like a key typed after `/login`'s
 /// provider: then it's never shown again, or kept for ↑.
 pub fn hides(line: &str) -> bool {
-    matches!(parse(line), Some(Err(refused)) if refused.hides_the_line())
+    match parse(line) {
+        Some(Ok(Slash::LoginWith(..))) => true,
+        Some(Err(refused)) => refused.hides_the_line(),
+        _ => false,
+    }
+}
+
+/// `line` as it may be shown while it waits for the end of a turn: with
+/// the key it holds, if any, left out.
+pub fn shown(line: &str) -> std::borrow::Cow<'_, str> {
+    match parse(line) {
+        Some(Ok(Slash::LoginWith(provider, _))) => format!("/login {provider} (key hidden)").into(),
+        _ => line.into(),
+    }
 }
 
 /// `api fix the tests` → the rein it's for, and what to tell it.
@@ -280,12 +322,17 @@ mod tests {
     }
 
     #[test]
-    fn a_key_after_logins_provider_is_turned_down_without_saying_it() {
-        for (line, account) in
-            [("/login openrouter sk-or-v1-FAKE", Account::Login), ("/login  anthropic --key sk-ant-FAKE ", Account::Login), ("/logout openrouter sk-or-v1-FAKE", Account::Logout)]
-        {
+    fn a_key_after_logins_provider_is_taken_and_never_shown() {
+        for line in ["/login openrouter sk-or-v1-FAKE", "/login  anthropic --key sk-ant-FAKE "] {
+            let Some(Ok(Slash::LoginWith(provider, key))) = parse(line) else { panic!("{line} is a key for a provider") };
+            assert!(["openrouter", "anthropic"].contains(&provider.as_str()) && key.into_inner().contains("FAKE"));
+            assert!(hides(line), "{line} is neither shown again nor kept");
+            assert!(!shown(line).contains("FAKE") && shown(line).ends_with("(key hidden)"), "{}", shown(line));
+            assert!(!format!("{:?}", parse(line)).contains("FAKE"), "nor in Debug");
+        }
+        for (line, account) in [("/login openrouter sk-or-v1-FAKE and more", Account::Login), ("/logout openrouter sk-or-v1-FAKE", Account::Logout)] {
             let refused = parse(line).and_then(Result::err).unwrap_or_else(|| panic!("{line} is turned down"));
-            assert_eq!(refused, Refused::MoreThanAName(account));
+            assert_eq!(refused, Refused::TooManyWords(account));
             assert!(!refused.to_string().contains("FAKE"), "{refused}");
             assert!(hides(line), "{line} is neither shown again nor kept");
         }

@@ -290,6 +290,7 @@ impl Boxed {
             above.push(format!("{pad}{} {first} {}", s.dim("↳ steering:"), s.dim("· goes in at the next step")));
         }
         for message in &self.queued {
+            let message = commands::shown(message);
             let first = message.lines().next().unwrap_or_default();
             above.push(format!("{pad}{} {first}", s.dim("↳ after this turn:")));
         }
