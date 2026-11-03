@@ -193,6 +193,15 @@ impl Places {
         self.protected.iter().any(|p| full.starts_with(lower(p))) || self.locked.iter().any(|l| full == lower(l))
     }
 
+    /// Whether `path`, absolute, is out of a sandboxed command's reach:
+    /// what it can't read, it's not for rein's own file tools to read for
+    /// the model either. Symlinks are followed as far as the path exists,
+    /// and letter case doesn't count, as on macOS.
+    pub fn hides(&self, path: &Path) -> bool {
+        let full = lower(&resolve(path));
+        self.hidden.iter().any(|hidden| full.starts_with(lower(hidden)))
+    }
+
     /// Protects `path`, and locks the folders between it and the writable
     /// place it's in.
     fn protect(&mut self, path: &Path) {
@@ -430,5 +439,20 @@ mod tests {
             assert!(places.hidden().contains(&home.join(name)), "{name}");
         }
         assert!(places.protected().contains(&home.join(".zshrc")));
+    }
+
+    #[test]
+    fn says_what_it_hides_whatever_the_case_or_the_way_there() {
+        let root = project("hides");
+        let home = project("hides-home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh"), root.join("keys")).unwrap();
+        let places = Places::new(&root, Some(&home), Some(&home.join("rein-home")));
+        assert!(places.hides(&home.join(".ssh/id_ed25519")));
+        assert!(places.hides(&home.join(".SSH/id_ed25519")), "letter case doesn't count");
+        assert!(places.hides(&root.join("keys/id_ed25519")), "nor a symlink on the way");
+        assert!(places.hides(&home.join("rein-home/keys.json")));
+        assert!(!places.hides(&root.join("src/main.rs")));
+        assert!(!places.hides(&home.join(".sshd_config")), "a name that only starts the same isn't hidden");
     }
 }
