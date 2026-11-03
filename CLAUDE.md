@@ -146,6 +146,10 @@ finding. Each says why in a line.
 - Keys stay out of rein's environment (`secrets::keep`, first in `main`):
   macOS hands any process of yours another's environment (`KERN_PROCARGS2`),
   sandbox or not, and a sandboxed command read rein's key from it.
+- Seatbelt rules never name syscalls by number, not even in a quick
+  experiment: a profile allowing numbers 0 to 599 crashed macOS (its kernel
+  takes 560), and the Mac restarted. An older macOS has fewer syscalls, so a
+  number that's fine here can crash one there.
 - Between fork and exec, only system calls on what's ready: no allocating,
   no locks. The Landlock ruleset is built in rein's process; the command's
   only takes it on.
