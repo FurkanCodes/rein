@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::Result;
+use crate::{Error, Result};
 
 /// `$REIN_HOME` if set, otherwise `~/.config/rein`.
 pub fn config_dir() -> Option<PathBuf> {
@@ -18,10 +18,11 @@ pub fn config_dir() -> Option<PathBuf> {
     std::env::home_dir().map(|home| home.join(".config").join("rein"))
 }
 
-/// Reads a JSON file, or returns `None` if it doesn't exist.
+/// Reads a JSON file, or returns `None` if it doesn't exist. One that isn't
+/// as rein wrote it says where, never what's there: it may be a key.
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     match fs::read(path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| Error::Unreadable { path: path.to_owned(), line: e.line(), column: e.column() }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -80,6 +81,27 @@ fn private_dir(dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_damaged_file_says_where_but_never_whats_in_it() {
+        let dir = std::env::temp_dir().join(format!("rein-store-damaged-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+        for (text, line, column) in
+            [("\"sk-test-FAKE-bare-string\"", 1, 26), ("{\n  \"openrouter\": \"sk-or-v1-FAKE\",\n  \"anthropic\": sk-ant-FAKE\n}", 3, 16), ("{\"anthropic\": \"sk-ant-FAKE", 1, 26)]
+        {
+            fs::write(&path, text).unwrap();
+            let e = read_json::<std::collections::BTreeMap<String, String>>(&path).unwrap_err();
+            let shown = e.to_string();
+            assert!(matches!(&e, Error::Unreadable { line: l, column: c, .. } if (*l, *c) == (line, column)), "{e:?}");
+            assert!(shown.starts_with(&path.display().to_string()) && shown.contains(&format!("line {line}, column {column}")), "{shown}");
+            assert!(!shown.contains("FAKE") && !shown.contains("response"), "{shown}");
+            assert!(!format!("{e:?}").contains("FAKE"), "{e:?}");
+            assert!(std::error::Error::source(&e).is_none(), "the cause would quote it");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn writers_at_the_same_time_never_leave_a_half_written_file() {

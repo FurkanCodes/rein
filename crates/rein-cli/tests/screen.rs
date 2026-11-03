@@ -1513,6 +1513,21 @@ fn ctrl_c_at_the_key_prompt_shows_typing_again() {
 }
 
 #[test]
+fn a_damaged_credential_file_says_where_but_never_whats_in_it() {
+    let model = Model::start(Vec::new());
+    let home = std::env::temp_dir().join(format!("rein-damaged-{}", std::process::id()));
+    for (file, args) in [("keys.json", &["providers"][..]), ("chatgpt.json", &["login"]), ("claude-code.json", &["models", "claude-code"])] {
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(file), "\"sk-test-FAKE-bare-string\"").unwrap();
+        let (ok, said) = run(&model, &home, args, "");
+        assert!(!ok && said.contains(&format!("{file} isn't as rein wrote it (line 1, column 26)")), "{file}: {said}");
+        assert!(!said.contains("FAKE") && !said.contains("response"), "{file}: {said}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn a_saved_key_is_checked_kept_private_used_and_forgotten() {
     let model = Model::claude(vec![]);
     let home = std::env::temp_dir().join(format!("rein-login-{}", std::process::id()));

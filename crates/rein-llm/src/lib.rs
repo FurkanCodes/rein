@@ -379,6 +379,14 @@ pub enum Error {
     },
     /// Signing in or refreshing credentials failed.
     Auth(String),
+    /// One of rein's own files, like `keys.json`, isn't as rein wrote it:
+    /// where, but never what's there, which may be a key. (serde_json's
+    /// own error quotes it.)
+    Unreadable {
+        path: std::path::PathBuf,
+        line: usize,
+        column: usize,
+    },
     /// The response stopped early, for example at an output limit.
     Incomplete(String),
     /// The connection closed before the response finished.
@@ -479,6 +487,9 @@ impl fmt::Display for Error {
                 Ok(())
             }
             Error::Auth(message) => write!(f, "{message}"),
+            Error::Unreadable { path, line, column } => {
+                write!(f, "{} isn't as rein wrote it (line {line}, column {column}); fix it, or delete it and sign in again", path.display())
+            }
             Error::Incomplete(reason) => write!(f, "the response stopped early: {reason}"),
             Error::Interrupted => write!(f, "the connection closed before the response finished"),
         }
