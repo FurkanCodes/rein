@@ -99,6 +99,42 @@ impl Spawn {
     }
 }
 
+/// Why a command can't be done as typed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// `/login` or `/logout` with more than a provider's name after it.
+    /// What follows may be a key: the line isn't shown again or kept for
+    /// ↑, and this doesn't say it back.
+    MoreThanAName(Account),
+    /// Anything else, said in words.
+    Said(String),
+}
+
+/// Which of the commands about a provider's account it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Account {
+    Login,
+    Logout,
+}
+
+impl Refused {
+    /// The line it was typed in may hold a secret, so it's never shown
+    /// again or kept.
+    pub fn hides_the_line(&self) -> bool {
+        matches!(self, Self::MoreThanAName(_))
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MoreThanAName(Account::Login) => f.write_str("/login takes only a provider's name; paste the key when it asks"),
+            Self::MoreThanAName(Account::Logout) => f.write_str("/logout takes only a provider's name"),
+            Self::Said(words) => f.write_str(words),
+        }
+    }
+}
+
 /// What `/effort` sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffortSetting {
@@ -120,7 +156,7 @@ impl EffortSetting {
 /// line counts as a command when its first word looks like one (`/mode`),
 /// so a message that starts with a path, like `/usr/bin is…`, stays a
 /// message.
-pub fn parse(line: &str) -> Option<Result<Slash, String>> {
+pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
     let line = line.trim();
     let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let name = word.strip_prefix('/')?;
@@ -130,19 +166,21 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
     let word = ALIASES.iter().find(|(alias, _)| *alias == word).map_or(word, |(_, name)| *name);
     let rest = rest.trim();
     let arg = (!rest.is_empty()).then(|| rest.to_owned());
+    // A provider's name is one word: whatever comes after it may be a key.
+    let account = |account: Account| if rest.split_whitespace().nth(1).is_some() { Err(Refused::MoreThanAName(account)) } else { Ok(arg.clone()) };
     Some(match word {
         "/help" => Ok(Slash::Help),
         "/mode" => match &arg {
             None => Ok(Slash::Mode(None)),
-            Some(name) => name.parse().map(|m| Slash::Mode(Some(m))),
+            Some(name) => name.parse().map(|m| Slash::Mode(Some(m))).map_err(Refused::Said),
         },
         "/model" => Ok(Slash::Model(arg)),
-        "/login" => Ok(Slash::Login(arg)),
-        "/logout" => Ok(Slash::Logout(arg)),
+        "/login" => account(Account::Login).map(Slash::Login),
+        "/logout" => account(Account::Logout).map(Slash::Logout),
         "/effort" => match arg.as_deref() {
             None => Ok(Slash::Effort(None)),
             Some("default") => Ok(Slash::Effort(Some(EffortSetting::Default))),
-            Some(level) => level.parse().map(|e| Slash::Effort(Some(EffortSetting::Level(e)))).map_err(|e| format!("{e}, or default")),
+            Some(level) => level.parse().map(|e| Slash::Effort(Some(EffortSetting::Level(e)))).map_err(|e| Refused::Said(format!("{e}, or default"))),
         },
         "/status" => Ok(Slash::Status),
         "/compact" => Ok(Slash::Compact(arg)),
@@ -160,12 +198,18 @@ pub fn parse(line: &str) -> Option<Result<Slash, String>> {
             Ok(Slash::Delegate(to, task))
         }
         "/inbox" => Ok(Slash::Inbox),
-        "/spawn" => Spawn::parse(rest).map(Slash::Spawn),
+        "/spawn" => Spawn::parse(rest).map(Slash::Spawn).map_err(Refused::Said),
         "/name" => Ok(Slash::Name(arg)),
         "/workspace" => Ok(Slash::Workspace(arg)),
         "/exit" => Ok(Slash::Exit),
-        other => Err(format!("there's no {other} command; /help lists them")),
+        other => Err(Refused::Said(format!("there's no {other} command; /help lists them"))),
     })
+}
+
+/// Whether `line` may hold a secret, like a key typed after `/login`'s
+/// provider: then it's never shown again, or kept for ↑.
+pub fn hides(line: &str) -> bool {
+    matches!(parse(line), Some(Err(refused)) if refused.hides_the_line())
 }
 
 /// `api fix the tests` → the rein it's for, and what to tell it.
@@ -207,7 +251,7 @@ mod tests {
         assert_eq!(parse("/model gpt-6.1-terra"), Some(Ok(Slash::Model(Some("gpt-6.1-terra".into())))));
         assert_eq!(parse("/effort default"), Some(Ok(Slash::Effort(Some(EffortSetting::Default)))));
         assert_eq!(parse("/effort xhigh"), Some(Ok(Slash::Effort(Some(EffortSetting::Level(Effort::XHigh))))));
-        assert_eq!(parse("/effort extreme"), Some(Err("no effort called extreme; use off, minimal, low, medium, high, xhigh or max, or default".into())));
+        assert_eq!(parse("/effort extreme"), Some(Err(Refused::Said("no effort called extreme; use off, minimal, low, medium, high, xhigh or max, or default".into()))));
         assert_eq!(parse("/compact keep the test output"), Some(Ok(Slash::Compact(Some("keep the test output".into())))));
         assert_eq!(parse("/clear"), Some(Ok(Slash::New)));
         assert_eq!(parse("/quit"), Some(Ok(Slash::Exit)));
@@ -226,13 +270,28 @@ mod tests {
         assert_eq!(parse("/spawn review -m claude-opus-5-5 --edits fix it"), spawn(Some("review"), Some("claude-opus-5-5"), true, Some("fix it")));
         assert_eq!(parse("/spawn"), spawn(None, None, false, None));
         assert_eq!(parse("/spawn docs"), spawn(Some("docs"), None, false, None));
-        assert_eq!(parse("/spawn x -m"), Some(Err("-m needs a model".into())));
+        assert_eq!(parse("/spawn x -m"), Some(Err(Refused::Said("-m needs a model".into()))));
     }
 
     #[test]
     fn says_what_went_wrong() {
-        assert_eq!(parse("/mode yolo"), Some(Err("no mode called yolo; use ask, edits, auto, read-only or trust".into())));
-        assert_eq!(parse("/frobnicate"), Some(Err("there's no /frobnicate command; /help lists them".into())));
+        assert_eq!(parse("/mode yolo"), Some(Err(Refused::Said("no mode called yolo; use ask, edits, auto, read-only or trust".into()))));
+        assert_eq!(parse("/frobnicate"), Some(Err(Refused::Said("there's no /frobnicate command; /help lists them".into()))));
+    }
+
+    #[test]
+    fn a_key_after_logins_provider_is_turned_down_without_saying_it() {
+        for (line, account) in
+            [("/login openrouter sk-or-v1-FAKE", Account::Login), ("/login  anthropic --key sk-ant-FAKE ", Account::Login), ("/logout openrouter sk-or-v1-FAKE", Account::Logout)]
+        {
+            let refused = parse(line).and_then(Result::err).unwrap_or_else(|| panic!("{line} is turned down"));
+            assert_eq!(refused, Refused::MoreThanAName(account));
+            assert!(!refused.to_string().contains("FAKE"), "{refused}");
+            assert!(hides(line), "{line} is neither shown again nor kept");
+        }
+        for line in ["/login openrouter", "/login", "/logout anthropic", "/model gpt-6.1-terra extra", "/frobnicate sk-FAKE", "fix it"] {
+            assert!(!hides(line), "{line} is shown and kept as usual");
+        }
     }
 
     #[test]

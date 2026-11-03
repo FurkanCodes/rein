@@ -918,6 +918,44 @@ fn tab_while_rein_works_waits_for_the_end_of_the_turn() {
 }
 
 #[test]
+fn a_key_typed_after_logins_provider_is_never_shown_or_kept() {
+    let model = Model::start(vec![says("Hi."), two_steps(), says("Made it.")]);
+    let mut term = Term::start_with(&model, "login-more", 30, 100, &[ALLOWED]);
+    term.wait_for(IDLE);
+    term.keys("hello\r");
+    term.wait_for("Hi.");
+    term.wait_for(IDLE);
+    term.keys("/login openrouter sk-or-v1-FAKE-in-the-box\r");
+    term.wait_for("✗ /login takes only a provider's name; paste the key when it asks");
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("FAKE"), "neither shown again nor said back:\n{}", term.text());
+    // ↑ brings back what was sent before it.
+    term.keys("\x1b[A");
+    term.wait_until("the message before it in the box", |_| term.in_box() == "hello");
+    term.keys("\x15");
+    term.wait_for(IDLE);
+
+    // Typed while rein works, it doesn't wait above the box either.
+    term.keys("make the file\r");
+    term.wait_for("Running sleep 1");
+    term.keys("/logout openrouter sk-or-v1-FAKE-while-working\r");
+    term.wait_until("why it can't go, or the key", |screen| screen.contains("/logout takes only a provider's name") || screen.contains("FAKE"));
+    assert!(!term.text().contains("FAKE"), "{}", term.text());
+    term.wait_for("Made it.");
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("FAKE"), "{}", term.text());
+    term.keys("\x04");
+    term.wait_exit();
+
+    assert!(!model.requests().iter().any(|request| request.to_string().contains("FAKE")), "the model never saw it");
+    let files = every_file(&term.dir);
+    assert!(files.iter().any(|file| file.starts_with(term.dir.join("home/history"))), "what was sent is kept: {files:?}");
+    for file in files {
+        assert!(!std::fs::read_to_string(&file).unwrap_or_default().contains("FAKE"), "{} has the key", file.display());
+    }
+}
+
+#[test]
 fn typing_a_slash_lists_the_commands() {
     let model = Model::start(Vec::new());
     let mut term = Term::start(&model, "slash", 24, 80);

@@ -484,12 +484,14 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
         match crate::commands::parse(line) {
             Some(Ok(Slash::Exit)) => break,
             Some(parsed) => {
-                if terminal.input.pinned() {
+                // A line that may hold a key isn't shown again.
+                let hidden = matches!(&parsed, Err(refused) if refused.hides_the_line());
+                if terminal.input.pinned() && !hidden {
                     say!("\n{}", you_said(line, terminal.err, terminal.wrap_width().unwrap_or(80)));
                 }
                 let done = match parsed {
                     Ok(command) => run_command(command, agent, terminal, setup).await,
-                    Err(e) => Err(e),
+                    Err(refused) => Err(refused.to_string()),
                 };
                 if let Err(e) = done {
                     say!("{pad}{}", terminal.err.red(&format!("✗ {e}")));

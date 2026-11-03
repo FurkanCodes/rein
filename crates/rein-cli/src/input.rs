@@ -724,6 +724,9 @@ impl Boxed {
         let found = self.mention_menu();
         let pick = found.get(self.picked.min(found.len().saturating_sub(1))).cloned();
         let typed = self.editor.mention().map(|(_, typed)| typed);
+        // A key that changes the box takes away the note shown before it;
+        // a note the key itself brings stays.
+        let before = self.notice.take();
         let mut edited = true;
         match (waiting, &key) {
             // The paths that match an `@` word: Esc closes the list, the
@@ -799,7 +802,8 @@ impl Boxed {
         }
         if edited {
             self.pick_default();
-            self.notice = None;
+        } else if self.notice.is_none() {
+            self.notice = before;
         }
         self.draw();
     }
@@ -833,7 +837,7 @@ impl Boxed {
     /// Tab while rein works: the message waits for the end of the turn.
     fn submit_later(&mut self) {
         let text = self.take_message(Waiting::Nothing);
-        if !text.trim().is_empty() {
+        if !text.trim().is_empty() && !self.turned_down(&text) {
             self.queued.push(text);
         }
     }
@@ -843,6 +847,9 @@ impl Boxed {
     /// the end of the turn instead.
     fn submit(&mut self, waiting: Waiting) {
         let text = self.take_message(waiting);
+        if waiting == Waiting::Nothing && self.turned_down(&text) {
+            return;
+        }
         match waiting {
             Waiting::Nothing if text.trim().is_empty() => {}
             Waiting::Nothing if commands::parse(&text).is_some() => self.queued.push(text),
@@ -851,8 +858,20 @@ impl Boxed {
         }
     }
 
-    /// Takes the message out of the box: kept for ↑, and how the box showed
-    /// it kept for the conversation.
+    /// While rein works, a line that may hold a key doesn't wait above the
+    /// box, where it would show: why it can't go is said at once, in place
+    /// of the bar. `true` when it was such a line.
+    fn turned_down(&mut self, text: &str) -> bool {
+        let Some(Err(refused)) = commands::parse(text) else { return false };
+        if !refused.hides_the_line() {
+            return false;
+        }
+        self.notice = Some((refused.to_string(), Instant::now()));
+        true
+    }
+
+    /// Takes the message out of the box: kept for ↑, unless it may hold a
+    /// key, and how the box showed it kept for the conversation.
     fn take_message(&mut self, waiting: Waiting) -> String {
         self.dismissed = None;
         screen::follow();
@@ -862,7 +881,7 @@ impl Boxed {
         if shown != text && !self.secret {
             self.shown.push((text.clone(), shown));
         }
-        if waiting != Waiting::Answer {
+        if waiting != Waiting::Answer && !commands::hides(&text) {
             self.editor.remember(entry);
         }
         text
