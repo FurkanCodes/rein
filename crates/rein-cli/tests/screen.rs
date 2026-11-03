@@ -2027,8 +2027,11 @@ fn claude_code_subprocess_keeps_reins_tools_and_uses_subscription_auth() {
     std::fs::write(
         &program,
         r#"#!/bin/sh
-[ "$CLAUDE_CODE_OAUTH_TOKEN" = subscription-test ] || exit 10
+[ -z "${CLAUDE_CODE_OAUTH_TOKEN+set}" ] || exit 12
+[ "$(/bin/cat "/dev/fd/$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")" = subscription-test ] || exit 10
 [ -z "$OPENAI_API_KEY$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$ANTHROPIC_BASE_URL" ] || exit 11
+pwd -P >> "$0.pwd"
+printf '%s\n' "$@" > "$0.args"
 /bin/cat > "$0.input"
 if [ -f "$0.called" ]; then
     printf '%s' '{"structured_output":{"text":"Read through rein, not Claude tools.","tool_calls":[]}}'
@@ -2055,6 +2058,14 @@ fi
     assert!(input.contains("subprocess fixture contents"), "{input}");
     assert!(model.requests.lock().unwrap().is_empty(), "no native HTTP requests");
     assert!(!term.text().contains("subscription-test"));
+    // Never in the project, whose `.claude` settings could send the token
+    // elsewhere; and never reading a project's settings at all.
+    let project = term.dir.join("project").canonicalize().unwrap();
+    let places = std::fs::read_to_string(bin.join("claude.pwd")).unwrap();
+    assert_eq!(places.lines().count(), 2, "{places}");
+    assert!(places.lines().all(|place| !std::path::Path::new(place).starts_with(&project) && !std::path::Path::new(place).exists()), "{places}");
+    let args = std::fs::read_to_string(bin.join("claude.args")).unwrap();
+    assert!(args.contains("--setting-sources\nuser\n"), "{args}");
 }
 
 /// A project and a home for reins in several tabs, as one user's terminals

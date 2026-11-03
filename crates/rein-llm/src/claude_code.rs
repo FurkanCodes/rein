@@ -33,7 +33,10 @@ impl Backend {
     }
 
     async fn run(&self, program: &str, request: &Request<'_>, idle: Duration) -> Result<VecDeque<Result<Event>>> {
+        // Declared before the process group, so it goes after the CLI does.
+        let workdir = Workdir::new()?;
         let mut command = Command::new(program);
+        command.current_dir(&workdir.0);
         command.env_clear();
         // Never inherit API keys, endpoint overrides, provider switches, or
         // executable hooks from the harness's environment.
@@ -42,8 +45,9 @@ impl Backend {
                 command.env(name, value);
             }
         }
+        #[cfg(unix)]
         if let Some(token) = &self.token {
-            command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+            hand_over(&mut command, token)?;
         }
         command.args([
             "-p",
@@ -55,6 +59,11 @@ impl Backend {
             "--safe-mode",
             "--disable-slash-commands",
             "--no-session-persistence",
+            // Only the user's own settings: a project's, even from another
+            // folder, can set `env` and `apiKeyHelper`, which `--safe-mode`
+            // leaves on.
+            "--setting-sources",
+            "user",
             "--model",
             request.model,
             "--json-schema",
@@ -68,6 +77,8 @@ impl Backend {
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|e| Error::Auth(format!("couldn't start Claude Code: {e}; install the `claude` CLI and run `rein login claude-code`")))?;
+        // The CLI has its own copy of the token's pipe now; this closes rein's.
+        drop(command);
         let mut group = Group(child.id());
         let mut stdin = child.stdin.take().ok_or_else(|| Error::Incomplete("Claude Code stdin unavailable".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Incomplete("Claude Code stdout unavailable".into()))?;
@@ -92,6 +103,71 @@ impl Backend {
         };
         // Even a child that closes its pipes and then hangs is bounded.
         tokio::time::timeout(Duration::from_secs(600), work).await.map_err(|_| Error::Incomplete("Claude Code exceeded ten minutes".into()))?
+    }
+}
+
+/// Where the CLI reads the token rein hands it: a descriptor it inherits.
+const TOKEN_FD: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
+
+/// The longest token rein hands over. rein fills the pipe before the CLI
+/// starts, so the token must fit in it at once, and a pipe holds at least
+/// a page: a longer token would block rein for good.
+const LONGEST_TOKEN: usize = 4096;
+
+/// Hands the CLI its token on a pipe, never in its environment: on macOS
+/// any process of the user's, a sandboxed command too, can read another's
+/// environment (`KERN_PROCARGS2`). rein writes the token and closes its end
+/// before the CLI starts, so the CLI reads the token and then the pipe's
+/// end. The read end is the only descriptor the CLI gets beyond its stdio.
+#[cfg(unix)]
+fn hand_over(command: &mut Command, token: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    if token.len() > LONGEST_TOKEN {
+        return Err(Error::Auth(format!("the Claude Code token is over {LONGEST_TOKEN} bytes; run `claude setup-token` for a new one")));
+    }
+    // Both ends are close-on-exec: no other command rein starts gets them.
+    let (reader, mut writer) = std::io::pipe()?;
+    writer.write_all(token.as_bytes())?;
+    drop(writer);
+    command.env(TOKEN_FD, reader.as_raw_fd().to_string());
+    // SAFETY: between fork and exec this only calls fcntl, which is
+    // async-signal-safe, on the read end, which the closure owns and so
+    // keeps open for as long as the command can spawn.
+    unsafe {
+        command.pre_exec(move || {
+            // Only this descriptor stays open across exec.
+            if libc::fcntl(reader.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+/// A fresh, empty, private folder for one run of the CLI, removed when the
+/// run ends or is cancelled. Run in the user's project, the CLI read the
+/// project's `.claude/settings.json`: a cloned repo sent the token to a
+/// server of its own, or ran a command as the user.
+struct Workdir(std::path::PathBuf);
+
+impl Workdir {
+    fn new() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("rein-claude-code-{}", crate::oauth::random_token()?));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        // Not `recursive`: a folder or link already at this path is an error,
+        // never a place to run in.
+        builder.create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Workdir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -248,9 +324,13 @@ mod tests {
 
     #[tokio::test]
     async fn subprocess_receives_token_stdin_and_safe_flags() {
+        // The token comes on a descriptor, never in the environment, which
+        // other processes can read. Reading to the end proves rein's write
+        // end didn't leak into the CLI: `cat` would wait on it for good.
         let fake = Fake::new(
             r#"
-[ "$CLAUDE_CODE_OAUTH_TOKEN" = test-secret ] || exit 10
+[ -z "${CLAUDE_CODE_OAUTH_TOKEN+set}" ] || exit 12
+[ "$(/bin/cat "/dev/fd/$CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")" = test-secret ] || exit 10
 [ -z "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$ANTHROPIC_BASE_URL$OPENAI_API_KEY$CLAUDE_CODE_USE_BEDROCK" ] || exit 11
 printf '%s\n' "$@" > "$0.args"
 /bin/cat > "$0.input"
@@ -260,7 +340,7 @@ printf '%s' '{"structured_output":{"text":"Hello from CLI","tool_calls":[]},"usa
         let backend = Backend::new(Some("test-secret".into()));
         let events = backend.run(&fake.program, &request(), Duration::from_secs(5)).await.unwrap();
         let args = std::fs::read_to_string(format!("{}.args", fake.program)).unwrap();
-        for flag in ["-p", "--safe-mode", "--strict-mcp-config", "--no-session-persistence", "--json-schema", "--tools\n\n"] {
+        for flag in ["-p", "--safe-mode", "--strict-mcp-config", "--no-session-persistence", "--json-schema", "--tools\n\n", "--setting-sources\nuser\n"] {
             assert!(args.contains(flag), "{args}");
         }
         assert!(!args.contains("--bare"));
@@ -269,6 +349,68 @@ printf '%s' '{"structured_output":{"text":"Hello from CLI","tool_calls":[]},"usa
         assert!(matches!(events.front(), Some(Ok(Event::TextDelta(text))) if text == "Hello from CLI"));
         assert!(matches!(events.back(), Some(Ok(Event::Completed { usage })) if usage.input_tokens == 9 && usage.output_tokens == 5 && usage.cached_input_tokens == 3));
         assert!(!format!("{backend:?}").contains("test-secret"));
+    }
+
+    #[tokio::test]
+    async fn subprocess_runs_in_an_empty_private_folder_on_the_users_settings_alone() {
+        // A cloned project's `.claude/settings.json` could send the token
+        // elsewhere or run a command: the CLI never runs in it, nor reads
+        // a project's settings.
+        let fake = Fake::new(
+            r#"
+pwd -P > "$0.pwd"
+/bin/ls -A > "$0.ls"
+/bin/ls -ld . > "$0.mode"
+printf '%s\n' "$@" > "$0.args"
+[ -z "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR+set}" ] || exit 12
+/bin/cat > /dev/null
+printf '%s' '{"structured_output":{"text":"ok","tool_calls":[]}}'
+"#,
+        );
+        Backend::new(None).run(&fake.program, &request(), Duration::from_secs(5)).await.unwrap();
+        let read = |what: &str| std::fs::read_to_string(format!("{}.{what}", fake.program)).unwrap();
+        let (pwd, project) = (read("pwd"), std::env::current_dir().unwrap().canonicalize().unwrap());
+        let pwd = std::path::Path::new(pwd.trim_end());
+        assert!(!pwd.starts_with(&project), "ran in rein's folder: {}", pwd.display());
+        assert_eq!(read("ls"), "", "the folder was empty");
+        assert!(read("mode").starts_with("drwx------"), "{}", read("mode"));
+        assert!(read("args").contains("--setting-sources\nuser\n"), "{}", read("args"));
+        assert!(!pwd.exists(), "the folder goes when the run ends");
+    }
+
+    #[tokio::test]
+    async fn a_token_too_long_for_a_pipe_is_refused_before_the_cli_starts() {
+        let fake = Fake::new(": > \"$0.ran\"");
+        let token = "x".repeat(LONGEST_TOKEN + 1);
+        let err = Backend::new(Some(token.clone())).run(&fake.program, &request(), Duration::from_secs(5)).await.unwrap_err();
+        assert!(matches!(&err, Error::Auth(message) if !message.contains(&token)), "{err}");
+        assert!(!std::path::Path::new(&format!("{}.ran", fake.program)).exists());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_removes_its_folder() {
+        let fake = Fake::new("pwd -P > \"$0.pwd.tmp\"; /bin/mv \"$0.pwd.tmp\" \"$0.pwd\"; /bin/sleep 30");
+        let (backend, request) = (Backend::new(None), request());
+        let started = async {
+            loop {
+                if let Ok(pwd) = std::fs::read_to_string(format!("{}.pwd", fake.program)) {
+                    return pwd;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        // The run is dropped once the CLI is in its folder: a stopped turn.
+        let pwd = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = backend.run(&fake.program, &request, Duration::from_secs(30)) => panic!("the fake never finishes: {:?}", result.err()),
+                pwd = started => pwd,
+            }
+        })
+        .await
+        .expect("the fake started");
+        let pwd = std::path::Path::new(pwd.trim_end());
+        assert!(pwd.starts_with(std::env::temp_dir().canonicalize().unwrap()), "{}", pwd.display());
+        assert!(!pwd.exists(), "{} is still there", pwd.display());
     }
 
     #[test]
