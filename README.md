@@ -65,9 +65,10 @@ key_env = MY_OPENROUTER_KEY
 ```
 
 Servers that speak an API don't all take every field of it. When one turns a
-request away naming a field rein can do without (`reasoning_effort` on a
+request away naming a field rein can do without (`stream_options` on a
 server that has none, say), rein sends it again without it and leaves that
-field out from then on. What an error can't say, like Mistral's
+field out from then on. An effort level is left out only for the model that
+turned it down. What an error can't say, like Mistral's
 nine-character tool call IDs, rein knows per provider.
 
 `/model` lists the provider's models and switches to any provider's, in the
@@ -147,9 +148,20 @@ invalidate it remotely. `rein logout anthropic` still forgets only the API key.
   change, keeps the rest, and records that in the session file. If Anthropic
   still turns some away (from an older rein's tools, say), rein drops it and
   asks again, once.
-- **Effort.** `--effort` and `/effort` (`low` to `max`) become Claude's
-  effort, Gemini's thinking level, or `reasoning_effort`. Claude models from
-  before adaptive thinking get a thinking budget instead.
+- **Effort, per model.** Each model takes its own effort levels, and most
+  providers' model lists say which: Sign in with ChatGPT, Anthropic,
+  OpenRouter, xAI and DeepSeek list them, and Sign in with ChatGPT and
+  OpenRouter also say each model's default. Gemini's levels go by
+  generation. `/effort` offers only the levels the model in use takes, names
+  its default, and keeps ChatGPT's description of each. You choose a level
+  once (`off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`), and
+  each model gets the closest it has without going over: `max` on a model
+  whose top level is `xhigh` sends `xhigh`, and switching back to one with
+  `max` sends `max` again. The bar shows the level actually sent. Where the
+  list says nothing (an OpenAI API key, Groq, Ollama), every level is
+  offered, and one the model turns down is said once and not sent again.
+  Claude models from before adaptive thinking get a thinking budget
+  instead.
 - **Gemini's signatures.** Gemini's answers carry thought signatures that have
   to come back on the parts they came on, and a function call without one is
   turned away. rein keeps each with its part. A call Gemini didn't make (a
@@ -216,7 +228,7 @@ message, so typing ahead can't answer it by accident.
 | Drag over text | select it and copy it to the clipboard |
 | Ctrl-L | draw the window again |
 | `/mode [ask\|edits\|auto\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
-| `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort |
+| `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/login [provider]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |

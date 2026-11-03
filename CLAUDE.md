@@ -44,6 +44,12 @@ finding. Each says why in a line.
 - A serde enum for a closed set in tool arguments (`GrepOutput`,
   `StepStatus`): a value the model misspells comes back as an error it can fix.
 
+- What a model can do comes from its provider's model list where the list
+  says, not from one list for every model: rein once offered the same six
+  effort levels to every model, and `minimal` to a model that doesn't take
+  it failed the turn. Read it into the type (`Efforts`), and where a list
+  says nothing, learn from what the server turns down, per model.
+
 ## Errors are values until the edge
 
 - Keep errors typed until `main`, and turn them into text once there

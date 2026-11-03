@@ -17,8 +17,8 @@ use rein_agent::session::{self, Header, Loaded, Session};
 use rein_agent::tools::Tools;
 use rein_agent::{context, prompt};
 use rein_llm::Item;
+use rein_llm::ModelInfo;
 use rein_llm::provider::{self, Provider};
-use rein_llm::{Effort, ModelInfo};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -136,6 +136,11 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     }
     agent.max_output = max_output;
     agent.reasoning_effort = args.effort;
+    agent.efforts = setup.efforts(&agent.model_name);
+    terminal.effort = crate::effort::now(&agent);
+    if let Some(why) = crate::effort::unlike_chosen(&agent) {
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("({why})")));
+    }
     agent.step_limit = step_limit(args.mode, args.prompt.is_some(), args.max_steps);
     // A continued conversation is as full as it was.
     terminal.context_used = agent.estimated();
@@ -222,6 +227,11 @@ impl Setup {
         self.models.iter().find(|m| m.id == model).and_then(|m| m.max_output)
     }
 
+    /// The effort levels `model` takes, as its provider lists them.
+    fn efforts(&self, model: &str) -> rein_llm::Efforts {
+        self.models.iter().find(|m| m.id == model).map(|m| m.efforts.clone()).unwrap_or_default()
+    }
+
     /// `spec` as saved: `provider/model`.
     fn canonical(&self, spec: &str) -> CliResult<String> {
         let (provider, model) = crate::connect::resolve(spec, &self.providers)?;
@@ -242,6 +252,7 @@ impl Setup {
 /// wasn't by finishing.
 pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Terminal) -> CliResult<Outcome> {
     let interrupted = terminal.interrupted.clone();
+    let effort = crate::effort::watch(agent);
     let work = async {
         match &start {
             Start::You(prompt) => agent.send(prompt.clone(), terminal).await,
@@ -269,6 +280,11 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Te
     let refused = agent.model.client.traffic().compression == rein_llm::Compression::Refused;
     if refused && !std::mem::replace(&mut terminal.said_uncompressed, true) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(this server doesn't take compressed requests, so they go uncompressed)"));
+    }
+    if let Some(said) = effort.said(agent) {
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&said));
+        terminal.effort = crate::effort::now(agent);
+        terminal.input.set_bar(terminal.bar());
     }
     // Finished: the tab says so until the next turn starts. Stopped,
     // failed or cut short, it's just idle.
@@ -508,6 +524,9 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             let current = setup.current(agent);
             agent.save_model(&current).map_err(describe)?;
             say!("{pad}{} now using {shown}", s.green("✓"));
+            if let Some(why) = crate::effort::unlike_chosen(agent) {
+                say!("{pad}{}", s.dim(&format!("({why})")));
+            }
             say!("{pad}{}", s.dim("The prompt cache starts over: it's kept per model."));
         }
         Slash::Login(Some(name)) => login_here(&name, agent, terminal, setup).await?,
@@ -518,8 +537,13 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         }
         Slash::Effort(Some(setting)) => {
             agent.reasoning_effort = setting.level();
-            terminal.effort = agent.reasoning_effort;
-            say!("{pad}{} reasoning effort: {}", s.green("✓"), agent.reasoning_effort.map_or("the model's default", Effort::as_str));
+            terminal.effort = crate::effort::now(agent);
+            let chosen = match agent.reasoning_effort {
+                Some(level) => level.to_string(),
+                None => crate::effort::words(agent),
+            };
+            let why = crate::effort::unlike_chosen(agent).map(|why| s.dim(&format!(" · {why}"))).unwrap_or_default();
+            say!("{pad}{} reasoning effort: {chosen}{why}", s.green("✓"));
         }
         Slash::Status => {
             let header = agent.session().map(|session| session.header().clone());
@@ -527,7 +551,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             let rows = [
                 ("model", terminal.model.clone()),
                 ("provider", format!("{} · {}", setup.provider.title, agent.model.client.base_url())),
-                ("effort", agent.reasoning_effort.map_or("the model's default", Effort::as_str).to_owned()),
+                ("effort", crate::effort::words(agent)),
                 ("mode", mode_description(agent.permissions.mode, terminal.sandboxed).to_owned()),
                 ("sandbox", agent.permissions.sandbox().describe()),
                 (
@@ -614,22 +638,18 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
             let current = modes.iter().position(|&m| m == agent.permissions.mode);
             terminal.input.choose(menu("what runs without asking", items, current)).await.map(|i| Slash::Mode(Some(modes[i])))
         }
-        Slash::Effort(None) => {
-            let about = |effort: Option<Effort>| match effort {
-                None => "the model's own",
-                Some(Effort::Minimal) => "as little thinking as there can be",
-                Some(Effort::Low) => "quick: for simple work",
-                Some(Effort::Medium) => "a balance",
-                Some(Effort::High) => "thorough",
-                Some(Effort::XHigh) => "more thorough, where the model has it",
-                Some(Effort::Max) => "the most thinking, where the model has it",
-            };
-            let levels: Vec<Option<Effort>> = std::iter::once(None).chain(Effort::ALL.map(Some)).collect();
-            let items = levels.iter().map(|&level| (level.map_or("default", Effort::as_str).to_owned(), about(level).to_owned())).collect();
-            let current = levels.iter().position(|&level| level == agent.reasoning_effort);
-            let chosen = terminal.input.choose(menu("how hard the model thinks", items, current)).await;
-            chosen.map(|i| Slash::Effort(Some(levels[i].map_or(EffortSetting::Default, EffortSetting::Level))))
-        }
+        Slash::Effort(None) => match crate::effort::choices(agent) {
+            Some(choices) => {
+                let title = format!("how hard {} thinks", agent.model_name);
+                let chosen = terminal.input.choose(menu(&title, choices.items, choices.current)).await;
+                chosen.map(|i| Slash::Effort(Some(choices.levels[i].map_or(EffortSetting::Default, EffortSetting::Level))))
+            }
+            None => {
+                let none = format!("{} takes no effort setting: it thinks as it will, or not at all", agent.model_name);
+                say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&none));
+                None
+            }
+        },
         Slash::Model(None) => {
             let mut specs = Vec::new();
             let mut items = Vec::new();
@@ -642,7 +662,7 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
             };
             if setup.models.is_empty() {
                 // The list couldn't be had: the one in use, at least.
-                add(&setup.provider, &[ModelInfo { id: agent.model_name.clone(), name: agent.model_name.clone(), context_window: None, max_output: None }]);
+                add(&setup.provider, &[ModelInfo::named(&agent.model_name)]);
             } else {
                 add(&setup.provider, &setup.models);
             }
@@ -860,8 +880,10 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
     agent.set_limit(setup.limit(&model)?);
     terminal.context_limit = agent.limit();
     agent.max_output = setup.max_output(&model);
+    agent.efforts = setup.efforts(&model);
     terminal.model = provider::shown(&setup.provider, &model);
     agent.model_name = model;
+    terminal.effort = crate::effort::now(agent);
     Ok(terminal.model.clone())
 }
 

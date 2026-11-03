@@ -21,10 +21,10 @@ pub mod oauth;
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, Optional};
+use crate::client::{Client, EFFORT, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Effort, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
 
 pub const API_BASE: &str = "https://api.anthropic.com/v1";
 
@@ -49,8 +49,8 @@ const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 pub(crate) const OPTIONAL: Optional = &[
     ("fallbacks", "fallbacks", "fallbacks"),
     ("display", "display", "thinking.display"),
-    ("output_config", "output_config", "output_config"),
-    ("effort", "effort", "output_config"),
+    ("output_config", "output_config", EFFORT),
+    ("effort", "effort", EFFORT),
     ("cache_control", "cache_control", "cache_control"),
 ];
 
@@ -86,9 +86,30 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
                 name: m["display_name"].as_str().unwrap_or(id).to_owned(),
                 context_window: m["max_input_tokens"].as_u64(),
                 max_output: m["max_tokens"].as_u64(),
+                efforts: efforts(&m["capabilities"]),
             })
         })
         .collect()
+}
+
+/// A model's levels, from what its `capabilities` say it supports. The
+/// older models think only with a budget, which rein sets from its own
+/// levels, and not at all when told none. Claude's list doesn't say which
+/// level a model uses by default.
+fn efforts(capabilities: &Value) -> Efforts {
+    if !capabilities.is_object() {
+        return Efforts::Unknown;
+    }
+    let supported = |value: &Value| value["supported"] == true;
+    let effort = &capabilities["effort"];
+    if supported(effort) {
+        let levels = [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max].into_iter().filter(|level| supported(&effort[level.as_str()]));
+        return Efforts::listed(levels.map(|level| (level, None)), None);
+    }
+    if supported(&capabilities["thinking"]["types"]["enabled"]) {
+        return Efforts::listed([Effort::Off, Effort::Minimal, Effort::Low, Effort::Medium, Effort::High].map(|level| (level, None)), Some(Effort::Off));
+    }
+    Efforts::NotTaken
 }
 
 /// Models from before adaptive thinking, which think only with a budget.
@@ -100,21 +121,25 @@ fn legacy(model: &str) -> bool {
         || ["-4-5", "-4-1", "-4-0", "opus-4-2025", "sonnet-4-2025", "opus-4@", "sonnet-4@"].iter().any(|old| model.contains(old))
 }
 
-/// A thinking budget for the older models, from rein's effort levels.
-fn budget(effort: Effort) -> u64 {
+/// A thinking budget for the older models, from rein's effort levels;
+/// none, for no thinking.
+fn budget(effort: Effort) -> Option<u64> {
     match effort {
-        Effort::Minimal => 1024,
-        Effort::Low => 4096,
-        Effort::Medium => 10_000,
-        Effort::High => 24_000,
-        Effort::XHigh | Effort::Max => 32_000,
+        Effort::Off => None,
+        Effort::Minimal => Some(1024),
+        Effort::Low => Some(4096),
+        Effort::Medium => Some(10_000),
+        Effort::High => Some(24_000),
+        Effort::XHigh | Effort::Max => Some(32_000),
     }
 }
 
-/// `output_config.effort`: Claude's levels start at `low`.
+/// `output_config.effort`. Claude's levels start at `low`, and the newest
+/// models can't stop thinking, so less than that is `low`: only a model
+/// whose list says nothing is sent one.
 fn claude_effort(effort: Effort) -> &'static str {
     match effort {
-        Effort::Minimal | Effort::Low => "low",
+        Effort::Off | Effort::Minimal | Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High => "high",
         Effort::XHigh => "xhigh",
@@ -154,8 +179,7 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], base_url: &s
     if legacy {
         // They don't think unless given a budget, which the answer's
         // limit has to leave room for.
-        if let Some(effort) = effort {
-            let budget = budget(effort);
+        if let Some(budget) = effort.and_then(budget) {
             max_tokens = max_tokens.max(budget + 8192);
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
@@ -167,9 +191,7 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], base_url: &s
             thinking["display"] = json!("summarized");
         }
         body["thinking"] = thinking;
-        if let Some(effort) = effort
-            && !omitted.contains(&"output_config")
-        {
+        if let Some(effort) = effort {
             body["output_config"] = json!({ "effort": claude_effort(effort) });
         }
     }
@@ -516,8 +538,12 @@ mod tests {
         let mut big = request("claude-opus-5-5", &hi);
         big.max_output_tokens = Some(128_000);
         assert_eq!(request_body(&big, &[], API_BASE)["max_tokens"], MAX_TOKENS_CAP);
-        let left_out = request_body(&request("claude-opus-5-5", &[Item::User("hi".into())]), &["thinking.display", "output_config"], API_BASE);
-        assert_eq!((left_out["thinking"].clone(), left_out.get("output_config")), (json!({ "type": "adaptive" }), None));
+        let left_out = request_body(&request("claude-opus-5-5", &hi), &["thinking.display"], API_BASE);
+        assert_eq!(left_out["thinking"], json!({ "type": "adaptive" }));
+        // A level the model turned down comes as none (see `Client::turned_down`).
+        let mut unsaid = request("claude-opus-5-5", &hi);
+        unsaid.reasoning_effort = None;
+        assert_eq!(request_body(&unsaid, &[], API_BASE).get("output_config"), None);
     }
 
     #[test]
@@ -650,6 +676,39 @@ mod tests {
     #[test]
     fn reads_the_model_list() {
         let page = json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false });
-        assert_eq!(parse_models(&page), [ModelInfo { id: "claude-opus-5-5".into(), name: "Claude Opus 5.5".into(), context_window: Some(1_000_000), max_output: Some(128_000) }]);
+        let models = parse_models(&page);
+        assert_eq!(
+            models,
+            [ModelInfo { id: "claude-opus-5-5".into(), name: "Claude Opus 5.5".into(), context_window: Some(1_000_000), max_output: Some(128_000), efforts: Efforts::Unknown }]
+        );
+    }
+
+    #[test]
+    fn a_models_levels_are_what_its_capabilities_support() {
+        let yes = json!({ "supported": true });
+        let no = json!({ "supported": false });
+        // As the Models API shows them: every leaf says whether.
+        let adaptive = json!({ "effort": { "supported": true, "low": yes, "medium": yes, "high": yes, "xhigh": no, "max": yes }, "thinking": { "supported": true, "types": { "adaptive": yes, "enabled": no } } });
+        let levels: Vec<Effort> = efforts(&adaptive).offered().iter().map(|l| l.effort).collect();
+        assert_eq!(levels, [Effort::Low, Effort::Medium, Effort::High, Effort::Max]);
+        assert_eq!(efforts(&adaptive).default(), None, "Claude's list doesn't say");
+        // Older models think with a budget, and not unless told to.
+        let budget = json!({ "effort": { "supported": false }, "thinking": { "supported": true, "types": { "adaptive": no, "enabled": yes } } });
+        assert_eq!(efforts(&budget).default(), Some(Effort::Off));
+        assert_eq!(efforts(&budget).sent(Some(Effort::Max)), Some(Effort::High), "its biggest budget");
+        let neither = json!({ "effort": { "supported": false }, "thinking": { "supported": false, "types": { "adaptive": no, "enabled": no } } });
+        assert_eq!(efforts(&neither), Efforts::NotTaken);
+        assert_eq!(efforts(&Value::Null), Efforts::Unknown, "a gateway's list without them");
+    }
+
+    #[test]
+    fn off_on_a_budget_model_is_no_thinking() {
+        let input = [Item::User("hi".into())];
+        let mut quiet = request("claude-haiku-4-5", &input);
+        quiet.reasoning_effort = Some(Effort::Off);
+        let body = request_body(&quiet, &[], API_BASE);
+        assert!(body.get("thinking").is_none(), "{body}");
+        quiet.reasoning_effort = Some(Effort::Low);
+        assert_eq!(request_body(&quiet, &[], API_BASE)["thinking"]["budget_tokens"], 4096);
     }
 }

@@ -52,8 +52,9 @@ Options:
   -m, --model <id>      Model to use, like claude-opus-5-5 or anthropic/claude-sonnet-5-5
                         (default: $REIN_MODEL, or gpt-6.1-sol; claude-opus-5-5 when
                         Anthropic is the only provider you have a key for)
-      --effort <level>  How hard the model thinks: minimal, low, medium, high,
-                        xhigh or max (where the model has them)
+      --effort <level>  How hard the model thinks: off, minimal, low, medium, high,
+                        xhigh or max. Each model takes some of them, and gets
+                        the closest it has without going over
   -c, --continue        Continue the latest conversation in this folder
   -r, --resume          Choose which saved conversation to continue
   -s, --system <text>   Standing instructions, added to rein's system prompt
@@ -262,7 +263,7 @@ mod tests {
         let settings = Settings::parse("mode = edits\nmodel = from-file\neffort = low").unwrap();
         let parsed = AskArgs::parse(vec!["hi".into()], &settings).unwrap();
         assert_eq!((parsed.mode, parsed.effort), (Mode::Edits, Some(Effort::Low)));
-        assert_eq!(args("--effort loud hi").err().as_deref(), Some("no effort called loud; use minimal, low, medium, high, xhigh or max"));
+        assert_eq!(args("--effort loud hi").err().as_deref(), Some("no effort called loud; use off, minimal, low, medium, high, xhigh or max"));
         let parsed = AskArgs::parse(["--mode", "trust", "-m", "flagged", "hi"].map(str::to_owned).to_vec(), &settings).unwrap();
         assert_eq!((parsed.mode, parsed.model.as_deref()), (Mode::Trust, Some("flagged")));
     }

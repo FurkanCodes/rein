@@ -24,6 +24,7 @@ mod claude;
 mod commands;
 mod connect;
 mod conversation;
+mod effort;
 mod format;
 mod input;
 mod peers;

@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use crate::chat::Quirks;
 use crate::decode::Decode;
-use crate::{Api, Error, Event, ModelInfo, Request, Result, anthropic, chat, gemini, openai};
+use crate::{Api, Effort, Error, Event, ModelInfo, Request, Result, anthropic, chat, gemini, openai};
 
 /// How requests prove who's asking. Its `Debug` never shows the secret,
 /// so neither can a log line, a `dbg!` or a panic message.
@@ -86,6 +86,8 @@ struct Wire {
     sent: AtomicU64,
     /// Fields the server turned away, left out from then on.
     omitted: Mutex<Vec<&'static str>>,
+    /// Effort levels a model turned down, which it isn't sent again.
+    turned_down: Mutex<Vec<(String, Effort)>>,
 }
 
 /// What requests have cost on the wire so far.
@@ -111,6 +113,11 @@ pub enum Compression {
 /// error would name it by, its key in the body, and what rein calls leaving
 /// it out.
 pub(crate) type Optional = &'static [(&'static str, &'static str, &'static str)];
+
+/// What every format calls the field that says how hard to think. A model
+/// that turns it down is turned down one level at a time: another level
+/// may well do.
+pub(crate) const EFFORT: &str = "effort";
 
 impl Client {
     /// A client for the server at `base_url` (like `https://api.anthropic.com/v1`),
@@ -191,12 +198,22 @@ impl Client {
         self.wire.omitted.lock().map(|o| o.clone()).unwrap_or_default()
     }
 
+    /// The effort levels `model` turned down, which go as none from then
+    /// on, so it thinks as it does by default.
+    pub fn turned_down(&self, model: &str) -> Vec<Effort> {
+        let turned_down = self.wire.turned_down.lock().map(|t| t.clone()).unwrap_or_default();
+        turned_down.into_iter().filter(|(which, _)| which == model).map(|(_, effort)| effort).collect()
+    }
+
     /// The models this credential can use, in the server's order.
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
         if self.claude_code.is_some() {
             // The CLI has no model-discovery endpoint. These are its aliases;
             // callers may also supply full model IDs directly.
-            return Ok(["sonnet", "opus", "haiku"].into_iter().map(|id| ModelInfo { id: id.into(), name: id.into(), context_window: None, max_output: None }).collect());
+            return Ok(["sonnet", "opus", "haiku"]
+                .into_iter()
+                .map(|id| ModelInfo { id: id.into(), name: id.into(), context_window: None, max_output: None, efforts: crate::Efforts::Unknown })
+                .collect());
         }
         match self.api {
             Api::Responses => openai::models(self).await,
@@ -284,7 +301,7 @@ impl Client {
 
     fn optional(&self) -> Optional {
         match self.api {
-            Api::Responses => &[],
+            Api::Responses => openai::OPTIONAL,
             Api::Anthropic => anthropic::OPTIONAL,
             Api::Chat => chat::OPTIONAL,
             Api::Gemini => gemini::OPTIONAL,
@@ -315,14 +332,18 @@ impl Client {
             return Ok(ResponseStream { source: StreamSource::Buffered(backend.respond(request, self.idle).await?) });
         }
         let mut omitted = self.omitted();
+        let mut request = *request;
+        if request.reasoning_effort.is_some_and(|effort| self.turned_down(request.model).contains(&effort)) {
+            request.reasoning_effort = None;
+        }
         loop {
-            let body = self.body(request, &omitted);
-            match self.send(request, &body, &omitted).await {
+            let body = self.body(&request, &omitted);
+            match self.send(&request, &body, &omitted).await {
                 Ok(response) => {
                     return Ok(ResponseStream {
                         source: StreamSource::Http(Box::new(HttpStream {
                             response,
-                            decoder: self.decoder(request),
+                            decoder: self.decoder(&request),
                             record: None,
                             idle: self.idle,
                             claude_oauth: self.claude_oauth.is_some(),
@@ -330,13 +351,22 @@ impl Client {
                     });
                 }
                 // The server named a field it doesn't take: once more
-                // without it, and never again with it.
-                Err(e) if let Some(field) = rejected_field(&e, &body, self.optional(), &omitted) => {
-                    omitted.push(field);
-                    if let Ok(mut learned) = self.wire.omitted.lock() {
-                        learned.push(field);
+                // without it, and never again with it. For effort, that's
+                // this level for this model.
+                Err(e) if let Some(field) = rejected_field(&e, &body, self.optional(), &omitted) => match (field, request.reasoning_effort) {
+                    (EFFORT, Some(effort)) => {
+                        if let Ok(mut turned_down) = self.wire.turned_down.lock() {
+                            turned_down.push((request.model.to_owned(), effort));
+                        }
+                        request.reasoning_effort = None;
                     }
-                }
+                    _ => {
+                        omitted.push(field);
+                        if let Ok(mut learned) = self.wire.omitted.lock() {
+                            learned.push(field);
+                        }
+                    }
+                },
                 Err(e) => return Err(e),
             }
         }
@@ -388,8 +418,9 @@ impl Client {
 /// `body` has it. The server has to say its name: a request turned away for
 /// any other reason is an error, not something to learn from.
 fn rejected_field(error: &Error, body: &Value, optional: Optional, omitted: &[&str]) -> Option<&'static str> {
-    let Error::Api { status: Some(400 | 422), message, .. } = error else { return None };
-    let message = message.to_lowercase();
+    let Error::Api { status: Some(400 | 422), message, param, .. } = error else { return None };
+    // OpenAI names the field apart from the message.
+    let message = format!("{} {}", message.to_lowercase(), param.as_deref().unwrap_or_default().to_lowercase());
     let body = body.to_string();
     optional.iter().find(|(word, key, field)| message.contains(word) && !omitted.contains(field) && body.contains(&format!("\"{key}\""))).map(|(_, _, field)| *field)
 }
@@ -413,7 +444,8 @@ pub(crate) async fn check(response: reqwest::Response) -> Result<reqwest::Respon
     let request_id = ["x-request-id", "request-id"].iter().find_map(|name| headers.get(*name)).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let text = response.text().await.unwrap_or_default();
     let (code, message) = parse_error_body(&text);
-    Err(Error::api(Some(status.as_u16()), code, message, request_id))
+    let param = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["param"].as_str().map(str::to_owned));
+    Err(Error::api(Some(status.as_u16()), code, message, request_id).about(param))
 }
 
 /// The code and message in an error body, in any of the shapes providers
@@ -523,6 +555,60 @@ impl HttpStream {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_level_a_model_turns_down_goes_as_none_from_then_on_for_that_model_only() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 65536];
+                // Head and body come in one read or a few; the body is the JSON after the head.
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") || !bytes.ends_with(b"}") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let body: Value = serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                // As OpenAI says it, naming the field apart from the message.
+                let reply = if body["model"] == "picky" && body["reasoning"]["effort"] == "minimal" {
+                    let error = r#"{"error":{"message":"Unsupported value: 'minimal' is not supported with the 'picky' model.","type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}"#;
+                    format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}", error.len())
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                };
+                seen.lock().unwrap().push(body);
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None);
+        let input = [crate::Item::User("hi".into())];
+        let request = |model| Request {
+            model,
+            instructions: None,
+            input: &input,
+            tools: &[],
+            reasoning_effort: Some(Effort::Minimal),
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+        };
+        assert!(client.stream(&request("picky")).await.is_ok());
+        assert_eq!(client.turned_down("picky"), [Effort::Minimal]);
+        assert!(client.stream(&request("picky")).await.is_ok());
+        assert!(client.stream(&request("easy")).await.is_ok());
+        let bodies = bodies.lock().unwrap();
+        let efforts: Vec<&Value> = bodies.iter().map(|b| &b["reasoning"]["effort"]).collect();
+        // Turned down, sent again without; then never again for it; another model still gets it.
+        assert_eq!(efforts, [&json!("minimal"), &Value::Null, &Value::Null, &json!("minimal")]);
+        assert!(client.turned_down("easy").is_empty());
+        server.abort();
+    }
 
     #[tokio::test]
     async fn an_answer_that_goes_quiet_is_given_up_on() {

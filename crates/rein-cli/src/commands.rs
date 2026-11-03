@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(parse("/model gpt-6.1-terra"), Some(Ok(Slash::Model(Some("gpt-6.1-terra".into())))));
         assert_eq!(parse("/effort default"), Some(Ok(Slash::Effort(Some(EffortSetting::Default)))));
         assert_eq!(parse("/effort xhigh"), Some(Ok(Slash::Effort(Some(EffortSetting::Level(Effort::XHigh))))));
-        assert_eq!(parse("/effort extreme"), Some(Err("no effort called extreme; use minimal, low, medium, high, xhigh or max, or default".into())));
+        assert_eq!(parse("/effort extreme"), Some(Err("no effort called extreme; use off, minimal, low, medium, high, xhigh or max, or default".into())));
         assert_eq!(parse("/compact keep the test output"), Some(Ok(Slash::Compact(Some("keep the test output".into())))));
         assert_eq!(parse("/clear"), Some(Ok(Slash::New)));
         assert_eq!(parse("/quit"), Some(Ok(Slash::Exit)));

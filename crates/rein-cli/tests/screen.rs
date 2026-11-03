@@ -58,6 +58,11 @@ struct Model {
     turned_away: Arc<Mutex<usize>>,
     /// Its model list takes a while, as a busy provider's can.
     slow_list: Arc<std::sync::atomic::AtomicBool>,
+    /// The model list it gives, when not its wire's usual.
+    models: Arc<Mutex<Option<Value>>>,
+    /// A request with this in it is turned away with that error, as a
+    /// model turns down an effort level it doesn't take.
+    turns_down: Arc<Mutex<Option<(&'static str, Value)>>>,
 }
 
 /// The wire format a model server speaks.
@@ -116,6 +121,21 @@ impl Model {
         self
     }
 
+    /// Lists `models` instead of its usual.
+    fn with_models(self, models: Value) -> Model {
+        *self.models.lock().unwrap() = Some(models);
+        self
+    }
+
+    /// Turns away requests that have `level` as their effort, as OpenAI
+    /// does for a level the model doesn't take.
+    fn turning_down(self, level: &'static str) -> Model {
+        let error = json!({ "error": { "message": format!("Unsupported value: '{level}' is not supported with this model."), "type": "invalid_request_error", "param": "reasoning.effort", "code": "unsupported_value" } });
+        let needle: &'static str = Box::leak(format!("\"effort\":\"{level}\"").into_boxed_str());
+        *self.turns_down.lock().unwrap() = Some((needle, error));
+        self
+    }
+
     /// Also sets `name` to `value` in rein's environment.
     fn with_env(mut self, name: &str, value: &str) -> Model {
         self.env.push((name.into(), value.into()));
@@ -131,6 +151,10 @@ impl Model {
         let refused = turned_away.clone();
         let slow_list = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let slow = slow_list.clone();
+        let models = Arc::new(Mutex::new(None::<Value>));
+        let listed_now = models.clone();
+        let turns_down = Arc::new(Mutex::new(None::<(&'static str, Value)>));
+        let turning_now = turns_down.clone();
         std::thread::spawn(move || {
             let mut turns = turns.into_iter();
             for socket in listener.incoming() {
@@ -152,13 +176,14 @@ impl Model {
                     if slow.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(1500));
                     }
-                    let models = match wire {
-                        Wire::Responses => json!({ "data": [{ "id": "test-model" }, { "id": "gpt-6.1-sol" }] }),
-                        Wire::Messages => {
+                    let models = match (listed_now.lock().unwrap().clone(), wire) {
+                        (Some(models), _) => models,
+                        (None, Wire::Responses) => json!({ "data": [{ "id": "test-model" }, { "id": "gpt-6.1-sol" }] }),
+                        (None, Wire::Messages) => {
                             json!({ "data": [{ "id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "max_input_tokens": 1_000_000, "max_tokens": 128_000 }], "has_more": false })
                         }
-                        Wire::Chat => json!({ "object": "list", "data": [{ "id": "llama-test", "context_window": 131_072 }] }),
-                        Wire::Gemini => {
+                        (None, Wire::Chat) => json!({ "object": "list", "data": [{ "id": "llama-test", "context_window": 131_072 }] }),
+                        (None, Wire::Gemini) => {
                             json!({ "models": [{ "name": "models/gemini-3.8-flash", "inputTokenLimit": 1_048_576, "outputTokenLimit": 65_536, "supportedGenerationMethods": ["generateContent"] }] })
                         }
                     };
@@ -168,8 +193,12 @@ impl Model {
                     how.lock().unwrap().push(gzip);
                     let unpacked = if gzip && takes_gzip { gunzip(&body) } else { body.clone() };
                     let rejected = rejects.filter(|field| String::from_utf8_lossy(&unpacked).contains(&format!("\"{field}\"")));
+                    let turned_down = turning_now.lock().unwrap().clone().filter(|(needle, _)| String::from_utf8_lossy(&unpacked).contains(needle));
                     if gzip && !takes_gzip {
                         http(400, "application/json", br#"{"detail":"Bad Request"}"#)
+                    } else if let Some((_, error)) = turned_down {
+                        *refused.lock().unwrap() += 1;
+                        http(400, "application/json", error.to_string().as_bytes())
                     } else if let Some(field) = rejected {
                         *refused.lock().unwrap() += 1;
                         let error = json!({ "error": { "message": format!("property '{field}' is unsupported"), "type": "invalid_request_error" } });
@@ -193,7 +222,7 @@ impl Model {
                 let _ = socket.write_all(&reply);
             }
         });
-        Model { base, requests, heads, gzipped, env: Vec::new(), home: Vec::new(), turned_away, slow_list }
+        Model { base, requests, heads, gzipped, env: Vec::new(), home: Vec::new(), turned_away, slow_list, models, turns_down }
     }
 
     fn turned_away(&self) -> usize {
@@ -1557,12 +1586,12 @@ fn a_menu_is_chosen_from_with_the_arrows_and_enter() {
 
     // Esc changes nothing; what's typed narrows the list.
     term.keys("/effort\r");
-    term.wait_for("how hard the model thinks");
+    term.wait_for("how hard gpt-6.1-sol thinks");
     term.keys("\x1b");
     term.wait_for(IDLE);
     assert!(!term.text().contains("reasoning effort:"), "{}", term.text());
     term.keys("/effort\r");
-    term.wait_for("how hard the model thinks");
+    term.wait_for("how hard gpt-6.1-sol thinks");
     term.keys("xh");
     term.wait_until("only xhigh", |screen| screen.contains("› xhigh") && !screen.contains("minimal"));
     term.keys("\r");
@@ -2077,4 +2106,100 @@ fn a_strip_across_the_top_shows_every_rein_live() {
     api.wait_for("Made it.");
     web.wait_until("web to see api is done", |_| web.rows()[0].contains("api ✓ done"));
     api.wait_until("the strip in api too", |_| api.rows()[0].contains("▸ api ✓ done") && api.rows()[0].contains("web ○"));
+}
+
+/// Three models as Sign in with ChatGPT lists them: one with three levels
+/// and a default, one with two, one that takes none.
+fn models_with_levels() -> Value {
+    json!({ "models": [
+        { "slug": "gpt-6.1-sol", "visibility": "list", "default_reasoning_level": "low", "supported_reasoning_levels": [
+            { "effort": "low", "description": "Fast responses" }, { "effort": "medium", "description": "Balanced" }, { "effort": "max", "description": "Deepest" },
+        ] },
+        { "slug": "small", "visibility": "list", "default_reasoning_level": "medium", "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "medium" }] },
+        { "slug": "plain", "visibility": "list", "supported_reasoning_levels": [] },
+    ] })
+}
+
+fn bar_says(term: &mut Term, what: &str) {
+    term.wait_until(&format!("the bar says {what}"), |screen| screen.lines().last().is_some_and(|bar| bar.contains(what)));
+}
+
+#[test]
+fn effort_follows_the_model_its_levels_its_default_and_what_you_chose() {
+    let model = Model::start(vec![says("One."), says("Two."), says("Three.")]).with_models(models_with_levels());
+    let mut term = Term::start(&model, "efforts", 30, 110);
+    term.wait_for(IDLE);
+    // Nothing chosen: the bar says what it thinks at, its own default.
+    bar_says(&mut term, "gpt-6.1-sol low");
+    term.keys("/effort\r");
+    term.wait_for("how hard gpt-6.1-sol thinks");
+    term.wait_for("Deepest");
+    let screen = term.text();
+    assert!(screen.contains("the model's own: low") && screen.contains("Fast responses"), "{screen}");
+    assert!(!screen.contains("minimal") && !screen.contains("xhigh"), "only its own levels:\n{screen}");
+    term.keys("max\r");
+    term.wait_for("✓ reasoning effort: max");
+    bar_says(&mut term, "gpt-6.1-sol max");
+    term.keys("hello\r");
+    term.wait_for("One.");
+    term.wait_for(IDLE);
+    // Another model: your level stays yours, and it gets the closest it has.
+    term.keys("/model openai/small\r");
+    term.wait_for("small has no max, so it gets medium");
+    bar_says(&mut term, "small medium");
+    term.keys("again\r");
+    term.wait_for("Two.");
+    term.wait_for(IDLE);
+    // One that takes none has nothing to choose.
+    term.keys("/model openai/plain\r");
+    term.wait_for("max waits for a model that does");
+    term.keys("/effort\r");
+    term.wait_for("it thinks as it will");
+    // Back where it was: what you chose.
+    term.keys("/model openai/gpt-6.1-sol\r");
+    bar_says(&mut term, "gpt-6.1-sol max");
+    term.keys("once more\r");
+    term.wait_for("Three.");
+    term.wait_for(IDLE);
+    let efforts: Vec<Value> = model.requests().iter().map(|r| r["reasoning"]["effort"].clone()).collect();
+    assert_eq!(efforts, [json!("max"), json!("medium"), json!("max")]);
+}
+
+#[test]
+fn a_level_the_model_hasnt_got_is_said_at_the_start_and_the_closest_sent() {
+    let model = Model::start(vec![says("Done.")]).with_models(models_with_levels()).with_env("REIN_EFFORT", "minimal");
+    let mut term = Term::start(&model, "effort-start", 24, 100);
+    term.wait_for("gpt-6.1-sol has no minimal, so it gets low");
+    term.wait_for(IDLE);
+    bar_says(&mut term, "gpt-6.1-sol low");
+    term.keys("hi\r");
+    term.wait_for("Done.");
+    assert_eq!(model.requests()[0]["reasoning"]["effort"], "low");
+}
+
+#[test]
+fn a_level_the_model_turns_down_is_said_once_and_not_offered_again() {
+    // A list that says nothing of levels, as with an API key.
+    let model = Model::start(vec![says("One."), says("Two.")]).turning_down("minimal").with_env("REIN_EFFORT", "minimal");
+    let mut term = Term::start(&model, "turned-down", 30, 110);
+    term.wait_for(IDLE);
+    bar_says(&mut term, "gpt-6.1-sol minimal");
+    term.keys("hello\r");
+    term.wait_for("One.");
+    term.wait_for("doesn't take effort minimal, so it thought as it does by default");
+    term.wait_for(IDLE);
+    term.keys("again\r");
+    term.wait_for("Two.");
+    term.wait_for(IDLE);
+    assert_eq!(model.turned_away(), 1, "turned down once, then never sent again");
+    assert!(model.requests().iter().all(|r| r["reasoning"]["effort"].is_null()), "{:?}", model.requests());
+    assert_eq!(term.text().matches("doesn't take effort minimal").count(), 1, "said once:\n{}", term.text());
+    assert!(term.text().lines().last().is_some_and(|bar| !bar.contains("minimal")), "{}", term.text());
+    term.keys("/effort\r");
+    term.wait_for("how hard gpt-6.1-sol thinks");
+    // Its last item, so the list is drawn.
+    term.wait_for("the most thinking there is");
+    let rows = term.text();
+    assert!(!rows.lines().any(|row| row.trim_start_matches(['›', ' ']).starts_with("minimal")), "not offered again:\n{rows}");
+    term.keys("\x1b");
 }

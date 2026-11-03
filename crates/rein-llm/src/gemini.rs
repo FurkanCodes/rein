@@ -14,10 +14,10 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, Optional};
+use crate::client::{Client, EFFORT, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Effort, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
 
 pub const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -26,9 +26,9 @@ pub const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 const UNSIGNED: &str = "skip_thought_signature_validator";
 
 pub(crate) const OPTIONAL: Optional = &[
-    ("thinkinglevel", "thinkingLevel", "level"),
-    ("thinking_level", "thinkingLevel", "level"),
-    ("thinking level", "thinkingLevel", "level"),
+    ("thinkinglevel", "thinkingLevel", EFFORT),
+    ("thinking_level", "thinkingLevel", EFFORT),
+    ("thinking level", "thinkingLevel", EFFORT),
     ("includethoughts", "includeThoughts", "thoughts"),
     ("include_thoughts", "includeThoughts", "thoughts"),
 ];
@@ -62,9 +62,28 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
                 name: m["displayName"].as_str().unwrap_or(id).to_owned(),
                 context_window: m["inputTokenLimit"].as_u64(),
                 max_output: m["outputTokenLimit"].as_u64(),
+                efforts: efforts(m, id),
             })
         })
         .collect()
+}
+
+/// A model's levels. Gemini's list says only whether a model thinks, and
+/// the levels go by generation: Gemini 3 and later take `thinkingLevel`'s
+/// four (each model some of them; one it turns down goes as none from then
+/// on), and earlier ones turn it down and think as they will.
+fn efforts(m: &Value, id: &str) -> Efforts {
+    match m["thinking"].as_bool() {
+        Some(false) => return Efforts::NotTaken,
+        None => return Efforts::Unknown,
+        Some(true) => {}
+    }
+    let generation = id.strip_prefix("gemini-").and_then(|rest| rest.split(['.', '-']).next()).and_then(|n| n.parse::<u32>().ok());
+    match generation {
+        Some(3..) => Efforts::listed([Effort::Minimal, Effort::Low, Effort::Medium, Effort::High].map(|level| (level, None)), None),
+        Some(_) => Efforts::NotTaken,
+        None => Efforts::Unknown,
+    }
 }
 
 pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str]) -> Value {
@@ -80,11 +99,10 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str]) -> Value {
     if request.reasoning_summary && !omitted.contains(&"thoughts") {
         thinking["includeThoughts"] = json!(true);
     }
-    if let Some(effort) = request.reasoning_effort
-        && !omitted.contains(&"level")
-    {
+    if let Some(effort) = request.reasoning_effort {
+        // Gemini can't stop thinking: less than its least is its least.
         let level = match effort {
-            Effort::Minimal => "MINIMAL",
+            Effort::Off | Effort::Minimal => "MINIMAL",
             Effort::Low => "LOW",
             Effort::Medium => "MEDIUM",
             Effort::High | Effort::XHigh | Effort::Max => "HIGH",
@@ -391,10 +409,13 @@ mod tests {
 
     #[test]
     fn leaves_out_what_the_model_doesnt_take() {
-        let body = request_body(&request(&[Item::User("hi".into())]), &["level"]);
-        assert_eq!(body["generationConfig"]["thinkingConfig"], json!({ "includeThoughts": true }));
-        let body = request_body(&request(&[Item::User("hi".into())]), &["level", "thoughts"]);
-        assert_eq!(body.get("generationConfig"), None);
+        let body = request_body(&request(&[Item::User("hi".into())]), &["thoughts"]);
+        assert_eq!(body["generationConfig"]["thinkingConfig"], json!({ "thinkingLevel": "HIGH" }), "xhigh is beyond Gemini: its highest");
+        // A level the model turned down comes as none (see `Client::turned_down`).
+        let input = [Item::User("hi".into())];
+        let mut quiet = request(&input);
+        quiet.reasoning_effort = None;
+        assert_eq!(request_body(&quiet, &["thoughts"]).get("generationConfig"), None);
     }
 
     fn stream(chunks: &[Value], closed: bool) -> Vec<Result<Event>> {
@@ -478,6 +499,23 @@ mod tests {
             { "name": "models/gemini-3.8-flash", "displayName": "Gemini 3.8 Flash", "inputTokenLimit": 1048576, "outputTokenLimit": 65536, "supportedGenerationMethods": ["generateContent", "countTokens"] },
             { "name": "models/text-embedding-005", "supportedGenerationMethods": ["embedContent"] },
         ] });
-        assert_eq!(parse_models(&page), [ModelInfo { id: "gemini-3.8-flash".into(), name: "Gemini 3.8 Flash".into(), context_window: Some(1_048_576), max_output: Some(65_536) }]);
+        assert_eq!(
+            parse_models(&page),
+            [ModelInfo { id: "gemini-3.8-flash".into(), name: "Gemini 3.8 Flash".into(), context_window: Some(1_048_576), max_output: Some(65_536), efforts: Efforts::Unknown }]
+        );
+    }
+
+    #[test]
+    fn thinking_levels_go_by_generation() {
+        let page = json!({ "models": [
+            { "name": "models/gemini-4-argon", "thinking": true },
+            { "name": "models/gemini-2.5-pro", "thinking": true },
+            { "name": "models/gemma-4-27b-it", "thinking": false },
+        ] });
+        let models = parse_models(&page);
+        let levels: Vec<Effort> = models[0].efforts.offered().iter().map(|l| l.effort).collect();
+        assert_eq!(levels, [Effort::Minimal, Effort::Low, Effort::Medium, Effort::High]);
+        assert_eq!(models[1].efforts, Efforts::NotTaken, "before Gemini 3, thinkingLevel is turned down");
+        assert_eq!(models[2].efforts, Efforts::NotTaken);
     }
 }

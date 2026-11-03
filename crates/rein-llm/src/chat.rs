@@ -14,10 +14,10 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::client::{Client, Optional};
+use crate::client::{Client, EFFORT, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Effort, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
 
 /// What a provider needs that it can't say in an error.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -35,8 +35,8 @@ pub(crate) const OPTIONAL: Optional = &[
     ("stream_options", "stream_options", "stream_options"),
     ("reasoning_content", "reasoning_content", "replay"),
     ("reasoning_details", "reasoning_details", "replay"),
-    ("reasoning_effort", "reasoning_effort", "effort"),
-    ("reasoning", "reasoning", "effort"),
+    ("reasoning_effort", "reasoning_effort", EFFORT),
+    ("reasoning", "reasoning", EFFORT),
 ];
 
 /// The models a server offers, with their windows where it says.
@@ -56,9 +56,47 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
                 name: m["name"].as_str().unwrap_or(id).to_owned(),
                 context_window: window.or(m["top_provider"]["context_length"].as_u64()),
                 max_output: m["top_provider"]["max_completion_tokens"].as_u64(),
+                efforts: efforts(m),
             })
         })
         .collect()
+}
+
+/// The effort levels a model takes, where its server's list says, each in
+/// its own way. The levels' names are the ones rein uses too; any other is
+/// one rein doesn't know, and isn't offered.
+fn efforts(m: &Value) -> Efforts {
+    let levels = |list: &Value| list.as_array().map(|list| list.iter().filter_map(|e| e.as_str()?.parse::<Effort>().ok()).map(|e| (e, None)).collect::<Vec<_>>());
+    let level = |value: &Value| value.as_str().and_then(|name| name.parse::<Effort>().ok());
+    // OpenRouter: `{"reasoning": {"supported_efforts": [...], "default_effort": ..}}`,
+    // where no list means any level, and a model that must think can't be
+    // told none. A model it lists without reasoning takes no effort.
+    let reasoning = &m["reasoning"];
+    if reasoning.is_object() {
+        let mut listed = levels(&reasoning["supported_efforts"]).unwrap_or_else(|| Effort::ALL.map(|e| (e, None)).to_vec());
+        if reasoning["mandatory"] == true {
+            listed.retain(|(e, _)| *e != Effort::Off);
+        }
+        return Efforts::listed(listed, level(&reasoning["default_effort"]));
+    }
+    if let Some(parameters) = m["supported_parameters"].as_array()
+        && !parameters.iter().any(|p| p == "reasoning" || p == "reasoning_effort")
+    {
+        return Efforts::NotTaken;
+    }
+    // xAI: `{"capabilities": {"reasoning_effort": [...], "default_reasoning_effort": ..}}`.
+    if let Some(listed) = levels(&m["capabilities"]["reasoning_effort"]) {
+        return Efforts::listed(listed, level(&m["capabilities"]["default_reasoning_effort"]));
+    }
+    // DeepSeek: `{"effort": {"supported_levels": [...], "default_level": ..}}`.
+    if let Some(listed) = levels(&m["effort"]["supported_levels"]) {
+        return Efforts::listed(listed, level(&m["effort"]["default_level"]));
+    }
+    // Mistral says only whether the model thinks.
+    if m["capabilities"]["reasoning"] == false {
+        return Efforts::NotTaken;
+    }
+    Efforts::Unknown
 }
 
 /// A tool call's ID the way the server takes it.
@@ -93,16 +131,11 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], quirks: Quir
             request.tools.iter().map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } })).collect();
         body["tools"] = json!(tools);
     }
-    if let Some(effort) = request.reasoning_effort
-        && !omitted.contains(&"effort")
-    {
-        // The levels the format knows; beyond them, its highest.
-        let effort = match effort {
-            Effort::Minimal => "minimal",
-            Effort::Low => "low",
-            Effort::Medium => "medium",
-            Effort::High | Effort::XHigh | Effort::Max => "high",
-        };
+    // Each level in its own word. Only a level the model listed comes
+    // here, or any where its server lists none; one it turns down then
+    // goes as none (see `Client::turned_down`).
+    if let Some(effort) = request.reasoning_effort {
+        let effort = effort.wire();
         if quirks.effort_object {
             body["reasoning"] = json!({ "effort": effort });
         } else {
@@ -414,7 +447,7 @@ mod tests {
         assert_eq!(messages[5], json!({ "role": "assistant", "content": "Done." }));
         assert_eq!(messages.len(), 6, "Claude's signed thinking means nothing here");
         assert_eq!(body["stream_options"], json!({ "include_usage": true }));
-        assert_eq!(body["reasoning_effort"], "high", "max is beyond the format: its highest");
+        assert_eq!(body["reasoning_effort"], "max", "each level in its own word");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
     }
 
@@ -430,9 +463,9 @@ mod tests {
     #[test]
     fn leaves_out_what_the_server_turned_away() {
         let reasoning = Item::Opaque(Opaque::new(Api::Chat, json!({ "reasoning_content": "hm" })));
-        let body = request_body(&request(&[Item::User("hi".into()), reasoning, Item::Assistant("a".into())]), &["stream_options", "effort", "replay"], Quirks::default());
+        let body = request_body(&request(&[Item::User("hi".into()), reasoning, Item::Assistant("a".into())]), &["stream_options", "replay"], Quirks::default());
         let text = body.to_string();
-        assert!(!text.contains("stream_options") && !text.contains("reasoning"), "{text}");
+        assert!(!text.contains("stream_options") && !text.contains("reasoning_content"), "{text}");
         // An assistant message of reasoning alone isn't sent.
         let lone = Item::Opaque(Opaque::new(Api::Chat, json!({ "reasoning_content": "hm" })));
         let body = request_body(&request(&[Item::User("hi".into()), lone, Item::User("again".into())]), &[], Quirks::default());
@@ -443,7 +476,7 @@ mod tests {
     fn says_it_the_way_each_provider_needs() {
         let openrouter = Quirks { effort_object: true, ..Quirks::default() };
         let body = request_body(&request(&[Item::User("hi".into())]), &[], openrouter);
-        assert_eq!((body["reasoning"].clone(), body.get("reasoning_effort")), (json!({ "effort": "high" }), None));
+        assert_eq!((body["reasoning"].clone(), body.get("reasoning_effort")), (json!({ "effort": "max" }), None));
 
         let mistral = Quirks { short_ids: true, tool_names: true, ..Quirks::default() };
         let body = request_body(&request(&[Item::User("hi".into()), call("toolu_01A09q90qw90lq917835lq9"), result("toolu_01A09q90qw90lq917835lq9")]), &[], mistral);
@@ -538,17 +571,45 @@ mod tests {
         let real: Value = serde_json::from_str(include_str!("../tests/fixtures/real-openrouter-models.json")).unwrap();
         let models = parse_models(&real);
         assert_eq!(models.len(), 3);
+        let (flint, haiku) = (&models[0], &models[2]);
         assert_eq!(
-            models[0],
-            ModelInfo { id: "recursive/flint-v1.0:free".into(), name: "Recursive: Flint (free)".into(), context_window: Some(262_144), max_output: Some(235_929) }
+            (flint.id.as_str(), flint.name.as_str(), flint.context_window, flint.max_output),
+            ("recursive/flint-v1.0:free", "Recursive: Flint (free)", Some(262_144), Some(235_929))
         );
-        assert_eq!((models[2].id.as_str(), models[2].context_window, models[2].max_output), ("anthropic/claude-haiku-5.5", Some(1_000_000), Some(128_000)));
+        assert_eq!((haiku.id.as_str(), haiku.context_window, haiku.max_output), ("anthropic/claude-haiku-5.5", Some(1_000_000), Some(128_000)));
+        let levels = |model: &ModelInfo| model.efforts.offered().iter().map(|l| l.effort).collect::<Vec<_>>();
+        // Its own list, least first, with its default.
+        assert_eq!(levels(haiku), [Effort::Off, Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max]);
+        assert_eq!(haiku.efforts.default(), Some(Effort::Medium));
+        // No list is any level; one that must think can't be told none.
+        assert_eq!(levels(flint), &Effort::ALL[1..]);
+    }
+
+    #[test]
+    fn each_providers_list_says_its_models_levels_its_own_way() {
+        let xai = json!({ "data": [{ "id": "grok-4.7", "capabilities": { "reasoning_effort": ["low", "medium", "high", "xhigh"], "default_reasoning_effort": "high" } }] });
+        let grok = &parse_models(&xai)[0].efforts;
+        assert_eq!((grok.sent(Some(Effort::Max)), grok.default()), (Some(Effort::XHigh), Some(Effort::High)));
+        let deepseek = json!({ "data": [{ "id": "deepseek-flash", "effort": { "supported_levels": ["low", "high", "max"], "default_level": "high" } }] });
+        let flash = &parse_models(&deepseek)[0].efforts;
+        assert_eq!((flash.sent(Some(Effort::Medium)), flash.default()), (Some(Effort::Low), Some(Effort::High)), "the closest without going over");
+        let mistral = json!({ "data": [{ "id": "codestral", "capabilities": { "reasoning": false } }, { "id": "mistral-large-4-0", "capabilities": { "reasoning": true } }] });
+        let models = parse_models(&mistral);
+        assert_eq!((&models[0].efforts, &models[1].efforts), (&Efforts::NotTaken, &Efforts::Unknown));
+        let openrouter = json!({ "data": [{ "id": "some/chat-model", "supported_parameters": ["tools", "temperature"] }] });
+        assert_eq!(parse_models(&openrouter)[0].efforts, Efforts::NotTaken, "OpenRouter lists no reasoning for it");
+        let unknown = json!({ "data": [{ "id": "llama-4" }, { "id": "x", "reasoning": { "supported_efforts": ["ultra"] } }] });
+        let models = parse_models(&unknown);
+        assert_eq!((&models[0].efforts, &models[1].efforts), (&Efforts::Unknown, &Efforts::NotTaken), "levels rein doesn't know aren't offered");
     }
 
     #[test]
     fn reads_every_model_list() {
         let openrouter = json!({ "data": [{ "id": "qwen/qwen3-coder", "name": "Qwen3 Coder", "context_length": 262144, "top_provider": { "max_completion_tokens": 65536 } }] });
-        assert_eq!(parse_models(&openrouter)[0], ModelInfo { id: "qwen/qwen3-coder".into(), name: "Qwen3 Coder".into(), context_window: Some(262_144), max_output: Some(65_536) });
+        assert_eq!(
+            parse_models(&openrouter)[0],
+            ModelInfo { id: "qwen/qwen3-coder".into(), name: "Qwen3 Coder".into(), context_window: Some(262_144), max_output: Some(65_536), efforts: Efforts::Unknown }
+        );
         let groq = json!({ "data": [{ "id": "llama-4", "context_window": 131072 }] });
         assert_eq!(parse_models(&groq)[0].context_window, Some(131_072));
         let ollama = json!({ "object": "list", "data": [{ "id": "qwen3:8b", "object": "model" }] });

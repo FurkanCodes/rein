@@ -296,7 +296,11 @@ pub struct Agent<M> {
     /// What may run without asking.
     pub permissions: Permissions,
     pub model_name: String,
+    /// How hard you asked the model to think: `None` for its own default.
     pub reasoning_effort: Option<rein_llm::Effort>,
+    /// The levels the model takes, which decide what it's sent for
+    /// `reasoning_effort` (see [`Agent::effort`]).
+    pub efforts: rein_llm::Efforts,
     /// The most one answer may take, when the model list says.
     pub max_output: Option<u64>,
     /// How many steps (answers from the model) a turn may take before it's
@@ -782,6 +786,7 @@ impl<M> Agent<M> {
             permissions,
             model_name,
             reasoning_effort: None,
+            efforts: rein_llm::Efforts::Unknown,
             max_output: None,
             step_limit: None,
             instructions: header.instructions,
@@ -811,8 +816,30 @@ impl<M> Agent<M> {
 
     /// The same agent, in the same conversation, answered by `model`.
     pub fn with_model<N>(self, model: N) -> Agent<N> {
-        let Agent { model: _, tools, permissions, model_name, reasoning_effort, max_output, step_limit, specs, instructions, session_id, history, session, context, window } = self;
-        Agent { model, tools, permissions, model_name, reasoning_effort, max_output, step_limit, specs, instructions, session_id, history, session, context, window }
+        let Agent {
+            model: _,
+            tools,
+            permissions,
+            model_name,
+            reasoning_effort,
+            efforts,
+            max_output,
+            step_limit,
+            specs,
+            instructions,
+            session_id,
+            history,
+            session,
+            context,
+            window,
+        } = self;
+        Agent { model, tools, permissions, model_name, reasoning_effort, efforts, max_output, step_limit, specs, instructions, session_id, history, session, context, window }
+    }
+
+    /// The level the model is sent for the one you chose: the same where it
+    /// has it, else the closest it has below (see [`rein_llm::Efforts::sent`]).
+    pub fn effort(&self) -> Option<rein_llm::Effort> {
+        self.efforts.sent(self.reasoning_effort)
     }
 
     /// Also offers the tools that reach other reins: `peers`, `message` and
@@ -864,7 +891,7 @@ impl<M> Agent<M> {
             instructions: self.instructions.as_deref(),
             input,
             tools: &self.specs,
-            reasoning_effort: self.reasoning_effort,
+            reasoning_effort: self.effort(),
             reasoning_summary: true,
             session_id: self.session_id.as_deref(),
             max_output_tokens: self.max_output,
@@ -1350,6 +1377,7 @@ mod tests {
             model_name: "m".into(),
             instructions: None,
             reasoning_effort: None,
+            efforts: rein_llm::Efforts::Unknown,
             max_output: None,
             step_limit: None,
             session_id: Some("session-1".into()),

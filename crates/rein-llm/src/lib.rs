@@ -178,11 +178,15 @@ pub struct Request<'a> {
     pub max_output_tokens: Option<u64>,
 }
 
-/// How hard a model thinks, in rein's words. Each format says it its own
-/// way, and every one of them has to decide what each level means: a
-/// `match` on this is exhaustive, so a new level can't be forgotten.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// How hard a model thinks, in rein's words, least first. Each format says
+/// it its own way, and every one of them has to decide what each level
+/// means: a `match` on this is exhaustive, so a new level can't be
+/// forgotten. Each model takes some of them; see [`Efforts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Effort {
+    /// No thinking, where the model can do without: providers call it
+    /// `none`.
+    Off,
     Minimal,
     Low,
     Medium,
@@ -194,10 +198,11 @@ pub enum Effort {
 }
 
 impl Effort {
-    pub const ALL: [Effort; 6] = [Self::Minimal, Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+    pub const ALL: [Effort; 7] = [Self::Off, Self::Minimal, Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Off => "off",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
@@ -207,7 +212,15 @@ impl Effort {
         }
     }
 
-    /// The levels, for messages: `minimal, low, medium, high, xhigh or max`.
+    /// The word OpenAI's formats and most others use for it.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "none",
+            other => other.as_str(),
+        }
+    }
+
+    /// The levels, for messages: `off, minimal, low, medium, high, xhigh or max`.
     pub fn choices() -> String {
         let names: Vec<&str> = Self::ALL.iter().map(|e| e.as_str()).collect();
         format!("{} or {}", names[..names.len() - 1].join(", "), names[names.len() - 1])
@@ -218,7 +231,74 @@ impl std::str::FromStr for Effort {
     type Err = String;
 
     fn from_str(name: &str) -> Result<Self, String> {
-        Self::ALL.into_iter().find(|e| e.as_str() == name.trim()).ok_or_else(|| format!("no effort called {name}; use {}", Self::choices()))
+        let name = name.trim();
+        // Providers' word for off.
+        if name == "none" {
+            return Ok(Self::Off);
+        }
+        Self::ALL.into_iter().find(|e| e.as_str() == name).ok_or_else(|| format!("no effort called {name}; use {}", Self::choices()))
+    }
+}
+
+/// One level a model takes, and what its provider says it's for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Level {
+    pub effort: Effort,
+    pub about: Option<String>,
+}
+
+/// The effort levels a model takes, as its provider lists them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Efforts {
+    /// The provider doesn't say. Every level is offered, and one the model
+    /// turns down is left out from then on (see [`Client::turned_down`]).
+    #[default]
+    Unknown,
+    /// The model takes no effort: it doesn't think, or thinks as it will.
+    NotTaken,
+    /// These levels, least first, and the one the model uses when it's
+    /// told none, where the provider says.
+    Levels { levels: Vec<Level>, default: Option<Effort> },
+}
+
+impl Efforts {
+    /// The levels a provider listed, in any order, with what each is for.
+    /// None at all means the model takes none.
+    pub fn listed(levels: impl IntoIterator<Item = (Effort, Option<String>)>, default: Option<Effort>) -> Efforts {
+        let mut levels: Vec<Level> = levels.into_iter().map(|(effort, about)| Level { effort, about }).collect();
+        levels.sort_by_key(|level| level.effort);
+        levels.dedup_by_key(|level| level.effort);
+        if levels.is_empty() { Efforts::NotTaken } else { Efforts::Levels { levels, default } }
+    }
+
+    /// The levels to offer: all of rein's where nobody said.
+    pub fn offered(&self) -> Vec<Level> {
+        match self {
+            Efforts::Unknown => Effort::ALL.into_iter().map(|effort| Level { effort, about: None }).collect(),
+            Efforts::NotTaken => Vec::new(),
+            Efforts::Levels { levels, .. } => levels.clone(),
+        }
+    }
+
+    /// The level the model uses when it's told none, where that's known.
+    pub fn default(&self) -> Option<Effort> {
+        match self {
+            Efforts::Levels { default, .. } => *default,
+            Efforts::Unknown | Efforts::NotTaken => None,
+        }
+    }
+
+    /// What goes to the model for `chosen`: the level itself where the
+    /// model has it, or else the highest it has below it, so a model never
+    /// costs more than you chose; below them all, its lowest. Nothing for a
+    /// model that takes none, or when nothing was chosen.
+    pub fn sent(&self, chosen: Option<Effort>) -> Option<Effort> {
+        let chosen = chosen?;
+        match self {
+            Efforts::Unknown => Some(chosen),
+            Efforts::NotTaken => None,
+            Efforts::Levels { levels, .. } => levels.iter().map(|level| level.effort).filter(|&effort| effort <= chosen).max().or_else(|| levels.first().map(|level| level.effort)),
+        }
     }
 }
 
@@ -248,6 +328,15 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     /// How many tokens one answer may take, when the list says.
     pub max_output: Option<u64>,
+    /// The effort levels it takes.
+    pub efforts: Efforts,
+}
+
+impl ModelInfo {
+    /// `id`, of which nothing else is known.
+    pub fn named(id: &str) -> ModelInfo {
+        ModelInfo { id: id.to_owned(), name: id.to_owned(), context_window: None, max_output: None, efforts: Efforts::Unknown }
+    }
 }
 
 /// What kind of failure an [`Error::Api`] is, whoever sent it and in
@@ -283,6 +372,9 @@ pub enum Error {
         code: Option<String>,
         message: String,
         request_id: Option<String>,
+        /// The field of the request it's about, where the provider says
+        /// (OpenAI does: `reasoning.effort`).
+        param: Option<String>,
     },
     /// Signing in or refreshing credentials failed.
     Auth(String),
@@ -310,17 +402,25 @@ impl Error {
         } else {
             ErrorKind::Other
         };
-        Error::Api { status, kind, code, message, request_id }
+        Error::Api { status, kind, code, message, request_id, param: None }
+    }
+
+    /// The same error, about the request's field `param`.
+    pub(crate) fn about(mut self, field: Option<String>) -> Error {
+        if let Error::Api { param, .. } = &mut self {
+            *param = field;
+        }
+        self
     }
 
     /// The model declined to answer, saying `why`.
     pub fn refusal(why: impl Into<String>) -> Error {
-        Error::Api { status: None, kind: ErrorKind::Refusal, code: None, message: why.into(), request_id: None }
+        Error::Api { status: None, kind: ErrorKind::Refusal, code: None, message: why.into(), request_id: None, param: None }
     }
 
     /// The conversation doesn't fit: `why`, in the provider's words.
     pub fn context_full(why: impl Into<String>) -> Error {
-        Error::Api { status: None, kind: ErrorKind::ContextFull, code: None, message: why.into(), request_id: None }
+        Error::Api { status: None, kind: ErrorKind::ContextFull, code: None, message: why.into(), request_id: None, param: None }
     }
 
     /// What kind of failure this is, where a provider said; `None` for the
@@ -420,6 +520,30 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_gets_the_closest_level_it_has_without_going_over() {
+        let some = Efforts::listed([Effort::High, Effort::Low, Effort::Medium, Effort::XHigh].map(|e| (e, None)), Some(Effort::Medium));
+        assert_eq!(some.offered().iter().map(|l| l.effort).collect::<Vec<_>>(), [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh], "least first");
+        assert_eq!(some.sent(Some(Effort::High)), Some(Effort::High));
+        assert_eq!(some.sent(Some(Effort::Max)), Some(Effort::XHigh), "never more than you chose");
+        assert_eq!(some.sent(Some(Effort::Minimal)), Some(Effort::Low), "below them all: its lowest");
+        assert_eq!(some.sent(None), None, "nothing chosen: its own default");
+        assert_eq!(some.default(), Some(Effort::Medium));
+        let gapped = Efforts::listed([Effort::Low, Effort::High].map(|e| (e, None)), None);
+        assert_eq!(gapped.sent(Some(Effort::Medium)), Some(Effort::Low));
+        assert_eq!(Efforts::NotTaken.sent(Some(Effort::High)), None);
+        assert_eq!(Efforts::Unknown.sent(Some(Effort::Max)), Some(Effort::Max), "nobody said: as chosen");
+        assert_eq!(Efforts::Unknown.offered().len(), Effort::ALL.len());
+        assert_eq!(Efforts::listed([], None), Efforts::NotTaken);
+    }
+
+    #[test]
+    fn off_is_called_none_by_providers() {
+        assert_eq!(("none".parse::<Effort>(), "off".parse::<Effort>()), (Ok(Effort::Off), Ok(Effort::Off)));
+        assert_eq!((Effort::Off.as_str(), Effort::Off.wire(), Effort::XHigh.wire()), ("off", "none", "xhigh"));
+        assert!(Effort::ALL.windows(2).all(|pair| pair[0] < pair[1]), "least first");
+    }
 
     fn api(status: u16, code: Option<&str>) -> Error {
         Error::api(Some(status), code.map(str::to_owned), String::new(), None)

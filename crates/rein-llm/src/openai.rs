@@ -7,10 +7,14 @@ pub mod signin;
 
 use serde_json::{Value, json};
 
-use crate::client::Client;
+use crate::client::{Client, EFFORT, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+
+/// What the Responses API may turn away: an effort level the model doesn't
+/// take, which OpenAI names as the error's `param`.
+pub(crate) const OPTIONAL: Optional = &[("reasoning.effort", "reasoning", EFFORT)];
 
 pub const API_BASE: &str = "https://api.openai.com/v1";
 
@@ -42,7 +46,7 @@ pub(crate) fn request_body(request: &Request<'_>) -> Value {
         body["instructions"] = json!(instructions);
     }
     if let Some(effort) = &request.reasoning_effort {
-        body["reasoning"] = json!({ "effort": effort.as_str() });
+        body["reasoning"] = json!({ "effort": effort.wire() });
     }
     if request.reasoning_summary {
         body["reasoning"]["summary"] = json!("auto");
@@ -73,20 +77,36 @@ fn item_json(item: &Item) -> Value {
 }
 
 fn parse_models(body: &Value) -> Vec<ModelInfo> {
-    // Sign in with ChatGPT lists {"models": [{slug, display_name, visibility}]};
-    // API keys get the standard {"data": [{id}]}.
+    // Sign in with ChatGPT lists {"models": [{slug, display_name, visibility,
+    // supported_reasoning_levels, ..}]}; API keys get the standard
+    // {"data": [{id}]}, which says nothing about effort.
     if let Some(models) = body["models"].as_array() {
         return models
             .iter()
             .filter(|m| m["visibility"].as_str().is_none_or(|v| v == "list"))
             .filter_map(|m| {
                 let id = m["slug"].as_str()?;
-                Some(ModelInfo { id: id.to_owned(), name: m["display_name"].as_str().unwrap_or(id).to_owned(), context_window: m["context_window"].as_u64(), max_output: None })
+                Some(ModelInfo {
+                    id: id.to_owned(),
+                    name: m["display_name"].as_str().unwrap_or(id).to_owned(),
+                    context_window: m["context_window"].as_u64(),
+                    max_output: None,
+                    efforts: efforts(m),
+                })
             })
             .collect();
     }
     let ids = body["data"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str());
-    ids.map(|id| ModelInfo { id: id.to_owned(), name: id.to_owned(), context_window: None, max_output: None }).collect()
+    ids.map(ModelInfo::named).collect()
+}
+
+/// A ChatGPT model's levels, each with what it's for, and its default. One
+/// rein doesn't know (`ultra` hands work to helpers, as only Codex does)
+/// isn't offered.
+fn efforts(m: &Value) -> Efforts {
+    let Some(levels) = m["supported_reasoning_levels"].as_array() else { return Efforts::Unknown };
+    let listed = levels.iter().filter_map(|level| Some((level["effort"].as_str()?.parse::<Effort>().ok()?, level["description"].as_str().map(str::to_owned))));
+    Efforts::listed(listed, m["default_reasoning_level"].as_str().and_then(|name| name.parse().ok()))
 }
 
 /// Reads the Responses API's stream; see [`crate::decode`].
@@ -243,8 +263,43 @@ mod tests {
             {"slug": "a", "display_name": "Model A", "visibility": "list", "context_window": 500000},
             {"slug": "hidden", "display_name": "Hidden", "visibility": "hide"},
         ]});
-        assert_eq!(parse_models(&chatgpt), [ModelInfo { id: "a".into(), name: "Model A".into(), context_window: Some(500_000), max_output: None }]);
+        assert_eq!(parse_models(&chatgpt), [ModelInfo { id: "a".into(), name: "Model A".into(), context_window: Some(500_000), max_output: None, efforts: Efforts::Unknown }]);
         let api_key = json!({"data": [{"id": "b"}]});
-        assert_eq!(parse_models(&api_key), [ModelInfo { id: "b".into(), name: "b".into(), context_window: None, max_output: None }]);
+        assert_eq!(parse_models(&api_key), [ModelInfo { id: "b".into(), name: "b".into(), context_window: None, max_output: None, efforts: Efforts::Unknown }]);
+    }
+
+    #[test]
+    fn a_chatgpt_models_levels_come_from_its_list() {
+        // As the list said for gpt-6.1-sol on 2026-11-03, trimmed.
+        let chatgpt = json!({"models": [{"slug": "gpt-6.1-sol", "visibility": "list", "default_reasoning_level": "low", "supported_reasoning_levels": [
+            {"effort": "low", "description": "Fast responses with lighter reasoning"},
+            {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+            {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+            {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"},
+            {"effort": "max", "description": "Maximum reasoning depth for the hardest problems"},
+            {"effort": "ultra", "description": "Maximum reasoning with automatic task delegation"},
+        ]}]});
+        let efforts = &parse_models(&chatgpt)[0].efforts;
+        let levels: Vec<Effort> = efforts.offered().iter().map(|l| l.effort).collect();
+        assert_eq!(levels, [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max], "not ultra, which hands work to helpers");
+        assert_eq!(efforts.offered()[0].about.as_deref(), Some("Fast responses with lighter reasoning"));
+        assert_eq!(efforts.default(), Some(Effort::Low));
+        assert_eq!(efforts.sent(Some(Effort::Minimal)), Some(Effort::Low), "below them all: its lowest");
+    }
+
+    #[test]
+    fn off_goes_as_none() {
+        let input = [Item::User("hi".into())];
+        let request = Request {
+            model: "m",
+            instructions: None,
+            input: &input,
+            tools: &[],
+            reasoning_effort: Some(Effort::Off),
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+        };
+        assert_eq!(request_body(&request)["reasoning"]["effort"], "none");
     }
 }
