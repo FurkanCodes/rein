@@ -50,7 +50,10 @@ pub(crate) async fn join(
                 1 => "1 other rein is running · /peers".to_owned(),
                 n => format!("{n} other reins are running · /peers"),
             };
-            say!("{}", s.dim(&format!("You're {} in {} · {about}", node.info().name, node.info().workspace)));
+            // Under the logo, the tab's title and the strip say this.
+            if !crate::ui::logo::is_shown() {
+                say!("{}", s.dim(&format!("You're {} in {} · {about}", node.info().name, node.info().workspace)));
+            }
             if let Some((parent, id)) = child {
                 match node.claim(parent, id).await {
                     Ok(from) => say!("{}", s.dim(&format!("A sub-agent of {from}: its task follows, and the result goes back to it"))),

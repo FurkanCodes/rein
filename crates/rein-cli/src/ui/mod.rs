@@ -6,6 +6,7 @@ pub mod editor;
 pub mod fuzzy;
 pub mod history;
 pub mod keys;
+pub mod logo;
 pub mod markdown;
 pub mod screen;
 pub mod spinner;

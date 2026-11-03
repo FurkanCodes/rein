@@ -331,7 +331,7 @@ pub(crate) fn default_workspace(root: &Path) -> String {
 }
 
 /// The branch checked out where `root` is, read from git's own files.
-fn git_branch(root: &Path) -> Option<String> {
+pub(crate) fn git_branch(root: &Path) -> Option<String> {
     let dot_git = root.ancestors().map(|dir| dir.join(".git")).find(|path| path.exists())?;
     // A worktree's `.git` is a file that says where its git folder is.
     let git_dir = if dot_git.is_file() {

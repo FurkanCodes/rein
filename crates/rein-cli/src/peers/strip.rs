@@ -44,7 +44,7 @@ impl Colors {
     }
 
     /// `text` in the colour `(r, g, b)`, bold if `bold`.
-    fn paint(self, color: (u8, u8, u8), bold: bool, text: &str) -> String {
+    pub(crate) fn paint(self, color: (u8, u8, u8), bold: bool, text: &str) -> String {
         self.paint_on(color, None, bold, text)
     }
 

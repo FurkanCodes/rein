@@ -49,10 +49,13 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     // which says how big each model's context window is, loads while
     // everything else gets ready.
     let early = if args.model_given || args.resume == Resume::New { Some(wanted.clone()) } else { latest.as_deref().and_then(session::peek).map(|header| header.model) };
+    if args.prompt.is_none() {
+        crate::ui::logo::show(&root, early.as_deref());
+    }
     let mut connected = match &early {
         Some(spec) => {
             let connected = crate::connect::connect(http, &providers, &keys, spec, args.compress).await?;
-            say!("{}", connected.pays);
+            say_pays(&connected.pays, false);
             Some(connected)
         }
         None => None,
@@ -99,7 +102,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         Some(connected) if connected.provider.name == provider.name => connected,
         _ => {
             let connected = crate::connect::connect(http, &providers, &keys, &spec, args.compress).await?;
-            say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&connected.pays));
+            say_pays(&connected.pays, true);
             connected
         }
     };
@@ -127,6 +130,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.context_limit = limit;
     terminal.model = provider::shown(&setup.provider, &model_name);
     terminal.spec.clone_from(&spec);
+    crate::ui::logo::update(|facts| facts.model = Some(crate::ui::logo::model_name(&spec)));
     terminal.tab_command.clone_from(&args.tab_command);
     terminal.input.set_bar(terminal.bar());
     let max_output = setup.max_output(&model_name);
@@ -162,6 +166,19 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
             }
         }
         None => conversation(&mut agent, &mut terminal, &mut setup).await,
+    }
+}
+
+/// What pays for the model: beside the logo, or said, `dim` and indented
+/// if `quiet`, where there's none.
+fn say_pays(pays: &str, quiet: bool) {
+    if crate::ui::logo::update(|facts| facts.pays = Some(crate::ui::logo::pays_briefly(pays))) {
+        return;
+    }
+    if quiet {
+        say!("{}{}", " ".repeat(GUTTER), crate::ui::style::Style::stderr().dim(pays));
+    } else {
+        say!("{pays}");
     }
 }
 
@@ -213,8 +230,9 @@ impl Setup {
         };
         let stamp = format!("{}T{:02}-{:02}-{:02}", now.date(), now.hour, now.minute, now.second);
         let files = context::find(&self.root, Some(&self.personal));
-        if !files.is_empty() {
-            let names: Vec<String> = files.iter().map(|f| shown_path(&f.path, &self.root)).collect();
+        let names: Vec<String> = files.iter().map(|f| shown_path(&f.path, &self.root)).collect();
+        // Beside the logo, or said where there's none.
+        if !crate::ui::logo::update(|facts| facts.instructions.clone_from(&names)) && !names.is_empty() {
             say!("Instructions: {}", names.join(", "));
         }
         let context = context::message(&self.root, std::env::consts::OS, &now.date(), &files);
@@ -549,6 +567,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             }
             let current = setup.current(agent);
             terminal.spec.clone_from(&current);
+            crate::ui::logo::update(|facts| facts.model = Some(crate::ui::logo::model_name(&current)));
             agent.save_model(&current).map_err(describe)?;
             say!("{pad}{} now using {shown}", s.green("✓"));
             if let Some(why) = crate::effort::unlike_chosen(agent) {
@@ -892,7 +911,7 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
     let missing = |models: &[ModelInfo]| !models.is_empty() && !models.iter().any(|m| m.id == model);
     if provider.name != setup.provider.name {
         let connected = crate::connect::connect(&setup.http, &setup.providers, &setup.keys, spec, setup.compress).await?;
-        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&connected.pays));
+        say_pays(&connected.pays, true);
         let (client, models) = connected.models().await;
         if missing(&models) {
             return Err(format!("{} has no model called {model}; `rein models {}` lists them", provider.title, provider.name));

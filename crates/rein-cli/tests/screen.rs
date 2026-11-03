@@ -698,8 +698,54 @@ impl Drop for Term {
 
 const IDLE: &str = "type a message";
 
+/// The wordmark's first and last rows, as the screen shows them.
+const MARK_TOP: &str = " █▀▀▄ █▀▀▀ █ █▄  █";
+const MARK_BOTTOM: &str = " ▀  ▀ ▀▀▀▀ ▀ ▀   ▀";
+/// The strip's row: under the wordmark's three and a row of space.
+const STRIP: usize = 4;
+
 /// Long enough to wrap at any width these tests use.
 const PARAGRAPH: &str = "A harness is everything around the model: the conversation, the tools, the checks before anything runs, and the screen you read it all on, laid out again whenever the window changes size.";
+
+#[test]
+fn a_conversation_starts_with_reins_wordmark_and_what_it_starts_with() {
+    let long = (1..=40).map(|n| format!("Line {n}.")).collect::<Vec<_>>().join("\n\n");
+    let model = Model::start(vec![says(&long)]);
+    let mut term = Term::start(&model, "logo", 24, 80);
+    term.wait_for(IDLE);
+    let at_top = |rows: &[String]| {
+        rows[0].starts_with(&format!("{MARK_TOP}   gpt-6.1-sol · OPENAI_API_KEY · v"))
+            && rows[1].contains("project")
+            && rows[2].starts_with(MARK_BOTTOM)
+            && rows[3].starts_with("━━━━")
+    };
+    assert!(at_top(&term.rows()), "the wordmark at the very top, with what it started with and a line under:\n{}", term.text());
+    let text = term.text();
+    assert!(!text.contains("Using OPENAI_API_KEY") && !text.contains("You're project in"), "what it says beside the logo isn't said again:\n{text}");
+    // A conversation longer than the window scrolls under it.
+    term.keys("go\r");
+    term.wait_for("Line 40.");
+    assert!(at_top(&term.rows()), "still at the top:\n{}", term.text());
+    // Too narrow for it beside the wordmark: under it.
+    let model = Model::start(vec![]);
+    let narrow = Term::start(&model, "logo-narrow", 24, 26);
+    narrow.wait_for(IDLE);
+    let rows = narrow.rows();
+    let first = rows.iter().position(|row| row.trim_end() == MARK_TOP).unwrap_or_else(|| panic!("no wordmark alone:\n{}", narrow.text()));
+    assert!(rows[first + 3].starts_with(" gpt-6.1-sol · OPENAI"), "what it uses under it, the model kept:\n{}", narrow.text());
+}
+
+#[test]
+fn a_click_before_anything_is_said_is_nothing_to_select() {
+    let model = Model::start(vec![says("Still here.")]);
+    let mut term = Term::start(&model, "click", 24, 80);
+    term.wait_for(IDLE);
+    // A press, a drag and a release over the empty conversation.
+    term.keys("\x1b[<0;10;5M\x1b[<32;20;6M\x1b[<0;20;6m");
+    term.keys("hi\r");
+    term.wait_for("Still here.");
+    assert!(term.child.try_wait().unwrap().is_none(), "rein is still running:\n{}", term.text());
+}
 
 #[test]
 fn an_answer_appears_above_the_box() {
@@ -1925,12 +1971,12 @@ fn a_message_from_another_tab_starts_a_turn_there() {
     let api_model = Model::start(vec![says("Adding a /health endpoint now.")]);
     let web_model = Model::start(vec![calls("message", json!({ "to": "api", "text": "please add a /health endpoint" })), says("Asked api.")]);
     let api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
-    api.wait_for("You're api in project · no other rein is running yet");
     api.wait_for(IDLE);
     api.wait_title("○ api");
     let mut web = Term::spawn_in(&web_model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
-    web.wait_for("You're web in project · 1 other rein is running");
     web.wait_for(IDLE);
+    // In, and it sees api: its strip shows it.
+    web.wait_until("web to see api", |_| web.rows().iter().any(|row| row.contains(" api ○")));
     web.keys("ask api for a health endpoint\r");
     web.wait_for("Asked api.");
     api.wait_for("✉ from web");
@@ -2092,25 +2138,28 @@ fn a_strip_across_the_top_shows_every_rein_live() {
     let api_model = Model::start(vec![runs("touch made.txt"), says("Made it.")]);
     let mut api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
     api.wait_for(IDLE);
-    assert!(!api.rows()[0].contains(" api ○"), "alone, there's no strip:\n{}", api.text());
+    assert!(!api.rows().iter().any(|row| row.contains(" api ○")), "alone, there's no strip:\n{}", api.text());
     let idle = Model::start(vec![]);
     let web = Term::spawn_in(&idle, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
     web.wait_for(IDLE);
-    web.wait_until("the strip in web", |_| web.rows()[0].starts_with("  api ○    web ○"));
-    api.wait_until("the same strip in api", |_| api.rows()[0] == web.rows()[0]);
+    web.wait_until("the strip in web", |_| web.rows()[STRIP].starts_with("  api ○    web ○"));
+    api.wait_until("the same strip in api", |_| api.rows()[STRIP] == web.rows()[STRIP]);
+    // The logo stays over it, its own line given up for the strip's, and
+    // a row of space between them.
+    assert!(web.rows()[0].starts_with(MARK_TOP) && web.rows()[STRIP - 2].starts_with(MARK_BOTTOM) && web.rows()[STRIP - 1].trim().is_empty(), "{}", web.text());
     // A line under it, heavy only under the tab's own.
     let heavy = |row: &str| row.chars().position(|c| c == '━');
-    assert!(web.rows()[1].chars().all(|c| c == '━' || c == '─'), "a line under it: {:?}", web.rows()[1]);
-    assert_eq!(heavy(&api.rows()[1]), Some(1), "under api, the first: {:?}", api.rows()[1]);
-    assert_eq!(heavy(&web.rows()[1]), Some(1 + " api ○ ".chars().count() + 2), "under web, the second: {:?}", web.rows()[1]);
+    assert!(web.rows()[STRIP + 1].chars().all(|c| c == '━' || c == '─'), "a line under it: {:?}", web.rows()[STRIP + 1]);
+    assert_eq!(heavy(&api.rows()[STRIP + 1]), Some(1), "under api, the first: {:?}", api.rows()[STRIP + 1]);
+    assert_eq!(heavy(&web.rows()[STRIP + 1]), Some(1 + " api ○ ".chars().count() + 2), "under web, the second: {:?}", web.rows()[STRIP + 1]);
     api.keys("make a file\r");
     api.wait_for("Allow this command");
-    web.wait_until("web to see api needs you", |_| web.rows()[0].contains("api ◆ needs you"));
+    web.wait_until("web to see api needs you", |_| web.rows()[STRIP].contains("api ◆ needs you"));
     std::thread::sleep(Duration::from_millis(700));
     api.keys("y");
     api.wait_for("Made it.");
-    web.wait_until("web to see api is done", |_| web.rows()[0].contains("api ✓ done"));
-    api.wait_until("the strip in api too", |_| api.rows()[0].starts_with("  api ✓ done") && api.rows()[0].contains("web ○"));
+    web.wait_until("web to see api is done", |_| web.rows()[STRIP].contains("api ✓ done"));
+    api.wait_until("the strip in api too", |_| api.rows()[STRIP].starts_with("  api ✓ done") && api.rows()[STRIP].contains("web ○"));
 }
 
 /// Three models as Sign in with ChatGPT lists them: one with three levels

@@ -68,7 +68,13 @@ struct State {
     since: usize,
     /// Rows across the top, over the conversation: the other reins, live.
     strip: Vec<String>,
+    /// What stays at the very top, over the strip: rein's logo, laid out
+    /// for a width, with its own line under it or not (the strip has one).
+    header: Option<Header>,
 }
+
+/// Lays out the header for `columns`, with its line under it if `ruled`.
+type Header = Box<dyn Fn(usize, bool) -> Vec<String> + Send>;
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
     Mutex::new(State {
@@ -83,6 +89,7 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         stale: true,
         since: 0,
         strip: Vec::new(),
+        header: None,
     })
 });
 
@@ -317,7 +324,12 @@ pub fn select(x: usize, y: usize, drag: Drag) -> Option<String> {
         return None;
     }
     let (first, top, count) = state.area;
-    let row = (y.saturating_sub(1)).clamp(first, (first + count).max(1) - 1) - first + top;
+    // No conversation on screen yet: nothing to select.
+    if count == 0 {
+        state.selection = None;
+        return None;
+    }
+    let row = (y.saturating_sub(1)).clamp(first, first + count - 1) - first + top;
     let at = (row, x.saturating_sub(1));
     match drag {
         Drag::Start => {
@@ -369,16 +381,34 @@ fn selected_text(state: &mut State, from: (usize, usize), to: (usize, usize)) ->
 }
 
 fn conversation_height(state: &State) -> usize {
-    let rows = size().0;
     let live = state.live.lines.len();
-    rows.saturating_sub(live + usize::from(rows > live + 1) + strip_rows(state, rows))
+    let (rows, cols) = size();
+    rows.saturating_sub(live + usize::from(rows > live + 1) + top_rows(state, rows, cols).len())
 }
 
-/// How many rows the strip takes: none in a window that hasn't room to
-/// spare for it and still show a few rows of the conversation.
-fn strip_rows(state: &State, rows: usize) -> usize {
-    let strip = state.strip.len();
-    if strip > 0 && rows >= state.live.lines.len() + strip + 6 { strip } else { 0 }
+/// The rows across the top: the header, then the strip, in a window with
+/// room to spare for them and still show a few rows of the conversation.
+/// Short of room, the header goes first, then the strip.
+fn top_rows(state: &State, rows: usize, cols: usize) -> Vec<String> {
+    let room = |lines: &[String]| rows >= state.live.lines.len() + lines.len() + 6;
+    let strip = if room(&state.strip) { state.strip.clone() } else { Vec::new() };
+    let mut top = state.header.as_ref().map(|header| header(cols, strip.is_empty())).unwrap_or_default();
+    // A row of space between the logo and the strip.
+    if !top.is_empty() && !strip.is_empty() {
+        top.push(String::new());
+    }
+    top.extend(strip.iter().cloned());
+    if room(&top) { top } else { strip }
+}
+
+/// Keeps `header` at the very top of the full screen, laid out again for
+/// each width.
+pub fn set_header(header: impl Fn(usize, bool) -> Vec<String> + Send + 'static) {
+    let _guard = lock();
+    let mut state = state();
+    state.header = Some(Box::new(header));
+    state.stale = true;
+    render(&mut state);
 }
 
 /// Puts `lines` across the top of the full screen, over the conversation,
@@ -400,7 +430,8 @@ fn render(state: &mut State) {
     let (rows, cols) = size();
     let s = Style::stderr();
     let area = conversation_height(state);
-    let strip = strip_rows(state, rows);
+    let top_lines = top_rows(state, rows, cols);
+    let strip = top_lines.len();
     let gap = rows.saturating_sub(strip + area + state.live.lines.len());
     let selection = state.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
     let (closed, open) = state.transcript.rows(cols);
@@ -411,7 +442,7 @@ fn render(state: &mut State) {
     let row_at = |i: usize| if i < closed.len() { &closed[i] } else { &open[i - closed.len()] };
     // The strip first; then, anchored to the bottom, the conversation: a
     // short one sits just over the box.
-    let mut screen: Vec<String> = state.strip[..strip].to_vec();
+    let mut screen: Vec<String> = top_lines;
     screen.extend(std::iter::repeat_n(String::new(), area - count));
     for i in top..top + count {
         let text = &row_at(i).text;
