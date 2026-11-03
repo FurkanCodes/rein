@@ -1130,6 +1130,53 @@ fn run(model: &Model, home: &std::path::Path, args: &[&str], input: &str) -> (bo
 }
 
 #[test]
+fn claude_code_can_be_selected_from_the_login_menu() {
+    let model = Model::start(vec![]);
+    let mut term = Term::start(&model, "login-claude-code-menu", 40, 110);
+    term.wait_for(IDLE);
+    term.keys("/login\r");
+    term.wait_for("sign in to a provider");
+    term.keys("claude-code");
+    term.wait_for("CLI login or setup-token");
+    term.keys("\r");
+    term.wait_for("press Enter to use an existing");
+    term.keys("\r");
+    term.wait_for("Claude Code enabled");
+    term.wait_for(IDLE);
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/claude-code.json")).unwrap()).unwrap();
+    assert!(saved["token"].is_null());
+    assert!(model.requests().is_empty(), "selecting CLI login doesn't call a model");
+}
+
+#[test]
+fn claude_code_login_saves_private_tokens_or_selects_the_clis_login() {
+    use std::os::unix::fs::PermissionsExt;
+    let model = Model::start(Vec::new());
+    let home = std::env::temp_dir().join(format!("rein-login-claude-code-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("claude-oauth.json"), "legacy credentials").unwrap();
+    let (ok, said) = run(&model, &home, &["login", "claude-code"], "test-subscription-token\n");
+    assert!(ok && said.contains("Claude Code enabled") && !said.contains("test-subscription-token"), "{said}");
+    let path = home.join("claude-code.json");
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["token"], "test-subscription-token");
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    let (ok, said) = run(&model, &home, &["models", "claude-code"], "");
+    assert!(ok && said.contains("sonnet") && said.contains("opus"), "{said}");
+    assert!(model.requests.lock().unwrap().is_empty());
+    let (ok, said) = run(&model, &home, &["logout", "claude-code"], "");
+    assert!(ok && said.contains("does not sign the Claude CLI out"), "{said}");
+    assert!(!path.exists());
+    assert_eq!(std::fs::read_to_string(home.join("claude-oauth.json")).unwrap(), "legacy credentials");
+    let (ok, said) = run(&model, &home, &["login", "claude-code"], "\n");
+    assert!(ok, "{said}");
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(saved["token"].is_null());
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn a_key_is_checked_where_only_a_good_one_gets_an_answer() {
     // OpenRouter lists its models for anyone, so that proves nothing.
     let model = Model::chat(vec![], None);
@@ -1729,4 +1776,47 @@ fn switching_to_auto_mode_brings_the_step_limit_and_back_again() {
     }
     term.keys("/status\r");
     term.wait_for("at most 200 a turn, as nobody's watching (auto mode)");
+}
+
+#[test]
+fn claude_code_subprocess_keeps_reins_tools_and_uses_subscription_auth() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("rein-screen-{}-claude-code", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(dir.join("project")).unwrap();
+    std::fs::write(dir.join("project/example.txt"), "subprocess fixture contents\n").unwrap();
+    let program = bin.join("claude");
+    std::fs::write(
+        &program,
+        r#"#!/bin/sh
+[ "$CLAUDE_CODE_OAUTH_TOKEN" = subscription-test ] || exit 10
+[ -z "$OPENAI_API_KEY$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$ANTHROPIC_BASE_URL" ] || exit 11
+/bin/cat > "$0.input"
+if [ -f "$0.called" ]; then
+    printf '%s' '{"structured_output":{"text":"Read through rein, not Claude tools.","tool_calls":[]}}'
+else
+    : > "$0.called"
+    printf '%s' '{"structured_output":{"text":"Inspecting the fixture.","tool_calls":[{"name":"read","arguments":{"path":"example.txt","start_line":null,"line_count":null}}]}}'
+fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let model = Model::start(Vec::new())
+        .with_env("PATH", bin.to_str().unwrap())
+        .with_env("REIN_MODEL", "claude-code/sonnet")
+        .with_env("CLAUDE_CODE_OAUTH_TOKEN", "subscription-test")
+        .with_env("ANTHROPIC_BASE_URL", "https://must-not-be-used.invalid")
+        .with_env("ANTHROPIC_API_KEY", "must-not-be-passed");
+    let mut term = Term::spawn(&model, dir, 35, 120);
+    term.wait_for(IDLE);
+    term.keys("read example.txt\r");
+    term.wait_for("Read through rein, not Claude tools.");
+    term.wait_for(IDLE);
+    let input = std::fs::read_to_string(bin.join("claude.input")).unwrap();
+    assert!(input.contains("subprocess fixture contents"), "{input}");
+    assert!(model.requests.lock().unwrap().is_empty(), "no native HTTP requests");
+    assert!(!term.text().contains("subscription-test"));
 }

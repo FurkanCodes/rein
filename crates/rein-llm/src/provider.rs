@@ -117,6 +117,7 @@ pub fn builtin() -> Vec<Provider> {
             default_model: Some("claude-opus-5-5".into()),
             ..Provider::new("anthropic", "Anthropic", Api::Anthropic, crate::anthropic::API_BASE, &["ANTHROPIC_API_KEY"]).keys_at("https://platform.claude.com/settings/keys")
         },
+        Provider { default_model: Some("sonnet".into()), needs_key: true, ..Provider::new("claude-code", "Claude Code CLI", Api::Anthropic, "claude-code", &[]) },
         Provider {
             url_env: Some("GOOGLE_GEMINI_BASE_URL".into()),
             default_model: Some("gemini-3.8-flash".into()),

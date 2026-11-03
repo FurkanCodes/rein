@@ -9,6 +9,7 @@
 
 pub mod anthropic;
 pub mod chat;
+mod claude_code;
 pub mod client;
 pub mod decode;
 pub mod gemini;

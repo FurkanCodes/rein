@@ -605,7 +605,12 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
             for provider in setup.providers.iter().filter(|p| p.needs_key) {
                 names.push(provider.name.clone());
                 let how = if provider.sign_in_url.is_some() { ", signs in in the browser" } else { "" };
-                items.push((provider.name.clone(), format!("{}{how}", crate::connect::pays(provider, &setup.keys, false))));
+                let description = if provider.name == "claude-code" {
+                    "Claude Code subscription: CLI login or setup-token".to_owned()
+                } else {
+                    format!("{}{how}", crate::connect::pays(provider, &setup.keys, false))
+                };
+                items.push((provider.name.clone(), description));
             }
             names.push(crate::claude::NAME.into());
             items.push((crate::claude::NAME.into(), "unofficial Claude subscription login; account risk; explicit consent required".into()));
@@ -619,6 +624,9 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
                 names.push("chatgpt".into());
             }
             names.extend(setup.keys.keys().cloned());
+            if config_dir()?.join(crate::claude::CODE_FILE).exists() {
+                names.push("claude-code".into());
+            }
             if config_dir()?.join(crate::claude::FILE).exists() {
                 names.push(crate::claude::NAME.into());
             }

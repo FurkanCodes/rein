@@ -838,6 +838,7 @@ dependencies = [
  "base64",
  "flate2",
  "getrandom 0.4.3",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

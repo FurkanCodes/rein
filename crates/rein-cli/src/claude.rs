@@ -1,5 +1,5 @@
-//! Explicit opt-in to unofficial Claude subscription login. API-key login
-//! remains separate; no browser opens until the user accepts the warning.
+//! Claude subscription setup: the official CLI subprocess path, and the
+//! separate explicit opt-in to unofficial OAuth. API-key login stays separate.
 
 use crate::{CliResult, config_dir, describe};
 use rein_llm::{anthropic::oauth, store};
@@ -7,6 +7,21 @@ use std::time::Duration;
 
 pub(crate) const NAME: &str = "anthropic --oauth";
 pub(crate) const FILE: &str = "claude-oauth.json";
+pub(crate) const CODE_FILE: &str = "claude-code.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodeCredentials {
+    pub(crate) token: Option<String>,
+}
+
+pub(crate) fn save_code(token: String, tell: &dyn Fn(&str)) -> CliResult {
+    let token = token.trim();
+    let credentials = CodeCredentials { token: (!token.is_empty()).then(|| token.to_owned()) };
+    store::write_json_private(&config_dir()?.join(CODE_FILE), &credentials).map_err(describe)?;
+    tell("Claude Code enabled. Use `/model claude-code/sonnet` or `rein -m claude-code/sonnet`. The CLI must be installed and signed in, or supplied a setup-token token.");
+    Ok(())
+}
+
 pub(crate) const WARNING: &str = "Warning: Claude OAuth is unofficial and not authorized by Anthropic for third-party apps.\n\
 It impersonates Claude Code, including its client ID, headers and system identity.\n\
 Anthropic may block access or restrict your account without notice. Your subscription's limits apply.\n\

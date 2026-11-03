@@ -64,6 +64,7 @@ pub struct Client {
     claude_oauth: Option<Arc<anthropic::oauth::Session>>,
     /// Your ChatGPT plan's sign-in, which renews itself.
     chatgpt: Option<Arc<openai::signin::Session>>,
+    claude_code: Option<crate::claude_code::Backend>,
 }
 
 /// How long a streaming answer may send nothing at all. Providers send
@@ -116,7 +117,7 @@ impl Client {
     /// which speaks `api`.
     pub fn new(http: reqwest::Client, api: Api, base_url: impl Into<String>, auth: Auth) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
-        Client { http, api, base_url, auth, quirks: Quirks::default(), idle: IDLE, wire: Arc::default(), claude_oauth: None, chatgpt: None }
+        Client { http, api, base_url, auth, quirks: Quirks::default(), idle: IDLE, wire: Arc::default(), claude_oauth: None, chatgpt: None, claude_code: None }
     }
 
     /// OpenAI on your ChatGPT plan, signed in to with `rein login` and saved
@@ -139,6 +140,14 @@ impl Client {
     pub fn claude_oauth(http: reqwest::Client, credentials: std::path::PathBuf) -> Self {
         let mut client = Self::new(http, Api::Anthropic, anthropic::API_BASE, Auth::None);
         client.claude_oauth = Some(Arc::new(anthropic::oauth::Session::new(credentials)));
+        client
+    }
+
+    /// Uses the official Claude Code CLI. A token, when supplied, is passed
+    /// only to that subprocess; otherwise the CLI uses its stored login.
+    pub fn claude_code(http: reqwest::Client, token: Option<String>) -> Self {
+        let mut client = Self::new(http, Api::Anthropic, "claude-code", Auth::None);
+        client.claude_code = Some(crate::claude_code::Backend::new(token));
         client
     }
 
@@ -184,6 +193,11 @@ impl Client {
 
     /// The models this credential can use, in the server's order.
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        if self.claude_code.is_some() {
+            // The CLI has no model-discovery endpoint. These are its aliases;
+            // callers may also supply full model IDs directly.
+            return Ok(["sonnet", "opus", "haiku"].into_iter().map(|id| ModelInfo { id: id.into(), name: id.into(), context_window: None, max_output: None }).collect());
+        }
         match self.api {
             Api::Responses => openai::models(self).await,
             Api::Anthropic => anthropic::models(self).await,
@@ -297,11 +311,24 @@ impl Client {
 
     /// Sends the request and returns the answer as a stream of events.
     pub async fn stream(&self, request: &Request<'_>) -> Result<ResponseStream> {
+        if let Some(backend) = &self.claude_code {
+            return Ok(ResponseStream { source: StreamSource::Buffered(backend.respond(request, self.idle).await?) });
+        }
         let mut omitted = self.omitted();
         loop {
             let body = self.body(request, &omitted);
             match self.send(request, &body, &omitted).await {
-                Ok(response) => return Ok(ResponseStream { response, decoder: self.decoder(request), record: None, idle: self.idle, claude_oauth: self.claude_oauth.is_some() }),
+                Ok(response) => {
+                    return Ok(ResponseStream {
+                        source: StreamSource::Http(Box::new(HttpStream {
+                            response,
+                            decoder: self.decoder(request),
+                            record: None,
+                            idle: self.idle,
+                            claude_oauth: self.claude_oauth.is_some(),
+                        })),
+                    });
+                }
                 // The server named a field it doesn't take: once more
                 // without it, and never again with it.
                 Err(e) if let Some(field) = rejected_field(&e, &body, self.optional(), &omitted) => {
@@ -410,9 +437,34 @@ pub(crate) fn parse_error_body(text: &str) -> (Option<String>, String) {
     (None, text.chars().take(500).collect())
 }
 
-/// A streaming answer. Call [`ResponseStream::next`] until it returns `None`.
-/// Dropping it closes the connection, which cancels the request.
+/// An answer. HTTP answers stream incrementally; CLI answers are buffered.
+/// Dropping an in-flight request cancels its connection or subprocess.
 pub struct ResponseStream {
+    source: StreamSource,
+}
+
+enum StreamSource {
+    Http(Box<HttpStream>),
+    Buffered(std::collections::VecDeque<Result<Event>>),
+}
+
+impl ResponseStream {
+    /// Also writes the raw HTTP stream to `file`; subprocess replies are not recorded.
+    pub fn record_to(&mut self, file: File) {
+        if let StreamSource::Http(stream) = &mut self.source {
+            stream.record_to(file);
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<Result<Event>> {
+        match &mut self.source {
+            StreamSource::Http(stream) => stream.next().await,
+            StreamSource::Buffered(events) => events.pop_front(),
+        }
+    }
+}
+
+struct HttpStream {
     response: reqwest::Response,
     decoder: Box<dyn Decode>,
     record: Option<File>,
@@ -420,7 +472,7 @@ pub struct ResponseStream {
     claude_oauth: bool,
 }
 
-impl ResponseStream {
+impl HttpStream {
     fn normalize(&self, mut event: Result<Event>) -> Result<Event> {
         if self.claude_oauth
             && let Ok(Event::Item(crate::Item::ToolCall(call))) = &mut event

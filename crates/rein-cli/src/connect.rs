@@ -56,6 +56,8 @@ enum Payment {
     Plan,
     /// Explicitly opted-in, unofficial Claude subscription OAuth.
     ClaudeOAuth,
+    /// Official CLI subprocess, with a saved login or a setup-token token.
+    ClaudeCode,
     /// A key in one of the provider's variables.
     Key { var: String, key: String },
     /// A gateway's token, sent as a bearer token.
@@ -67,6 +69,9 @@ enum Payment {
 }
 
 fn payment(provider: &Provider, keys: &Keys) -> Option<Payment> {
+    if provider.name == "claude-code" {
+        return (env("CLAUDE_CODE_OAUTH_TOKEN").is_some() || config_dir().is_ok_and(|dir| dir.join(crate::claude::CODE_FILE).exists())).then_some(Payment::ClaudeCode);
+    }
     if provider.chatgpt && config_dir().is_ok_and(|dir| dir.join(CREDENTIALS_FILE).exists()) {
         return Some(Payment::Plan);
     }
@@ -137,6 +142,11 @@ pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, k
             Client::claude_oauth(http.clone(), config_dir()?.join(crate::claude::FILE)),
             "Using Claude subscription OAuth (unofficial; not authorized by Anthropic; access or your account may be restricted)".into(),
         )),
+        Some(Payment::ClaudeCode) => {
+            let saved: Option<crate::claude::CodeCredentials> = store::read_json(&config_dir()?.join(crate::claude::CODE_FILE)).map_err(describe)?;
+            let token = env("CLAUDE_CODE_OAUTH_TOKEN").or_else(|| saved.and_then(|c| c.token));
+            Ok((Client::claude_code(http.clone(), token), "Using Claude Code CLI subscription login (subprocess; rein handles tools)".into()))
+        }
         Some(Payment::Key { var, key }) => Ok((client(auth(provider, key)), pays(&var))),
         Some(Payment::Token { var, token }) => Ok((client(Auth::Bearer(token)), pays(&var))),
         Some(Payment::Saved(key)) => Ok((client(auth(provider, key)), pays(&format!("your saved {} key", provider.title)))),
@@ -146,6 +156,9 @@ pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, k
 }
 
 fn no_key(provider: &Provider) -> String {
+    if provider.name == "claude-code" {
+        return "Claude Code is not enabled: install `claude`, run `claude auth login` or `claude setup-token`, then `rein login claude-code`".into();
+    }
     let get = provider.keys_url.as_deref().map(|url| format!(" (get one at {url})")).unwrap_or_default();
     let vars = provider.key_env.join(" or ");
     if provider.chatgpt {
@@ -232,6 +245,9 @@ pub fn sign_in(provider: &Provider, paste: bool) -> CliResult<Option<&str>> {
 
 /// What to ask for when a key is pasted.
 pub fn paste_prompt(provider: &Provider) -> String {
+    if provider.name == "claude-code" {
+        return "Run `claude setup-token` and paste its token, or press Enter to use an existing `claude auth login` session".into();
+    }
     let get = provider.keys_url.as_deref().map(|url| format!(" (from {url})")).unwrap_or_default();
     format!("Paste your {} API key{get}", provider.title)
 }
@@ -254,6 +270,9 @@ pub async fn login(http: &rein_llm::reqwest::Client, name: &str, paste: bool) ->
 /// Checks `key` with `provider` and saves it, saying how that went.
 /// `made`: the provider made it for rein, in the browser.
 pub async fn save_key(http: &rein_llm::reqwest::Client, provider: &Provider, key: String, made: bool, tell: &dyn Fn(&str)) -> CliResult {
+    if provider.name == "claude-code" {
+        return crate::claude::save_code(key, tell);
+    }
     if key.trim().is_empty() {
         return Err("no key given; nothing was saved".into());
     }
@@ -299,6 +318,11 @@ pub async fn key_from_browser(http: &rein_llm::reqwest::Client, provider: &Provi
 /// `rein logout <provider>`: forgets its saved key, or your ChatGPT sign-in.
 pub fn logout(name: &str, tell: &dyn Fn(&str)) -> CliResult {
     let dir = config_dir()?;
+    if name == "claude-code" {
+        std::fs::remove_file(dir.join(crate::claude::CODE_FILE)).map_err(|e| format!("couldn't forget Claude Code configuration: {e}"))?;
+        tell("Forgot rein's Claude Code configuration. This does not sign the Claude CLI out or revoke tokens; an environment token still takes precedence.");
+        return Ok(());
+    }
     if name == crate::claude::NAME {
         std::fs::remove_file(dir.join(crate::claude::FILE)).map_err(|e| format!("couldn't sign out of Claude OAuth: {e}"))?;
         tell("Signed out of Claude OAuth locally. Revoke the grant in your Claude account to invalidate it remotely.");
@@ -366,11 +390,13 @@ pub async fn models(http: &rein_llm::reqwest::Client, name: Option<&str>) -> Cli
 /// when there's none.
 pub fn pays(provider: &Provider, keys: &Keys, how: bool) -> String {
     match payment(provider, keys) {
+        Some(Payment::ClaudeCode) => "Claude Code CLI subscription login".to_owned(),
         Some(Payment::Plan) => "your ChatGPT plan".to_owned(),
         Some(Payment::ClaudeOAuth) => "Claude subscription OAuth (unofficial; account risk)".to_owned(),
         Some(Payment::Key { var, .. } | Payment::Token { var, .. }) => format!("${var}"),
         Some(Payment::Saved(_)) => "your saved key".to_owned(),
         Some(Payment::Free) => "nothing: no key needed".to_owned(),
+        None if how && provider.name == "claude-code" => "not enabled: `rein login claude-code`".to_owned(),
         None if how => format!("no key yet: ${} or `rein login {}`", provider.key_env.join(" or $"), provider.name),
         None => "no key yet".to_owned(),
     }

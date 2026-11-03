@@ -77,6 +77,39 @@ read (OpenAI's encrypted reasoning, Claude's signed thinking, Gemini's
 thought signatures) only goes back to that provider. `rein -c` continues with
 the model the conversation was left with.
 
+### Claude Code CLI (separate subscription path)
+
+Install the official `claude` CLI, then choose either:
+
+- Run `claude auth login`, then `rein login claude-code` and press Enter to
+  use the CLI's stored login.
+- Run `claude setup-token`, then `rein login claude-code` and paste the token
+  at the hidden prompt. This is the preferred option for unattended use;
+  renew it through the CLI when it expires.
+
+Use `rein -m claude-code/sonnet`, `claude-code/opus`, `claude-code/haiku`, or
+`claude-code/<full-model-id>`. Inside rein, `/login claude-code` accepts a token
+(or an empty answer for the CLI login) and `/model claude-code/sonnet` switches.
+You can also supply `CLAUDE_CODE_OAUTH_TOKEN` instead of saving a token. For a
+service, configure its PATH to include `claude`; shell profiles aren't loaded.
+
+This is independent of the API-key and unofficial OAuth paths below. rein
+invokes `claude -p`, never sends this token through its HTTP provider, and
+strips inherited API keys, endpoint overrides and alternate-provider switches
+from the subprocess environment. It does not use `--bare`. A recent CLI with
+`--safe-mode` and `--json-schema` support is required. Customizations, MCP
+servers and built-in tools are disabled: structured responses request rein's
+tools, which still go through rein's approvals and sandbox. Each step starts a
+fresh subprocess with the conversation; text appears when that step completes,
+not token by token. Output is capped at 16 MiB per pipe, quiet subprocesses
+time out after five minutes, and a step has a ten-minute ceiling.
+
+Saved tokens live in private `claude-code.json` under rein's config directory.
+`rein logout claude-code` removes that configuration; it does not sign the CLI
+out, revoke a token, or unset an environment token. Subscription availability,
+limits and permitted usage are governed by Anthropic's current terms; this
+integration does not guarantee entitlement or a particular token lifetime.
+
 ### Optional, unofficial Claude subscription OAuth
 
 `rein login anthropic --oauth` (or `/login anthropic --oauth` inside a
