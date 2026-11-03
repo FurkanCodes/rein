@@ -320,6 +320,8 @@ In a conversation:
   `--workspace` at the start. A workspace is a group of tabs on one piece
   of work: by default the git branch, so tabs on one feature are together.
   A name is found in your own workspace first, `checkout/api` elsewhere.
+  Renaming one renames its tab and its place in every strip, a sub-agent's
+  too; in zellij, a tab rein opened keeps the name it was opened with.
 - `--workspace health --worktree` works in the workspace's own git worktree
   beside the repository, on a branch of its name, so two workspaces never
   touch each other's files.

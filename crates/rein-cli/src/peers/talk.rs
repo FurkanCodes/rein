@@ -298,7 +298,12 @@ pub(crate) async fn command(command: Slash, agent: &mut Agent<Llm>, terminal: &m
     match command {
         Slash::Name(None) => say!("{pad}{}", info_line(terminal)),
         Slash::Name(Some(name)) => {
-            let name = node(terminal)?.rename(&name).await?;
+            let node = node(terminal)?;
+            let name = node.rename(&name).await?;
+            // A tab rein opened in tmux or screen has the name it was given.
+            if node.parent().is_some() {
+                super::spawn::rename_tab(&|key| std::env::var(key).ok(), &name).await;
+            }
             say!("{pad}{} other reins call this one {name} now", s.green("✓"));
         }
         Slash::Workspace(None) => say!("{pad}{}", info_line(terminal)),

@@ -223,22 +223,20 @@ pub(crate) fn steps(opener: &Opener, file: &str, run: &str, title: &str) -> Vec<
         Opener::Tmux => vec![step("tmux", &["new-window", "-d", "-n", title, run])],
         Opener::Zellij => vec![step("zellij", &["action", "new-tab", "--name", title, "--", "/bin/sh", file]), nicety("zellij", &["action", "go-to-previous-tab"])],
         Opener::Screen => vec![step("screen", &["-X", "screen", "-t", title, "/bin/sh", file]), nicety("screen", &["-X", "other"])],
-        Opener::Kitty => vec![step("kitten", &["@", "launch", "--type=tab", "--keep-focus", "--tab-title", title, "/bin/sh", file])],
-        Opener::WezTerm(back) => vec![
-            step("wezterm", &["cli", "spawn", "--", "/bin/sh", file]),
-            nicety("wezterm", &["cli", "set-tab-title", "--pane-id", "{out}", title]),
-            nicety("wezterm", &["cli", "activate-pane", "--pane-id", back]),
-        ],
-        Opener::ITerm => vec![step("osascript", &["-e", &iterm_script(run, title)])],
+        // These take their title from the rein in them, which moves and
+        // follows /name: a title given here would pin it.
+        Opener::Kitty => vec![step("kitten", &["@", "launch", "--type=tab", "--keep-focus", "/bin/sh", file])],
+        Opener::WezTerm(back) => vec![step("wezterm", &["cli", "spawn", "--", "/bin/sh", file]), nicety("wezterm", &["cli", "activate-pane", "--pane-id", back])],
+        Opener::ITerm => vec![step("osascript", &["-e", &iterm_script(run)])],
         Opener::Ghostty => vec![step("osascript", &["-e", &ghostty_script(run)])],
-        Opener::GhosttyLinux => vec![step("ghostty", &["+new-tab", &format!("--title={title}"), "-e", "/bin/sh", file])],
+        Opener::GhosttyLinux => vec![step("ghostty", &["+new-tab", "-e", "/bin/sh", file])],
         // `exec`: your shell doesn't stay on once the sub-agent is done.
         Opener::Terminal => vec![step("osascript", &["-e", &format!("tell application \"Terminal\" to do script {}", apple(&format!("exec {run}")))])],
         Opener::WindowsTerminal(distro) => {
-            vec![step("cmd.exe", &["/c", "wt.exe", "-w", "0", "nt", "--title", title, "--suppressApplicationTitle", "wsl.exe", "-d", distro, "--", "/bin/sh", file])]
+            vec![step("cmd.exe", &["/c", "wt.exe", "-w", "0", "nt", "--title", title, "wsl.exe", "-d", distro, "--", "/bin/sh", file])]
         }
         Opener::GnomeTerminal => vec![step("gnome-terminal", &["--tab", &format!("--title={title}"), "--", "/bin/sh", file])],
-        Opener::Konsole => vec![step("konsole", &["--new-tab", "-p", &format!("tabtitle={title}"), "-e", "/bin/sh", file])],
+        Opener::Konsole => vec![step("konsole", &["--new-tab", "-p", "tabtitle=%w", "-e", "/bin/sh", file])],
         Opener::Alacritty => vec![step("alacritty", &["msg", "create-window", "-T", title, "-e", "/bin/sh", file])],
         Opener::Foot => vec![step("footclient", &["--no-wait", &format!("--title={title}"), "--", "/bin/sh", file])],
     }
@@ -260,22 +258,40 @@ fn ghostty_script(run: &str) -> String {
     )
 }
 
-/// The AppleScript that opens an iTerm2 tab running `run`, named `title`,
-/// then goes back to the tab you were in. No variable may be named like a
+/// The AppleScript that opens an iTerm2 tab running `run`, then goes back to the tab you were in. No variable may be named like a
 /// word of AppleScript's own: `back` (as in front and back) once made
 /// iTerm2 try to set its "last insertion point", and fail.
-fn iterm_script(run: &str, title: &str) -> String {
+fn iterm_script(run: &str) -> String {
     format!(
         "tell application \"iTerm2\"\n\
          set theWindow to current window\n\
          set yourTab to current tab of theWindow\n\
          tell theWindow to set newTab to (create tab with default profile command {})\n\
-         tell current session of newTab to set name to {}\n\
          tell yourTab to select\n\
          end tell",
-        apple(run),
-        apple(title)
+        apple(run)
     )
+}
+
+/// Renames the window rein opened for this sub-agent, where the
+/// multiplexer names windows itself and doesn't take a program's title:
+/// tmux and screen. Everywhere else the tab follows rein's own title.
+pub(crate) async fn rename_tab(env: &impl Fn(&str) -> Option<String>, name: &str) {
+    if let Some(step) = renaming(env, name) {
+        let args: Vec<&str> = step.args.iter().map(String::as_str).collect();
+        let _ = program(step.program, &args).await;
+    }
+}
+
+/// What renames the window this rein is in, to `name`, if anything must.
+fn renaming(env: &impl Fn(&str) -> Option<String>, name: &str) -> Option<Step> {
+    if let Some(pane) = env("TMUX_PANE") {
+        Some(step("tmux", &["rename-window", "-t", &pane, name]))
+    } else if let (Some(session), Some(window)) = (env("STY"), env("WINDOW")) {
+        Some(step("screen", &["-S", &session, "-p", &window, "-X", "title", name]))
+    } else {
+        None
+    }
 }
 
 /// macOS opens new windows as tabs: Desktop & Dock's "Prefer tabs when
@@ -376,19 +392,24 @@ mod tests {
         assert_eq!(first(Opener::Tmux), ("tmux", words(&["new-window", "-d", "-n", "tests", run])));
         assert_eq!(first(Opener::Zellij), ("zellij", words(&["action", "new-tab", "--name", "tests", "--", "/bin/sh", file])));
         assert_eq!(first(Opener::Screen), ("screen", words(&["-X", "screen", "-t", "tests", "/bin/sh", file])));
-        assert_eq!(first(Opener::Kitty), ("kitten", words(&["@", "launch", "--type=tab", "--keep-focus", "--tab-title", "tests", "/bin/sh", file])));
+        assert_eq!(first(Opener::Kitty), ("kitten", words(&["@", "launch", "--type=tab", "--keep-focus", "/bin/sh", file])));
         assert_eq!(first(Opener::GnomeTerminal), ("gnome-terminal", words(&["--tab", "--title=tests", "--", "/bin/sh", file])));
-        assert_eq!(first(Opener::Konsole), ("konsole", words(&["--new-tab", "-p", "tabtitle=tests", "-e", "/bin/sh", file])));
-        assert_eq!(first(Opener::GhosttyLinux), ("ghostty", words(&["+new-tab", "--title=tests", "-e", "/bin/sh", file])));
+        assert_eq!(first(Opener::Konsole), ("konsole", words(&["--new-tab", "-p", "tabtitle=%w", "-e", "/bin/sh", file])));
+        assert_eq!(first(Opener::GhosttyLinux), ("ghostty", words(&["+new-tab", "-e", "/bin/sh", file])));
         assert_eq!(first(Opener::Alacritty), ("alacritty", words(&["msg", "create-window", "-T", "tests", "-e", "/bin/sh", file])));
         assert_eq!(first(Opener::Foot), ("footclient", words(&["--no-wait", "--title=tests", "--", "/bin/sh", file])));
         let (wt, args) = first(Opener::WindowsTerminal("Ubuntu".into()));
         assert_eq!((wt, &args[..2], args.last().map(String::as_str)), ("cmd.exe", &words(&["/c", "wt.exe"])[..], Some(file)));
-        // WezTerm names the pane it opened, then goes back to yours.
+        // WezTerm goes back to yours once it's opened one.
         let wez = steps(&Opener::WezTerm("7".into()), file, run, "tests");
-        assert_eq!(wez[1].args, words(&["cli", "set-tab-title", "--pane-id", "{out}", "tests"]));
-        assert_eq!(wez[2].args, words(&["cli", "activate-pane", "--pane-id", "7"]));
-        assert!(wez[0].needed && !wez[1].needed && !wez[2].needed, "only opening it must work");
+        assert_eq!(wez[1].args, words(&["cli", "activate-pane", "--pane-id", "7"]));
+        assert!(wez[0].needed && !wez[1].needed, "only opening it must work");
+        // None that would take the title from rein is given one to keep.
+        for opener in [Opener::Kitty, Opener::WezTerm("7".into()), Opener::ITerm, Opener::Ghostty, Opener::GhosttyLinux, Opener::Konsole, Opener::WindowsTerminal("Ubuntu".into())]
+        {
+            let all = steps(&opener, file, run, "tests").iter().flat_map(|s| s.args.clone()).collect::<Vec<_>>().join(" ");
+            assert!(!all.contains("tab-title") && !all.contains("set name") && !all.contains("suppress") && !all.contains("=tests"), "{opener:?}: {all}");
+        }
         let (osa, script) = first(Opener::Ghostty);
         assert!(osa == "osascript" && script[1].contains("set command of newConfig to \"/bin/sh /h/peers/start-1.sh\""), "{script:?}");
         let yours = steps(&Opener::Yours("my-term --tab --title {title} -- {command}".into()), file, run, "tests");
@@ -416,8 +437,18 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_sub_agent_renames_its_window_where_the_title_wont() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_owned());
+        let tmux = renaming(&env(&[("TMUX_PANE", "%3")]), "api").map(|s| (s.program, s.args));
+        assert_eq!(tmux, Some(("tmux", ["rename-window", "-t", "%3", "api"].map(str::to_owned).to_vec())));
+        let screen = renaming(&env(&[("STY", "12.pts"), ("WINDOW", "2")]), "api").map(|s| (s.program, s.args));
+        assert_eq!(screen, Some(("screen", ["-S", "12.pts", "-p", "2", "-X", "title", "api"].map(str::to_owned).to_vec())));
+        assert!(renaming(&env(&[("TERM_PROGRAM", "iTerm.app")]), "api").is_none(), "elsewhere the title says it");
+    }
+
+    #[test]
     fn the_iterm_script_names_nothing_like_a_word_of_applescripts() {
-        let script = iterm_script("/bin/sh /p/start-1.sh", "tests");
+        let script = iterm_script("/bin/sh /p/start-1.sh");
         for word in ["back", "front", "last", "first", "end", "beginning", "it", "me", "result", "window", "tab", "name"] {
             for line in script.lines() {
                 assert!(!line.trim_start().starts_with(&format!("set {word} to")), "a variable named {word}: {line}");

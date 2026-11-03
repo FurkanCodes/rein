@@ -2092,12 +2092,17 @@ fn a_strip_across_the_top_shows_every_rein_live() {
     let api_model = Model::start(vec![runs("touch made.txt"), says("Made it.")]);
     let mut api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
     api.wait_for(IDLE);
-    assert!(!api.rows()[0].contains("▸ api"), "alone, there's no strip:\n{}", api.text());
+    assert!(!api.rows()[0].contains(" api ○"), "alone, there's no strip:\n{}", api.text());
     let idle = Model::start(vec![]);
     let web = Term::spawn_in(&idle, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
     web.wait_for(IDLE);
-    web.wait_until("the strip in web", |_| web.rows()[0].contains("▸ web ○") && web.rows()[0].contains("api ○"));
-    assert!(web.rows()[1].chars().all(|c| c == '━'), "a line under it: {:?}", web.rows()[1]);
+    web.wait_until("the strip in web", |_| web.rows()[0].starts_with("  api ○    web ○"));
+    api.wait_until("the same strip in api", |_| api.rows()[0] == web.rows()[0]);
+    // A line under it, heavy only under the tab's own.
+    let heavy = |row: &str| row.chars().position(|c| c == '━');
+    assert!(web.rows()[1].chars().all(|c| c == '━' || c == '─'), "a line under it: {:?}", web.rows()[1]);
+    assert_eq!(heavy(&api.rows()[1]), Some(1), "under api, the first: {:?}", api.rows()[1]);
+    assert_eq!(heavy(&web.rows()[1]), Some(1 + " api ○ ".chars().count() + 2), "under web, the second: {:?}", web.rows()[1]);
     api.keys("make a file\r");
     api.wait_for("Allow this command");
     web.wait_until("web to see api needs you", |_| web.rows()[0].contains("api ◆ needs you"));
@@ -2105,7 +2110,7 @@ fn a_strip_across_the_top_shows_every_rein_live() {
     api.keys("y");
     api.wait_for("Made it.");
     web.wait_until("web to see api is done", |_| web.rows()[0].contains("api ✓ done"));
-    api.wait_until("the strip in api too", |_| api.rows()[0].contains("▸ api ✓ done") && api.rows()[0].contains("web ○"));
+    api.wait_until("the strip in api too", |_| api.rows()[0].starts_with("  api ✓ done") && api.rows()[0].contains("web ○"));
 }
 
 /// Three models as Sign in with ChatGPT lists them: one with three levels

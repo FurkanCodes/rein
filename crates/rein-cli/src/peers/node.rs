@@ -264,10 +264,10 @@ impl Node {
         if show.title {
             crate::ui::screen::save_title();
         }
-        if show.title || show.strip {
-            let colors = super::strip::Colors::here(crate::ui::style::Style::stderr().on());
-            tasks.spawn(present(shared.clone(), show, colors));
-        }
+        // Always: it also watches a sub-agent's parent, and draws only
+        // what's shown.
+        let colors = super::strip::Colors::here(crate::ui::style::Style::stderr().on());
+        tasks.spawn(present(shared.clone(), show, colors));
         let node = Node { file, info, policy, shared, inbox, tasks, next_question: 0, show };
         node.save()?;
         Ok(node)
@@ -593,12 +593,21 @@ async fn present(shared: Arc<Mutex<Shared>>, show: Show, colors: super::strip::C
         // A sub-agent whose rein has gone: nobody will read its result.
         if frame.is_multiple_of(fps) {
             let mut shared = locked(&shared);
-            if let Some(pid) = shared.parent
-                && !shared.folder.join(format!("{pid}.json")).exists()
-            {
-                shared.parent = None;
-                let from = shared.status.parent.clone().unwrap_or_default();
-                let _ = shared.inbox.try_send(Incoming::Close { from });
+            if let Some(pid) = shared.parent {
+                match std::fs::read_to_string(shared.folder.join(format!("{pid}.json"))) {
+                    // Its parent may have been renamed: the strip groups
+                    // this one under the name it has now.
+                    Ok(text) => {
+                        if let Ok(info) = serde_json::from_str::<super::Info>(&text) {
+                            shared.status.parent = Some(info.name);
+                        }
+                    }
+                    Err(_) => {
+                        shared.parent = None;
+                        let from = shared.status.parent.clone().unwrap_or_default();
+                        let _ = shared.inbox.try_send(Incoming::Close { from });
+                    }
+                }
             }
         }
         if show.strip && frame.is_multiple_of(fps) {
@@ -874,6 +883,32 @@ mod tests {
             node.expect_child(&format!("t{n}"), "x", "y").unwrap();
         }
         assert!(node.expect_child("one-more", "x", "y").unwrap_err().contains("the most at once"));
+        drop(node);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_follows_its_parents_name_and_goes_when_its_parent_does() {
+        let folder = PathBuf::from(format!("/tmp/rein-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let mut node = Node::start(&folder, Some("tests"), Some("w"), Path::new("/p"), "m", Policy::Accept, Show { title: false, strip: false }).await.unwrap();
+        // A parent, as its file says it is: another pid, renamed to lead.
+        let parent = Info { pid: 4_000_000, name: "lead".into(), ..node.info().clone() };
+        let file = folder.join(format!("{}.json", parent.pid));
+        std::fs::write(&file, serde_json::to_string(&parent).unwrap()).unwrap();
+        {
+            let mut shared = locked(&node.shared);
+            shared.parent = Some(parent.pid);
+            shared.status.parent = Some("furkan".into());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while locked(&node.shared).status.parent.as_deref() != Some("lead") {
+            assert!(Instant::now() < deadline, "the parent's new name never came");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        std::fs::remove_file(&file).unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), node.inbox.recv()).await;
+        assert!(matches!(closed, Ok(Some(Incoming::Close { ref from })) if from == "lead"), "{closed:?}");
         drop(node);
         std::fs::remove_dir_all(folder).unwrap();
     }
