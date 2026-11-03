@@ -278,11 +278,18 @@ Open another terminal tab, start `rein` there, and the two can talk. It
 works in any terminal: rein needs nothing from it but a tab.
 
 ```text
- [ ● api · working ]  [ ⚠ web · needs you ]  [ ✓ review · done ]  [ ○ tests · idle ]
+ [ ⠹ api · 41s ]  [ ◆ web · needs you ]  [ ✓ review · done 12s ]  [ ○ tests ]
 ```
 
-Each tab's title says which rein it is and what it's doing, and ⚠ means it's
-waiting for you. In a conversation:
+Each tab's title says which rein it is and what it's doing: a spinner that
+turns and the time so far while it works, ◆ when it waits for you, and how
+long it took once it's done. That's in every terminal. Inside each rein, a
+strip across the top shows all of them live, in colour, with a line under
+it that runs with light while any of them works, turns amber while one needs
+you, and settles green when they're done (`strip = off` hides it). iTerm2
+3.6 and later, Ghostty, WezTerm and Windows Terminal also show a progress
+bar on the tab, and iTerm2 3.7 a coloured status under the title. In a
+conversation:
 
 - `/send api add a /health endpoint` writes to another rein. If it's idle,
   it starts on it; if it's working, it reads it at its next step.
@@ -336,11 +343,12 @@ bell = off
 compress = off
 sandbox = on
 peers = hold
+strip = off
 ```
 
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
 `$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS`,
-`$REIN_SANDBOX` and `$REIN_PEERS`, which win over the file.
+`$REIN_SANDBOX`, `$REIN_PEERS` and `$REIN_STRIP`, which win over the file.
 
 ## Small things that matter
 

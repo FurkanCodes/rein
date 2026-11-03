@@ -105,6 +105,15 @@ impl std::str::FromStr for Joining {
     }
 }
 
+/// What this rein shows of itself where you can see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Show {
+    /// The tab's title, moving while it works.
+    pub(crate) title: bool,
+    /// The strip of all the reins across the top of its screen.
+    pub(crate) strip: bool,
+}
+
 /// The most messages waiting to go into the conversation, and in `/inbox`.
 const QUEUE: usize = 50;
 /// How many messages one sender may send a minute.
@@ -148,13 +157,13 @@ pub(crate) struct Node {
     /// The server, and messages on their way: stopped when this rein ends.
     tasks: JoinSet<()>,
     next_question: u64,
-    titled: bool,
+    show: Show,
 }
 
 impl Node {
     /// Joins the reins in `folder` as `name` (taken from the folder when
     /// `None`), in `workspace` (the git branch when `None`), working in `root`.
-    pub(crate) async fn start(folder: &Path, name: Option<&str>, workspace: Option<&str>, root: &Path, model: &str, policy: Policy, titled: bool) -> Result<Node, String> {
+    pub(crate) async fn start(folder: &Path, name: Option<&str>, workspace: Option<&str>, root: &Path, model: &str, policy: Policy, show: Show) -> Result<Node, String> {
         let folder = super::private_folder(folder)?;
         let peers = super::list(&folder).await;
         let name = match name {
@@ -188,6 +197,7 @@ impl Node {
             state: State::Idle,
             doing: None,
             since: super::now(),
+            took: None,
             tokens: 0,
             editing: Vec::new(),
             question: None,
@@ -221,12 +231,15 @@ impl Node {
                 });
             }
         }
-        let node = Node { file, info, policy, shared, inbox, tasks, next_question: 0, titled };
-        node.save()?;
-        if titled {
+        if show.title {
             crate::ui::screen::save_title();
         }
-        node.title();
+        if show.title || show.strip {
+            let colors = super::strip::Colors::here(crate::ui::style::Style::stderr().on());
+            tasks.spawn(present(shared.clone(), show, colors));
+        }
+        let node = Node { file, info, policy, shared, inbox, tasks, next_question: 0, show };
+        node.save()?;
         Ok(node)
     }
 
@@ -244,15 +257,6 @@ impl Node {
         rein_llm::store::write_private(&self.file, text.as_bytes()).map_err(|e| format!("can't write {}: {e}", self.file.display()))
     }
 
-    /// The tab's title: what this rein is called and doing.
-    fn title(&self) {
-        if !self.titled {
-            return;
-        }
-        let status = &locked(&self.shared).status;
-        crate::ui::screen::title(&format!("{} {} · {}", status.state.mark(), status.name, status.state.word()));
-    }
-
     pub(crate) async fn rename(&mut self, name: &str) -> Result<String, String> {
         let name = super::clean_name(name)?;
         if super::list(&self.folder()).await.iter().any(|p| p.name == name) {
@@ -261,7 +265,6 @@ impl Node {
         self.info.name.clone_from(&name);
         locked(&self.shared).status.name.clone_from(&name);
         self.save()?;
-        self.title();
         Ok(name)
     }
 
@@ -294,17 +297,32 @@ impl Node {
         locked(&self.shared).status.model = model.to_owned();
     }
 
-    /// Now `state`, doing `doing`; the tab says so.
+    /// Now `state`, doing `doing`; the tab and the strip say so at their
+    /// next frame. Done after working keeps how long the work took.
     pub(crate) fn set_state(&self, state: State, doing: Option<String>) {
-        {
-            let mut shared = locked(&self.shared);
-            if shared.status.state != state {
-                shared.status.since = super::now();
+        let mut shared = locked(&self.shared);
+        let status = &mut shared.status;
+        if status.state != state {
+            let now = super::now();
+            status.took = match (status.state, state) {
+                (State::Working | State::Waiting, State::Done) => Some(now.saturating_sub(status.since)),
+                (_, State::Done) => status.took,
+                _ => None,
+            };
+            // Waiting is part of the work: the time goes on from where it was.
+            if !matches!((status.state, state), (State::Working, State::Waiting) | (State::Waiting, State::Working)) {
+                status.since = now;
             }
-            shared.status.state = state;
-            shared.status.doing = doing;
         }
-        self.title();
+        let changed = status.state != state;
+        status.state = state;
+        status.doing = doing;
+        // A change shows at once, however short: frames only animate.
+        if changed && self.show.title {
+            let status = status.clone();
+            drop(shared);
+            show_on_tab(&status, 0);
+        }
     }
 
     pub(crate) fn doing(&self, what: &str) {
@@ -467,9 +485,50 @@ impl Drop for Node {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.file);
         let _ = std::fs::remove_file(&self.info.socket);
-        if self.titled {
+        if self.show.title {
+            crate::ui::screen::tab_status(None);
             crate::ui::screen::restore_title();
         }
+        if self.show.strip {
+            crate::ui::screen::set_strip(Vec::new());
+        }
+    }
+}
+
+/// The tab's title for `status` at `frame`, and iTerm2's status under it.
+fn show_on_tab(status: &Status, frame: u64) {
+    crate::ui::screen::title(&super::strip::title(status, frame, super::now()));
+    crate::ui::screen::tab_status(status.state.color().map(|color| (status.state.word(), color)));
+}
+
+/// Shows this rein where you look, eight frames a second: its tab's title,
+/// moving while it works, iTerm2's status under it, and the strip of all
+/// the reins, asked how they are once a second. A frame that changes
+/// nothing draws nothing.
+async fn present(shared: Arc<Mutex<Shared>>, show: Show, colors: super::strip::Colors) {
+    let fps = super::strip::FPS;
+    let mut ticks = tokio::time::interval(Duration::from_millis(1000 / fps));
+    let (mut frame, mut others, mut shown_title, mut shown_state) = (0u64, Vec::new(), String::new(), None);
+    loop {
+        ticks.tick().await;
+        if show.strip && frame.is_multiple_of(fps) {
+            let folder = locked(&shared).folder.clone();
+            others = super::dashboard::gather(super::list(&folder).await).await.into_iter().filter_map(|(_, status)| status).collect();
+        }
+        let me = locked(&shared).status.clone();
+        let now = super::now();
+        if show.title {
+            let title = super::strip::title(&me, frame, now);
+            if title != shown_title || shown_state != Some(me.state) {
+                show_on_tab(&me, frame);
+                (shown_title, shown_state) = (title, Some(me.state));
+            }
+        }
+        if show.strip {
+            let lines = if others.is_empty() { Vec::new() } else { super::strip::lines(&me, &others, frame, now, colors, crate::ui::screen::size().1) };
+            crate::ui::screen::set_strip(lines);
+        }
+        frame += 1;
     }
 }
 
@@ -636,7 +695,7 @@ mod tests {
     async fn only_you_with_its_token_get_in_and_only_reins_may_say_anything() {
         let folder = PathBuf::from(format!("/tmp/rein-node-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
-        let mut node = Node::start(&folder, Some("api"), Some("w"), Path::new("/p"), "m", Policy::Accept, false).await.unwrap();
+        let mut node = Node::start(&folder, Some("api"), Some("w"), Path::new("/p"), "m", Policy::Accept, Show { title: false, strip: false }).await.unwrap();
         let me = node.info().clone();
         let wrong = Info { token: "not-it".into(), ..me.clone() };
         assert_eq!(super::super::ask(&wrong, Body::Status).await, Ok(Reply::Refused { why: "wrong token".into() }));
@@ -663,7 +722,7 @@ mod tests {
     async fn held_messages_wait_and_refused_ones_are_turned_away() {
         let folder = PathBuf::from(format!("/tmp/rein-hold-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
-        let node = Node::start(&folder, Some("api"), Some("w"), Path::new("/p"), "m", Policy::Accept, false).await.unwrap();
+        let node = Node::start(&folder, Some("api"), Some("w"), Path::new("/p"), "m", Policy::Accept, Show { title: false, strip: false }).await.unwrap();
         let me = node.info().clone();
         node.follow_mode(rein_agent::permissions::Mode::Trust);
         assert_eq!(super::super::ask(&me, Body::Message { text: "run rm -rf".into() }).await, Ok(Reply::Held), "trust mode lets nothing in on its own");

@@ -390,8 +390,13 @@ struct Seen {
     bells: usize,
     /// What was put on the clipboard (OSC 52), decoded.
     copied: Vec<String>,
-    /// Each title the tab was given (OSC 2).
+    /// Each title the tab was given (OSC 0 or 1: a tab shows the icon
+    /// name, not the window's title).
     titles: Vec<String>,
+    /// What the tab's progress bar was told (OSC 9;4), like `3;0`.
+    progress: Vec<String>,
+    /// What the tab's status under its title was told (iTerm2's OSC 21337).
+    statuses: Vec<String>,
 }
 
 impl vt100::Callbacks for Seen {
@@ -403,8 +408,17 @@ impl vt100::Callbacks for Seen {
         self.copied.push(String::from_utf8(unbase64(data)).unwrap());
     }
 
-    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
-        self.titles.push(String::from_utf8_lossy(title).into_owned());
+    fn set_window_icon_name(&mut self, _: &mut vt100::Screen, name: &[u8]) {
+        self.titles.push(String::from_utf8_lossy(name).into_owned());
+    }
+
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params.first() == Some(&&b"21337"[..]) {
+            self.statuses.push(params[1..].iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>().join(";"));
+        }
+        if params.first() == Some(&&b"9"[..]) && params.get(1) == Some(&&b"4"[..]) {
+            self.progress.push(params[2..].iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>().join(";"));
+        }
     }
 }
 
@@ -580,10 +594,28 @@ impl Term {
         self.screen.lock().unwrap().callbacks().titles.clone()
     }
 
+    fn statuses(&self) -> Vec<String> {
+        self.screen.lock().unwrap().callbacks().statuses.clone()
+    }
+
+    fn progress(&self) -> Vec<String> {
+        self.screen.lock().unwrap().callbacks().progress.clone()
+    }
+
     fn wait_title(&self, wanted: &str) {
+        self.wait_title_like(wanted, |title| title == wanted);
+    }
+
+    /// Waits for the tab's title to start with `start`: one that moves,
+    /// like `⠋ api · 3s`, is never the same twice.
+    fn wait_title_from(&self, start: &str) {
+        self.wait_title_like(start, |title| title.starts_with(start));
+    }
+
+    fn wait_title_like(&self, wanted: &str, like: impl Fn(&str) -> bool) {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(10) {
-            if self.titles().last().is_some_and(|title| title == wanted) {
+            if self.titles().last().is_some_and(|title| like(title)) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1866,7 +1898,7 @@ fn a_message_from_another_tab_starts_a_turn_there() {
     let api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
     api.wait_for("You're api in project · no other rein is running yet");
     api.wait_for(IDLE);
-    api.wait_title("○ api · idle");
+    api.wait_title("○ api");
     let mut web = Term::spawn_in(&web_model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
     web.wait_for("You're web in project · 1 other rein is running");
     web.wait_for(IDLE);
@@ -1877,8 +1909,9 @@ fn a_message_from_another_tab_starts_a_turn_there() {
     let heard = api_model.requests()[0].to_string();
     assert!(heard.contains("please add a /health endpoint") && heard.contains("not from the user"), "framed as another rein's: {heard}");
     assert!(web_model.requests()[1].to_string().contains("Sent to api."), "the model heard it went");
-    assert!(api.titles().iter().any(|title| title == "● api · working"), "the tab said it was working: {:?}", api.titles());
-    api.wait_title("○ api · idle");
+    let spinning: Vec<String> = api.titles().into_iter().filter(|title| title.contains(" api · ") && title.chars().next().is_some_and(|c| ('⠀'..='⣿').contains(&c))).collect();
+    assert!(!spinning.is_empty(), "the tab's spinner turned while it worked: {:?}", api.titles());
+    api.wait_title_from("✓ api · done ");
 }
 
 #[test]
@@ -1910,7 +1943,7 @@ fn a_question_can_be_answered_from_the_dashboard_in_another_tab() {
     api.wait_for(IDLE);
     api.keys("make a file\r");
     api.wait_for("Allow this command");
-    api.wait_title("⚠ api · needs you");
+    api.wait_title("◆ api · needs you");
     let idle = Model::start(vec![]);
     let mut dashboard = Term::spawn_in(&idle, base.clone(), &project, &home, 30, 120, &["peers"]);
     dashboard.wait_for("1 needs you");
@@ -1954,7 +1987,7 @@ fn a_rein_in_trust_mode_holds_what_another_tab_sends_until_you_let_it_in() {
     web.wait_for(IDLE);
     web.keys("/name front\r");
     web.wait_for("other reins call this one front now");
-    web.wait_title("○ front · idle");
+    web.wait_title("○ front");
     web.keys("/send api hello there\r");
     web.wait_for("api keeps it for its user to let in");
     std::thread::sleep(Duration::from_millis(300));
@@ -1981,4 +2014,67 @@ fn closing_the_tab_takes_the_rein_out_of_the_peers_folder() {
     unsafe { libc::kill(api.child.id() as i32, libc::SIGHUP) };
     api.wait_exit();
     assert_eq!(files(), 0, "nothing is left of it");
+}
+
+#[test]
+fn the_tab_shows_a_bar_while_rein_works_and_another_while_it_waits_for_you() {
+    let model = Model::start(vec![runs("touch made.txt"), says("Made it.")]).with_env("TERM_PROGRAM", "ghostty");
+    let mut term = Term::start(&model, "progress", 24, 80);
+    term.wait_for(IDLE);
+    term.keys("make a file\r");
+    term.wait_for("Allow this command");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Made it.");
+    term.wait_for(IDLE);
+    term.wait_until("the bar to go", |_| term.progress().last().is_some_and(|p| p == "0;0"));
+    assert_eq!(term.progress(), ["3;0", "4;100", "3;0", "0;0"], "working, waiting for you, working, done");
+
+    // A terminal that isn't known to draw it is never sent it.
+    let plain = Model::start(vec![says("Hi.")]);
+    let mut term = Term::start(&plain, "no-progress", 24, 80);
+    term.wait_for(IDLE);
+    term.keys("hi\r");
+    term.wait_for("Hi.");
+    assert!(term.progress().is_empty(), "{:?}", term.progress());
+}
+
+#[test]
+fn in_iterm2_the_tab_shows_the_name_with_its_state_in_colour_under_it() {
+    let (base, project, home) = tabs("status");
+    let model = Model::start(vec![says("Hello.")]).with_env("TERM_PROGRAM", "iTerm.app").with_env("TERM_PROGRAM_VERSION", "3.7.6");
+    let mut api = Term::spawn_in(&model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
+    api.wait_for(IDLE);
+    api.wait_title("○ api");
+    api.keys("hi\r");
+    api.wait_for("Hello.");
+    api.wait_for(IDLE);
+    api.wait_until("the tab to say done", |_| api.statuses().last().is_some_and(|s| s == "status=done;indicator=#3fb950;status-color=#3fb950"));
+    assert!(api.statuses().contains(&"status=working;indicator=#ffa500;status-color=#ffa500".to_owned()), "{:?}", api.statuses());
+    api.keys("/exit\r");
+    api.wait_exit();
+    assert_eq!(api.statuses().last().map(String::as_str), Some("status=;indicator=;status-color="), "leaving clears it");
+    assert!(api.progress().contains(&"3;0".to_owned()), "the bar while it works: {:?}", api.progress());
+}
+
+#[test]
+fn a_strip_across_the_top_shows_every_rein_live() {
+    let (base, project, home) = tabs("strip");
+    let api_model = Model::start(vec![runs("touch made.txt"), says("Made it.")]);
+    let mut api = Term::spawn_in(&api_model, base.clone(), &project, &home, 30, 100, &["--name", "api"]);
+    api.wait_for(IDLE);
+    assert!(!api.rows()[0].contains("▸ api"), "alone, there's no strip:\n{}", api.text());
+    let idle = Model::start(vec![]);
+    let web = Term::spawn_in(&idle, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.wait_until("the strip in web", |_| web.rows()[0].contains("▸ web ○") && web.rows()[0].contains("api ○"));
+    assert!(web.rows()[1].chars().all(|c| c == '━'), "a line under it: {:?}", web.rows()[1]);
+    api.keys("make a file\r");
+    api.wait_for("Allow this command");
+    web.wait_until("web to see api needs you", |_| web.rows()[0].contains("api ◆ needs you"));
+    std::thread::sleep(Duration::from_millis(700));
+    api.keys("y");
+    api.wait_for("Made it.");
+    web.wait_until("web to see api is done", |_| web.rows()[0].contains("api ✓ done"));
+    api.wait_until("the strip in api too", |_| api.rows()[0].contains("▸ api ✓ done") && api.rows()[0].contains("web ○"));
 }

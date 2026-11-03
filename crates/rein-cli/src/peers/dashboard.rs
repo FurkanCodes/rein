@@ -200,6 +200,7 @@ mod tests {
             state,
             doing: Some("Running cargo test".into()),
             since: super::super::now(),
+            took: None,
             tokens: 0,
             editing: vec!["src/routes.rs".into()],
             question: None,

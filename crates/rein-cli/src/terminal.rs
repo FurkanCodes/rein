@@ -7,6 +7,7 @@ use crate::peers::node::Incoming;
 use crate::peers::{Node, State};
 use crate::ui::history::History;
 use crate::ui::markdown::Markdown;
+use crate::ui::screen::Progress;
 use crate::ui::spinner::Spinner;
 use crate::ui::steps;
 use crate::ui::style::{GUTTER, Style, strip};
@@ -125,6 +126,13 @@ pub(crate) struct Terminal {
     pub(crate) notes: Vec<Heard>,
 }
 
+impl Drop for Terminal {
+    /// The tab's bar goes with rein.
+    fn drop(&mut self) {
+        crate::ui::screen::progress(Progress::Off);
+    }
+}
+
 /// A run of reads, shown as one line.
 pub(crate) struct Reads {
     key: u64,
@@ -230,13 +238,20 @@ impl Terminal {
 
     /// Says how this rein is doing, to the others and on its tab.
     pub(crate) fn state(&self, state: State) {
+        crate::ui::screen::progress(match state {
+            State::Working => Progress::Working,
+            State::Waiting => Progress::Waiting,
+            State::Idle | State::Done => Progress::Off,
+        });
         if let Some(peers) = &self.peers {
             peers.set_state(state, None);
         }
     }
 
-    /// The question is answered: the others stop showing it.
+    /// The question is answered: the others stop showing it, and the tab
+    /// shows rein working again.
     fn answered(&self, answer: Approval) -> Approval {
+        crate::ui::screen::progress(Progress::Working);
         if let Some(peers) = &self.peers {
             peers.answered();
         }
@@ -340,7 +355,6 @@ impl Terminal {
     /// ```
     pub(crate) fn end_turn(&mut self) {
         self.end_line();
-        self.state(State::Idle);
         self.input.busy(None, std::time::Instant::now());
         self.input.look_for_paths();
         self.turn.took = self.turn.started.map(|t| t.elapsed());
@@ -580,6 +594,7 @@ impl Ui for Terminal {
         self.end_line();
         self.input.busy(None, std::time::Instant::now());
         self.step = None;
+        crate::ui::screen::progress(Progress::Waiting);
         let bash = BashCall::of(call);
         let (question, always) = match ToolName::of(call) {
             Some(ToolName::Bash) => (self.command_question(bash.as_ref()), "Yes, and don't ask again for this command"),
@@ -597,7 +612,7 @@ impl Ui for Terminal {
             }
             let prompt = format!("{pad}{question}  [y]es  [n]o  [a]lways › ");
             return match self.input.read(&prompt, false).await {
-                Read::Line(answer) => approval(&answer),
+                Read::Line(answer) => self.answered(approval(&answer)),
                 // Ctrl-C at a question stops the whole turn.
                 Read::Interrupted => {
                     // The turn is waiting on this; nothing is kept for later.

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 pub const FILE: &str = "config";
-const KEYS: [&str; 9] = ["model", "effort", "mode", "compact_at", "max_steps", "bell", "compress", "sandbox", "peers"];
+const KEYS: [&str; 10] = ["model", "effort", "mode", "compact_at", "max_steps", "bell", "compress", "sandbox", "peers", "strip"];
 
 #[derive(Debug, Default)]
 pub struct Settings {
@@ -79,7 +79,10 @@ mod tests {
 
     #[test]
     fn says_what_is_wrong() {
-        assert_eq!(Settings::parse("colour = blue").unwrap_err(), "line 1: unknown setting colour; use model, effort, mode, compact_at, max_steps, bell, compress, sandbox, peers");
+        assert_eq!(
+            Settings::parse("colour = blue").unwrap_err(),
+            "line 1: unknown setting colour; use model, effort, mode, compact_at, max_steps, bell, compress, sandbox, peers, strip"
+        );
         assert_eq!(Settings::parse("model").unwrap_err(), "line 1: write it as key = value");
     }
 }

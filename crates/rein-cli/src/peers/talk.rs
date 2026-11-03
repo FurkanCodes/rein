@@ -7,7 +7,7 @@ use rein_agent::agent::{Agent, Heard, Llm, Outcome};
 use rein_agent::permissions::Mode;
 use rein_llm::Item;
 
-use super::node::{Incoming, Joining, Policy, preview};
+use super::node::{Incoming, Joining, Policy, Show, preview};
 use super::{Body, Node, Reply, State};
 use crate::CliResult;
 use crate::commands::Slash;
@@ -24,10 +24,11 @@ const TURNS_IN_A_ROW: usize = 12;
 const RESULT_CHARS: usize = 4000;
 
 /// Joins the other reins, as the settings say, and says who this one is.
-pub(crate) async fn join(joining: Joining, name: Option<&str>, workspace: Option<&str>, rein: &Path, root: &Path, mode: Mode, terminal: &mut Terminal) -> bool {
+pub(crate) async fn join(joining: Joining, name: Option<&str>, workspace: Option<&str>, strip: bool, rein: &Path, root: &Path, mode: Mode, terminal: &mut Terminal) -> bool {
     let Joining::On(policy) = joining else { return false };
     let s = terminal.err;
-    match Node::start(&super::folder(rein), name, workspace, root, &terminal.model, policy, terminal.fancy).await {
+    let show = Show { title: terminal.fancy, strip: strip && terminal.input.pinned() };
+    match Node::start(&super::folder(rein), name, workspace, root, &terminal.model, policy, show).await {
         Ok(node) => {
             node.follow_mode(mode);
             let others = node.peers().await.len();

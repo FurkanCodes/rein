@@ -131,7 +131,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     let mut agent = Agent::new(Llm { client, record }, Tools::new(root.clone()).with_sandbox(sandbox), permissions, model_name, limit, loaded, context);
     // Only a conversation joins the others: a task done on its own has no
     // one to answer what they send.
-    if args.prompt.is_none() && crate::peers::talk::join(args.joining, args.name.as_deref(), args.workspace.as_deref(), &dir, &root, args.mode, &mut terminal).await {
+    if args.prompt.is_none() && crate::peers::talk::join(args.joining, args.name.as_deref(), args.workspace.as_deref(), args.strip, &dir, &root, args.mode, &mut terminal).await {
         agent = agent.with_peer_tools();
     }
     agent.max_output = max_output;
@@ -261,6 +261,7 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Te
         agent.repair();
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(interrupted; what should rein do instead?)"));
         terminal.end_turn();
+        terminal.state(crate::peers::State::Idle);
         return Ok(Outcome::Stopped);
     };
     terminal.end_turn();
@@ -269,6 +270,9 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Te
     if refused && !std::mem::replace(&mut terminal.said_uncompressed, true) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(this server doesn't take compressed requests, so they go uncompressed)"));
     }
+    // Finished: the tab says so until the next turn starts. Stopped,
+    // failed or cut short, it's just idle.
+    terminal.state(if matches!(outcome, Ok(Outcome::Done)) { crate::peers::State::Done } else { crate::peers::State::Idle });
     let outcome = outcome.map_err(describe)?;
     let said = match &outcome {
         Outcome::Done => None,

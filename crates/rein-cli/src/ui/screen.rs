@@ -66,6 +66,8 @@ struct State {
     /// The transcript's length when the full screen came up: what was
     /// printed before is in the terminal's own scrollback already.
     since: usize,
+    /// Rows across the top, over the conversation: the other reins, live.
+    strip: Vec<String>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
@@ -80,6 +82,7 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         shown: Vec::new(),
         stale: true,
         since: 0,
+        strip: Vec::new(),
     })
 });
 
@@ -186,25 +189,101 @@ pub fn follow() {
     }
 }
 
-/// Names the tab, or the window, rein runs in: OSC 2, which nearly every
-/// terminal takes, and the rest ignore. Control characters are left out,
-/// so nothing in a name can reach the terminal as a sequence of its own.
+/// What the tab's progress bar shows: OSC 9;4, which iTerm2 (from 3.6),
+/// Ghostty, WezTerm and Windows Terminal draw on the tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    Off,
+    /// rein is working: a bar that moves, as it can't say how far along.
+    Working,
+    /// A question waits for you: a full bar in the warning colour.
+    Waiting,
+}
+
+/// The terminal draws OSC 9;4. Only those known to: an older iTerm2 takes
+/// OSC 9 for a notification, and would show one with every change.
+static PROGRESS: LazyLock<bool> = LazyLock::new(|| {
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    if std::env::var_os("TMUX").is_some() {
+        return false;
+    }
+    match var("TERM_PROGRAM").as_str() {
+        "iTerm.app" => iterm_from(3, 6),
+        "ghostty" | "WezTerm" => true,
+        _ => std::env::var_os("WT_SESSION").is_some(),
+    }
+});
+
+/// rein runs in iTerm2 `major.minor` or later, not inside tmux, which
+/// would keep its own sequences from it.
+fn iterm_from(major: u32, minor: u32) -> bool {
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    if std::env::var_os("TMUX").is_some() || var("TERM_PROGRAM") != "iTerm.app" {
+        return false;
+    }
+    let version: Vec<u32> = var("TERM_PROGRAM_VERSION").split('.').map_while(|part| part.parse().ok()).collect();
+    version.as_slice() >= [major, minor].as_slice()
+}
+
+/// The tab can show a status of its own under its title: iTerm2 from 3.7
+/// draws OSC 21337 as a coloured subtitle and a dot.
+static TAB_STATUS: LazyLock<bool> = LazyLock::new(|| iterm_from(3, 7));
+
+/// Shows `status` under the tab's title, in `color` (`#rrggbb`), with a
+/// dot of that colour; `None` clears it. Only where the tab draws it.
+pub fn tab_status(status: Option<(&str, &str)>) {
+    if !*TAB_STATUS {
+        return;
+    }
+    let (text, color) = status.unwrap_or(("", ""));
+    let text: String = text.chars().filter(|c| !c.is_control() && *c != ';').collect();
+    let _guard = lock();
+    write_raw(&format!("\x1b]21337;status={text};indicator={color};status-color={color}\x07"));
+}
+
+/// What the bar shows now, so it's only sent when it changes.
+static SHOWN_PROGRESS: Mutex<Progress> = Mutex::new(Progress::Off);
+
+/// Shows `progress` on the tab, where the terminal draws it.
+pub fn progress(progress: Progress) {
+    if !*PROGRESS {
+        return;
+    }
+    let mut shown = SHOWN_PROGRESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *shown == progress {
+        return;
+    }
+    *shown = progress;
+    let code = match progress {
+        Progress::Off => "0;0",
+        Progress::Working => "3;0",
+        Progress::Waiting => "4;100",
+    };
+    let _guard = lock();
+    write_raw(&format!("\x1b]9;4;{code}\x07"));
+}
+
+/// Names the tab rein runs in, and its window: OSC 0, which sets both.
+/// OSC 2 alone is only the window's title, which iTerm2 and others don't
+/// show on the tab. Control characters are left out, so nothing in a name
+/// can reach the terminal as a sequence of its own.
 pub fn title(title: &str) {
     let title: String = title.chars().filter(|c| !c.is_control()).collect();
     let _guard = lock();
-    write_raw(&format!("\x1b]2;{title}\x07"));
+    write_raw(&format!("\x1b]0;{title}\x07"));
 }
 
-/// Keeps the title the terminal had, on xterm's title stack, for
-/// [`restore_title`] to put back. Terminals without one ignore both.
+/// Keeps the titles the terminal had, the tab's and the window's, on
+/// xterm's title stack, for [`restore_title`] to put back. Terminals
+/// without one ignore both.
 pub fn save_title() {
     let _guard = lock();
-    write_raw("\x1b[22;2t");
+    write_raw("\x1b[22;0t");
 }
 
 pub fn restore_title() {
     let _guard = lock();
-    write_raw("\x1b[23;2t");
+    write_raw("\x1b[23;0t");
 }
 
 /// Asks the terminal to put `encoded` (base64) on the clipboard: OSC 52.
@@ -292,7 +371,25 @@ fn selected_text(state: &mut State, from: (usize, usize), to: (usize, usize)) ->
 fn conversation_height(state: &State) -> usize {
     let rows = size().0;
     let live = state.live.lines.len();
-    rows.saturating_sub(live + usize::from(rows > live + 1))
+    rows.saturating_sub(live + usize::from(rows > live + 1) + strip_rows(state, rows))
+}
+
+/// How many rows the strip takes: none in a window that hasn't room to
+/// spare for it and still show a few rows of the conversation.
+fn strip_rows(state: &State, rows: usize) -> usize {
+    let strip = state.strip.len();
+    if strip > 0 && rows >= state.live.lines.len() + strip + 6 { strip } else { 0 }
+}
+
+/// Puts `lines` across the top of the full screen, over the conversation,
+/// and draws them; none takes the strip away.
+pub fn set_strip(lines: Vec<String>) {
+    let _guard = lock();
+    let mut state = state();
+    if state.strip != lines {
+        state.strip = lines;
+        render(&mut state);
+    }
 }
 
 /// Draws the window from the state: the rows that changed, or all of them.
@@ -303,7 +400,8 @@ fn render(state: &mut State) {
     let (rows, cols) = size();
     let s = Style::stderr();
     let area = conversation_height(state);
-    let gap = rows.saturating_sub(area + state.live.lines.len());
+    let strip = strip_rows(state, rows);
+    let gap = rows.saturating_sub(strip + area + state.live.lines.len());
     let selection = state.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
     let (closed, open) = state.transcript.rows(cols);
     let total = closed.len() + open.len();
@@ -311,8 +409,10 @@ fn render(state: &mut State) {
     let top = state.top.map_or(end, |top| top.min(end));
     let count = total.min(area);
     let row_at = |i: usize| if i < closed.len() { &closed[i] } else { &open[i - closed.len()] };
-    // Anchored to the bottom: a short conversation sits just over the box.
-    let mut screen: Vec<String> = vec![String::new(); area - count];
+    // The strip first; then, anchored to the bottom, the conversation: a
+    // short one sits just over the box.
+    let mut screen: Vec<String> = state.strip[..strip].to_vec();
+    screen.extend(std::iter::repeat_n(String::new(), area - count));
     for i in top..top + count {
         let text = &row_at(i).text;
         screen.push(match selection {
@@ -330,7 +430,7 @@ fn render(state: &mut State) {
         let last = screen.len() - 1;
         screen[last] = format!("{}{}", " ".repeat(cols.saturating_sub(width(&note) + 1)), s.yellow(&note));
     }
-    state.area = (area - count, top, count);
+    state.area = (strip + area - count, top, count);
     screen.extend(std::iter::repeat_n(String::new(), gap));
     let live_top = screen.len();
     screen.extend(state.live.lines.iter().cloned());

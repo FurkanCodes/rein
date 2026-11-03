@@ -96,7 +96,9 @@ nobody watches stops at max_steps, with the model saying where it got to.
 
 Every conversation joins the other reins on this computer: start rein in
 another terminal tab and they can talk. Each tab's title says what its rein
-is doing, and needs you: ⚠. /peers shows them all, /send and /delegate write
+is doing: a turning spinner and its time while it works, ◆ when it needs
+you, ✓ and how long once it's done. Across the top of each, a strip shows
+them all live, in colour (strip = off hides it). /peers shows them all, /send and /delegate write
 to one or hand it a task, /name and /workspace say who this one is, and
 /inbox holds what's waiting to be let in. The model can do the same with its
 peers, message and delegate tools. Another rein's message is never yours: it
@@ -105,10 +107,10 @@ peers = hold to let each message in yourself (trust mode always does),
 refuse to take none, or off to stay out.
 
 Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
-compact_at, max_steps, peers, and bell, compress and sandbox (on or off), like
+compact_at, max_steps, peers, and bell, compress, sandbox and strip (on or off), like
 `mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE,
-$REIN_COMPACT_AT, $REIN_MAX_STEPS, $REIN_BELL, $REIN_COMPRESS, $REIN_SANDBOX
-and $REIN_PEERS, which win over the file.
+$REIN_COMPACT_AT, $REIN_MAX_STEPS, $REIN_BELL, $REIN_COMPRESS, $REIN_SANDBOX,
+$REIN_PEERS and $REIN_STRIP, which win over the file.
 
 Each request carries the whole conversation, so rein gzips it on the way:
 about three times fewer bytes, and the same text for the model. A server that
@@ -160,6 +162,8 @@ pub(crate) struct AskArgs {
     pub(crate) worktree: bool,
     /// Whether it joins the other reins, and what it lets in.
     pub(crate) joining: Joining,
+    /// The strip of all the reins across the top of the screen.
+    pub(crate) strip: bool,
 }
 
 impl AskArgs {
@@ -179,6 +183,7 @@ impl AskArgs {
             Some(other) => Err(format!("{key} should be on or off, not {other}")),
         };
         let (bell, compress, sandbox) = (switch("bell", "REIN_BELL")?, switch("compress", "REIN_COMPRESS")?, switch("sandbox", "REIN_SANDBOX")?);
+        let strip = switch("strip", "REIN_STRIP")?;
         let joining = match settings.get("peers", "REIN_PEERS") {
             Some(value) => value.parse::<Joining>()?,
             None => Joining::On(Policy::Accept),
@@ -220,7 +225,7 @@ impl AskArgs {
         if worktree && workspace.is_none() {
             return Err("--worktree needs --workspace <name>: the worktree is the workspace's".into());
         }
-        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, sandbox, max_steps, prompt, name, workspace, worktree, joining })
+        Ok(AskArgs { model, model_given, resume, effort, system, mode, record, bell, compress, sandbox, max_steps, prompt, name, workspace, worktree, joining, strip })
     }
 }
 

@@ -16,6 +16,7 @@
 
 pub(crate) mod dashboard;
 pub(crate) mod node;
+pub(crate) mod strip;
 pub(crate) mod talk;
 pub(crate) mod worktree;
 
@@ -81,6 +82,18 @@ impl State {
         }
     }
 
+    /// Its colour under the tab's title: orange while working, as
+    /// Claude Code's is, blue when it needs you, green when done. Idle
+    /// shows nothing there.
+    pub(crate) const fn color(self) -> Option<&'static str> {
+        match self {
+            Self::Idle => None,
+            Self::Working => Some("#ffa500"),
+            Self::Waiting => Some("#4a9eff"),
+            Self::Done => Some("#3fb950"),
+        }
+    }
+
     pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -114,6 +127,8 @@ pub(crate) struct Status {
     pub(crate) doing: Option<String>,
     /// Seconds since the epoch when it went into `state`.
     pub(crate) since: u64,
+    /// How long its last turn took, once it's done.
+    pub(crate) took: Option<u64>,
     /// Tokens sent and received in this conversation.
     pub(crate) tokens: u64,
     /// The files it changed lately, newest first.
