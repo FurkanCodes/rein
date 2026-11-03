@@ -13,6 +13,8 @@
 
 mod clean;
 pub mod config;
+pub mod import;
+pub mod registry;
 mod rpc;
 
 use std::collections::{BTreeMap, HashMap, HashSet};

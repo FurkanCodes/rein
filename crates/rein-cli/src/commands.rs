@@ -13,7 +13,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
     ("/effort", "[level|default]", "change how hard the model thinks"),
     ("/status", "", "the model, mode, context and conversation"),
-    ("/mcp", "[add|remove|allow …]", "the MCP servers; add or remove one, or let its tools run without asking"),
+    ("/mcp", "[add|import|remove|allow …]", "the MCP servers: add one by name from the MCP Registry, bring yours from other apps, or change one"),
     ("/compact", "[focus]", "make room in the conversation now"),
     ("/copy", "", "copy rein's last answer, as it wrote it"),
     ("/undo", "", "put back the files rein changed in its last turn"),
@@ -71,6 +71,11 @@ pub enum Slash {
 pub enum Mcp {
     /// Says how each server is doing.
     Show,
+    /// `/mcp add <word>`: a server looked up in the MCP Registry, or one
+    /// asked for when `None`.
+    Find(Option<String>),
+    /// `/mcp import`: your servers from other apps' settings.
+    Import,
     /// `/mcp add`: these servers, as yours, and those that can't be, with
     /// why.
     Add(rein_mcp::Named),
@@ -88,20 +93,27 @@ impl Mcp {
         let words: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
         match (word, words.as_slice()) {
             ("", _) => Ok(Mcp::Show),
-            ("add", []) => Err(Refused::Said(ADD.into())),
+            ("add", []) => Ok(Mcp::Find(None)),
+            ("add", [url]) if url.starts_with("http://") || url.starts_with("https://") => {
+                Err(Refused::Said("rein starts servers on this computer so far; one reached at a URL comes later".into()))
+            }
+            // A word that may be a key isn't sent to the registry to look up.
+            ("add", [word]) if rein_mcp::config::looks_like_a_key(word) => {
+                Err(Refused::MayHoldKey("that looks like a key, not a server's name, so rein doesn't look it up".into()))
+            }
+            ("add", [word]) if !word.starts_with(['{', '"']) && !word.contains('=') => Ok(Mcp::Find(Some(word.clone()))),
             // What follows may hold a key, even when it can't be read.
             ("add", _) => rein_mcp::config::added(rest).map(Mcp::Add).map_err(|e| Refused::MayHoldKey(format!("can't add that: {e}"))),
+            ("import", []) => Ok(Mcp::Import),
+            ("import", _) => Err(Refused::Said("/mcp import takes nothing more: it looks for your servers in other apps' settings".into())),
             ("remove", [name]) => Ok(Mcp::Remove(name.clone())),
             ("remove", _) => Err(Refused::Said("/mcp remove takes a server's name".into())),
             ("allow", [name, tools @ ..]) if !tools.is_empty() => Ok(Mcp::Allow(name.clone(), tools.to_vec())),
             ("allow", _) => Err(Refused::Said("/mcp allow takes a server's name and its tools to run without asking, or * for all of them".into())),
-            (other, _) => Err(Refused::Said(format!("/mcp takes add, remove or allow, not {other}; alone, it lists the servers"))),
+            (other, _) => Err(Refused::Said(format!("/mcp takes add, import, remove or allow, not {other}; alone, it lists the servers"))),
         }
     }
 }
-
-/// How `/mcp add` is used.
-pub const ADD: &str = "/mcp add <name> [NAME=value …] <command> [args …], or a server's JSON as its README gives it";
 
 /// What `/spawn` asks for: what's not given is asked for.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -395,7 +407,19 @@ mod tests {
         assert_eq!(parse("/mcp"), Some(Ok(Slash::Mcp(Mcp::Show))));
         assert_eq!(parse("/mcp remove github"), Some(Ok(Slash::Mcp(Mcp::Remove("github".into())))));
         assert_eq!(parse("/mcp allow github get_issue *"), Some(Ok(Slash::Mcp(Mcp::Allow("github".into(), vec!["get_issue".into(), "*".into()])))));
-        for (line, why) in [("/mcp add", "/mcp add <name>"), ("/mcp remove", "a server's name"), ("/mcp allow github", "its tools"), ("/mcp start x", "not start")] {
+        assert_eq!(parse("/mcp add playwright"), Some(Ok(Slash::Mcp(Mcp::Find(Some("playwright".into()))))), "one word is looked up");
+        assert_eq!(parse("/mcp add"), Some(Ok(Slash::Mcp(Mcp::Find(None)))), "nothing: asked what to look up");
+        assert_eq!(parse("/mcp import"), Some(Ok(Slash::Mcp(Mcp::Import))));
+        assert!(matches!(parse(r#"/mcp add {"mcpServers":{"x":{"command":"x"}}}"#), Some(Ok(Slash::Mcp(Mcp::Add(_))))), "JSON in one word is still JSON");
+        let key = parse("/mcp add ghp_FAKEaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").and_then(Result::err).expect("a key isn't looked up");
+        assert!(key.hides_the_line() && !key.to_string().contains("FAKE"), "{key}");
+        for (line, why) in [
+            ("/mcp add https://mcp.linear.app/mcp", "comes later"),
+            ("/mcp import x", "takes nothing"),
+            ("/mcp remove", "a server's name"),
+            ("/mcp allow github", "its tools"),
+            ("/mcp start x", "not start"),
+        ] {
             let refused = parse(line).and_then(Result::err).unwrap_or_else(|| panic!("{line} is turned down"));
             assert!(refused.to_string().contains(why), "{line}: {refused}");
         }

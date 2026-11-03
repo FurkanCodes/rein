@@ -25,7 +25,9 @@ use crate::terminal::Terminal;
 use crate::ui::style::{GUTTER, Style};
 use crate::{CliResult, describe};
 
+mod import;
 mod panel;
+mod registry;
 
 /// Your own servers, in rein's folder.
 pub(crate) const FILE: &str = "mcp.json";
@@ -55,6 +57,8 @@ pub(crate) struct Mcp {
     /// The project's, which has its file, and by which your yes to its
     /// servers is kept.
     root: PathBuf,
+    /// For looking servers up in the MCP Registry.
+    http: rein_llm::reqwest::Client,
 }
 
 impl Mcp {
@@ -74,7 +78,7 @@ impl Mcp {
 /// project's you haven't said yes to as it is now, and for any variable a
 /// server needs that isn't set (when `asks`: there's someone to ask), and
 /// starts them all in the background.
-pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, terminal: &mut Terminal, asks: bool) -> Mcp {
+pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, http: rein_llm::reqwest::Client, terminal: &mut Terminal, asks: bool) -> Mcp {
     let named = read(&dir.join(FILE), Origin::Yours).and(read(&root.join(PROJECT_FILE), Origin::Project));
     let approved = approved(dir);
     let key = root.display().to_string();
@@ -101,13 +105,15 @@ pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, termina
         say!("{}", terminal.err.dim(&format!("({count} MCP server{} not started: /mcp says why)", if count == 1 { "" } else { "s" })));
     }
     let launch = rein_mcp::Launch { sandbox, root: root.to_owned(), caches: caches(), keys };
-    Mcp { servers: Arc::new(Servers::start(servers, launch)), off: named.off, waiting, skipped: named.skipped, dir: dir.to_owned(), root: root.to_owned() }
+    Mcp { servers: Arc::new(Servers::start(servers, launch)), off: named.off, waiting, skipped: named.skipped, dir: dir.to_owned(), root: root.to_owned(), http }
 }
 
 /// `/mcp`, and what follows it.
 pub(crate) async fn command(command: Command, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
     match command {
         Command::Show => panel::panel(mcp, agent, terminal).await,
+        Command::Find(word) => registry::find(word, mcp, agent, terminal).await,
+        Command::Import => import::import(mcp, agent, terminal).await,
         Command::Add(named) => add(named, mcp, agent, terminal).await,
         Command::Remove(name) => remove(&name, mcp, agent, terminal),
         Command::Allow(name, tools) => allow(&name, &tools, mcp, agent, terminal),

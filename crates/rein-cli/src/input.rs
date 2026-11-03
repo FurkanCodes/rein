@@ -301,7 +301,20 @@ impl Boxed {
         let bottom = match &self.asking {
             Some(asking) if self.waiting == Waiting::Answer => {
                 let mut lines = vec![s.bold(&asking.question.title)];
-                lines.extend(asking.question.detail.as_ref().map(|detail| s.dim(detail)));
+                // Wrapped between words, as what it says, like a server's
+                // walls, may be what decides the answer.
+                if let Some(detail) = &asking.question.detail {
+                    let mut wrap = crate::ui::wrap::Wrap::new(self.pinned.text_width(), 0, 0);
+                    let wrapped = wrap.push(detail) + &wrap.finish();
+                    let mut detail: Vec<String> = wrapped.lines().map(|line| s.dim(line)).collect();
+                    if detail.len() > DETAIL_LINES {
+                        detail.truncate(DETAIL_LINES);
+                        if let Some(last) = detail.last_mut() {
+                            last.push_str(&s.dim(" …"));
+                        }
+                    }
+                    lines.extend(detail);
+                }
                 if let Some(command) = &asking.question.command {
                     // Wrapped at the box's width now, which a resize changes.
                     let mut shown = command_lines(command, s, self.pinned.text_width());
@@ -945,6 +958,9 @@ impl Boxed {
 /// The most lines of a command a question shows; a longer one is shown
 /// above the box too.
 pub const COMMAND_LINES: usize = 8;
+
+/// The most lines of a question's detail shown in the box.
+const DETAIL_LINES: usize = 4;
 
 /// A command as a question shows it: whole, wrapped to `width`, after a
 /// `$`. Never cut short at the side, as what isn't seen can't be judged.

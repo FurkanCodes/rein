@@ -218,7 +218,7 @@ message, so typing ahead can't answer it by accident.
 | `/mode [ask\|edits\|auto\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
-| `/mcp`, `/mcp add`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one as you'd start it in a shell, or from the JSON its README gives; the same changes typed (see [MCP servers](#mcp-servers)) |
+| `/mcp`, `/mcp add`, `/mcp import`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one by name from the MCP Registry, as you'd start it in a shell, or from the JSON its README gives; bring yours in from other apps; the same changes typed (see [MCP servers](#mcp-servers)) |
 | `/undo` | put back the files rein changed in its last turn (not what commands did) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
@@ -568,13 +568,46 @@ sandbox, so `deny rm` doesn't stop `/bin/rm`.
 ## MCP servers
 
 MCP servers give the model more tools: an issue tracker's, a browser's, a
-database's. Add one in the conversation, as you'd start it in a shell:
+database's. Add one in the conversation by its name:
+
+```
+/mcp add playwright
+```
+
+rein looks it up in the official [MCP Registry](https://registry.modelcontextprotocol.io)
+and lists what it finds, each under who published it: a GitHub account or
+a domain the registry checked, like `microsoft/playwright-mcp`. Copies of a
+popular server often share its name and its description, but seldom its
+publisher or its package, so the one whose package is its own comes
+first. Pick one, give it what it needs that isn't a key, and rein shows
+the command it would run, pinned to a version (`npx -y
+@playwright/mcp@0.0.84`), so what you said yes to is what runs. A key it
+needs is a `${NAME}` of yours, asked for in dots as it starts, and never
+written in your `mcp.json`. npm and PyPI packages run in the sandbox;
+Docker images run with Docker, which walls in its containers itself and
+which the sandbox can't reach. Servers reached only at a URL are named,
+for later. `REIN_MCP_REGISTRY` points rein at another registry, as a
+company's own.
+
+```
+/mcp import
+```
+
+brings in the servers you set up in Claude Code (yours, and this
+project's), Claude Desktop, Cursor, Codex, VS Code, Windsurf and Gemini
+CLI: each is listed with where it's from and what it runs (a variable's
+name, never its value), marked to bring in unless rein has one of its name,
+another app has the same name, or the app has it off. Each app's way of
+naming your variables (`${env:NAME}`, `$NAME`, VS Code's `${input:id}`) is
+read as rein's `${NAME}`.
+
+Or add one as you'd start it in a shell, or paste the JSON a server's
+README gives after `/mcp add`, as it is:
 
 ```
 /mcp add context7 npx -y @upstash/context7-mcp
 ```
 
-Or paste the JSON a server's README gives after `/mcp add`, as it is.
 rein starts it at once and says how it did, and the model is offered its
 tools from your next message.
 
@@ -658,7 +691,7 @@ that the sandbox may be why, and that you can let it out from `/mcp`.
 |---|---|
 | `crates/rein-llm` | Streaming LLM provider layer: one client for every provider, the Responses, Messages, Gemini and Chat Completions APIs, the providers rein knows, Sign in with ChatGPT |
 | `crates/rein-sandbox` | The walls commands run inside: macOS's Seatbelt, Linux's Landlock and seccomp, what's protected and hidden |
-| `crates/rein-mcp` | MCP servers: their files, started in the sandbox, what they say cleaned, their tools under rein's names |
+| `crates/rein-mcp` | MCP servers: their files, started in the sandbox, what they say cleaned, their tools under rein's names; what the MCP Registry lists and other apps' settings have, read into servers to add |
 | `crates/rein-agent` | The agent loop, the tools, the permission engine, saved conversations, and what the model is told first |
 | `crates/rein-cli` | The `rein` command |
 

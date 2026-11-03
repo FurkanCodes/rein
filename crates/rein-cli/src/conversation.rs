@@ -77,7 +77,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.input.set_bar(terminal.bar());
     // Your MCP servers and the project's start now, while the rest gets
     // ready; the project's only once you've said yes to each as it is.
-    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), &mut terminal, args.prompt.is_none()).await;
+    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), http.clone(), &mut terminal, args.prompt.is_none()).await;
     let saved = match args.resume {
         Resume::New => None,
         Resume::Latest => latest,

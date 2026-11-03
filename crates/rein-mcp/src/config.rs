@@ -231,6 +231,16 @@ fn typed(text: &str) -> Result<Named, String> {
     Ok(servers(BTreeMap::from([(name, entry)]), Origin::Yours))
 }
 
+/// Whether `word`, typed alone, may be a key rather than a name: then it's
+/// never sent anywhere to look up. It starts as providers' keys do, or is
+/// long and of letters and digits, as no server's name is, or is a URL with
+/// a password in it.
+pub fn looks_like_a_key(word: &str) -> bool {
+    const STARTS: [&str; 13] = ["sk-", "sk_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA", "AIza"];
+    let long = word.len() >= 32 && word.chars().any(|c| c.is_ascii_digit()) && word.chars().any(|c| c.is_ascii_alphabetic());
+    STARTS.iter().any(|start| word.starts_with(start)) || long || rein_sandbox::looks_secret("", word)
+}
+
 /// `NAME=value`, as a shell sets a variable for a command.
 fn setting(word: &str) -> Option<(String, String)> {
     let (name, value) = word.split_once('=')?;
@@ -295,7 +305,7 @@ fn variable(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, word: &mut Str
 
 /// The servers `entries` name, by name. One rein can't start is skipped,
 /// with why.
-fn servers(entries: BTreeMap<String, Value>, origin: Origin) -> Named {
+pub(crate) fn servers(entries: BTreeMap<String, Value>, origin: Origin) -> Named {
     let mut named = Named::default();
     for (name, entry) in entries {
         let skip = |why: String| Skipped { name: name.clone(), origin, why };
@@ -400,6 +410,15 @@ impl Server {
             let own = arg.split_once('=').is_some_and(|(name, value)| rein_sandbox::looks_secret(name.trim_start_matches('-'), value));
             written(arg) && (after || own || rein_sandbox::looks_secret("", arg))
         })
+    }
+
+    /// What it runs, for a list where a key it was given mustn't show: its
+    /// command and arguments, one that may be a key left out, and the names
+    /// of its variables, never their values.
+    pub fn described(&self) -> String {
+        let args = self.args.iter().zip(self.keyed()).map(|(arg, keyed)| if keyed { "…".to_owned() } else { quote(arg) });
+        let line = std::iter::once(quote(&self.command)).chain(args).collect::<Vec<_>>().join(" ");
+        if self.env.is_empty() { line } else { format!("{line} (with {})", self.env.keys().cloned().collect::<Vec<_>>().join(", ")) }
     }
 
     /// What it runs as you'd type it in a shell, its environment first,
@@ -676,5 +695,13 @@ mod tests {
         }
         let debug = format!("{:?}", one("s npx s --api-key sk-FAKE --token=FAKE --verbose"));
         assert!(!debug.contains("FAKE") && debug.contains("--verbose"), "{debug}");
+        for word in ["sk-or-v1-FAKE", "ghp_FAKE", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7", "postgres://me:pw@db/x"] {
+            assert!(looks_like_a_key(word), "{word}");
+        }
+        for word in ["playwright", "context7", "github-mcp-server", "mcp-server-sequential-thinking"] {
+            assert!(!looks_like_a_key(word), "{word}");
+        }
+        let described = one("s GITHUB_TOKEN=ghp_FAKE npx s --api-key sk-FAKE --verbose").described();
+        assert_eq!(described, "npx s --api-key … --verbose (with GITHUB_TOKEN)", "names, never values");
     }
 }

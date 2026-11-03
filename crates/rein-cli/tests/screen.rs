@@ -63,6 +63,8 @@ struct Model {
     /// A request with this in it is turned away with that error, as a
     /// model turns down an effort level it doesn't take.
     turns_down: Arc<Mutex<Option<(&'static str, Value)>>>,
+    /// The page it gives as the MCP Registry, when rein is told it's that.
+    registry: Arc<Mutex<Option<Value>>>,
 }
 
 /// The wire format a model server speaks.
@@ -136,6 +138,13 @@ impl Model {
         self
     }
 
+    /// Answers as the MCP Registry with `page`, and rein looks servers up here.
+    fn with_registry(self, page: Value) -> Model {
+        *self.registry.lock().unwrap() = Some(page);
+        let base = self.base.trim_end_matches("/v1").to_owned();
+        self.with_env("REIN_MCP_REGISTRY", &base)
+    }
+
     /// Also sets `name` to `value` in rein's environment.
     fn with_env(mut self, name: &str, value: &str) -> Model {
         self.env.push((name.into(), value.into()));
@@ -155,6 +164,8 @@ impl Model {
         let listed_now = models.clone();
         let turns_down = Arc::new(Mutex::new(None::<(&'static str, Value)>));
         let turning_now = turns_down.clone();
+        let registry = Arc::new(Mutex::new(None::<Value>));
+        let listing = registry.clone();
         std::thread::spawn(move || {
             let mut turns = turns.into_iter();
             for socket in listener.incoming() {
@@ -172,6 +183,10 @@ impl Model {
                     // As OpenRouter does at the end of its browser sign-in.
                     heard.lock().unwrap().push(format!("{head}{}", String::from_utf8_lossy(&body)));
                     http(200, "application/json", br#"{"key":"good-key","user_id":"u1"}"#)
+                } else if head.starts_with("GET /v0.1/servers?") {
+                    heard.lock().unwrap().push(head.lines().next().unwrap_or_default().to_owned());
+                    let page = listing.lock().unwrap().clone().unwrap_or_else(|| json!({ "servers": [] }));
+                    http(200, "application/json", page.to_string().as_bytes())
                 } else if head.starts_with("GET") {
                     if slow.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(1500));
@@ -222,7 +237,7 @@ impl Model {
                 let _ = socket.write_all(&reply);
             }
         });
-        Model { base, requests, heads, gzipped, env: Vec::new(), home: Vec::new(), turned_away, slow_list, models, turns_down }
+        Model { base, requests, heads, gzipped, env: Vec::new(), home: Vec::new(), turned_away, slow_list, models, turns_down, registry }
     }
 
     fn turned_away(&self) -> usize {
@@ -2738,7 +2753,10 @@ fn mcp_add_allow_and_remove_change_the_servers_without_editing_a_file() {
     let mut term = Term::start_with(&model, "mcp-add", 30, 130, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
     term.keys("/mcp\r");
-    term.wait_for("No MCP servers yet. To add one: /mcp add <name>");
+    term.wait_for("No MCP servers yet. /mcp add <name> looks one up in the MCP Registry");
+    term.wait_for(PICKING);
+    term.keys("\x1b");
+    term.wait_for(IDLE);
     term.keys("/mcp add fake sh server.sh\r");
     term.wait_for("✓ fake added to ~/mcp.json");
     term.wait_for("fake  5 tools: echo, peek, given, has, quit");
@@ -2869,6 +2887,96 @@ fn a_key_a_server_needs_is_asked_for_kept_and_hidden() {
     }
 }
 
+/// A folder with a stand-in for `npx` in it, which starts the project's
+/// fake server whatever it's asked to fetch: so a server added from the
+/// registry starts without the internet, as it would with it.
+fn fake_npx(name: &str) -> (PathBuf, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = std::env::temp_dir().join(format!("rein-screen-{}-{name}-bin", std::process::id()));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("npx"), "#!/bin/sh\nexec sh server.sh\n").unwrap();
+    std::fs::set_permissions(bin.join("npx"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    (bin, path)
+}
+
+/// `/mcp add <word>` looks the server up in the MCP Registry, shows who
+/// published each it finds, the real one first, asks for what it needs,
+/// shows what it runs, and once you say yes, adds it pinned to its version
+/// and starts it, its key asked for in dots and kept out of your mcp.json.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_server_is_added_by_name_from_the_mcp_registry() {
+    let package = |id: &str| {
+        json!([{ "registryType": "npm", "identifier": id, "version": "1.0.0", "transport": { "type": "stdio" },
+        "environmentVariables": [{ "name": "ACME_TOKEN", "isSecret": true, "isRequired": true }, { "name": "ACME_SITE", "isRequired": true, "description": "your site" }] }])
+    };
+    let page = json!({ "servers": [
+        { "server": { "name": "io.github.copycat/thing-mcp", "description": "Not the one", "packages": package("@copycat/thing-mcp") } },
+        { "server": { "name": "io.github.acme/thing-mcp", "description": "Acme's own", "repository": { "url": "https://github.com/acme/thing-mcp" }, "packages": package("@thing/mcp") } },
+        { "server": { "name": "ai.smithery/thing", "remotes": [{ "type": "streamable-http", "url": "https://x.example/mcp" }] } }
+    ] });
+    let (bin, path) = fake_npx("registry");
+    let model = Model::start(Vec::new()).with_registry(page).with_env("PATH", &path);
+    let mut term = Term::start_with(&model, "mcp-registry", 34, 140, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("/mcp add thing\r");
+    term.wait_for("Reached at a URL, which rein starts later: smithery.ai/thing");
+    term.wait_for("add which thing server");
+    let list = term.text();
+    let (real, copy) = (list.find("acme/thing-mcp").unwrap(), list.find("copycat/thing-mcp").unwrap());
+    assert!(real < copy, "the one whose package is its own comes first:\n{list}");
+    assert!(list.contains("npm @thing/mcp@1.0.0 · Acme's own"), "{list}");
+    term.keys("\r");
+    term.wait_for("thing needs ACME_SITE (your site):");
+    term.keys("https://acme.example\r");
+    term.wait_for("Add acme/thing-mcp as thing?");
+    term.wait_for("Published by github.com/acme");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("thing needs ACME_TOKEN to start, and it isn't set.");
+    term.keys("FAKE-acme-token-321\r");
+    term.wait_for("thing  5 tools: echo");
+    term.wait_for(IDLE);
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        file["mcpServers"]["thing"],
+        json!({ "command": "npx", "args": ["-y", "@thing/mcp@1.0.0"], "env": { "ACME_SITE": "https://acme.example", "ACME_TOKEN": "${ACME_TOKEN}" } }),
+        "pinned, and the key a variable of yours"
+    );
+    assert!(std::fs::read_to_string(term.dir.join("home/mcp-keys.json")).unwrap().contains("FAKE-acme-token-321"));
+    assert!(model.heads().iter().any(|head| head.starts_with("GET /v0.1/servers?search=%2Fthing&")), "{:?}", model.heads());
+    let _ = std::fs::remove_dir_all(bin);
+}
+
+/// `/mcp import` finds the servers you set up in other apps, offers each
+/// to bring in, one another app has off left unmarked, and adds those you
+/// keep, each app's way of naming your variables read as rein's.
+#[cfg(target_os = "macos")]
+#[test]
+fn mcp_import_brings_your_servers_from_other_apps() {
+    let mut model = Model::start(Vec::new());
+    let cursor = json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "env": { "GIVEN": "${env:REIN_IMPORT_GIVEN}" } }, "linear": { "url": "https://mcp.linear.app/mcp" } } });
+    model.home.push((".cursor/mcp.json".into(), cursor.to_string()));
+    model.home.push((".codex/config.toml".into(), "[mcp_servers.other]\ncommand = \"sh\"\nargs = [\"server.sh\"]\nenabled = false\n".into()));
+    let mut term = Term::start_with(&model, "mcp-import", 34, 140, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("/mcp import\r");
+    term.wait_for("linear from Cursor isn't brought in: it's reached at a URL");
+    term.wait_for("bring in which servers");
+    let list = term.text();
+    assert!(list.contains("✓ fake") && list.contains("from Cursor · sh server.sh (with GIVEN)"), "{list}");
+    assert!(list.contains("  other") && list.contains("off in Codex"), "off there: not marked\n{list}");
+    pick(&mut term, "done");
+    term.wait_for("fake needs REIN_IMPORT_GIVEN to start, and it isn't set.");
+    term.keys("FAKE-import-given\r");
+    term.wait_for("fake  5 tools: echo");
+    term.wait_for(IDLE);
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/mcp.json")).unwrap()).unwrap();
+    assert_eq!(file["mcpServers"]["fake"], json!({ "command": "sh", "args": ["server.sh"], "env": { "GIVEN": "${REIN_IMPORT_GIVEN}" } }));
+    assert!(file["mcpServers"].get("other").is_none(), "left unmarked: not brought in");
+}
+
 /// A server added with a key written in is kept in your mcp.json and
 /// nowhere else: the line isn't shown again or kept for ↑, and what the
 /// server says has the key hidden.
@@ -2880,6 +2988,9 @@ fn a_server_added_with_its_key_keeps_it_out_of_the_screen_history_and_conversati
     term.wait_for(IDLE);
     term.keys("/mcp\r");
     term.wait_for("No MCP servers yet");
+    term.wait_for(PICKING);
+    term.keys("\x1b");
+    term.wait_for(IDLE);
     term.keys("/mcp add fake GIVEN=postgres://me:FAKE-mcp-pw@db/x sh server.sh\r");
     term.wait_for("fake  5 tools");
     term.wait_for(IDLE);
