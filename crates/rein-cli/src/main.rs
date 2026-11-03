@@ -48,8 +48,10 @@ type CliResult<T = ()> = Result<T, String>;
 
 fn main() -> ExitCode {
     // First, while rein has one thread: other programs can read the
-    // environment it was started with, and the keys in it are rein's.
-    rein_agent::sandbox::secrets::keep();
+    // environment it was started with, and the keys in it are rein's,
+    // your providers' among them, whatever their variables are called.
+    let key_names = provider_key_names();
+    rein_agent::sandbox::secrets::keep_with(&key_names.iter().map(String::as_str).collect::<Vec<_>>());
     if let Err(e) = harden::harden() {
         eprintln!("rein: a crash could write rein's memory, keys and all, to a file: {e}");
     }
@@ -182,6 +184,13 @@ fn with_causes(error: &dyn std::error::Error) -> String {
         cause = underneath.source();
     }
     text
+}
+
+/// The variables your providers' keys are in, as the providers file names
+/// them, for [`rein_agent::sandbox::secrets::keep_with`]. A file that can't
+/// be read names none here; rein says what's wrong with it when it's used.
+fn provider_key_names() -> Vec<String> {
+    config_dir().and_then(|dir| connect::providers(&dir)).unwrap_or_default().into_iter().flat_map(|provider| provider.key_env).collect()
 }
 
 fn config_dir() -> CliResult<PathBuf> {

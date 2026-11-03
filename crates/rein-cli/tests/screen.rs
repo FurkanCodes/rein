@@ -1991,6 +1991,21 @@ print("leaked" if b"OPENAI_API_KEY=test" in buf.raw[: size.value] else ("kept" i
 }
 
 #[test]
+fn a_providers_own_key_variable_is_kept_from_commands_too() {
+    // A name no rule takes for a key's: only the providers file says it is.
+    let mut model = Model::start(vec![Turn { out: vec![bash("echo \"[$ACME_LLM]\"", "look", None)] }, says("Looked.")]).with_env("ACME_LLM", "FAKE-acme-0123");
+    model.home.push(("providers".into(), "[openai]\nkey_env = ACME_LLM\n".into()));
+    let mut term = Term::start(&model, "provider-key-env", 30, 100);
+    term.wait_for(IDLE);
+    if term.text().contains("Sandbox: none") {
+        return;
+    }
+    term.keys("look\r");
+    term.wait_for("Looked.");
+    assert_eq!(results(&model)[0], "[]\n[exit code 0]");
+}
+
+#[test]
 fn a_command_outside_the_sandbox_still_gets_your_keys() {
     let model = Model::start(vec![Turn { out: vec![bash("echo key=${OPENAI_API_KEY:-none}", "outside", Some("to call the API"))] }, says("Done.")]).with_env("REIN_MODE", "trust");
     let mut term = Term::start(&model, "outside-environment", 30, 100);
