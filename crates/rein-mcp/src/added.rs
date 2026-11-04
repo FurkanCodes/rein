@@ -61,7 +61,7 @@ fn snippet(text: &str) -> Result<Named, String> {
 fn typed(text: &str) -> Result<Named, String> {
     const USAGE: &str = "/mcp add takes a name, then the command that starts the server or the URL it's at: /mcp add github npx -y @modelcontextprotocol/server-github";
     let mut words = words(text)?.into_iter();
-    let (mut name, mut access, mut env, mut headers) = (None, None, BTreeMap::new(), BTreeMap::new());
+    let (mut name, mut access, mut env, mut headers, mut sse) = (None, None, BTreeMap::new(), BTreeMap::new(), false);
     let command = loop {
         let Some(word) = words.next() else { return Err(USAGE.into()) };
         match word.as_str() {
@@ -78,9 +78,9 @@ fn typed(text: &str) -> Result<Named, String> {
                 headers.insert(key, value);
             }
             "-t" | "--transport" => match words.next().as_deref() {
-                Some("http" | "stdio") => {}
-                Some("sse") => return Err("rein doesn't speak MCP's old SSE transport; a server often has a newer address, ending in /mcp".into()),
-                _ => return Err(format!("{word} takes http or stdio")),
+                Some("http" | "stdio") => sse = false,
+                Some("sse") => sse = true,
+                _ => return Err(format!("{word} takes http, sse or stdio")),
             },
             "--" => break words.next().ok_or(USAGE)?,
             _ if word.starts_with('-') => {
@@ -99,8 +99,8 @@ fn typed(text: &str) -> Result<Named, String> {
     };
     let rest: Vec<String> = words.collect();
     if !is_url(&command) {
-        if !headers.is_empty() {
-            return Err("--header is for a server reached at a URL; a command's takes -e NAME=value".into());
+        if !headers.is_empty() || sse {
+            return Err("--header and --transport sse are for a server reached at a URL; a command's takes -e NAME=value".into());
         }
         let name = name.ok_or(USAGE)?;
         let entry = json!({ "command": command, "args": rest, "env": env, "access": access });
@@ -113,7 +113,7 @@ fn typed(text: &str) -> Result<Named, String> {
         return Err("a server reached at a URL runs none of its code here: it takes headers (--header 'Name: value'), not -e or --access".into());
     }
     let name = name.unwrap_or_else(|| name_of(&command));
-    let entry = json!({ "type": "http", "url": command, "headers": headers });
+    let entry = json!({ "type": if sse { "sse" } else { "http" }, "url": command, "headers": headers });
     Ok(servers(BTreeMap::from([(name, entry)]), Origin::Yours))
 }
 
@@ -304,8 +304,13 @@ mod tests {
             Reach::Remote(remote) => remote.clone(),
             Reach::Local(_) => panic!("{} is a command", server.name),
         };
+        let old = one("asana --transport sse https://mcp.asana.com/sse");
+        assert_eq!((old.name.as_str(), remote(&old).wire), ("asana", crate::config::Wire::Sse), "the SSE before Streamable HTTP");
         let linear = one("https://mcp.linear.app/mcp");
-        assert_eq!((linear.name.as_str(), remote(&linear)), ("linear", Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new() }));
+        assert_eq!(
+            (linear.name.as_str(), remote(&linear)),
+            ("linear", Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new(), wire: crate::config::Wire::Http })
+        );
         let keyed = one(r#"ctx --transport http --header "CONTEXT7_API_KEY: $CONTEXT7_KEY" -H 'X-Mode:fast' https://mcp.context7.com/mcp"#);
         assert_eq!(keyed.name, "ctx");
         assert_eq!(remote(&keyed).headers, BTreeMap::from([("CONTEXT7_API_KEY".to_owned(), "${CONTEXT7_KEY}".to_owned()), ("X-Mode".to_owned(), "fast".to_owned())]));
@@ -329,8 +334,8 @@ mod tests {
             ("x -e A=1 https://x.example/mcp", "runs none of its code here"),
             ("x --access outside https://x.example/mcp", "runs none of its code here"),
             ("x -H nope https://x.example/mcp", "takes 'Name: value'"),
-            ("x -H 'A: b' npx s", "--header is for a server reached at a URL"),
-            ("x --transport sse https://x.example/sse", "old SSE"),
+            ("x -H 'A: b' npx s", "--header and --transport sse are for a server reached at a URL"),
+            ("x --transport sse npx s", "for a server reached at a URL"),
         ] {
             let e = added(text).err().unwrap_or_else(|| panic!("{text} isn't a server"));
             assert!(e.contains(why), "{text}: {e}");

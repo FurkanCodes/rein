@@ -327,7 +327,7 @@ impl Session {
 
 /// The error a response that isn't an answer is: its status, and the start
 /// of what it said, cleaned.
-async fn failed(response: Response) -> Error {
+pub(crate) async fn failed(response: Response) -> Error {
     let status = response.status;
     let said = read_all(response.body).await.unwrap_or_default();
     let said: String = crate::clean::text(said.trim()).chars().take(300).collect();
@@ -335,7 +335,7 @@ async fn failed(response: Response) -> Error {
 }
 
 /// All of `body`, as long as it's no longer than [`LONGEST`].
-async fn read_all(mut body: Box<dyn Body>) -> Result<String, Error> {
+pub(crate) async fn read_all(mut body: Box<dyn Body>) -> Result<String, Error> {
     let mut all = Vec::new();
     while let Some(bytes) = body.chunk().await.map_err(Error::Unreachable)? {
         all.extend_from_slice(&bytes);
@@ -348,27 +348,30 @@ async fn read_all(mut body: Box<dyn Body>) -> Result<String, Error> {
 
 /// Server-sent events as they come, a line at a time.
 #[derive(Default)]
-struct Events {
+pub(crate) struct Events {
     line: Vec<u8>,
     /// The last line ended in `\r`: a `\n` after it ends nothing more.
     after_cr: bool,
     data: String,
     id: Option<String>,
     retry: Option<u64>,
+    kind: Option<String>,
     /// The event under way has had a field.
     begun: bool,
 }
 
 /// One event: its data, and what it said of the stream.
-struct Event {
-    data: String,
+pub(crate) struct Event {
+    pub(crate) data: String,
     id: Option<String>,
     retry: Option<u64>,
+    /// What it says it is (`event: endpoint`): a message when it says not.
+    pub(crate) kind: Option<String>,
 }
 
 impl Events {
     /// The events `bytes` ends.
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Event>, Error> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<Event>, Error> {
         let mut ended = Vec::new();
         for &byte in bytes {
             if std::mem::take(&mut self.after_cr) && byte == b'\n' {
@@ -394,7 +397,7 @@ impl Events {
             if !std::mem::take(&mut self.begun) {
                 return Ok(None);
             }
-            return Ok(Some(Event { data: std::mem::take(&mut self.data), id: self.id.take(), retry: self.retry.take() }));
+            return Ok(Some(Event { data: std::mem::take(&mut self.data), id: self.id.take(), retry: self.retry.take(), kind: self.kind.take() }));
         }
         let line = String::from_utf8_lossy(line);
         if line.starts_with(':') {
@@ -413,6 +416,7 @@ impl Events {
             }
             "id" if !value.contains('\0') => self.id = Some(value.to_owned()),
             "retry" => self.retry = value.parse().ok(),
+            "event" => self.kind = Some(value.to_owned()),
             _ => {}
         }
         self.begun = true;

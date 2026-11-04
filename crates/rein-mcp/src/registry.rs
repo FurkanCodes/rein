@@ -14,7 +14,7 @@ use rein_sandbox::Access;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::{Local, Origin, Reach, Remote, Server};
+use crate::config::{Local, Origin, Reach, Remote, Server, Wire};
 
 /// Where the registry is.
 pub const URL: &str = "https://registry.modelcontextprotocol.io";
@@ -93,7 +93,7 @@ enum How {
         access: Access,
     },
     /// Each joined from its pieces: `https://{slug}.inite.ai/mcp` is three.
-    Remote { url: Vec<Piece>, headers: Vec<(String, Vec<Piece>)> },
+    Remote { url: Vec<Piece>, headers: Vec<(String, Vec<Piece>)>, wire: Wire },
 }
 
 /// A setting a server needs you to give.
@@ -147,8 +147,9 @@ impl Plan {
                 env: env.iter().map(|(name, piece)| Some((name.clone(), fill(piece)?))).collect::<Option<_>>()?,
                 access: *access,
             }),
-            How::Remote { url, headers } => {
-                Reach::Remote(Remote { url: join(url)?, headers: headers.iter().map(|(name, value)| Some((name.clone(), join(value)?))).collect::<Option<_>>()? })
+            How::Remote { url, headers, wire } => {
+                let headers = headers.iter().map(|(name, value)| Some((name.clone(), join(value)?))).collect::<Option<_>>()?;
+                Reach::Remote(Remote { url: join(url)?, headers, wire: *wire })
             }
         };
         Some(Server { name: name.to_owned(), origin: Origin::Yours, reach, allow: Vec::new() })
@@ -331,7 +332,9 @@ impl From<Detail> for Found {
         let order = |package: &Package| ["npm", "pypi", "oci"].iter().position(|kind| *kind == package.registry_type).unwrap_or(usize::MAX);
         let mut packages: Vec<&Package> = packages.iter().collect();
         packages.sort_by_key(|package| order(package));
-        let remotes: Vec<RemoteEntry> = detail.remotes.into_iter().filter_map(|remote| serde_json::from_value(remote).ok()).collect();
+        let mut remotes: Vec<RemoteEntry> = detail.remotes.into_iter().filter_map(|remote| serde_json::from_value(remote).ok()).collect();
+        // Streamable HTTP before the SSE it replaced, where a server has both.
+        remotes.sort_by_key(|remote| remote.kind != "streamable-http");
         // One reached at a URL first: none of its code runs here.
         let plans: Vec<Result<Plan, String>> =
             remotes.iter().map(|remote| remote_plan(remote, &short)).chain(packages.iter().map(|package| plan(package, detail.version.as_deref()))).collect();
@@ -353,11 +356,11 @@ impl From<Detail> for Found {
 /// How the server named `short` is reached at `remote`: its URL and
 /// headers of fixed pieces, keys of yours (`${NAME}`), and settings to ask.
 fn remote_plan(remote: &RemoteEntry, short: &str) -> Result<Plan, String> {
-    match remote.kind.as_str() {
-        "streamable-http" => {}
-        "sse" => return Err("it's reached over MCP's old SSE transport, which rein doesn't speak".into()),
+    let wire = match remote.kind.as_str() {
+        "streamable-http" => Wire::Http,
+        "sse" => Wire::Sse,
         kind => return Err(format!("it's reached over {}, which rein doesn't speak", crate::clean::text(kind))),
-    }
+    };
     crate::remote::reachable(&remote.url)?;
     let mut asks = Vec::new();
     // A `{name}` of the URL's is one of its variables.
@@ -382,7 +385,7 @@ fn remote_plan(remote: &RemoteEntry, short: &str) -> Result<Plan, String> {
         headers.push((header.name.clone(), value));
     }
     let host = remote.url.split_once("://").map_or(remote.url.as_str(), |(_, rest)| rest).split(['/', '?']).next().unwrap_or_default();
-    Ok(Plan { package: format!("at {}", crate::clean::text(host)), how: How::Remote { url, headers }, asks })
+    Ok(Plan { package: format!("at {}", crate::clean::text(host)), how: How::Remote { url, headers, wire }, asks })
 }
 
 /// `text` in pieces: what's written, and each `{name}` in it as `input`
@@ -720,13 +723,21 @@ mod tests {
         assert_eq!(asks, ["region (where your data is), one of eu, us"]);
         let server = plan.server("thing", &["eu".into()]).unwrap();
         let headers = BTreeMap::from([("Authorization".to_owned(), "Bearer ${ACME_API_KEY}".to_owned()), ("X-Mode".to_owned(), "fast".to_owned())]);
-        assert_eq!(server.reach, Reach::Remote(Remote { url: "https://eu.acme.example/mcp/main".into(), headers }), "the key a variable of yours, the optional header left out");
+        assert_eq!(
+            server.reach,
+            Reach::Remote(Remote { url: "https://eu.acme.example/mcp/main".into(), headers, wire: Wire::Http }),
+            "the key a variable of yours, the optional header left out"
+        );
         let bare =
             detail(json!([{ "type": "streamable-http", "url": "https://mcp.acme.example/mcp", "headers": [{ "name": "Authorization", "isSecret": true, "isRequired": true }] }]));
         let Reach::Remote(remote) = plan_of(&bare).server("thing", &[]).unwrap().reach else { panic!("a URL") };
         assert_eq!(remote.headers["Authorization"], "Bearer ${THING_TOKEN}", "a token of yours, named for the server");
         let old = detail(json!([{ "type": "sse", "url": "https://mcp.acme.example/sse" }]));
-        assert_eq!(plan_of(&old).command(), Some("npx"), "not reached over the old SSE: its package instead");
+        let Reach::Remote(remote) = plan_of(&old).server("thing", &[]).unwrap().reach else { panic!("a URL") };
+        assert_eq!((remote.url.as_str(), remote.wire), ("https://mcp.acme.example/sse", Wire::Sse), "reached over the SSE before Streamable HTTP");
+        let both = detail(json!([{ "type": "sse", "url": "https://mcp.acme.example/sse" }, { "type": "streamable-http", "url": "https://mcp.acme.example/mcp" }]));
+        let Reach::Remote(remote) = plan_of(&both).server("thing", &[]).unwrap().reach else { panic!("a URL") };
+        assert_eq!(remote.wire, Wire::Http, "Streamable HTTP over the SSE it replaced");
         let plain = detail(json!([{ "type": "streamable-http", "url": "http://mcp.acme.example/mcp" }]));
         assert_eq!(plan_of(&plain).command(), Some("npx"), "nor over plain http, across the network");
     }

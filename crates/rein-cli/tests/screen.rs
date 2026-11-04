@@ -3073,17 +3073,18 @@ fn a_server_is_added_by_name_from_the_mcp_registry() {
 #[test]
 fn mcp_import_brings_your_servers_from_other_apps() {
     let mut model = Model::start(Vec::new());
-    let cursor = json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "env": { "GIVEN": "${env:REIN_IMPORT_GIVEN}" } }, "far": { "url": "http://127.0.0.1:9/mcp" }, "old": { "type": "sse", "url": "http://127.0.0.1:9/sse" } } });
+    let cursor = json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "env": { "GIVEN": "${env:REIN_IMPORT_GIVEN}" } }, "far": { "url": "http://127.0.0.1:9/mcp" }, "old": { "type": "sse", "url": "http://127.0.0.1:9/sse" }, "a__b": { "command": "x" } } });
     model.home.push((".cursor/mcp.json".into(), cursor.to_string()));
     model.home.push((".codex/config.toml".into(), "[mcp_servers.other]\ncommand = \"sh\"\nargs = [\"server.sh\"]\nenabled = false\n".into()));
     let mut term = Term::start_with(&model, "mcp-import", 34, 140, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
     term.keys("/mcp import\r");
-    term.wait_for("old from Cursor isn't brought in: it speaks MCP's old SSE transport");
+    term.wait_for("a__b from Cursor isn't brought in: a server's name may have letters");
     term.wait_for("bring in which servers");
     let list = term.text();
     assert!(list.contains("✓ fake") && list.contains("from Cursor · sh server.sh (with GIVEN)"), "{list}");
     assert!(list.contains("✓ far") && list.contains("from Cursor · http://127.0.0.1:9/mcp"), "one at a URL is brought in too\n{list}");
+    assert!(list.contains("✓ old") && list.contains("from Cursor · http://127.0.0.1:9/sse"), "and one over SSE\n{list}");
     assert!(list.contains("  other") && list.contains("off in Codex"), "off there: not marked\n{list}");
     pick(&mut term, "done");
     term.wait_for("fake needs REIN_IMPORT_GIVEN to start, and it isn't set.");

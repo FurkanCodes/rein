@@ -92,6 +92,19 @@ pub struct Remote {
     /// What's sent with each request, as written: a key in one is a
     /// `${NAME}` of yours, or written in as it is.
     pub headers: BTreeMap<String, String>,
+    pub wire: Wire,
+}
+
+/// How a server at a URL is spoken to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wire {
+    /// MCP's Streamable HTTP, and if the server turns that away, the HTTP
+    /// with SSE before it, as MCP's spec says to try (`"type": "http"`).
+    #[default]
+    Http,
+    /// Only the HTTP with SSE of MCP before Streamable HTTP (2024-11-05):
+    /// a stream that's kept open for every answer (`"type": "sse"`).
+    Sse,
 }
 
 /// Never what `env` or `headers` say, or an argument or a part of a URL
@@ -122,7 +135,7 @@ impl std::fmt::Debug for Local {
 /// Its headers by name, and its URL but what may be a key in it.
 impl std::fmt::Debug for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Remote").field("url", &shown_url(&self.url)).field("headers", &self.headers.keys().collect::<Vec<_>>()).finish()
+        f.debug_struct("Remote").field("url", &shown_url(&self.url)).field("headers", &self.headers.keys().collect::<Vec<_>>()).field("wire", &self.wire).finish()
     }
 }
 
@@ -186,8 +199,8 @@ struct Entry {
     disabled: bool,
 }
 
-/// How a server is reached, as a file says: `http` is Streamable HTTP;
-/// `sse` the transport before it, which rein doesn't speak.
+/// How a server is reached, as a file says: `http` is Streamable HTTP,
+/// `sse` the transport before it.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Kind {
@@ -242,15 +255,13 @@ pub(crate) fn servers(entries: BTreeMap<String, Value>, origin: Origin) -> Named
 
 /// How `entry` is reached, or why rein can't reach it.
 fn reach(entry: &Entry) -> Result<Reach, String> {
-    if entry.kind == Some(Kind::Sse) {
-        return Err("it speaks MCP's old SSE transport, which rein doesn't; a server often has a newer address, ending in /mcp".into());
-    }
-    if entry.url.is_some() || entry.kind == Some(Kind::Http) {
+    if entry.url.is_some() || matches!(entry.kind, Some(Kind::Http | Kind::Sse)) {
         let url = entry.url.clone().ok_or("it's reached at a URL, and its entry has none")?;
         if !["https://", "http://", "${"].iter().any(|start| url.starts_with(start)) {
             return Err("its url isn't one rein can reach: it starts with https://".into());
         }
-        return Ok(Reach::Remote(Remote { url, headers: entry.headers.clone() }));
+        let wire = if entry.kind == Some(Kind::Sse) { Wire::Sse } else { Wire::Http };
+        return Ok(Reach::Remote(Remote { url, headers: entry.headers.clone(), wire }));
     }
     let command = entry.command.clone().ok_or("it has no command to start")?;
     Ok(Reach::Local(Local { command, args: entry.args.clone(), env: entry.env.clone(), access: entry.access.unwrap_or(Access::Network) }))
@@ -305,6 +316,7 @@ impl Server {
     pub fn fingerprint(&self) -> String {
         match &self.reach {
             Reach::Local(local) => json!({ "name": self.name, "command": local.command, "args": local.args, "env": local.env, "access": local.access.as_str() }),
+            Reach::Remote(remote) if remote.wire == Wire::Sse => json!({ "name": self.name, "url": remote.url, "headers": remote.headers, "type": "sse" }),
             Reach::Remote(remote) => json!({ "name": self.name, "url": remote.url, "headers": remote.headers }),
         }
         .to_string()
@@ -327,7 +339,7 @@ impl Server {
                 }
             }
             Reach::Remote(remote) => {
-                entry.insert("type".into(), json!("http"));
+                entry.insert("type".into(), json!(if remote.wire == Wire::Sse { "sse" } else { "http" }));
                 entry.insert("url".into(), json!(remote.url));
                 if !remote.headers.is_empty() {
                     entry.insert("headers".into(), json!(remote.headers));
@@ -411,7 +423,7 @@ impl Server {
                 env: map(&local.env)?,
                 access: local.access,
             }),
-            Reach::Remote(remote) => Reach::Remote(Remote { url: fill(&remote.url, var)?, headers: map(&remote.headers)? }),
+            Reach::Remote(remote) => Reach::Remote(Remote { url: fill(&remote.url, var)?, headers: map(&remote.headers)?, wire: remote.wire }),
         })
     }
 
@@ -569,15 +581,19 @@ pub(crate) mod tests {
     fn reads_what_claude_codes_files_say_and_skips_what_rein_cant_start() {
         let named = read(FILE, Origin::Yours).unwrap();
         let names: Vec<&str> = named.servers.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["ctx", "docs", "github", "linear"]);
+        assert_eq!(names, ["ctx", "docs", "github", "linear", "old"]);
         let github = &named.servers[2];
         assert_eq!((command(github).access, github.allow.as_slice()), (Access::Network, ["get_issue".to_owned()].as_slice()), "network when not said");
         assert_eq!(command(&named.servers[1]).access, Access::Look);
-        assert_eq!(named.servers[3].reach, Reach::Remote(Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new() }));
+        assert_eq!(named.servers[3].reach, Reach::Remote(Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new(), wire: Wire::Http }));
         assert_eq!(named.servers[0].access(), None, "one at a URL has no walls: none of its code runs here");
         let skipped: Vec<(&str, &str)> = named.skipped.iter().map(|s| (s.name.as_str(), s.why.as_str())).collect();
-        assert_eq!(skipped.len(), 6, "{skipped:?}");
-        assert!(skipped.iter().any(|(name, why)| *name == "old" && why.contains("old SSE")));
+        assert_eq!(skipped.len(), 5, "{skipped:?}");
+        assert_eq!(
+            named.servers[4].reach,
+            Reach::Remote(Remote { url: "https://mcp.asana.com/sse".into(), headers: BTreeMap::new(), wire: Wire::Sse }),
+            "the SSE before Streamable HTTP"
+        );
         assert!(skipped.iter().any(|(name, why)| *name == "ftp" && why.contains("https://")));
         assert!(skipped.iter().any(|(name, why)| *name == "a__b" && why.contains("two _")));
         assert!(skipped.iter().any(|(name, why)| *name == "typo" && why.contains("net")), "a misspelt access is said, not taken as network");
@@ -635,7 +651,7 @@ pub(crate) mod tests {
         let Reach::Remote(filled) = ctx.filled(&key).unwrap() else { panic!("a URL") };
         assert_eq!(filled.headers["CONTEXT7_API_KEY"], "FAKE-ctx-key");
         let bearer = Server {
-            reach: Reach::Remote(Remote { url: "https://x.example/mcp".into(), headers: [("Authorization".to_owned(), "Bearer FAKE-bearer".to_owned())].into() }),
+            reach: Reach::Remote(Remote { url: "https://x.example/mcp".into(), headers: [("Authorization".to_owned(), "Bearer FAKE-bearer".to_owned())].into(), wire: Wire::Http }),
             ..ctx.clone()
         };
         assert_eq!(bearer.secrets(&|_| None), ["Bearer FAKE-bearer", "FAKE-bearer"], "the token alone too, as it may show up alone");
@@ -661,7 +677,7 @@ pub(crate) mod tests {
         assert_eq!(quote("it's here"), r"'it'\''s here'");
         let ctx = named.servers[0].clone();
         let remote = |url: &str, headers: &[(&str, &str)]| Server {
-            reach: Reach::Remote(Remote { url: url.into(), headers: headers.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())).collect() }),
+            reach: Reach::Remote(Remote { url: url.into(), headers: headers.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())).collect(), wire: Wire::Http }),
             ..ctx.clone()
         };
         assert_ne!(remote("https://evil.example/mcp", &[("CONTEXT7_API_KEY", "${CONTEXT7_KEY}")]).fingerprint(), ctx.fingerprint(), "another URL");
@@ -671,8 +687,15 @@ pub(crate) mod tests {
 
     #[test]
     fn a_server_is_written_as_it_is_read_back() {
-        let remote = read(FILE, Origin::Yours).unwrap().servers.remove(0);
+        let mut named = read(FILE, Origin::Yours).unwrap();
+        let (remote, sse) = (named.servers.remove(0), named.servers.pop().unwrap());
+        let mut http = sse.clone();
+        if let Reach::Remote(remote) = &mut http.reach {
+            remote.wire = Wire::Http;
+        }
+        assert_ne!(sse.fingerprint(), http.fingerprint(), "spoken to another way: asked about again");
         for server in [
+            sse,
             local("github", "npx", &["-y", "gh"]),
             with(&local("x", "sh", &[]), |local| local.access = Access::Outside),
             Server { allow: vec!["*".into()], ..local("y", "sh", &[]) },
@@ -690,7 +713,7 @@ pub(crate) mod tests {
         assert_eq!(shown_url("https://me:FAKE-pw@x.example/mcp"), "https://me:…@x.example/mcp");
         assert_eq!(shown_url("https://x.example"), "https://x.example");
         assert_eq!(shown_url("https://x.example/mcp?key=${KEY}"), "https://x.example/mcp?key=${KEY}", "a variable of yours isn't a key written in");
-        let server = |url: &str| Server { reach: Reach::Remote(Remote { url: url.into(), headers: BTreeMap::new() }), ..local("x", "sh", &[]) };
+        let server = |url: &str| Server { reach: Reach::Remote(Remote { url: url.into(), headers: BTreeMap::new(), wire: Wire::Http }), ..local("x", "sh", &[]) };
         assert!(server("https://x.example/mcp?api_key=FAKE123").may_hold_keys());
         assert!(!server("https://x.example/mcp").may_hold_keys());
         assert_eq!(server("https://x.example/mcp?token=FAKE123").described(), "https://x.example/mcp?token=…");

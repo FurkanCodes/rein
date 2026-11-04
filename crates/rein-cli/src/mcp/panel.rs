@@ -423,7 +423,7 @@ mod tests {
     }
 
     fn remote(origin: Origin) -> Server {
-        let remote = rein_mcp::Remote { url: "https://mcp.example.com/mcp".into(), headers: BTreeMap::new() };
+        let remote = rein_mcp::Remote { url: "https://mcp.example.com/mcp".into(), headers: BTreeMap::new(), wire: rein_mcp::Wire::Http };
         Server { name: "far".into(), origin, reach: Reach::Remote(remote), allow: Vec::new() }
     }
 

@@ -97,6 +97,21 @@ impl App {
     /// doesn't start a server through a shell, which would say.
     fn translated(self, entry: Value, home: &Path) -> Value {
         let mut entry = strings(entry, &|text| self.words(text, home));
+        if let Some(entry) = entry.as_object_mut() {
+            match self {
+                // Gemini CLI's `url` is SSE's, and `httpUrl` Streamable HTTP's.
+                App::GeminiCli if entry.contains_key("url") && !entry.contains_key("type") => {
+                    entry.insert("type".into(), json!("sse"));
+                }
+                // Windsurf's server at a URL says so with `serverUrl`.
+                App::Windsurf => {
+                    if let Some(url) = entry.remove("serverUrl") {
+                        entry.entry("url").or_insert(url);
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(command) = entry.get_mut("command")
             && let Some(rest) = command.as_str().and_then(|command| command.strip_prefix("~/"))
         {
@@ -260,7 +275,7 @@ fn codex(text: &str) -> Result<(BTreeMap<String, Value>, Vec<Skipped>), String> 
 mod tests {
     use super::*;
     use crate::config::tests::command;
-    use crate::config::{Reach, Remote};
+    use crate::config::{Reach, Remote, Wire};
 
     fn names(named: &Named) -> Vec<&str> {
         named.servers.iter().map(|server| server.name.as_str()).collect()
@@ -276,7 +291,7 @@ mod tests {
         let named = App::ClaudeCode.read(claude, home, root).unwrap();
         assert_eq!(names(&named), ["db", "gh", "linear"], "this project's, not another's");
         assert_eq!(command(&named.servers[1]).command, "gh-local", "this project's own wins its name, as in Claude Code");
-        assert_eq!(named.servers[2].reach, Reach::Remote(Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new() }));
+        assert_eq!(named.servers[2].reach, Reach::Remote(Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new(), wire: Wire::Http }));
 
         let cursor = r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["fs", "${workspaceFolder}", "${userHome}/notes"], "env": { "K": "${env:FS_KEY}", "L": "${unknown}" } },
                                           "mine": { "command": "~/bin/tool" } } }"#;
@@ -291,12 +306,18 @@ mod tests {
         assert_eq!(command(&App::VsCode.read(vscode, home, root).unwrap().servers[0]).env["T"], "${GITHUB_TOKEN}", "what VS Code asks for, rein asks for in dots");
 
         let gemini = r#"{ "theme": "x", "mcpServers": { "g": { "command": "node", "args": ["s.js"], "env": { "K": "$API_KEY", "M": "${MODE}", "P": "a$" } },
-                          "web": { "httpUrl": "https://x.example/mcp" } } }"#;
+                          "web": { "httpUrl": "https://x.example/mcp" }, "events": { "url": "https://x.example/sse" } } }"#;
         let named = App::GeminiCli.read(gemini, home, root).unwrap();
-        let env = &command(&named.servers[0]).env;
+        let env = &command(&named.servers[1]).env;
         assert_eq!((env["K"].as_str(), env["M"].as_str(), env["P"].as_str()), ("${API_KEY}", "${MODE}", "a$"));
-        assert_eq!(named.servers[1].reach, Reach::Remote(Remote { url: "https://x.example/mcp".into(), headers: BTreeMap::new() }), "httpUrl is its URL");
+        assert_eq!(named.servers[2].reach, Reach::Remote(Remote { url: "https://x.example/mcp".into(), headers: BTreeMap::new(), wire: Wire::Http }), "httpUrl is its URL");
+        assert_eq!(named.servers[0].reach, Reach::Remote(Remote { url: "https://x.example/sse".into(), headers: BTreeMap::new(), wire: Wire::Sse }), "url is SSE's, in Gemini CLI");
 
+        let windsurf = r#"{ "mcpServers": { "w": { "serverUrl": "https://w.example/mcp" } } }"#;
+        assert_eq!(
+            App::Windsurf.read(windsurf, home, root).unwrap().servers[0].reach,
+            Reach::Remote(Remote { url: "https://w.example/mcp".into(), headers: BTreeMap::new(), wire: Wire::Http })
+        );
         let desktop = r#"{ "mcpServers": { "d": { "command": "uvx", "args": ["d"], "disabled": true } } }"#;
         assert_eq!(App::ClaudeDesktop.read(desktop, home, root).unwrap().off.len(), 1);
         assert!(App::Cursor.read("not json", home, root).is_err());
@@ -339,7 +360,7 @@ enabled = false
         assert_eq!(command(&named.servers[0]).env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}", "a variable it's given by name is yours");
         assert_eq!((named.off[0].name.as_str(), command(&named.off[0]).env["LEVEL"].as_str()), ("docs", "info"), "enabled = false is off");
         let figma = BTreeMap::from([("Authorization".to_owned(), "Bearer ${FIGMA_TOKEN}".to_owned()), ("X-Team".to_owned(), "${FIGMA_TEAM}".to_owned())]);
-        assert_eq!(named.servers[1].reach, Reach::Remote(Remote { url: "https://mcp.figma.com/mcp".into(), headers: figma }), "its token, a variable of yours");
+        assert_eq!(named.servers[1].reach, Reach::Remote(Remote { url: "https://mcp.figma.com/mcp".into(), headers: figma, wire: Wire::Http }), "its token, a variable of yours");
         assert!(named.skipped.iter().any(|skipped| skipped.name == "broken" && skipped.why.starts_with("can't be read")), "{:?}", named.skipped);
         let inside = named.skipped.iter().find(|skipped| skipped.name == "computer-use").expect("a path inside Codex's folder is left out, though off");
         assert!(inside.why.contains("inside Codex's own folder"), "{}", inside.why);

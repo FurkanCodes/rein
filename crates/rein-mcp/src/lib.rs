@@ -20,6 +20,7 @@ pub mod import;
 pub mod registry;
 pub mod remote;
 mod rpc;
+mod sse;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -32,7 +33,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub use clean::text as cleaned;
-pub use config::{Local, Named, Origin, Reach, Remote, Server, Skipped, Unfilled};
+pub use config::{Local, Named, Origin, Reach, Remote, Server, Skipped, Unfilled, Wire};
 pub use rpc::Error;
 
 /// What the names of servers' tools start with: they can't clash with
@@ -220,13 +221,35 @@ impl Launch {
     async fn reach(&self, remote: &Remote) -> Result<Connection, Failure> {
         remote::reachable(&remote.url).map_err(Failure::Other)?;
         let web = self.web.clone().ok_or_else(|| Failure::Other("rein can't reach servers at a URL here".into()))?;
-        let session = remote::Session::new(web, self.tokens.clone(), remote.url.clone(), remote.headers.clone());
-        match tokio::time::timeout(START, Connection::open(Channel::Http(session), None)).await {
+        let opened = async {
+            if remote.wire == Wire::Sse {
+                return self.over_sse(&web, remote).await;
+            }
+            let session = remote::Session::new(web.clone(), self.tokens.clone(), remote.url.clone(), remote.headers.clone());
+            match Connection::open(Channel::Http(session), None).await {
+                // A server that turns Streamable HTTP away may speak the
+                // SSE before it, as MCP's spec says to try; if it doesn't,
+                // what it said to Streamable HTTP says why.
+                Err(turned @ Error::Http { status: 400 | 404 | 405, .. }) => match self.over_sse(&web, remote).await {
+                    Err(Error::Unauthorized(challenge)) => Err(Error::Unauthorized(challenge)),
+                    Err(_) => Err(turned),
+                    connected => connected,
+                },
+                opened => opened,
+            }
+        };
+        match tokio::time::timeout(START, opened).await {
             Ok(Ok(connection)) => Ok(connection),
             Ok(Err(Error::Unauthorized(challenge))) => Err(Failure::SignIn(challenge)),
             Ok(Err(e)) => Err(Failure::Other(e.to_string())),
             Err(_) => Err(Failure::Other(format!("it didn't answer within {}s", START.as_secs()))),
         }
+    }
+
+    /// Reaches the server at `remote`'s URL over the HTTP with SSE.
+    async fn over_sse(&self, web: &Arc<dyn remote::Web>, remote: &Remote) -> Result<Connection, Error> {
+        let legacy = sse::Legacy::open(web.clone(), self.tokens.clone(), remote.url.clone(), remote.headers.clone()).await?;
+        Connection::open(Channel::Sse(legacy), None).await
     }
 
     /// Starts `server`'s command, `local`, filled in.
@@ -271,6 +294,7 @@ struct Process {
 enum Channel {
     Stdio(rpc::Rpc),
     Http(remote::Session),
+    Sse(sse::Legacy),
 }
 
 impl Channel {
@@ -278,6 +302,7 @@ impl Channel {
         match self {
             Channel::Stdio(rpc) => rpc.request(method, params, timeout).await,
             Channel::Http(session) => session.request(method, params, timeout).await,
+            Channel::Sse(legacy) => legacy.request(method, params, timeout).await,
         }
     }
 
@@ -285,6 +310,7 @@ impl Channel {
         match self {
             Channel::Stdio(rpc) => rpc.notify(method, params),
             Channel::Http(session) => session.notify(method, params).await,
+            Channel::Sse(legacy) => legacy.notify(method, params).await,
         }
     }
 
@@ -292,6 +318,7 @@ impl Channel {
         match self {
             Channel::Stdio(rpc) => rpc.alive(),
             Channel::Http(session) => session.alive(),
+            Channel::Sse(legacy) => legacy.alive(),
         }
     }
 }

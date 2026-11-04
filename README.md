@@ -699,9 +699,12 @@ A server at a URL runs none of its code here: rein talks to it over MCP's
 Streamable HTTP (`"type": "http"`, `"url"` and `"headers"` in your file,
 as Claude Code writes them), and it has no walls. Named for its host if
 you don't name it. rein reaches one over https, or over plain http only on
-this computer, and follows a redirect only on the same server. MCP's old
-SSE transport it doesn't speak: a server that has it often has a newer
-address too, ending in `/mcp`.
+this computer, and follows a redirect only on the same server. A server
+that speaks only the HTTP with SSE that came before Streamable HTTP is
+spoken to over that (`"type": "sse"`, or `/mcp add --transport sse
+<url>`): one stream kept open for its answers, and its messages sent where
+the stream says, which must be on the same server. A URL that turns
+Streamable HTTP away is tried over SSE too, as MCP's spec says.
 
 One that wants you to sign in says so as it's added or starts, and rein
 offers it there: "Sign in to linear?" Yes opens its sign-in page in your
