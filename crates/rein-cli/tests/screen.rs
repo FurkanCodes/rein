@@ -25,6 +25,20 @@ enum Out {
     Text(String),
     /// A call of the tool named, with these arguments.
     Call(&'static str, Value),
+    /// Text citing a page, as a model that searched the web writes it.
+    Cited(&'static str, &'static str),
+}
+
+impl Out {
+    /// What it says, where it's text: cited text is text to every fake but
+    /// the Responses one.
+    fn text(&self) -> &str {
+        match self {
+            Out::Text(text) => text,
+            Out::Cited(text, _) => text,
+            Out::Call(..) => "",
+        }
+    }
 }
 
 fn says(text: &str) -> Turn {
@@ -358,6 +372,11 @@ fn sse(turn: &Turn) -> String {
                 let message = json!({ "type": "message", "content": [{ "type": "output_text", "text": text }] });
                 event(json!({ "type": "response.output_item.done", "item": message }));
             }
+            Out::Cited(text, url) => {
+                let annotation = json!({ "type": "url_citation", "url": url, "title": "The page", "start_index": 0, "end_index": text.len() });
+                let message = json!({ "type": "message", "content": [{ "type": "output_text", "text": text, "annotations": [annotation] }] });
+                event(json!({ "type": "response.output_item.done", "item": message }));
+            }
             Out::Call(tool, arguments) => {
                 let call_id = format!("call_{}", CALLS.fetch_add(1, Ordering::Relaxed));
                 let call = json!({ "type": "function_call", "call_id": call_id, "namespace": "rein", "name": tool, "arguments": arguments.to_string() });
@@ -387,7 +406,8 @@ fn messages_sse(turn: &Turn, n: usize, tokens: u64) -> String {
     for (i, item) in turn.out.iter().enumerate() {
         let index = i + 1;
         match item {
-            Out::Text(text) => {
+            Out::Text(_) | Out::Cited(..) => {
+                let text = item.text();
                 event(json!({ "type": "content_block_start", "index": index, "content_block": { "type": "text", "text": "" } }));
                 for piece in text.split_inclusive(' ') {
                     event(json!({ "type": "content_block_delta", "index": index, "delta": { "type": "text_delta", "text": piece } }));
@@ -422,7 +442,8 @@ fn chat_sse(turn: &Turn) -> String {
     let mut called = 0;
     for item in &turn.out {
         match item {
-            Out::Text(text) => {
+            Out::Text(_) | Out::Cited(..) => {
+                let text = item.text();
                 for piece in text.split_inclusive(' ') {
                     chunk(json!({ "content": piece }), Value::Null);
                 }
@@ -459,7 +480,8 @@ fn gemini_sse(turn: &Turn, n: usize) -> String {
     let mut signed = false;
     for item in &turn.out {
         match item {
-            Out::Text(text) => {
+            Out::Text(_) | Out::Cited(..) => {
+                let text = item.text();
                 for piece in text.split_inclusive(' ') {
                     chunk(json!([{ "text": piece }]), None);
                 }
@@ -3008,6 +3030,45 @@ fn mcp_chooses_when_the_model_is_shown_a_servers_tools() {
     let names: Vec<Value> = requests[1]["tools"][0]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].clone()).collect();
     assert!(names.contains(&json!("tool_search")));
     wait_for_mcp(&mut term, "● 5 tools · found when needed");
+}
+
+/// The model asks rein's `web_search`; the model in use searches for it,
+/// from OpenAI's index outside trust, and the step says what it went by.
+/// `/search off` takes the tool away, kept in your settings.
+#[test]
+fn web_search_runs_on_the_model_in_use_and_says_what_it_went_by() {
+    let page = "https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/";
+    let turns = vec![
+        calls("web_search", json!({ "query": "the latest stable Rust release" })),
+        Turn { out: vec![Out::Cited("Rust 1.99.1, released 2026-10-15.", page)] },
+        says("It's 1.99.1."),
+        says("No search now."),
+    ];
+    // Not OpenAI's default model: the one in use is the one that searches.
+    let model = Model::start(turns).with_env("REIN_MODEL", "test-model");
+    let mut term = Term::start_with(&model, "web-search", 30, 110, &[]);
+    term.wait_for(IDLE);
+    term.keys("what's the latest rust?\r");
+    term.wait_for("It's 1.99.1.");
+    let text = term.text();
+    assert!(text.contains("the latest stable Rust release"), "{text}");
+    assert!(text.contains("1 source: blog.rust-lang.org · test-model, cached"), "{text}");
+    assert!(text.contains("Rust 1.99.1, released 2026-10-15."), "{text}");
+    let requests = model.requests();
+    let offered: Vec<Value> = requests[0]["tools"][0]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].clone()).collect();
+    assert!(offered.contains(&json!("web_search")), "{offered:?}");
+    assert_eq!(requests[1]["tools"], json!([{ "type": "web_search", "external_web_access": false }]), "a search of its own, from the index: not trust");
+    assert_eq!(requests[1]["model"], "test-model");
+    assert!(requests[1]["input"][0]["content"].as_str().unwrap().starts_with("the latest stable Rust release\n\n(Today is "));
+    assert!(results(&model)[0].starts_with("[web search by test-model, its provider's index:"), "{:?}", results(&model));
+    term.wait_for(IDLE);
+    term.keys("/search off\r");
+    term.wait_for("✓ the model can't search the web now");
+    assert!(std::fs::read_to_string(term.dir.join("home/config")).unwrap().contains("search = off"));
+    term.keys("and now?\r");
+    term.wait_for("No search now.");
+    let offered: Vec<Value> = model.requests()[3]["tools"][0]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].clone()).collect();
+    assert!(!offered.contains(&json!("web_search")), "taken away: {offered:?}");
 }
 
 /// A project's .mcp.json may be anyone's: its server starts only once

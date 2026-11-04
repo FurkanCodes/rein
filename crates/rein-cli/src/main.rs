@@ -31,6 +31,7 @@ mod input;
 mod mcp;
 mod peers;
 mod rules;
+mod search;
 mod settings;
 use settings::Settings;
 mod terminal;

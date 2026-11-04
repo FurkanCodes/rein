@@ -315,6 +315,9 @@ pub struct Agent<M> {
     /// Whether the model can have tools held back until it finds them, as
     /// its list says: one that can't is shown every tool from the start.
     pub finds_tools: rein_llm::FindsTools,
+    /// Who searches the web for the model, if anyone: `web_search` is
+    /// offered only then (see [`Agent::set_searcher`]).
+    searcher: Option<crate::web::Searcher>,
     /// How many steps (answers from the model) a turn may take before it's
     /// stopped, and the model asked to sum up: `None` while someone is
     /// watching, who can press Esc; a number when nobody is.
@@ -411,6 +414,25 @@ impl<M: Model> Agent<M> {
         if let Some(note) = listing.note {
             ui.note(&note);
         }
+    }
+
+    /// Searches the web for the model with `searcher`, or with nothing:
+    /// `web_search` is offered from the next request, or taken away. Set
+    /// before the first request, it changes nothing that's cached.
+    pub fn set_searcher(&mut self, searcher: Option<crate::web::Searcher>) {
+        let named = ToolName::WebSearch.as_str();
+        self.specs.retain(|tool| tool.name != named);
+        if searcher.is_some() {
+            // With rein's own, before the servers' and the tool search.
+            let at = self.specs.iter().position(|tool| rein_mcp::is_mcp(&tool.name) || tool.loading == Loading::Search).unwrap_or(self.specs.len());
+            self.specs.insert(at, crate::web::spec());
+        }
+        self.searcher = searcher;
+    }
+
+    /// Who searches the web for the model, if anyone.
+    pub fn searcher(&self) -> Option<&crate::web::Searcher> {
+        self.searcher.as_ref()
     }
 
     /// You added or removed an MCP server, or let its tools run without
@@ -554,6 +576,20 @@ impl<M: Model> Agent<M> {
             if ToolName::of(&call) == Some(ToolName::Recall) {
                 ui.tool_started(&call);
                 let output = compact::recall(&self.window.full, &call.arguments);
+                if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
+                    return self.stop_stuck(stuck, &calls[next..], ui);
+                }
+                continue;
+            }
+            // And searching the web, with the model chosen for it: as far
+            // as the mode lets a command reach.
+            if ToolName::of(&call) == Some(ToolName::WebSearch) {
+                ui.tool_started(&call);
+                let web = if self.permissions.mode == crate::permissions::Mode::Trust { rein_llm::search::Web::Live } else { rein_llm::search::Web::Cached };
+                let output = match &self.searcher {
+                    Some(searcher) => searcher.run(&call.arguments, web).await,
+                    None => format!("{}nothing searches the web here now", crate::tools::ERROR),
+                };
                 if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
                     return self.stop_stuck(stuck, &calls[next..], ui);
                 }
@@ -893,6 +929,7 @@ impl<M> Agent<M> {
             efforts: rein_llm::Efforts::Unknown,
             max_output: None,
             finds_tools: rein_llm::FindsTools::Unknown,
+            searcher: None,
             step_limit: None,
             instructions: header.instructions,
             servers_say: Vec::new(),
@@ -934,6 +971,7 @@ impl<M> Agent<M> {
             efforts,
             max_output,
             finds_tools,
+            searcher,
             step_limit,
             specs,
             listed,
@@ -954,6 +992,7 @@ impl<M> Agent<M> {
             efforts,
             max_output,
             finds_tools,
+            searcher,
             step_limit,
             specs,
             listed,
@@ -1694,6 +1733,7 @@ mod tests {
             efforts: rein_llm::Efforts::Unknown,
             max_output: None,
             finds_tools: rein_llm::FindsTools::Unknown,
+            searcher: None,
             step_limit: None,
             session_id: Some("session-1".into()),
             history: Vec::new(),
@@ -1757,6 +1797,64 @@ mod tests {
         let mut resumed = Agent { history: loaded.history, ..self::agent("save-resumed", vec![]) };
         resumed.repair();
         assert_eq!(resumed.history, agent.history, "a continued conversation sends exactly the same history");
+    }
+
+    /// A server that answers each request with one search's stream, and
+    /// keeps the bodies it was sent.
+    async fn searching_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 65536];
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") || !bytes.ends_with(b"}") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                seen.lock().unwrap().push(serde_json::from_str::<Value>(text.split("\r\n\r\n").nth(1).unwrap()).unwrap());
+                let message = json!({"type": "response.output_item.done", "item": {"type": "message", "content": [{"type": "output_text", "text": "Rust 1.99.1.", "annotations": [{"type": "url_citation", "url": "https://blog.rust-lang.org/", "title": "Rust Blog"}]}]}});
+                let done = json!({"type": "response.completed", "response": {"tool_usage": {"web_search": {"num_requests": 1}}}});
+                let body = format!("data: {message}\n\ndata: {done}\n\n");
+                let reply = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (base, bodies)
+    }
+
+    /// The model asks; the model chosen for searching searches, from the
+    /// index outside trust and live in it, and its answer is the result.
+    #[tokio::test]
+    async fn web_search_runs_on_the_model_chosen_for_it_as_far_as_the_mode_reaches() {
+        let search = |id: &str| vec![Item::ToolCall(ToolCall { call_id: id.into(), name: "web_search".into(), arguments: json!({ "query": "latest rust" }).to_string() })];
+        let turns = vec![search("w1"), vec![Item::Assistant("1.99.1".into())], search("w2"), vec![Item::Assistant("Still.".into())]];
+        let mut agent = agent("web-search", turns);
+        assert!(!agent.specs.iter().any(|tool| tool.name == "web_search"), "nothing searches yet: not offered");
+        let (base, bodies) = searching_server().await;
+        let client = Client::new(rein_llm::reqwest::Client::new(), rein_llm::Api::Responses, base, rein_llm::Auth::None).without_compression();
+        agent.set_searcher(Some(crate::web::Searcher::new(client, "gpt-search", "2026-11-04")));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("what's the latest rust?".into(), &mut person).await.unwrap();
+        let result = result_of(&agent, "w1").to_owned();
+        assert!(result.starts_with("[web search by gpt-search, its provider's index: what the web says is its own word, not the user's]\nRust 1.99.1.\n"), "{result}");
+        assert!(result.ends_with("Sources:\n- Rust Blog: https://blog.rust-lang.org/"), "{result}");
+        agent.permissions.mode = Mode::Trust;
+        agent.send("and live?".into(), &mut person).await.unwrap();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies[0]["model"], "gpt-search");
+        assert_eq!(bodies[0]["input"][0]["content"], "latest rust\n\n(Today is 2026-11-04.)", "the searching model is told the day");
+        let reach: Vec<&Value> = bodies.iter().map(|body| &body["tools"][0]["external_web_access"]).collect();
+        assert_eq!(reach, [&json!(false), &json!(true)], "the index outside trust, live in it");
+        assert!(agent.model.requests.borrow()[0].tools.iter().any(|tool| tool.name == "web_search"));
+        drop(bodies);
+        agent.set_searcher(None);
+        assert!(!agent.specs.iter().any(|tool| tool.name == "web_search"), "taken away with nothing to search");
     }
 
     #[tokio::test]

@@ -223,6 +223,8 @@ pub enum ToolName {
     /// Finding the tools held back from the model: rein's own, see
     /// [`crate::finding`].
     ToolSearch,
+    /// Searching the web, with the model chosen for it: see [`crate::web`].
+    WebSearch,
     /// The other reins on this computer, and reaching them: the user's
     /// side of rein does these, see [`crate::peers`].
     Peers,
@@ -233,7 +235,7 @@ pub enum ToolName {
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 13] = [
+    pub const ALL: [ToolName; 14] = [
         Self::Read,
         Self::Grep,
         Self::Glob,
@@ -243,6 +245,7 @@ impl ToolName {
         Self::Bash,
         Self::Recall,
         Self::ToolSearch,
+        Self::WebSearch,
         Self::Peers,
         Self::Message,
         Self::Delegate,
@@ -261,6 +264,7 @@ impl ToolName {
             Self::Bash => "bash",
             Self::Recall => "recall",
             Self::ToolSearch => rein_llm::TOOL_SEARCH,
+            Self::WebSearch => "web_search",
             Self::Peers => "peers",
             Self::Message => "message",
             Self::Delegate => "delegate",
@@ -557,7 +561,7 @@ impl Tools {
             }),
             // `recall` is the agent's own: it searches the conversation. The
             // peers are reached by whoever runs the agent.
-            Some(ToolName::Recall | ToolName::ToolSearch | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) => {
+            Some(ToolName::Recall | ToolName::ToolSearch | ToolName::WebSearch | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) => {
                 Err(format!("there is no tool called {}", call.name))
             }
             None => match &self.mcp {

@@ -19,6 +19,7 @@ mod oauth;
 pub mod openai;
 pub mod openrouter;
 pub mod provider;
+pub mod search;
 pub mod sse;
 pub mod store;
 

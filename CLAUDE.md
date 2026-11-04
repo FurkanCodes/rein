@@ -191,6 +191,10 @@ finding. Each says why in a line.
   loses the whole cache. A tool found mid-conversation joins after the
   conversation so far (`additional_tools`, `tool_reference`), and a format
   that can't do that shows every tool from the start.
+- What a tool brings into the conversation is sent again with every
+  request after it. A lookup that pulls in pages runs in a request of its
+  own and keeps only its answer: OpenAI's web search, run in the
+  conversation, added 12,000 tokens to it; in its own request, 780.
 - A CLI used only as the model (`claude -p`) is told it has one tool, the
   one it answers with, and that the tools listed are rein's: told only
   "don't run tools yourself", the model called `mcp__linear__list_teams` as

@@ -219,6 +219,7 @@ message, so typing ahead can't answer it by accident.
 | `/mode [trust\|ask\|edits\|auto\|read-only]` | show or change what runs without asking, and keep it for new conversations if you like |
 | `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
+| `/search [auto\|off\|model]` | which model searches the web for the model: the one in use as rein decides, one you pick, or none (see [Web search](#web-search)) |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/mcp`, `/mcp add`, `/mcp import`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one by name from the MCP Registry, as you'd start it in a shell, or from the JSON its README gives; bring yours in from other apps; the same changes typed (see [MCP servers](#mcp-servers)) |
 | `/undo` | put back what rein did to the project's files since a turn you pick, its commands' changes too (see [Undo](#undo)) |
@@ -374,6 +375,7 @@ Defaults go in `~/.config/rein/config`, one per line:
 model = "gpt-6.1-sol"
 effort = "medium"
 mode = "edits"
+search = "claude-code/sonnet"
 compact_at = 120000
 max_steps = 200
 bell = off
@@ -384,7 +386,7 @@ strip = off
 tab_command = "my-term --new-tab --title {title} -- {command}"
 ```
 
-A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
+A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`, `$REIN_SEARCH`,
 `$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS`,
 `$REIN_SANDBOX`, `$REIN_PEERS` and `$REIN_STRIP`, which win over the file.
 `/mode` writes `mode` here when you keep the one you picked, and leaves the
@@ -458,6 +460,41 @@ uncompressed, and nothing compressed after that; rein says so once.
   saved with the conversation, so a continued one starts with the same text.
 
 Credentials live in `~/.config/rein/` (or `$REIN_HOME`), readable only by you.
+
+## Web search
+
+The model can search the web with `web_search`, and decides when, as with
+any tool: its description says it's for what changes or what the model may
+not know (a library's current version, its docs or changelog, an error
+message it doesn't recognize, anything after its training) and never for
+what's in the project. It asks a question in words, and another request,
+to the model chosen for searching, searches with that provider's own
+search, reads what it needs and answers with its sources. The conversation
+gets that answer, not the pages: asked on a ChatGPT plan, a search added
+about 780 tokens to the conversation, where OpenAI's search in the
+conversation itself added 12,000, sent again with every request after.
+
+```
+● Search  the latest stable Rust release   1 source: blog.rust-lang.org · gpt-6.1-sol, cached
+  └ Rust 1.99.1, released 2026-10-15…
+```
+
+Who searches is the model in use when its provider can (OpenAI's models,
+on a ChatGPT plan too, Anthropic's and Claude Code's), or else the first of
+those you can pay for: so a Gemini or local model searches too.
+`/search` picks another, say a smaller one of the same provider, or `off`,
+and keeps it in your settings as `search`. Gemini's own search isn't used:
+Google's terms want its search suggestions shown with what it found, which
+a terminal can't.
+
+How far it reaches follows the mode. In trust, where a command can reach
+any site anyway, it's live. In the other modes it's OpenAI's index of the
+web, so no page is opened as it is now, nor one whose address the model
+made: a page couldn't then get the model to send what's in the project out
+in a link, past the sandbox's walls. Anthropic's and Claude Code's searches
+only search, and open nothing. What a search found is said to be the
+web's word, not yours, and the searching model is told not to do what a
+page says.
 
 ## What rein may do
 

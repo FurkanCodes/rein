@@ -13,6 +13,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/login", "[provider]", "sign in to a provider, or see what pays for each"),
     ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
     ("/effort", "[level|default]", "change how hard the model thinks"),
+    ("/search", "[auto|off|model]", "choose which model searches the web for the model"),
     ("/status", "", "the model, mode, context and conversation"),
     ("/mcp", "[add|import|remove|allow …]", "the MCP servers: add one by name from the MCP Registry, bring yours from other apps, or change one"),
     ("/compact", "[focus]", "make room in the conversation now"),
@@ -49,6 +50,8 @@ pub enum Slash {
     Logout(Option<String>),
     /// `None` asks which.
     Effort(Option<EffortSetting>),
+    /// Who searches the web; `None` asks.
+    Search(Option<crate::search::SearchWith>),
     Status,
     Mcp(Mcp),
     Compact(Option<String>),
@@ -294,6 +297,10 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
             None => Ok(Slash::Effort(None)),
             Some("default") => Ok(Slash::Effort(Some(EffortSetting::Default))),
             Some(level) => level.parse().map(|e| Slash::Effort(Some(EffortSetting::Level(e)))).map_err(|e| Refused::Said(format!("{e}, or default"))),
+        },
+        "/search" => match arg.as_deref() {
+            None => Ok(Slash::Search(None)),
+            Some(with) => with.parse().map(|with| Slash::Search(Some(with))).map_err(Refused::Said),
         },
         "/status" => Ok(Slash::Status),
         "/mcp" => Mcp::parse(rest).map(Slash::Mcp),

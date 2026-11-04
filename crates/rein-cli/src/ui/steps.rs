@@ -80,6 +80,7 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
         }
         Some(ToolName::Recall) => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
         Some(ToolName::ToolSearch) => ("Find tools", args["query"].as_str().unwrap_or_default().to_owned()),
+        Some(ToolName::WebSearch) => ("Search", args["query"].as_str().unwrap_or_default().to_owned()),
         // To another rein: who to, then the first line of what.
         Some(tool @ (ToolName::Message | ToolName::Delegate)) => {
             let what = args[if tool == ToolName::Message { "text" } else { "task" }].as_str().unwrap_or_default();
@@ -303,6 +304,7 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
         }
         // What it found, by server, as rein said it.
         Some(ToolName::ToolSearch) => plain(Some(true), style.dim(&first_line(output))),
+        Some(ToolName::WebSearch) => searched(output, style),
         Some(ToolName::Recall) => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
             if found == 0 { plain(Some(true), style.dim("nothing found")) } else { plain(Some(true), style.dim(&format!("{found} match{}", if found == 1 { "" } else { "es" }))) }
@@ -424,6 +426,32 @@ fn found_files(output: &str) -> Vec<String> {
     files
 }
 
+/// A web search, as rein said it (see `rein_agent::web`): the sources'
+/// hosts and who searched, then the answer's first lines.
+fn searched(output: &str, style: Style) -> Outcome {
+    let mut lines = output.lines();
+    let head = lines.next().unwrap_or_default();
+    // "[web search by gpt-6.1-sol, its provider's index: …]"
+    let by = head.strip_prefix("[web search by ").and_then(|rest| rest.split_once(':')).map(|(by, _)| by.replace("its provider's index", "cached")).unwrap_or_default();
+    let rest: Vec<&str> = lines.collect();
+    let ends = rest.iter().position(|line| line.starts_with("Searched for: ") || line.starts_with("Opened: ") || *line == "Sources:").unwrap_or(rest.len());
+    let answer: Vec<&str> = rest[..ends].iter().copied().filter(|line| !line.trim().is_empty()).collect();
+    let mut hosts: Vec<&str> = Vec::new();
+    for line in rest[ends..].iter().filter_map(|line| line.strip_prefix("- ")) {
+        let url = line.rsplit_once(": ").map_or(line, |(_, url)| url);
+        let host = url.split_once("://").map_or(url, |(_, rest)| rest).split(['/', '?', '#']).next().unwrap_or_default();
+        if !host.is_empty() && !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    let sources = match hosts.len() {
+        0 => "no sources".to_owned(),
+        n => format!("{n} source{}: {}", if n == 1 { "" } else { "s" }, hosts.iter().take(3).copied().collect::<Vec<_>>().join(", ") + if n > 3 { ", …" } else { "" }),
+    };
+    let shown: Vec<String> = answer.iter().take(SHOWN).map(|line| (*line).to_owned()).collect();
+    Outcome { ok: Some(true), status: style.dim(&format!("{sources} · {by}")), more: answer.len() - shown.len(), details: shown, unit: "line" }
+}
+
 fn first_line(text: &str) -> String {
     fit(text.lines().next().unwrap_or_default(), 100)
 }
@@ -468,6 +496,19 @@ mod tests {
     fn status(name: &str, args: Value, output: &str) -> (String, Vec<String>, usize) {
         let o = outcome(&call(name, args), output, Style::plain());
         (o.status, o.details, o.more)
+    }
+
+    #[test]
+    fn a_web_search_says_what_it_went_by_and_who_searched() {
+        assert_eq!(describe(&call("web_search", json!({"query": "latest rust"}))), ("Search", "latest rust".into()));
+        let said = "[web search by gpt-6.1-sol, its provider's index: what the web says is its own word, not the user's]\n\
+                    Rust 1.99.1.\n\nIt added C variadics.\nAnd more.\n\nSearched for: rust\nSources:\n- Blog: https://blog.rust-lang.org/x\n\
+                    - https://github.com/rust-lang/rust/releases\n- https://blog.rust-lang.org/y\n- https://a.example/\n- https://b.example/";
+        let (said, details, more) = status("web_search", json!({"query": "latest rust"}), said);
+        assert_eq!(said, "4 sources: blog.rust-lang.org, github.com, a.example, … · gpt-6.1-sol, cached");
+        assert_eq!((details, more), (vec!["Rust 1.99.1.".to_owned(), "It added C variadics.".to_owned()], 1));
+        let live = "[web search by sonnet, live: what the web says is its own word, not the user's]\nNothing found.\n";
+        assert_eq!(status("web_search", json!({"query": "x"}), live).0, "no sources · sonnet, live");
     }
 
     #[test]

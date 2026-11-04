@@ -33,6 +33,24 @@ impl Backend {
     }
 
     async fn run(&self, program: &str, request: &Request<'_>, idle: Duration) -> Result<VecDeque<Result<Event>>> {
+        let job = Job { model: request.model, effort: request.reasoning_effort, tool: None, schema: schema(request), prompt: prompt(request).to_string() };
+        decode(&self.exec(program, &job, idle).await?, request)
+    }
+
+    /// Searches the web for `question` with `model` and Claude Code's own
+    /// WebSearch, the one tool it's given: its answer and the sources it
+    /// names, in the shape asked for.
+    pub(crate) async fn search(&self, model: &str, question: &str, idle: Duration) -> Result<crate::search::Searched> {
+        self.search_with("claude", model, question, idle).await
+    }
+
+    async fn search_with(&self, program: &str, model: &str, question: &str, idle: Duration) -> Result<crate::search::Searched> {
+        let job = Job { model, effort: None, tool: Some("WebSearch"), schema: crate::search::schema(), prompt: crate::search::asked(question) };
+        crate::search::from_cli(&self.exec(program, &job, idle).await?)
+    }
+
+    /// Runs the CLI for `job`: what it printed, once it ended well.
+    async fn exec(&self, program: &str, job: &Job<'_>, idle: Duration) -> Result<Vec<u8>> {
         // Declared before the process group, so it goes after the CLI does.
         let workdir = Workdir::new()?;
         let mut command = Command::new(program);
@@ -54,7 +72,7 @@ impl Backend {
             "--output-format",
             "json",
             "--tools",
-            "",
+            job.tool.unwrap_or_default(),
             "--strict-mcp-config",
             "--safe-mode",
             "--disable-slash-commands",
@@ -65,11 +83,16 @@ impl Backend {
             "--setting-sources",
             "user",
             "--model",
-            request.model,
+            job.model,
             "--json-schema",
-            &schema(request).to_string(),
+            &job.schema.to_string(),
         ]);
-        if let Some(effort) = request.reasoning_effort {
+        // A print run asks before each tool and, with nobody to answer, is
+        // turned down: the one it's given is allowed.
+        if let Some(tool) = job.tool {
+            command.args(["--allowedTools", tool]);
+        }
+        if let Some(effort) = job.effort {
             let effort = if effort == crate::Effort::Minimal { crate::Effort::Low } else { effort };
             command.args(["--effort", effort.as_str()]);
         }
@@ -83,10 +106,9 @@ impl Backend {
         let mut stdin = child.stdin.take().ok_or_else(|| Error::Incomplete("Claude Code stdin unavailable".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Incomplete("Claude Code stdout unavailable".into()))?;
         let stderr = child.stderr.take().ok_or_else(|| Error::Incomplete("Claude Code stderr unavailable".into()))?;
-        let prompt = prompt(request).to_string();
         let work = async {
             let write = async {
-                stdin.write_all(prompt.as_bytes()).await?;
+                stdin.write_all(job.prompt.as_bytes()).await?;
                 stdin.shutdown().await?;
                 drop(stdin);
                 Ok::<_, Error>(())
@@ -99,11 +121,22 @@ impl Backend {
                 // helper may echo credentials. Keep failures deliberately terse.
                 return Err(Error::Auth(format!("Claude Code exited with {status}; check `claude auth status` or run `claude setup-token`")));
             }
-            decode(&out, request)
+            Ok(out)
         };
         // Even a child that closes its pipes and then hangs is bounded.
         tokio::time::timeout(Duration::from_secs(600), work).await.map_err(|_| Error::Incomplete("Claude Code exceeded ten minutes".into()))?
     }
+}
+
+/// One run of the CLI: the model, its effort, the one tool of its own it
+/// may use (none for a step of rein's conversation, whose tools rein runs),
+/// the shape of its answer, and what it's asked.
+struct Job<'a> {
+    model: &'a str,
+    effort: Option<crate::Effort>,
+    tool: Option<&'a str>,
+    schema: Value,
+    prompt: String,
 }
 
 /// Where the CLI reads the token rein hands it: a descriptor it inherits.
@@ -406,6 +439,28 @@ printf '%s' '{"structured_output":{"text":"Hello from CLI","tool_calls":[]},"usa
         assert!(matches!(events.front(), Some(Ok(Event::TextDelta(text))) if text == "Hello from CLI"));
         assert!(matches!(events.back(), Some(Ok(Event::Completed { usage })) if usage.input_tokens == 9 && usage.output_tokens == 5 && usage.cached_input_tokens == 3));
         assert!(!format!("{backend:?}").contains("test-secret"));
+    }
+
+    #[tokio::test]
+    async fn a_search_gives_the_cli_its_web_search_alone_and_reads_what_it_found() {
+        let fake = Fake::new(
+            r#"
+printf '%s\n' "$@" > "$0.args"
+/bin/cat > "$0.input"
+printf '%s' '{"structured_output":{"answer":"Rust 1.99.1","sources":[{"url":"https://blog.rust-lang.org/","title":"Rust Blog"}]}}'
+"#,
+        );
+        let found = Backend::new(None).search_with(&fake.program, "haiku", "latest rust", Duration::from_secs(5)).await.unwrap();
+        assert_eq!((found.answer.as_str(), found.sources[0].url.as_str()), ("Rust 1.99.1", "https://blog.rust-lang.org/"));
+        let args = std::fs::read_to_string(format!("{}.args", fake.program)).unwrap();
+        for flag in ["--tools\nWebSearch\n", "--allowedTools\nWebSearch\n", "--model\nhaiku\n", "--strict-mcp-config", "--safe-mode", "--setting-sources\nuser\n"] {
+            assert!(args.contains(flag), "{flag:?} in {args}");
+        }
+        assert!(std::fs::read_to_string(format!("{}.input", fake.program)).unwrap().ends_with("The question: latest rust"));
+        // A step of rein's conversation still gets no tool of the CLI's own.
+        let _ = Backend::new(None).run(&fake.program, &request(), Duration::from_secs(5)).await;
+        let args = std::fs::read_to_string(format!("{}.args", fake.program)).unwrap();
+        assert!(args.contains("--tools\n\n") && !args.contains("--allowedTools"), "{args}");
     }
 
     #[tokio::test]

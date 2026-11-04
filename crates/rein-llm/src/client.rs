@@ -51,18 +51,18 @@ impl std::fmt::Debug for Auth {
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
-    api: Api,
+    pub(crate) api: Api,
     base_url: String,
     auth: Auth,
     /// What this provider needs that it can't say in an error.
     quirks: Quirks,
     /// How long an answer may go quiet before rein gives up on it.
-    idle: Duration,
+    pub(crate) idle: Duration,
     /// How requests went over the wire, shared by the client's clones.
     wire: Arc<Wire>,
     /// Your ChatGPT plan's sign-in, which renews itself.
     chatgpt: Option<Arc<openai::signin::Session>>,
-    claude_code: Option<crate::claude_code::Backend>,
+    pub(crate) claude_code: Option<crate::claude_code::Backend>,
 }
 
 /// How long a streaming answer may send nothing at all. Providers send
@@ -357,7 +357,7 @@ impl Client {
     }
 
     /// Posts `body`, gzipped if it's worth it and the server takes it.
-    async fn send(&self, request: &Request<'_>, json: &Value, omitted: &[&str]) -> Result<reqwest::Response> {
+    pub(crate) async fn send(&self, request: &Request<'_>, json: &Value, omitted: &[&str]) -> Result<reqwest::Response> {
         let headers = self.headers(Some((request, json)));
         let body = serde_json::to_vec(json)?;
         let gzipped = (body.len() >= COMPRESS_FROM && !self.wire.off.load(Ordering::Relaxed)).then(|| gzip(&body)).flatten();

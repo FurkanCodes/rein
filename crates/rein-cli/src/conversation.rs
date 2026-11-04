@@ -130,6 +130,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         compress: args.compress,
         sandbox: sandbox.clone(),
         mcp,
+        search: args.search.clone(),
     };
     let (mut loaded, context) = setup.open(saved, &spec)?;
     if theirs.is_some_and(|theirs| theirs != spec) {
@@ -157,6 +158,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     agent.reasoning_effort = args.effort;
     agent.efforts = setup.efforts(&agent.model_name);
     agent.finds_tools = setup.finds_tools(&agent.model_name);
+    crate::search::follow(&mut agent, &setup).await;
     terminal.effort = crate::effort::now(&agent);
     if let Some(why) = crate::effort::unlike_chosen(&agent) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("({why})")));
@@ -237,9 +239,41 @@ pub(crate) struct Setup {
     sandbox: std::sync::Arc<Sandbox>,
     /// The MCP servers rein started, and those it didn't: for `/mcp`.
     mcp: crate::mcp::Mcp,
+    /// Who searches the web for the model, as you chose.
+    search: crate::search::SearchWith,
 }
 
 impl Setup {
+    pub(crate) fn providers(&self) -> &[Provider] {
+        &self.providers
+    }
+
+    /// The provider in use.
+    pub(crate) fn provider(&self) -> &Provider {
+        &self.provider
+    }
+
+    /// The models the provider in use offers.
+    pub(crate) fn models(&self) -> &[ModelInfo] {
+        &self.models
+    }
+
+    pub(crate) fn http(&self) -> &rein_llm::reqwest::Client {
+        &self.http
+    }
+
+    pub(crate) fn keys(&self) -> &crate::connect::Keys {
+        &self.keys
+    }
+
+    pub(crate) fn search(&self) -> &crate::search::SearchWith {
+        &self.search
+    }
+
+    pub(crate) fn set_search(&mut self, search: crate::search::SearchWith) {
+        self.search = search;
+    }
+
     /// A saved conversation (`saved`), or a new one: a header, the system
     /// prompt, and the first message with the project's instructions.
     fn open(&self, saved: Option<PathBuf>, model: &str) -> CliResult<(Loaded, Option<String>)> {
@@ -590,6 +624,10 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         Slash::Permissions(rules) => crate::rules::command(rules, agent, terminal).await?,
         Slash::Model(Some(spec)) => {
             let shown = use_model(&spec, agent, terminal, setup).await?;
+            // Searching as rein decides follows the model in use.
+            if *setup.search() == crate::search::SearchWith::Auto {
+                crate::search::follow(agent, setup).await;
+            }
             if let Some(peers) = &terminal.peers {
                 peers.set_model(&terminal.model);
             }
@@ -666,6 +704,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             }
         }
         Slash::Undo => crate::undo::command(agent, terminal).await?,
+        Slash::Search(with) => crate::search::command(with, agent, terminal, setup).await?,
         Slash::New => {
             let (loaded, context) = setup.open(None, &setup.current(agent))?;
             agent.resume(loaded, context);

@@ -145,6 +145,8 @@ pub(crate) struct AskArgs {
     pub(crate) model_given: bool,
     pub(crate) resume: Resume,
     pub(crate) effort: Option<Effort>,
+    /// Who searches the web for the model.
+    pub(crate) search: crate::search::SearchWith,
     /// The system prompt: standing instructions sent with every request.
     pub(crate) system: Option<String>,
     pub(crate) mode: Mode,
@@ -183,6 +185,7 @@ impl AskArgs {
         let mut model = settings.get("model", "REIN_MODEL");
         let effort = settings.get("effort", "REIN_EFFORT").map(|e| e.parse::<Effort>().map_err(|e| format!("{e} (in the settings)"))).transpose()?;
         let (mut effort, mut system, mut record, mut words) = (effort, None, None, Vec::new());
+        let search = settings.get("search", "REIN_SEARCH").map(|with| with.parse().map_err(|e| format!("{e} (in the settings)"))).transpose()?.unwrap_or_default();
         let mut mode = match settings.get("mode", "REIN_MODE") {
             Some(name) => name.parse::<Mode>().map_err(|e| format!("{e} (in the settings)"))?,
             None => Mode::default(),
@@ -248,6 +251,7 @@ impl AskArgs {
             model_given,
             resume,
             effort,
+            search,
             system,
             mode,
             record,
