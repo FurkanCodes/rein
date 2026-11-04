@@ -152,7 +152,7 @@ impl Plan {
                 Reach::Remote(Remote { url: join(url)?, headers, wire: *wire })
             }
         };
-        Some(Server { name: name.to_owned(), origin: Origin::Yours, reach, allow: Vec::new() })
+        Some(Server { name: name.to_owned(), origin: Origin::Yours, reach, allow: Vec::new(), offered: Default::default() })
     }
 }
 

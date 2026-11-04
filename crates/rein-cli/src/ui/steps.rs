@@ -79,6 +79,7 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             ("Run", format!("{first}{more}{past}"))
         }
         Some(ToolName::Recall) => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
+        Some(ToolName::ToolSearch) => ("Find tools", args["query"].as_str().unwrap_or_default().to_owned()),
         // To another rein: who to, then the first line of what.
         Some(tool @ (ToolName::Message | ToolName::Delegate)) => {
             let what = args[if tool == ToolName::Message { "text" } else { "task" }].as_str().unwrap_or_default();
@@ -300,6 +301,8 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             let status = style.dim(summary.split(';').next().unwrap_or_default());
             Outcome { ok: Some(true), status, more: files.len() - shown.len(), details: shown, unit: "file" }
         }
+        // What it found, by server, as rein said it.
+        Some(ToolName::ToolSearch) => plain(Some(true), style.dim(&first_line(output))),
         Some(ToolName::Recall) => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
             if found == 0 { plain(Some(true), style.dim("nothing found")) } else { plain(Some(true), style.dim(&format!("{found} match{}", if found == 1 { "" } else { "es" }))) }

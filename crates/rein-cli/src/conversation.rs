@@ -156,6 +156,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     agent.max_output = max_output;
     agent.reasoning_effort = args.effort;
     agent.efforts = setup.efforts(&agent.model_name);
+    agent.finds_tools = setup.finds_tools(&agent.model_name);
     terminal.effort = crate::effort::now(&agent);
     if let Some(why) = crate::effort::unlike_chosen(&agent) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("({why})")));
@@ -281,6 +282,12 @@ impl Setup {
     /// The effort levels `model` takes, as its provider lists them.
     fn efforts(&self, model: &str) -> rein_llm::Efforts {
         self.models.iter().find(|m| m.id == model).map(|m| m.efforts.clone()).unwrap_or_default()
+    }
+
+    /// Whether `model` can have tools held back until it finds them, as
+    /// its provider lists it.
+    fn finds_tools(&self, model: &str) -> rein_llm::FindsTools {
+        self.models.iter().find(|m| m.id == model).map(|m| m.finds_tools).unwrap_or_default()
     }
 
     /// `spec` as saved: `provider/model`.
@@ -916,6 +923,7 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
     terminal.context_limit = agent.limit();
     agent.max_output = setup.max_output(&model);
     agent.efforts = setup.efforts(&model);
+    agent.finds_tools = setup.finds_tools(&model);
     terminal.model = provider::shown(&setup.provider, &model);
     agent.model_name = model;
     terminal.effort = crate::effort::now(agent);

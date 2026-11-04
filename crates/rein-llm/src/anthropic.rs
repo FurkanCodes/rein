@@ -19,10 +19,10 @@
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, EFFORT, Optional};
+use crate::client::{Client, EFFORT, HOLD_BACK, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Efforts, Error, Event, Item, Loading, ModelInfo, Opaque, Request, Result, ToolCall, Usage, found_text};
 
 pub const API_BASE: &str = "https://api.anthropic.com/v1";
 
@@ -50,6 +50,8 @@ pub(crate) const OPTIONAL: Optional = &[
     ("output_config", "output_config", EFFORT),
     ("effort", "effort", EFFORT),
     ("cache_control", "cache_control", "cache_control"),
+    ("defer_loading", "defer_loading", HOLD_BACK),
+    ("tool_reference", "tool_reference", HOLD_BACK),
 ];
 
 pub(crate) fn headers(request: Option<(&Request<'_>, &Value)>) -> Vec<(&'static str, String)> {
@@ -85,6 +87,7 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
                 context_window: m["max_input_tokens"].as_u64(),
                 max_output: m["max_tokens"].as_u64(),
                 efforts: efforts(&m["capabilities"]),
+                finds_tools: crate::FindsTools::Unknown,
             })
         })
         .collect()
@@ -154,7 +157,8 @@ fn tool_id(id: &str) -> String {
 }
 
 pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], base_url: &str) -> Value {
-    let mut messages = messages(request.input);
+    let holds_back = request.holds_back();
+    let mut messages = messages(request, holds_back);
     let cache = !omitted.contains(&"cache_control");
     if cache {
         mark_last(&mut messages);
@@ -169,8 +173,21 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], base_url: &s
         }
         body["system"] = json!([system]);
     }
-    if !request.tools.is_empty() {
-        let tools: Vec<Value> = request.tools.iter().map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.parameters })).collect();
+    // Held back, a tool is sent with `defer_loading`: the model isn't shown
+    // it until the search's answer names it, and the cache holds.
+    let tools: Vec<Value> = request
+        .tools
+        .iter()
+        .filter(|t| holds_back || t.loading != Loading::Search)
+        .map(|t| {
+            let mut tool = json!({ "name": t.name, "description": t.description, "input_schema": t.parameters });
+            if holds_back && t.loading == Loading::Found {
+                tool["defer_loading"] = json!(true);
+            }
+            tool
+        })
+        .collect();
+    if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
     let effort = request.reasoning_effort;
@@ -202,16 +219,25 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], base_url: &s
     body
 }
 
-/// rein's items as Claude's messages: consecutive items from the same side
-/// go in one message, in order.
-fn messages(input: &[Item]) -> Vec<Value> {
+/// The request's items as Claude's messages: consecutive items from the
+/// same side go in one message, in order. Where tools are held back, what
+/// the search found is named as Claude's tool search names it, so the
+/// model is shown those tools.
+fn messages(request: &Request<'_>, holds_back: bool) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
-    for item in input {
+    for item in request.input {
         let (role, block) = match item {
             Item::User(text) if !text.is_empty() => ("user", json!({ "type": "text", "text": text })),
             Item::ToolResult { call_id, output } => {
                 let output = if output.is_empty() { "(no output)" } else { output };
                 ("user", json!({ "type": "tool_result", "tool_use_id": tool_id(call_id), "content": output }))
+            }
+            Item::Found { call_id, names } => {
+                // A name it doesn't have would turn the request away.
+                let found: Vec<Value> =
+                    names.iter().filter(|name| holds_back && request.held_back(name).is_some()).map(|name| json!({ "type": "tool_reference", "tool_name": name })).collect();
+                let content = if found.is_empty() { json!(found_text(names)) } else { json!(found) };
+                ("user", json!({ "type": "tool_result", "tool_use_id": tool_id(call_id), "content": content }))
             }
             Item::Assistant(text) if !text.is_empty() => ("assistant", json!({ "type": "text", "text": text })),
             Item::ToolCall(call) => {
@@ -443,11 +469,33 @@ impl Messages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_back_tools_are_deferred_and_what_the_search_found_is_referenced() {
+        use crate::testing::*;
+        let (tools, input) = (held_back_tools(), found_and_called());
+        let body = request_body(&request(&input, &tools, true), &[], "https://gateway.example");
+        assert_eq!(body["tools"][0].get("defer_loading"), None, "rein's own are shown");
+        assert_eq!(body["tools"][1]["defer_loading"], true);
+        assert_eq!(body["tools"][2]["name"], crate::TOOL_SEARCH);
+        assert_eq!(body["tools"][2].get("defer_loading"), None, "the search never is");
+        let result = &body["messages"][2]["content"][0];
+        assert_eq!(result["content"], json!([{"type": "tool_reference", "tool_name": "mcp__linear__create_issue"}]));
+        assert_eq!(result["tool_use_id"], "s1");
+
+        // A model that can't: every tool shown, no search, the finding in words.
+        let body = request_body(&request(&input, &tools, false), &[], "https://gateway.example");
+        let names: Vec<&Value> = body["tools"].as_array().unwrap().iter().map(|t| &t["name"]).collect();
+        assert_eq!(names, [&json!("read"), &json!("mcp__linear__create_issue")]);
+        assert!(body["tools"].as_array().unwrap().iter().all(|t| t.get("defer_loading").is_none()));
+        assert_eq!(body["messages"][2]["content"][0]["content"], "Found: mcp__linear__create_issue. Call them as any other tool.");
+    }
     use crate::Tool;
 
     /// The tool every test request offers.
-    static TOOLS: std::sync::LazyLock<Vec<Tool>> =
-        std::sync::LazyLock::new(|| vec![Tool { strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]);
+    static TOOLS: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
+        vec![Tool { loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
+    });
 
     fn request<'a>(model: &'a str, input: &'a [Item]) -> Request<'a> {
         Request {
@@ -459,6 +507,7 @@ mod tests {
             reasoning_summary: true,
             session_id: Some("s"),
             max_output_tokens: None,
+            hold_back: false,
         }
     }
 
@@ -677,7 +726,14 @@ mod tests {
         let models = parse_models(&page);
         assert_eq!(
             models,
-            [ModelInfo { id: "claude-opus-5-5".into(), name: "Claude Opus 5.5".into(), context_window: Some(1_000_000), max_output: Some(128_000), efforts: Efforts::Unknown }]
+            [ModelInfo {
+                id: "claude-opus-5-5".into(),
+                name: "Claude Opus 5.5".into(),
+                context_window: Some(1_000_000),
+                max_output: Some(128_000),
+                efforts: Efforts::Unknown,
+                finds_tools: crate::FindsTools::Unknown
+            }]
         );
     }
 

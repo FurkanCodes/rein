@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use crate::client::{Client, EFFORT, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage, in_words};
 
 /// What a provider needs that it can't say in an error.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -57,6 +57,7 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
                 context_window: window.or(m["top_provider"]["context_length"].as_u64()),
                 max_output: m["top_provider"]["max_completion_tokens"].as_u64(),
                 efforts: efforts(m),
+                finds_tools: crate::FindsTools::Unknown,
             })
         })
         .collect()
@@ -126,9 +127,11 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], quirks: Quir
         // Without it, most servers don't say what the answer cost.
         body["stream_options"] = json!({ "include_usage": true });
     }
-    if !request.tools.is_empty() {
-        let tools: Vec<Value> =
-            request.tools.iter().map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } })).collect();
+    // Chat Completions has no way to hold a tool back and add it later
+    // without losing the cache: every one is sent.
+    let tools: Vec<Value> =
+        request.all_tools().map(|t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } })).collect();
+    if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
     // Each level in its own word. Only a level the model listed comes
@@ -173,7 +176,7 @@ fn messages(request: &Request<'_>, omitted: &[&str], quirks: Quirks) -> Vec<Valu
         }
     };
     for item in request.input {
-        match item {
+        match &*in_words(item) {
             Item::User(text) => {
                 end(&mut turn, &mut messages);
                 messages.push(json!({ "role": "user", "content": text }));
@@ -215,7 +218,7 @@ fn messages(request: &Request<'_>, omitted: &[&str], quirks: Quirks) -> Vec<Valu
                     }
                 }
             }
-            Item::Opaque(_) => {}
+            Item::Opaque(_) | Item::Found { .. } => {}
         }
     }
     end(&mut turn, &mut messages);
@@ -390,11 +393,23 @@ impl Completions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tool_is_sent_but_the_search_and_what_it_found_is_said_in_words() {
+        use crate::testing::*;
+        let (tools, input) = (held_back_tools(), found_and_called());
+        let body = request_body(&request(&input, &tools, true), &[], Quirks::default());
+        let names: Vec<&Value> = body["tools"].as_array().unwrap().iter().map(|t| &t["function"]["name"]).collect();
+        assert_eq!(names, [&json!("read"), &json!("mcp__linear__create_issue")]);
+        let said = body["messages"].as_array().unwrap().iter().find(|m| m["tool_call_id"] == "s1").unwrap();
+        assert_eq!(said["content"], "Found: mcp__linear__create_issue. Call them as any other tool.");
+    }
     use crate::Tool;
 
     /// The tool every test request offers.
-    static TOOLS: std::sync::LazyLock<Vec<Tool>> =
-        std::sync::LazyLock::new(|| vec![Tool { strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]);
+    static TOOLS: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
+        vec![Tool { loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
+    });
 
     fn request(input: &[Item]) -> Request<'_> {
         Request {
@@ -406,6 +421,7 @@ mod tests {
             reasoning_summary: true,
             session_id: None,
             max_output_tokens: None,
+            hold_back: false,
         }
     }
 
@@ -608,7 +624,14 @@ mod tests {
         let openrouter = json!({ "data": [{ "id": "qwen/qwen3-coder", "name": "Qwen3 Coder", "context_length": 262144, "top_provider": { "max_completion_tokens": 65536 } }] });
         assert_eq!(
             parse_models(&openrouter)[0],
-            ModelInfo { id: "qwen/qwen3-coder".into(), name: "Qwen3 Coder".into(), context_window: Some(262_144), max_output: Some(65_536), efforts: Efforts::Unknown }
+            ModelInfo {
+                id: "qwen/qwen3-coder".into(),
+                name: "Qwen3 Coder".into(),
+                context_window: Some(262_144),
+                max_output: Some(65_536),
+                efforts: Efforts::Unknown,
+                finds_tools: crate::FindsTools::Unknown
+            }
         );
         let groq = json!({ "data": [{ "id": "llama-4", "context_window": 131072 }] });
         assert_eq!(parse_models(&groq)[0].context_window, Some(131_072));

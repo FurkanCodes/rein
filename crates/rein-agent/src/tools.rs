@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use rein_llm::{Tool, ToolCall};
+use rein_llm::{Loading, Tool, ToolCall};
 
 use crate::redact::{self, Secrets};
 use crate::sandbox::{self, Access, Run};
@@ -220,6 +220,9 @@ pub enum ToolName {
     Bash,
     /// Searching the conversation: rein's own, see `compact::recall`.
     Recall,
+    /// Finding the tools held back from the model: rein's own, see
+    /// [`crate::finding`].
+    ToolSearch,
     /// The other reins on this computer, and reaching them: the user's
     /// side of rein does these, see [`crate::peers`].
     Peers,
@@ -230,8 +233,21 @@ pub enum ToolName {
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 12] =
-        [Self::Read, Self::Grep, Self::Glob, Self::Write, Self::Edit, Self::Plan, Self::Bash, Self::Recall, Self::Peers, Self::Message, Self::Delegate, Self::Spawn];
+    pub const ALL: [ToolName; 13] = [
+        Self::Read,
+        Self::Grep,
+        Self::Glob,
+        Self::Write,
+        Self::Edit,
+        Self::Plan,
+        Self::Bash,
+        Self::Recall,
+        Self::ToolSearch,
+        Self::Peers,
+        Self::Message,
+        Self::Delegate,
+        Self::Spawn,
+    ];
 
     /// The name the model knows it by.
     pub const fn as_str(self) -> &'static str {
@@ -244,6 +260,7 @@ impl ToolName {
             Self::Plan => "plan",
             Self::Bash => "bash",
             Self::Recall => "recall",
+            Self::ToolSearch => rein_llm::TOOL_SEARCH,
             Self::Peers => "peers",
             Self::Message => "message",
             Self::Delegate => "delegate",
@@ -409,6 +426,7 @@ impl Tools {
     pub fn specs(&self) -> Vec<Tool> {
         vec![
             Tool {
+                loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Read.as_str().into(),
                 description: "Read a UTF-8 text file in the project. A long file comes back in parts: the \
@@ -421,6 +439,7 @@ impl Tools {
                 })),
             },
             Tool {
+                loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Grep.as_str().into(),
                 description: "Search what the project's files say with a regular expression (Rust syntax), and \
@@ -438,6 +457,7 @@ impl Tools {
                 })),
             },
             Tool {
+                loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Glob.as_str().into(),
                 description: "Find files in the project by name or path, like `*.rs`, `src/**/test_*.py` or \
@@ -450,6 +470,7 @@ impl Tools {
                 })),
             },
             Tool {
+                loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Write.as_str().into(),
                 description: "Create a text file, or replace an existing file's whole contents. Missing folders \
@@ -461,6 +482,7 @@ impl Tools {
                 })),
             },
             Tool {
+                loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Edit.as_str().into(),
                 description: "Replace text in a file. old_text must match the file exactly, spaces and \
@@ -475,6 +497,7 @@ impl Tools {
                 })),
             },
             Tool {
+                loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Plan.as_str().into(),
                 description: "Keep a short checklist for work with several steps, so you and the user can see \
@@ -497,6 +520,7 @@ impl Tools {
                 })),
             },
             Tool {
+                loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Bash.as_str().into(),
                 description: self.bash_description().into(),
@@ -533,7 +557,9 @@ impl Tools {
             }),
             // `recall` is the agent's own: it searches the conversation. The
             // peers are reached by whoever runs the agent.
-            Some(ToolName::Recall | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) => Err(format!("there is no tool called {}", call.name)),
+            Some(ToolName::Recall | ToolName::ToolSearch | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) => {
+                Err(format!("there is no tool called {}", call.name))
+            }
             None => match &self.mcp {
                 Some(servers) if rein_mcp::is_mcp(&call.name) => return self.servers_said(servers.call(&call.name, &call.arguments).await),
                 _ => Err(format!("there is no tool called {}", call.name)),

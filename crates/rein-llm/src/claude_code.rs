@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use crate::{Error, Event, Item, Request, Result, ToolCall, Usage};
+use crate::{Error, Event, Item, Loading, Request, Result, Tool, ToolCall, Usage, found_text};
 
 #[derive(Clone)]
 pub(crate) struct Backend {
@@ -198,10 +198,20 @@ async fn read_capped(mut reader: impl AsyncRead + Unpin, idle: Duration) -> Resu
     }
 }
 
+/// The tools the CLI is told of. Held back, a tool is told of once the
+/// search finds it, in the prompt's list, at its end, and in the answer's
+/// shape.
+fn shown<'a>(request: &'a Request<'_>) -> Vec<&'a Tool> {
+    if !request.holds_back() {
+        return request.all_tools().collect();
+    }
+    let found = crate::found_in(request.input);
+    request.tools.iter().filter(|tool| tool.loading != Loading::Found || found.contains(tool.name.as_str())).collect()
+}
+
 fn schema(request: &Request<'_>) -> Value {
-    let calls: Vec<Value> = request
-        .tools
-        .iter()
+    let calls: Vec<Value> = shown(request)
+        .into_iter()
         .map(|tool| {
             json!({
                 "type": "object", "properties": {
@@ -226,11 +236,12 @@ fn prompt(request: &Request<'_>) -> Value {
                 Item::Assistant(text) => json!({"role":"assistant", "text":text}),
                 Item::ToolCall(call) => json!({"role":"assistant", "call_id":call.call_id, "name":call.name, "arguments":call.arguments}),
                 Item::ToolResult { call_id, output } => json!({"role":"tool", "call_id":call_id, "output":output}),
+                Item::Found { call_id, names } => json!({"role":"tool", "call_id":call_id, "output":found_text(names)}),
                 Item::Opaque(_) => return None,
             })
         })
         .collect();
-    let tools: Vec<Value> = request.tools.iter().map(|t| json!({"name":t.name, "description":t.description, "parameters":t.parameters})).collect();
+    let tools: Vec<Value> = shown(request).into_iter().map(|t| json!({"name":t.name, "description":t.description, "parameters":t.parameters})).collect();
     json!({
         "task":"Continue this rein conversation. Follow its instructions. Return text and tool_calls using the output schema. To use a tool, put its name and arguments in tool_calls; rein executes it and supplies the result on the next request. Do not execute tools yourself. Return an empty tool_calls array when finished.",
         "instructions":request.instructions, "conversation":history, "tools":tools
@@ -261,7 +272,7 @@ fn decode(bytes: &[u8], request: &Request<'_>) -> Result<VecDeque<Result<Event>>
         events.push_back(Ok(Event::Item(Item::Assistant(reply.text))));
     }
     for call in reply.tool_calls {
-        if !request.tools.iter().any(|tool| tool.name == call.name) {
+        if !shown(request).iter().any(|tool| tool.name == call.name) {
             return Err(Error::Incomplete("Claude Code returned an unknown rein tool".into()));
         }
         events.push_back(Ok(Event::Item(Item::ToolCall(ToolCall { call_id: crate::oauth::random_token()?, name: call.name, arguments: call.arguments.to_string() }))));
@@ -319,7 +330,23 @@ mod tests {
             reasoning_summary: false,
             session_id: None,
             max_output_tokens: None,
+            hold_back: false,
         }
+    }
+
+    #[test]
+    fn a_held_back_tool_is_told_of_once_the_search_finds_it() {
+        use crate::testing::*;
+        let tools = held_back_tools();
+        let names = |request: &Request<'_>| shown(request).iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
+        let before = [Item::User("file an issue".into())];
+        assert_eq!(names(&request(&before, &tools, true)), ["read", crate::TOOL_SEARCH]);
+        let after = found_and_called();
+        assert_eq!(names(&request(&after, &tools, true)), ["read", "mcp__linear__create_issue", crate::TOOL_SEARCH]);
+        let prompt = prompt(&request(&after, &tools, true));
+        assert_eq!(prompt["conversation"][2]["output"], "Found: mcp__linear__create_issue. Call them as any other tool.");
+        assert_eq!(schema(&request(&before, &tools, true))["properties"]["tool_calls"]["items"]["anyOf"].as_array().unwrap().len(), 2, "only what it's told of, it can call");
+        assert_eq!(names(&request(&before, &tools, false)), ["read", "mcp__linear__create_issue"], "nothing held back: all, no search");
     }
 
     #[tokio::test]
@@ -415,8 +442,13 @@ printf '%s' '{"structured_output":{"text":"ok","tool_calls":[]}}'
 
     #[test]
     fn structured_tools_preserve_names_arguments_and_history() {
-        let tools =
-            [crate::Tool { strict: true, name: "read".into(), description: "Read a file".into(), parameters: json!({"type":"object", "properties":{"path":{"type":"string"}}}) }];
+        let tools = [crate::Tool {
+            loading: crate::Loading::UpFront,
+            strict: true,
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type":"object", "properties":{"path":{"type":"string"}}}),
+        }];
         let input = [Item::User("read this".into()), Item::ToolResult { call_id: "old".into(), output: "contents".into() }];
         let request = Request { tools: &tools, input: &input, ..request() };
         let events = decode(br#"{"structured_output":{"text":"Checking","tool_calls":[{"name":"read","arguments":{"path":"a.rs"}}]}}"#, &request).unwrap();

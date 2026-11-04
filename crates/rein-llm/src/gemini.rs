@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::client::{Client, EFFORT, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage, in_words};
 
 pub const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -63,6 +63,7 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
                 context_window: m["inputTokenLimit"].as_u64(),
                 max_output: m["outputTokenLimit"].as_u64(),
                 efforts: efforts(m, id),
+                finds_tools: crate::FindsTools::Unknown,
             })
         })
         .collect()
@@ -91,8 +92,9 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str]) -> Value {
     if let Some(instructions) = &request.instructions {
         body["systemInstruction"] = json!({ "parts": [{ "text": instructions }] });
     }
-    if !request.tools.is_empty() {
-        let declarations: Vec<Value> = request.tools.iter().map(|t| json!({ "name": t.name, "description": t.description, "parametersJsonSchema": t.parameters })).collect();
+    // Gemini has no way to hold a tool back: every one is sent.
+    let declarations: Vec<Value> = request.all_tools().map(|t| json!({ "name": t.name, "description": t.description, "parametersJsonSchema": t.parameters })).collect();
+    if !declarations.is_empty() {
         body["tools"] = json!([{ "functionDeclarations": declarations }]);
     }
     let mut thinking = json!({});
@@ -129,7 +131,7 @@ fn contents(input: &[Item]) -> Vec<Value> {
     let mut contents: Vec<Value> = Vec::new();
     let mut signature: Option<String> = None;
     for item in input {
-        let (role, mut part) = match item {
+        let (role, mut part) = match &*in_words(item) {
             Item::User(text) if !text.is_empty() => ("user", json!({ "text": text })),
             Item::ToolResult { call_id, output } => {
                 let name = names.get(call_id.as_str()).copied().unwrap_or("tool");
@@ -339,11 +341,25 @@ impl Generate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tool_is_declared_but_the_search_and_what_it_found_is_said_in_words() {
+        use crate::testing::*;
+        let (tools, input) = (held_back_tools(), found_and_called());
+        let body = request_body(&request(&input, &tools, true), &[]);
+        let names: Vec<&Value> = body["tools"][0]["functionDeclarations"].as_array().unwrap().iter().map(|t| &t["name"]).collect();
+        assert_eq!(names, [&json!("read"), &json!("mcp__linear__create_issue")]);
+        let parts: Vec<&Value> = body["contents"].as_array().unwrap().iter().flat_map(|c| c["parts"].as_array().unwrap()).collect();
+        let said = parts.iter().find(|p| p["functionResponse"]["id"] == "s1").unwrap();
+        assert_eq!(said["functionResponse"]["name"], "tool_search");
+        assert_eq!(said["functionResponse"]["response"]["output"], "Found: mcp__linear__create_issue. Call them as any other tool.");
+    }
     use crate::Tool;
 
     /// The tool every test request offers.
-    static TOOLS: std::sync::LazyLock<Vec<Tool>> =
-        std::sync::LazyLock::new(|| vec![Tool { strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]);
+    static TOOLS: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
+        vec![Tool { loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
+    });
 
     fn request(input: &[Item]) -> Request<'_> {
         Request {
@@ -355,6 +371,7 @@ mod tests {
             reasoning_summary: true,
             session_id: None,
             max_output_tokens: None,
+            hold_back: false,
         }
     }
 
@@ -501,7 +518,14 @@ mod tests {
         ] });
         assert_eq!(
             parse_models(&page),
-            [ModelInfo { id: "gemini-3.8-flash".into(), name: "Gemini 3.8 Flash".into(), context_window: Some(1_048_576), max_output: Some(65_536), efforts: Efforts::Unknown }]
+            [ModelInfo {
+                id: "gemini-3.8-flash".into(),
+                name: "Gemini 3.8 Flash".into(),
+                context_window: Some(1_048_576),
+                max_output: Some(65_536),
+                efforts: Efforts::Unknown,
+                finds_tools: crate::FindsTools::Unknown
+            }]
         );
     }
 

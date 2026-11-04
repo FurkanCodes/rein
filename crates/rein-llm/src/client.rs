@@ -86,6 +86,9 @@ struct Wire {
     omitted: Mutex<Vec<&'static str>>,
     /// Effort levels a model turned down, which it isn't sent again.
     turned_down: Mutex<Vec<(String, Effort)>>,
+    /// Models that turned held-back tools down: they're sent every tool
+    /// from the start.
+    shown_all: Mutex<Vec<String>>,
 }
 
 /// What requests have cost on the wire so far.
@@ -116,6 +119,11 @@ pub(crate) type Optional = &'static [(&'static str, &'static str, &'static str)]
 /// that turns it down is turned down one level at a time: another level
 /// may well do.
 pub(crate) const EFFORT: &str = "effort";
+
+/// What every format calls holding tools back for the tool search. A model
+/// that turns it down gets every tool from the start: per model, as some
+/// of a provider's models have it and others don't.
+pub(crate) const HOLD_BACK: &str = "hold back";
 
 impl Client {
     /// A client for the server at `base_url` (like `https://api.anthropic.com/v1`),
@@ -201,7 +209,9 @@ impl Client {
             // callers may also supply full model IDs directly.
             return Ok(["sonnet", "opus", "haiku"]
                 .into_iter()
-                .map(|id| ModelInfo { id: id.into(), name: id.into(), context_window: None, max_output: None, efforts: crate::Efforts::Unknown })
+                // rein says its tools to the CLI in words: what's held back
+                // is said once it's found, whatever the model.
+                .map(|id| ModelInfo { finds_tools: crate::FindsTools::Yes, ..ModelInfo::named(id) })
                 .collect());
         }
         match self.api {
@@ -306,6 +316,9 @@ impl Client {
         if request.reasoning_effort.is_some_and(|effort| self.turned_down(request.model).contains(&effort)) {
             request.reasoning_effort = None;
         }
+        if self.wire.shown_all.lock().is_ok_and(|models| models.iter().any(|model| model == request.model)) {
+            request.hold_back = false;
+        }
         loop {
             let body = self.body(&request, &omitted);
             match self.send(&request, &body, &omitted).await {
@@ -314,7 +327,8 @@ impl Client {
                 }
                 // The server named a field it doesn't take: once more
                 // without it, and never again with it. For effort, that's
-                // this level for this model.
+                // this level for this model; for holding tools back, this
+                // model.
                 Err(e) if let Some(field) = rejected_field(&e, &body, self.optional(), &omitted) => match (field, request.reasoning_effort) {
                     (EFFORT, Some(effort)) => {
                         if let Ok(mut turned_down) = self.wire.turned_down.lock() {
@@ -322,6 +336,14 @@ impl Client {
                         }
                         request.reasoning_effort = None;
                     }
+                    (HOLD_BACK, _) if request.hold_back => {
+                        if let Ok(mut shown_all) = self.wire.shown_all.lock() {
+                            shown_all.push(request.model.to_owned());
+                        }
+                        request.hold_back = false;
+                    }
+                    // Nothing's held back already: it's about something else.
+                    (HOLD_BACK, _) => return Err(e),
                     _ => {
                         omitted.push(field);
                         if let Ok(mut learned) = self.wire.omitted.lock() {
@@ -548,6 +570,7 @@ mod tests {
             reasoning_summary: false,
             session_id: None,
             max_output_tokens: None,
+            hold_back: false,
         };
         assert!(client.stream(&request("picky")).await.is_ok());
         assert_eq!(client.turned_down("picky"), [Effort::Minimal]);
@@ -558,6 +581,48 @@ mod tests {
         // Turned down, sent again without; then never again for it; another model still gets it.
         assert_eq!(efforts, [&json!("minimal"), &Value::Null, &Value::Null, &json!("minimal")]);
         assert!(client.turned_down("easy").is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_model_that_turns_added_tools_down_is_shown_every_tool_from_then_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 65536];
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") || !bytes.ends_with(b"}") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let body: Value = serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                let adds = body["input"].as_array().into_iter().flatten().any(|item| item["type"] == "additional_tools");
+                let reply = if body["model"] == "old" && adds {
+                    let error = r#"{"error":{"message":"Invalid value: 'additional_tools'. Supported values are: 'message', 'function_call' and 'function_call_output'.","type":"invalid_request_error","param":"input[3]","code":"invalid_value"}}"#;
+                    format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}", error.len())
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                };
+                seen.lock().unwrap().push(body);
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None).without_compression();
+        let (tools, input) = (crate::testing::held_back_tools(), crate::testing::found_and_called());
+        let request = |model| Request { model, ..crate::testing::request(&input, &tools, true) };
+        assert!(client.stream(&request("old")).await.is_ok());
+        assert!(client.stream(&request("old")).await.is_ok());
+        assert!(client.stream(&request("new")).await.is_ok());
+        let bodies = bodies.lock().unwrap();
+        let shown = |body: &Value| body["tools"][0]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "mcp__linear__create_issue");
+        // Turned down, sent again with all; then all from the start; another model still has them held back.
+        assert_eq!(bodies.iter().map(shown).collect::<Vec<_>>(), [false, true, true, false]);
         server.abort();
     }
 
@@ -576,8 +641,17 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None).with_idle_timeout(Duration::from_millis(300));
-        let request =
-            Request { model: "m", instructions: None, input: &[], tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        let request = Request {
+            model: "m",
+            instructions: None,
+            input: &[],
+            tools: &[],
+            reasoning_effort: None,
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+            hold_back: false,
+        };
         let mut stream = client.stream(&request).await.unwrap();
         assert!(matches!(stream.next().await, Some(Ok(Event::TextDelta(_)))));
         let started = std::time::Instant::now();
@@ -598,8 +672,17 @@ mod tests {
         let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         saved["expires_at"] = json!(0);
         std::fs::write(&path, saved.to_string()).unwrap();
-        let request =
-            Request { model: "m", instructions: None, input: &[], tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        let request = Request {
+            model: "m",
+            instructions: None,
+            input: &[],
+            tools: &[],
+            reasoning_effort: None,
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+            hold_back: false,
+        };
         assert!(client.stream(&request).await.is_ok());
         assert_eq!(renewals.lock().unwrap().len(), 1);
         let seen = seen.lock().unwrap();
@@ -615,8 +698,17 @@ mod tests {
         let expired = r#"{"error":{"message":"Provided authentication token is expired.","code":"token_expired"}}"#;
         let (api, seen) = serve(vec![(401, expired), (200, "{}")]).await;
         let client = Client::chatgpt_at(reqwest::Client::new(), &api, Session::at(path, &format!("{tokens}/token"))).await.unwrap();
-        let request =
-            Request { model: "m", instructions: None, input: &[], tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        let request = Request {
+            model: "m",
+            instructions: None,
+            input: &[],
+            tools: &[],
+            reasoning_effort: None,
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+            hold_back: false,
+        };
         assert!(client.stream(&request).await.is_ok());
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "{seen:?}");

@@ -22,7 +22,10 @@
 //! runs none of its code here, and has none. `allow` names tools that run
 //! without asking, or `*` for all of one server's; it counts only in your
 //! own file, never in a project's. `"disabled": true`, as Cline writes it,
-//! keeps a server in the file without starting it.
+//! keeps a server in the file without starting it. `"tools": "search"`
+//! holds a server's tools back until the model finds them with the tool
+//! search, and `"tools": "upfront"` shows them from the start; without it,
+//! they're held back once they'd take more than about 2,000 tokens.
 
 use std::collections::BTreeMap;
 
@@ -60,6 +63,36 @@ pub struct Server {
     pub reach: Reach,
     /// Its tools that run without asking: their names, or `*` for all.
     pub allow: Vec<String>,
+    /// When the model is shown its tools.
+    pub offered: Offered,
+}
+
+/// When the model is shown a server's tools, as your file says in
+/// `"tools"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum Offered {
+    /// As rein decides: held back until the model finds them once they'd
+    /// take more than [`crate::HOLD_BACK_FROM`] tokens of every request.
+    #[default]
+    #[serde(skip)]
+    BySize,
+    /// From the start: `"upfront"`.
+    #[serde(rename = "upfront")]
+    UpFront,
+    /// Once the model finds them with the tool search: `"search"`.
+    #[serde(rename = "search")]
+    OnSearch,
+}
+
+impl Offered {
+    /// As your file says it; nothing for rein's own choice.
+    pub const fn word(self) -> Option<&'static str> {
+        match self {
+            Offered::BySize => None,
+            Offered::UpFront => Some("upfront"),
+            Offered::OnSearch => Some("search"),
+        }
+    }
 }
 
 /// How a server is reached.
@@ -111,7 +144,13 @@ pub enum Wire {
 /// that may be a key: a file of yours may have one in it as it is.
 impl std::fmt::Debug for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Server").field("name", &self.name).field("origin", &self.origin).field("reach", &self.reach).field("allow", &self.allow).finish()
+        f.debug_struct("Server")
+            .field("name", &self.name)
+            .field("origin", &self.origin)
+            .field("reach", &self.reach)
+            .field("allow", &self.allow)
+            .field("offered", &self.offered)
+            .finish()
     }
 }
 
@@ -197,6 +236,7 @@ struct Entry {
     allow: Vec<String>,
     #[serde(default)]
     disabled: bool,
+    tools: Option<Offered>,
 }
 
 /// How a server is reached, as a file says: `http` is Streamable HTTP,
@@ -243,7 +283,7 @@ pub(crate) fn servers(entries: BTreeMap<String, Value>, origin: Origin) -> Named
         };
         // A project doesn't decide what runs without asking you.
         let allow = if origin == Origin::Yours { entry.allow } else { Vec::new() };
-        let server = Server { name, origin, reach, allow };
+        let server = Server { name, origin, reach, allow, offered: entry.tools.unwrap_or_default() };
         match (entry.disabled, origin) {
             (false, _) => named.servers.push(server),
             (true, Origin::Yours) => named.off.push(server),
@@ -348,6 +388,9 @@ impl Server {
         }
         if !self.allow.is_empty() {
             entry.insert("allow".into(), json!(self.allow));
+        }
+        if let Some(word) = self.offered.word() {
+            entry.insert("tools".into(), json!(word));
         }
         Value::Object(entry)
     }
@@ -546,7 +589,7 @@ pub(crate) mod tests {
     /// A command's server, for a test.
     pub(crate) fn local(name: &str, command: &str, args: &[&str]) -> Server {
         let local = Local { command: command.into(), args: args.iter().map(|arg| (*arg).to_owned()).collect(), env: BTreeMap::new(), access: Access::Network };
-        Server { name: name.into(), origin: Origin::Yours, reach: Reach::Local(local), allow: Vec::new() }
+        Server { name: name.into(), origin: Origin::Yours, reach: Reach::Local(local), allow: Vec::new(), offered: Default::default() }
     }
 
     /// The command of `server`, which is one.
@@ -699,12 +742,24 @@ pub(crate) mod tests {
             local("github", "npx", &["-y", "gh"]),
             with(&local("x", "sh", &[]), |local| local.access = Access::Outside),
             Server { allow: vec!["*".into()], ..local("y", "sh", &[]) },
+            Server { offered: Offered::OnSearch, ..local("z", "sh", &[]) },
+            Server { offered: Offered::UpFront, ..local("w", "sh", &[]) },
             remote,
         ] {
             let file = json!({ "mcpServers": { &server.name: server.entry() } }).to_string();
             assert_eq!(read(&file, Origin::Yours).unwrap().servers, std::slice::from_ref(&server), "{file}");
         }
         assert_eq!(local("y", "sh", &[]).entry(), json!({ "command": "sh" }), "nothing that goes without saying");
+    }
+
+    #[test]
+    fn a_file_says_when_a_servers_tools_are_shown() {
+        let file = r#"{ "mcpServers": { "a": { "command": "x", "tools": "search" }, "b": { "command": "x", "tools": "upfront" }, "c": { "command": "x" }, "d": { "command": "x", "tools": "later" } } }"#;
+        let named = read(file, Origin::Yours).unwrap();
+        let offered: Vec<(&str, Offered)> = named.servers.iter().map(|s| (s.name.as_str(), s.offered)).collect();
+        assert_eq!(offered, [("a", Offered::OnSearch), ("b", Offered::UpFront), ("c", Offered::BySize)]);
+        assert_eq!(named.skipped[0].name, "d", "a word rein doesn't know is said, not guessed at");
+        assert!(named.skipped[0].why.contains("upfront"), "{}", named.skipped[0].why);
     }
 
     #[test]

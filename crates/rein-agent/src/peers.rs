@@ -8,7 +8,7 @@
 //! with every message, and rein's types keep it so: a peer's words come in
 //! as [`crate::agent::Heard::Peer`], which nothing that asks you reads.
 
-use rein_llm::Tool;
+use rein_llm::{Loading, Tool};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -50,6 +50,7 @@ pub fn specs() -> Vec<Tool> {
     let to = json!({ "type": "string", "description": "The other rein's name, as `peers` lists it, or `workspace/name` for one in another workspace." });
     vec![
         Tool {
+            loading: Loading::UpFront,
             strict: true,
             name: ToolName::Peers.as_str().into(),
             description: "List the other reins running on this computer, each in a terminal of its own that the user \
@@ -58,6 +59,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({})),
         },
         Tool {
+            loading: Loading::UpFront,
             strict: true,
             name: ToolName::Message.as_str().into(),
             description: "Send a short message to another rein: to tell it something, or to answer it. It reads it \
@@ -67,6 +69,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({ "to": to, "text": { "type": "string", "description": "What to say." } })),
         },
         Tool {
+            loading: Loading::UpFront,
             strict: true,
             name: ToolName::Delegate.as_str().into(),
             description: "Hand a task to another rein, which works on it in its own terminal with its own model and \
@@ -77,6 +80,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({ "to": to, "task": { "type": "string", "description": "The task, complete in itself." } })),
         },
         Tool {
+            loading: Loading::UpFront,
             strict: true,
             name: ToolName::Spawn.as_str().into(),
             description: "Start a sub-agent: a new rein in a terminal tab of its own, which the user can watch and steer, \

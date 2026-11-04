@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub use clean::text as cleaned;
-pub use config::{Local, Named, Origin, Reach, Remote, Server, Skipped, Unfilled, Wire};
+pub use config::{Local, Named, Offered, Origin, Reach, Remote, Server, Skipped, Unfilled, Wire};
 pub use rpc::Error;
 
 /// What the names of servers' tools start with: they can't clash with
@@ -57,6 +57,11 @@ const LONGEST_DESCRIPTION: usize = 4_000;
 
 /// The longest name providers take for a tool.
 const LONGEST_NAME: usize = 64;
+
+/// A server's tools are held back until the model finds them once they'd
+/// take more than about this many tokens of every request: a tool or two
+/// is shown from the start, as a search would cost more than it saves.
+pub const HOLD_BACK_FROM: usize = 2_000;
 
 /// How many pages of tools rein asks a server for: one that never stops
 /// sending more doesn't keep rein waiting.
@@ -411,6 +416,17 @@ fn listed(tool: &Value) -> Option<Listed> {
     Some(Listed { name, description, schema: Value::Object(schema) })
 }
 
+/// Whether a server's `tools` are held back until the model finds them: as
+/// your file says, or once they'd take more than [`HOLD_BACK_FROM`] tokens.
+fn holds_back(offered: Offered, tools: &[Tool]) -> bool {
+    match offered {
+        Offered::UpFront => false,
+        Offered::OnSearch => !tools.is_empty(),
+        // About four characters a token, as rein counts elsewhere.
+        Offered::BySize => tools.iter().map(|tool| tool.name.len() + tool.description.len() + tool.parameters.to_string().len()).sum::<usize>() / 4 > HOLD_BACK_FROM,
+    }
+}
+
 /// How a server is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -462,6 +478,8 @@ pub struct Servers {
     /// The servers whose failed calls the model was told the sandbox may
     /// be why: once each, as most fail for reasons of their own.
     told: Mutex<HashSet<String>>,
+    /// The servers whose tools were held back when they were last offered.
+    held_back: Mutex<HashSet<String>>,
 }
 
 /// Never what the servers' environments hold.
@@ -479,6 +497,8 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    /// Shown only once the model finds it with the tool search.
+    pub held_back: bool,
 }
 
 /// The tools the model is offered, and what it says about the servers.
@@ -497,7 +517,7 @@ impl Servers {
     /// Starts each of `servers` at once, in the background. Inside a
     /// runtime: the starts are its tasks.
     pub fn start(servers: Vec<Server>, launch: Launch) -> Servers {
-        let started = Servers { entries: Mutex::default(), launch, offered: Mutex::default(), starts: Mutex::default(), told: Mutex::default() };
+        let started = Servers { entries: Mutex::default(), launch, offered: Mutex::default(), starts: Mutex::default(), told: Mutex::default(), held_back: Mutex::default() };
         for server in servers {
             started.add(server);
         }
@@ -540,6 +560,21 @@ impl Servers {
             entry.start.abort();
         }
         !gone.is_empty()
+    }
+
+    /// Shows the model the tools of the server called `name` as `offered`
+    /// says, from the next [`Servers::list`].
+    pub fn offer(&self, name: &str, offered: Offered) {
+        for entry in lock(&self.entries).iter_mut().filter(|entry| entry.server.name == name) {
+            let server = Server { offered, ..entry.server.clone() };
+            *entry = Arc::new(Entry { server, state: entry.state.clone(), start: entry.start.clone() });
+        }
+    }
+
+    /// Whether the server called `name` had its tools held back when they
+    /// were last offered.
+    pub fn held_back(&self, name: &str) -> bool {
+        lock(&self.held_back).contains(name)
     }
 
     /// Lets the tools `allow` names of the server called `name` run
@@ -606,9 +641,11 @@ impl Servers {
 
     /// The tools to offer the model, once every server has started or
     /// failed to: each named for its server, and left out if that name is
-    /// too long or taken. They're what the conversation offers from now on.
+    /// too long or taken; held back as its server's `offered` says. They're
+    /// what the conversation offers from now on.
     pub async fn list(&self) -> Listing {
         let (mut listing, mut offered, mut said, mut failed) = (Listing::default(), HashMap::new(), Vec::new(), false);
+        let mut held_back = HashSet::new();
         for entry in self.entries() {
             let state = entry.state.lock().await;
             let connection = match &*state {
@@ -626,6 +663,7 @@ impl Servers {
             };
             drop(state);
             let mut left_out = 0;
+            let first = listing.tools.len();
             for tool in &connection.tools {
                 let name = format!("{PREFIX}{}__{}", entry.server.name, tool.name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-', "_"));
                 if name.len() > LONGEST_NAME || offered.contains_key(&name) {
@@ -636,15 +674,22 @@ impl Servers {
                 if allow.iter().any(|allowed| allowed == "*" || *allowed == tool.name) {
                     listing.allowed.push(name.clone());
                 }
-                listing.tools.push(Tool { name: name.clone(), description: tool.description.clone(), parameters: tool.schema.clone() });
+                listing.tools.push(Tool { name: name.clone(), description: tool.description.clone(), parameters: tool.schema.clone(), held_back: false });
                 offered.insert(name, (entry.clone(), tool.name.clone()));
+            }
+            let theirs = &mut listing.tools[first..];
+            if holds_back(entry.server.offered, theirs) {
+                theirs.iter_mut().for_each(|tool| tool.held_back = true);
+                held_back.insert(entry.server.name.clone());
             }
             let count = connection.tools.len() - left_out;
             let tools = format!("{count} tool{}", if count == 1 { "" } else { "s" });
+            let found = if held_back.contains(&entry.server.name) { ", found when needed" } else { "" };
             let left_out = if left_out > 0 { format!(", {left_out} left out: their names are too long or taken") } else { String::new() };
-            said.push(format!("{} ({tools}{left_out})", entry.server.name));
+            said.push(format!("{} ({tools}{found}{left_out})", entry.server.name));
         }
         *lock(&self.offered) = offered;
+        *lock(&self.held_back) = held_back;
         let fix = if failed { ". /mcp says what to do" } else { "" };
         listing.note = (!said.is_empty()).then(|| format!("MCP servers: {}{fix}", said.join("; ")));
         listing

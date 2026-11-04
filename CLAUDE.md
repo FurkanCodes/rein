@@ -49,6 +49,11 @@ finding. Each says why in a line.
   effort levels to every model, and `minimal` to a model that doesn't take
   it failed the turn. Read it into the type (`Efforts`), and where a list
   says nothing, learn from what the server turns down, per model.
+- Try a provider's feature the way people pay for it, not only as its docs
+  and its list say: ChatGPT's list says gpt-6.1-sol has OpenAI's tool
+  search, and a ChatGPT plan turns it down ("subscription sharing … only
+  function and custom tools"). rein's search is a function of its own, and
+  what it finds comes as `additional_tools`, which the plan takes.
 
 ## Errors are values until the edge
 
@@ -181,6 +186,11 @@ finding. Each says why in a line.
 - A guard against rein looping on its own work goes by progress, not a
   count: compacting "once per message" overflowed long turns. Compact again
   after a step since the last time, and not after one that made no room.
+- What the model is shown changes at the end of a request, never at its
+  start: the tool list comes before everything, so a tool added to it
+  loses the whole cache. A tool found mid-conversation joins after the
+  conversation so far (`additional_tools`, `tool_reference`), and a format
+  that can't do that shows every tool from the start.
 
 ## Encapsulation
 

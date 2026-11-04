@@ -104,8 +104,13 @@ fn said(seen: &Seen, text: &str) -> Value {
 /// A server at `url` with `headers`, and how to reach it over `web`.
 fn at(url: &str, headers: &[(&str, &str)], web: Arc<Fake>, tokens: Option<Arc<dyn Tokens>>) -> (Server, Launch) {
     let headers = headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
-    let server =
-        Server { name: "far".into(), origin: Origin::Yours, reach: Reach::Remote(Remote { url: url.into(), headers, wire: crate::config::Wire::Http }), allow: Vec::new() };
+    let server = Server {
+        name: "far".into(),
+        origin: Origin::Yours,
+        reach: Reach::Remote(Remote { url: url.into(), headers, wire: crate::config::Wire::Http }),
+        allow: Vec::new(),
+        offered: Default::default(),
+    };
     let launch = Launch {
         sandbox: Arc::new(rein_sandbox::Sandbox::missing(rein_sandbox::Places::default(), rein_sandbox::Missing::NotHere)),
         root: std::env::temp_dir(),

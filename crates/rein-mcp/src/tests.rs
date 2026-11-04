@@ -22,7 +22,7 @@ async fn fake(name: &str, access: Access) -> (Server, Launch, PathBuf) {
     let places = rein_sandbox::Places::new(&root, Some(&home), None);
     let sandbox = Arc::new(Sandbox::detect(places).await);
     let local = Local { command: "sh".into(), args: vec!["server.sh".into()], env: [("GIVEN".to_owned(), "hello there".to_owned())].into(), access };
-    let server = Server { name: "fake".into(), origin: Origin::Yours, reach: Reach::Local(local), allow: vec!["echo".into()] };
+    let server = Server { name: "fake".into(), origin: Origin::Yours, reach: Reach::Local(local), allow: vec!["echo".into()], offered: Default::default() };
     (server, Launch { sandbox, root, caches: home.join(".cache/rein/mcp"), keys: Arc::default(), web: None, tokens: None }, home)
 }
 
@@ -273,7 +273,7 @@ async fn a_server_from_npm_starts_in_the_sandbox() {
     let sandbox = Arc::new(Sandbox::detect(rein_sandbox::Places::new(&root, Some(&home), None)).await);
     assert!(sandbox.available(), "no sandbox here");
     let local = Local { command: "npx".into(), args: vec!["-y".into(), "@modelcontextprotocol/server-everything".into()], env: Default::default(), access: Access::Network };
-    let server = Server { name: "everything".into(), origin: Origin::Yours, reach: Reach::Local(local), allow: Vec::new() };
+    let server = Server { name: "everything".into(), origin: Origin::Yours, reach: Reach::Local(local), allow: Vec::new(), offered: Default::default() };
     let launch = Launch { sandbox, root: root.clone(), caches: root.join("caches"), keys: Arc::default(), web: None, tokens: None };
     let servers = Servers::start(vec![server], launch);
     let listing = servers.list().await;
@@ -282,4 +282,16 @@ async fn a_server_from_npm_starts_in_the_sandbox() {
     let said = servers.call("mcp__everything__echo", r#"{"message":"from the sandbox"}"#).await;
     println!("{said:?}");
     assert!(said.unwrap().contains("from the sandbox"));
+}
+
+#[test]
+fn a_servers_tools_are_held_back_once_theyd_take_more_than_a_little_of_every_request() {
+    let tool = |words: usize| Tool { name: "mcp__s__t".into(), description: "word ".repeat(words), parameters: json!({"type": "object"}), held_back: false };
+    let few = [tool(10), tool(10)];
+    let many: Vec<Tool> = (0..70).map(|_| tool(120)).collect();
+    assert!(!holds_back(Offered::BySize, &few), "a search would cost more than they do");
+    assert!(holds_back(Offered::BySize, &many));
+    assert!(holds_back(Offered::OnSearch, &few), "as your file says");
+    assert!(!holds_back(Offered::UpFront, &many), "as your file says");
+    assert!(!holds_back(Offered::OnSearch, &[]), "nothing to find");
 }

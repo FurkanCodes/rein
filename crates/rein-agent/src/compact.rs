@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rein_llm::{Item, Tool};
+use rein_llm::{Item, Loading, Tool};
 
 use crate::agent::{DECLINED_AND_STOPPED, DECLINED_CALL, DECLINED_CHANGE, DECLINED_COMMAND, INTERRUPTED};
 use crate::tools::{ERROR, ToolName};
@@ -83,6 +83,7 @@ pub fn size(item: &Item) -> usize {
         Item::User(text) | Item::Assistant(text) => text.len(),
         Item::ToolCall(call) => call.name.len() + call.arguments.len(),
         Item::ToolResult { output, .. } => output.len(),
+        Item::Found { names, .. } => names.iter().map(String::len).sum(),
         Item::Opaque(opaque) => opaque.value.to_string().len(),
     }
 }
@@ -317,7 +318,7 @@ pub fn recent_start(history: &[Item], from: usize, budget: u64) -> usize {
     // Move later until every kept result has its call.
     while start < history.len() {
         let orphan = history[start..].iter().any(|item| match item {
-            Item::ToolResult { call_id, .. } => calls.get(call_id.as_str()).is_none_or(|(i, _)| *i < start),
+            Item::ToolResult { call_id, .. } | Item::Found { call_id, .. } => calls.get(call_id.as_str()).is_none_or(|(i, _)| *i < start),
             _ => false,
         });
         if !orphan {
@@ -328,9 +329,45 @@ pub fn recent_start(history: &[Item], from: usize, budget: u64) -> usize {
     start
 }
 
+/// The tools the part kept word for word calls that the tool search found
+/// before it, found again at its start: the search that found them is
+/// compacted away, and a provider that loads what was found shows the
+/// model a tool only after the search that found it. `None` when the kept
+/// part needs none. `id` is the search's call ID.
+pub(crate) fn found_again(earlier: &[Item], kept: &[Item], id: String) -> Option<[Item; 2]> {
+    let found = |items: &[Item]| -> BTreeSet<String> {
+        items
+            .iter()
+            .flat_map(|item| match item {
+                Item::Found { names, .. } => names.as_slice(),
+                _ => &[],
+            })
+            .cloned()
+            .collect()
+    };
+    let (before, again) = (found(earlier), found(kept));
+    let mut names: Vec<String> = Vec::new();
+    for item in kept {
+        if let Item::ToolCall(call) = item
+            && before.contains(&call.name)
+            && !again.contains(&call.name)
+            && !names.contains(&call.name)
+        {
+            names.push(call.name.clone());
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let arguments = json!({ "query": format!("select:{}", names.join(",")), "limit": null }).to_string();
+    let search = Item::ToolCall(rein_llm::ToolCall { call_id: id.clone(), name: ToolName::ToolSearch.as_str().into(), arguments });
+    Some([search, Item::Found { call_id: id, names }])
+}
+
 /// The tool for searching the conversation, offered once it's been compacted.
 pub fn recall_spec() -> Tool {
     Tool {
+        loading: Loading::UpFront,
         strict: true,
         name: ToolName::Recall.as_str().into(),
         description: "Search the whole conversation, including the parts compacted away, for messages and tool \
@@ -364,6 +401,7 @@ pub fn recall(full: &[Item], arguments: &str) -> String {
             Item::Assistant(text) => ("assistant", text.clone()),
             Item::ToolCall(call) => ("tool call", format!("{} {}", call.name, call.arguments)),
             Item::ToolResult { output, .. } => ("tool result", output.clone()),
+            Item::Found { names, .. } => ("tools found", names.join(", ")),
             Item::Opaque(_) => continue,
         };
         let lower = text.to_lowercase();
@@ -419,6 +457,21 @@ mod tests {
     use rein_llm::ToolCall;
 
     use super::*;
+
+    #[test]
+    fn a_tool_found_before_the_kept_part_is_found_again_at_its_start() {
+        let call = |id: &str, name: &str| Item::ToolCall(ToolCall { call_id: id.into(), name: name.into(), arguments: "{}".into() });
+        let found = |id: &str, names: &[&str]| Item::Found { call_id: id.into(), names: names.iter().map(|n| (*n).to_owned()).collect() };
+        let earlier = [call("s1", "tool_search"), found("s1", &["mcp__a__x", "mcp__a__y"]), call("c1", "mcp__a__x")];
+        let kept = [call("c2", "mcp__a__y"), Item::ToolResult { call_id: "c2".into(), output: "ok".into() }, call("c3", "mcp__a__y"), call("c4", "read")];
+        let [search, again] = found_again(&earlier, &kept, "again".into()).unwrap();
+        assert_eq!(again, found("again", &["mcp__a__y"]), "only what the kept part calls, once");
+        let Item::ToolCall(search) = search else { panic!("a call") };
+        assert_eq!((search.name.as_str(), search.arguments.as_str()), ("tool_search", r#"{"limit":null,"query":"select:mcp__a__y"}"#));
+        assert_eq!(found_again(&earlier, &kept[3..], "again".into()), None, "it calls none");
+        let refound = [found("s2", &["mcp__a__y"]), call("c5", "mcp__a__y")];
+        assert_eq!(found_again(&earlier, &refound, "again".into()), None, "found again in it already");
+    }
 
     fn call(id: &str, name: &str, args: Value) -> Item {
         Item::ToolCall(ToolCall { call_id: id.into(), name: name.into(), arguments: args.to_string() })
@@ -560,6 +613,14 @@ mod tests {
         assert_eq!(recent_start(&history, 1, 120), 6);
         // With room for everything it stops at `from`.
         assert_eq!(recent_start(&history, 1, 10_000), 1);
+        // What the search found is a result too: never kept without its search.
+        let searched = vec![
+            Item::User("go".into()),
+            call("s1", "tool_search", json!({"query": "x".repeat(400)})),
+            Item::Found { call_id: "s1".into(), names: vec!["mcp__a__b".into()] },
+            Item::Assistant("done".into()),
+        ];
+        assert_eq!(recent_start(&searched, 0, 20), 3);
     }
 
     #[test]

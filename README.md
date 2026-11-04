@@ -749,6 +749,32 @@ tools run without asking, and `"*"` allows all of one server's. `auto` runs only
 `read-only` none. Neither a project's `.mcp.json` nor its
 `.rein/permissions` can allow one.
 
+### Tool search
+
+A server's tools can take much of every request, though a task calls a
+few of them: Linear's 70, Playwright's 25 and Chrome DevTools' 32 came to
+about 25,000 tokens, sent again with each message. So once a server's
+tools would take more than about 2,000 tokens, rein holds them back. The
+model is shown one tool instead, `tool_search`, whose description names
+each held-back server's tools on a line. It finds what it needs by words
+from what they do (`create issue`) or by name
+(`select:mcp__linear__create_issue`), and calls them from then on: a step
+says `found linear: create_issue`. On a ChatGPT plan with those servers,
+the first request went from 27,831 tokens to 3,140. A server of a tool or
+two stays shown, as a search would cost more than it saves.
+
+What's found joins the model's tools after the conversation so far, so the
+prompt cache holds. OpenAI's API adds them where they were found
+(`additional_tools`; its own tool search isn't taken on a ChatGPT plan),
+Anthropic's references them as its tool search does, and `claude -p` is
+told of them from then on. Gemini and Chat Completions providers can't add
+a tool later without losing the cache, so they're shown every tool, and so
+is a model whose list says it can't find them, or that turns it down
+(learned per model). A compaction that keeps a call to a found tool keeps
+it found. `/mcp` says "found when needed" of a server held back, and
+changes it: `"tools": "search"` in your file holds a server's tools back
+however few, and `"tools": "upfront"` shows them from the start.
+
 What a server says is cleaned before you or the model see it: escape codes,
 and characters a terminal doesn't draw, are taken out. A call may take 5
 minutes. A long result is cut, and kept whole in a file in the temp folder

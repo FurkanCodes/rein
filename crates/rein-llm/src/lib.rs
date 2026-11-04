@@ -60,6 +60,11 @@ pub enum Item {
     ToolCall(ToolCall),
     /// What running that tool produced, sent back to the model.
     ToolResult { call_id: String, output: String },
+    /// What the tool search ([`TOOL_SEARCH`]) found for the call `call_id`:
+    /// tools held back from the model ([`Loading::Found`]), by name, which
+    /// it can call from then on. Each format says it its own way: where it
+    /// holds tools back, as the provider loads them; elsewhere, in words.
+    Found { call_id: String, names: Vec<String> },
     /// Provider data that has to be sent back unchanged, such as OpenAI's
     /// encrypted reasoning or Claude's signed thinking. rein never looks
     /// inside.
@@ -143,6 +148,28 @@ pub struct Tool {
     /// tools' schemas do; an MCP server's, as it wrote them, usually don't,
     /// and a provider turns a request away for one that doesn't.
     pub strict: bool,
+    /// When the model is shown it.
+    pub loading: Loading,
+}
+
+/// The name of the tool search: the tool, the model's call to it, and what
+/// each format calls it are all this.
+pub const TOOL_SEARCH: &str = "tool_search";
+
+/// When the model is shown a tool. A server's seventy tools can take
+/// 20,000 tokens of every request; held back, they take a line, and the
+/// model finds the few it needs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Loading {
+    /// From the start.
+    #[default]
+    UpFront,
+    /// Once the model finds it with the tool search, where the request
+    /// holds tools back ([`Request::hold_back`]) and its format can: from
+    /// the start where not.
+    Found,
+    /// The tool search itself: offered only where tools are held back.
+    Search,
 }
 
 /// Token counts reported when a response completes.
@@ -183,6 +210,60 @@ pub struct Request<'a> {
     /// The most the answer may take, where the format needs a number
     /// (Anthropic's does). `None` lets rein pick.
     pub max_output_tokens: Option<u64>,
+    /// Hold back the tools that are [`Loading::Found`] until the model finds
+    /// them, where the format can. Otherwise they're shown from the start,
+    /// and the search isn't offered: for a model whose list says it can't,
+    /// or that turned it down.
+    pub hold_back: bool,
+}
+
+impl Request<'_> {
+    /// Tools are held back from the model in this request, in a format
+    /// that can hold them back: there are some to hold back, and the model
+    /// can find them.
+    pub(crate) fn holds_back(&self) -> bool {
+        self.hold_back && self.tools.iter().any(|tool| tool.loading == Loading::Found) && self.tools.iter().any(|tool| tool.loading == Loading::Search)
+    }
+
+    /// The tools sent in a format that holds none back: all but the search.
+    pub(crate) fn all_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.tools.iter().filter(|tool| tool.loading != Loading::Search)
+    }
+
+    /// The tool held back as `name`, if there is one.
+    pub(crate) fn held_back(&self, name: &str) -> Option<&Tool> {
+        self.tools.iter().find(|tool| tool.loading == Loading::Found && tool.name == name)
+    }
+}
+
+/// `item` as a format that holds no tools back says it: what the tool
+/// search found, as a tool's result in words.
+pub(crate) fn in_words(item: &Item) -> std::borrow::Cow<'_, Item> {
+    match item {
+        Item::Found { call_id, names } => std::borrow::Cow::Owned(Item::ToolResult { call_id: call_id.clone(), output: found_text(names) }),
+        item => std::borrow::Cow::Borrowed(item),
+    }
+}
+
+/// What the tool search found, in words, for a format that says it so.
+pub fn found_text(names: &[String]) -> String {
+    if names.is_empty() {
+        "No tools matched. Search again with other words, or with select: and the names listed.".to_owned()
+    } else {
+        format!("Found: {}. Call them as any other tool.", names.join(", "))
+    }
+}
+
+/// Every tool the tool search has found in `input`, by name.
+pub(crate) fn found_in(input: &[Item]) -> std::collections::BTreeSet<&str> {
+    input
+        .iter()
+        .flat_map(|item| match item {
+            Item::Found { names, .. } => names.as_slice(),
+            _ => &[],
+        })
+        .map(String::as_str)
+        .collect()
 }
 
 /// How hard a model thinks, in rein's words, least first. Each format says
@@ -337,13 +418,27 @@ pub struct ModelInfo {
     pub max_output: Option<u64>,
     /// The effort levels it takes.
     pub efforts: Efforts,
+    /// Whether it can have tools held back until it finds them.
+    pub finds_tools: FindsTools,
 }
 
 impl ModelInfo {
     /// `id`, of which nothing else is known.
     pub fn named(id: &str) -> ModelInfo {
-        ModelInfo { id: id.to_owned(), name: id.to_owned(), context_window: None, max_output: None, efforts: Efforts::Unknown }
+        ModelInfo { id: id.to_owned(), name: id.to_owned(), context_window: None, max_output: None, efforts: Efforts::Unknown, finds_tools: FindsTools::Unknown }
     }
+}
+
+/// Whether a model can have tools held back until it finds them with the
+/// tool search ([`Loading::Found`]), as its provider's list says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FindsTools {
+    /// The list doesn't say: tools are held back, and if the server turns
+    /// that down, they're sent to this model from the start from then on.
+    #[default]
+    Unknown,
+    Yes,
+    No,
 }
 
 /// What kind of failure an [`Error::Api`] is, whoever sent it and in
@@ -534,6 +629,35 @@ impl From<serde_json::Error> for Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// What the formats' tests share.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use serde_json::json;
+
+    /// One of rein's tools, one held back, and the search.
+    pub(crate) fn held_back_tools() -> Vec<Tool> {
+        let tool = |name: &str, loading| Tool { name: name.into(), description: format!("{name}, said."), parameters: json!({"type": "object"}), strict: false, loading };
+        vec![tool("read", Loading::UpFront), tool("mcp__linear__create_issue", Loading::Found), tool(TOOL_SEARCH, Loading::Search)]
+    }
+
+    /// A conversation in which the model searched, found one tool and called it.
+    pub(crate) fn found_and_called() -> Vec<Item> {
+        let call = |id: &str, name: &str, arguments: &str| Item::ToolCall(ToolCall { call_id: id.into(), name: name.into(), arguments: arguments.into() });
+        vec![
+            Item::User("file an issue".into()),
+            call("s1", TOOL_SEARCH, r#"{"query":"linear issue"}"#),
+            Item::Found { call_id: "s1".into(), names: vec!["mcp__linear__create_issue".into()] },
+            call("c1", "mcp__linear__create_issue", r#"{"title":"x"}"#),
+            Item::ToolResult { call_id: "c1".into(), output: "made".into() },
+        ]
+    }
+
+    pub(crate) fn request<'a>(input: &'a [Item], tools: &'a [Tool], hold_back: bool) -> Request<'a> {
+        Request { model: "m", instructions: None, input, tools, reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None, hold_back }
+    }
+}
 
 #[cfg(test)]
 mod tests {

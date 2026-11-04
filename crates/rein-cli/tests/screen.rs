@@ -2946,6 +2946,70 @@ fn an_mcp_server_of_yours_starts_in_the_sandbox_and_its_tools_ask_unless_allowed
     wait_for_mcp(&mut term, "● 5 tools · sandbox (network)");
 }
 
+/// A server whose tools are held back is named in the tool search, not
+/// shown: the model finds the tool it needs, which is added to its tools
+/// where it found it, and calls it. `/mcp` says they're found when needed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_held_back_servers_tool_is_found_with_the_search_and_then_called() {
+    let mut model = Model::start(vec![calls("tool_search", json!({ "query": "echo it back", "limit": null })), calls("mcp__fake__echo", json!({ "text": "hi" })), says("Echoed.")]);
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "allow": ["echo"], "tools": "search" } } }).to_string()));
+    let mut term = Term::start_with(&model, "mcp-found", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("echo hi\r");
+    term.wait_for("Echoed.");
+    let text = term.text();
+    assert!(text.contains("MCP servers: fake (5 tools, found when needed)"), "{text}");
+    assert!(text.contains("Find tools echo it back"), "{text}");
+    assert!(text.contains("found fake: echo"), "{text}");
+    let requests = model.requests();
+    assert!(servers_tools(&requests[0]).is_empty(), "none shown: {:?}", servers_tools(&requests[0]));
+    let tools = requests[0]["tools"][0]["tools"].as_array().cloned().unwrap_or_default();
+    let search = tools.iter().find(|tool| tool["name"] == "tool_search").expect("the search, which rein runs");
+    assert!(search["description"].as_str().unwrap().contains("- fake: echo, "), "{search}");
+    let input = requests[1]["input"].as_array().cloned().unwrap_or_default();
+    let added = input.iter().find(|item| item["type"] == "additional_tools").expect("what it found, added where it found it");
+    assert_eq!(added["tools"][0]["tools"][0]["name"], "mcp__fake__echo");
+    let input = requests[2]["input"].as_array().cloned().unwrap_or_default();
+    assert!(input.iter().any(|item| item["type"] == "function_call" && item["name"] == "mcp__fake__echo" && item["namespace"] == "mcp"), "called where it was loaded");
+    assert_eq!(results(&model), ["Found: mcp__fake__echo. Call them as any other tool.", "hi"]);
+    assert!(requests.iter().all(|request| request["tools"] == requests[0]["tools"]), "the same tools all conversation, for the cache");
+    wait_for_mcp(&mut term, "● 5 tools · found when needed");
+}
+
+/// `/mcp` changes when the model is shown a server's tools: picked, it's
+/// kept in your mcp.json, and the next message holds them back.
+#[cfg(target_os = "macos")]
+#[test]
+fn mcp_chooses_when_the_model_is_shown_a_servers_tools() {
+    let mut model = Model::start(vec![says("Shown."), says("Held back.")]);
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] } } }).to_string()));
+    let mut term = Term::start_with(&model, "mcp-offered", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("one\r");
+    term.wait_for("Shown.");
+    assert!(term.text().contains("MCP servers: fake (5 tools)"), "a few small tools: shown\n{}", term.text());
+    term.wait_for(IDLE);
+    term.keys("/mcp\r");
+    pick(&mut term, "fake");
+    term.wait_for("now: from the start");
+    pick(&mut term, "choose when");
+    term.wait_for("fake: show the model its tools when");
+    pick(&mut term, "once it finds");
+    term.wait_for("✓ the model is shown fake's tools once it finds them, from your next message");
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/mcp.json")).unwrap()).unwrap();
+    assert_eq!(file["mcpServers"]["fake"], json!({ "command": "sh", "args": ["server.sh"], "tools": "search" }), "kept in your file, the rest as it was");
+    term.wait_for(IDLE);
+    term.keys("two\r");
+    term.wait_for("Held back.");
+    let requests = model.requests();
+    assert!(servers_tools(&requests[0]).contains(&"mcp__fake__echo".to_owned()));
+    assert!(servers_tools(&requests[1]).is_empty(), "held back from the next message: {:?}", servers_tools(&requests[1]));
+    let names: Vec<Value> = requests[1]["tools"][0]["tools"].as_array().unwrap().iter().map(|tool| tool["name"].clone()).collect();
+    assert!(names.contains(&json!("tool_search")));
+    wait_for_mcp(&mut term, "● 5 tools · found when needed");
+}
+
 /// A project's .mcp.json may be anyone's: its server starts only once
 /// you've said yes to it as it is, and is asked about again once it
 /// changes.

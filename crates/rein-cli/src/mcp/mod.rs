@@ -484,6 +484,28 @@ fn set_allow(name: &str, allow: &[String], mcp: &Mcp, agent: &mut Agent<Llm>, te
     Ok(())
 }
 
+/// Shows the model the tools of the server called `name` as `offered`
+/// says, kept in your file: from your next message.
+fn set_offered(name: &str, offered: rein_mcp::Offered, mcp: &Mcp, agent: &mut Agent<Llm>, terminal: &Terminal) -> CliResult {
+    edit(&mcp.dir, |servers| {
+        let entry = entry(servers, name)?;
+        match offered.word() {
+            Some(word) => entry.insert("tools".into(), json!(word)),
+            None => entry.remove("tools"),
+        };
+        Ok(())
+    })?;
+    mcp.servers.offer(name, offered);
+    agent.servers_changed();
+    let when = match offered {
+        rein_mcp::Offered::BySize => format!("as rein decides: once it finds them, if they'd take more than about {} tokens", rein_mcp::HOLD_BACK_FROM),
+        rein_mcp::Offered::UpFront => "from the start".to_owned(),
+        rein_mcp::Offered::OnSearch => "once it finds them".to_owned(),
+    };
+    say!("{}{} the model is shown {name}'s tools {when}, from your next message", " ".repeat(GUTTER), terminal.err.green("✓"));
+    Ok(())
+}
+
 /// The tools `allow` lets run without asking, in a few words.
 fn allowed(allow: &[String]) -> String {
     match allow {

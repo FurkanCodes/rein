@@ -117,7 +117,8 @@ impl Web for Old {
 /// A server at `url`, spoken to as `wire` says, and how to reach it.
 fn at(url: &str, wire: Wire, web: Arc<Old>) -> (Server, Launch) {
     let headers = [("X-Key".to_owned(), "${REIN_TEST_OLD_KEY}".to_owned())].into();
-    let server = Server { name: "old".into(), origin: Origin::Yours, reach: Reach::Remote(Remote { url: url.into(), headers, wire }), allow: Vec::new() };
+    let server =
+        Server { name: "old".into(), origin: Origin::Yours, reach: Reach::Remote(Remote { url: url.into(), headers, wire }), allow: Vec::new(), offered: Default::default() };
     let launch = Launch {
         sandbox: Arc::new(rein_sandbox::Sandbox::missing(rein_sandbox::Places::default(), rein_sandbox::Missing::NotHere)),
         root: std::env::temp_dir(),

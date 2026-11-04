@@ -7,20 +7,26 @@ pub mod signin;
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, EFFORT, Optional};
+use crate::client::{Client, EFFORT, HOLD_BACK, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage};
+use crate::{Api, Effort, Efforts, Error, Event, FindsTools, Item, Loading, ModelInfo, Opaque, Request, Result, Tool, ToolCall, Usage, found_text};
 
 /// What the Responses API may turn away: an effort level the model doesn't
-/// take, which OpenAI names as the error's `param`.
-pub(crate) const OPTIONAL: Optional = &[("reasoning.effort", "reasoning", EFFORT)];
+/// take, which OpenAI names as the error's `param`, and tools added partway
+/// through the conversation, for what the tool search found.
+pub(crate) const OPTIONAL: Optional = &[("reasoning.effort", "reasoning", EFFORT), ("additional_tools", "additional_tools", HOLD_BACK)];
 
 pub const API_BASE: &str = "https://api.openai.com/v1";
 
 /// Sign in with ChatGPT only accepts function tools grouped in a namespace,
-/// so all of rein's tools live in this one.
+/// so all of rein's tools live in this one,
 const NAMESPACE: &str = "rein";
+
+/// but those the tool search found, which come in this one, where it found
+/// them.
+const FOUND: &str = "mcp";
+const FOUND_ABOUT: &str = "Tools of the user's MCP servers that tool_search found.";
 
 /// The headers a request needs besides the body.
 pub(crate) fn headers(request: Option<(&Request<'_>, &Value)>) -> Vec<(&'static str, String)> {
@@ -37,7 +43,9 @@ pub(crate) async fn models(client: &Client) -> Result<Vec<ModelInfo>> {
 pub(crate) fn request_body(request: &Request<'_>) -> Value {
     // Only what the Responses API can read: another format's reasoning
     // means nothing here.
-    let input: Vec<Value> = request.input.iter().filter(|item| !matches!(item, Item::Opaque(o) if o.api != Api::Responses)).map(item_json).collect();
+    let holds_back = request.holds_back();
+    let input: Vec<Value> =
+        request.input.iter().filter(|item| !matches!(item, Item::Opaque(o) if o.api != Api::Responses)).flat_map(|item| item_json(item, request, holds_back)).collect();
     // Sign in with ChatGPT requires `store: false` and `stream: true`, and
     // rejects fields like `temperature` and `max_output_tokens`. Sending only
     // what it accepts keeps one request shape for both ways of paying.
@@ -51,29 +59,49 @@ pub(crate) fn request_body(request: &Request<'_>) -> Value {
     if request.reasoning_summary {
         body["reasoning"]["summary"] = json!("auto");
     }
-    if !request.tools.is_empty() {
-        let tools: Vec<Value> =
-            request.tools.iter().map(|t| json!({ "type": "function", "name": t.name, "description": t.description, "parameters": t.parameters, "strict": t.strict })).collect();
-        body["tools"] = json!([{ "type": "namespace", "name": NAMESPACE, "description": "rein's tools for working in the user's project.", "tools": tools }]);
+    // Held back, a tool comes where the search found it, after the
+    // conversation before, so the cache holds. The search is a function of
+    // rein's: OpenAI's own (`tool_search`) isn't taken on a ChatGPT plan.
+    let shown: Vec<Value> =
+        if holds_back { request.tools.iter().filter(|t| t.loading != Loading::Found).map(function).collect() } else { request.all_tools().map(function).collect() };
+    if !shown.is_empty() {
+        body["tools"] = json!([{ "type": "namespace", "name": NAMESPACE, "description": "rein's tools for working in the user's project.", "tools": shown }]);
     }
     body
 }
 
-/// One conversation item in the Responses API's input format.
-fn item_json(item: &Item) -> Value {
-    match item {
+/// `tool` as a function the model may call.
+fn function(tool: &Tool) -> Value {
+    json!({ "type": "function", "name": tool.name, "description": tool.description, "parameters": tool.parameters, "strict": tool.strict })
+}
+
+/// One conversation item in the Responses API's input format. Where tools
+/// are held back, what the search found is added to the model's tools
+/// right after its answer (`additional_tools`), in a namespace of their own.
+fn item_json(item: &Item, request: &Request<'_>, holds_back: bool) -> Vec<Value> {
+    let one = match item {
         Item::User(text) => json!({ "role": "user", "content": text }),
         Item::Assistant(text) => json!({ "role": "assistant", "content": text }),
         Item::ToolCall(call) => json!({
             "type": "function_call",
             "call_id": call.call_id,
-            "namespace": NAMESPACE,
+            "namespace": if holds_back && request.held_back(&call.name).is_some() { FOUND } else { NAMESPACE },
             "name": call.name,
             "arguments": call.arguments,
         }),
         Item::ToolResult { call_id, output } => json!({ "type": "function_call_output", "call_id": call_id, "output": output }),
+        Item::Found { call_id, names } => {
+            let said = json!({ "type": "function_call_output", "call_id": call_id, "output": found_text(names) });
+            let found: Vec<Value> = names.iter().filter_map(|name| request.held_back(name)).map(function).collect();
+            if !holds_back || found.is_empty() {
+                return vec![said];
+            }
+            let added = json!({ "type": "additional_tools", "role": "developer", "tools": [{ "type": "namespace", "name": FOUND, "description": FOUND_ABOUT, "tools": found }] });
+            return vec![said, added];
+        }
         Item::Opaque(opaque) => opaque.value.clone(),
-    }
+    };
+    vec![one]
 }
 
 fn parse_models(body: &Value) -> Vec<ModelInfo> {
@@ -92,6 +120,11 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
                     context_window: m["context_window"].as_u64(),
                     max_output: None,
                     efforts: efforts(m),
+                    finds_tools: match m["supports_search_tool"].as_bool() {
+                        Some(true) => FindsTools::Yes,
+                        Some(false) => FindsTools::No,
+                        None => FindsTools::Unknown,
+                    },
                 })
             })
             .collect();
@@ -162,6 +195,7 @@ fn decode_item(item: &Value) -> Option<Item> {
             name: item["name"].as_str()?.to_owned(),
             arguments: item["arguments"].as_str().unwrap_or("{}").to_owned(),
         })),
+
         // Encrypted reasoning: the next request must carry it back as is.
         "reasoning" => Some(Item::Opaque(Opaque::new(Api::Responses, item.clone()))),
         _ => None,
@@ -203,6 +237,7 @@ mod tests {
             reasoning_summary: false,
             session_id: None,
             max_output_tokens: None,
+            hold_back: false,
         };
         assert_eq!(
             request_body(&request),
@@ -224,7 +259,7 @@ mod tests {
     #[test]
     fn tools_go_in_a_namespace_and_calls_round_trip() {
         let call = ToolCall { call_id: "call_1".into(), name: "read".into(), arguments: r#"{"path":"a.rs"}"#.into() };
-        let tools = [Tool { strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }];
+        let tools = [Tool { loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }];
         let input = [
             Item::User("open a.rs".into()),
             Item::Opaque(Opaque::new(Api::Responses, json!({"type": "reasoning", "encrypted_content": "xyz"}))),
@@ -233,8 +268,17 @@ mod tests {
             Item::ToolCall(call.clone()),
             Item::ToolResult { call_id: "call_1".into(), output: "fn main() {}".into() },
         ];
-        let request =
-            Request { model: "m", instructions: None, input: &input, tools: &tools, reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        let request = Request {
+            model: "m",
+            instructions: None,
+            input: &input,
+            tools: &tools,
+            reasoning_effort: None,
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+            hold_back: false,
+        };
         let body = request_body(&request);
         assert_eq!(body["tools"][0]["type"], "namespace");
         assert_eq!(body["tools"][0]["tools"][0]["name"], "read");
@@ -246,6 +290,48 @@ mod tests {
         // The model's call comes back as the same item.
         let done = json!({"type": "function_call", "call_id": "call_1", "namespace": "rein", "name": "read", "arguments": "{\"path\":\"a.rs\"}"});
         assert_eq!(decode_item(&done), Some(Item::ToolCall(call)));
+    }
+
+    #[test]
+    fn what_the_search_found_is_added_where_it_found_it() {
+        use crate::testing::*;
+        let (tools, input) = (held_back_tools(), found_and_called());
+        let body = request_body(&request(&input, &tools, true));
+        // Up front: rein's own, and the search, which rein runs: a function of its own.
+        let names: Vec<&Value> = body["tools"][0]["tools"].as_array().unwrap().iter().map(|t| &t["name"]).collect();
+        assert_eq!(names, [&json!("read"), &json!("tool_search")]);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1, "no tool of OpenAI's: a ChatGPT plan turns them away");
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][2], json!({"type": "function_call_output", "call_id": "s1", "output": "Found: mcp__linear__create_issue. Call them as any other tool."}));
+        let found =
+            json!({"type": "function", "name": "mcp__linear__create_issue", "description": "mcp__linear__create_issue, said.", "parameters": {"type": "object"}, "strict": false});
+        assert_eq!(
+            body["input"][3],
+            json!({"type": "additional_tools", "role": "developer", "tools": [{"type": "namespace", "name": "mcp", "description": FOUND_ABOUT, "tools": [found]}]})
+        );
+        assert_eq!(body["input"][4]["namespace"], "mcp", "called where it was added");
+        assert_eq!(body["input"][5], json!({"type": "function_call_output", "call_id": "c1", "output": "made"}));
+        assert_eq!(body["input"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn held_back_by_nobody_every_tool_is_shown_and_the_search_said_in_words() {
+        use crate::testing::*;
+        let (tools, input) = (held_back_tools(), found_and_called());
+        let body = request_body(&request(&input, &tools, false));
+        let names: Vec<&Value> = body["tools"][0]["tools"].as_array().unwrap().iter().map(|t| &t["name"]).collect();
+        assert_eq!(names, [&json!("read"), &json!("mcp__linear__create_issue")], "no search: nothing to find");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][2], json!({"type": "function_call_output", "call_id": "s1", "output": "Found: mcp__linear__create_issue. Call them as any other tool."}));
+        assert_eq!(body["input"][3]["namespace"], "rein");
+    }
+
+    #[test]
+    fn a_chatgpt_models_list_says_whether_it_finds_tools() {
+        let chatgpt = json!({"models": [{"slug": "new", "supports_search_tool": true}, {"slug": "old", "supports_search_tool": false}, {"slug": "unsaid"}]});
+        let finds: Vec<FindsTools> = parse_models(&chatgpt).iter().map(|m| m.finds_tools).collect();
+        assert_eq!(finds, [FindsTools::Yes, FindsTools::No, FindsTools::Unknown]);
     }
 
     #[test]
@@ -263,9 +349,15 @@ mod tests {
             {"slug": "a", "display_name": "Model A", "visibility": "list", "context_window": 500000},
             {"slug": "hidden", "display_name": "Hidden", "visibility": "hide"},
         ]});
-        assert_eq!(parse_models(&chatgpt), [ModelInfo { id: "a".into(), name: "Model A".into(), context_window: Some(500_000), max_output: None, efforts: Efforts::Unknown }]);
+        assert_eq!(
+            parse_models(&chatgpt),
+            [ModelInfo { id: "a".into(), name: "Model A".into(), context_window: Some(500_000), max_output: None, efforts: Efforts::Unknown, finds_tools: FindsTools::Unknown }]
+        );
         let api_key = json!({"data": [{"id": "b"}]});
-        assert_eq!(parse_models(&api_key), [ModelInfo { id: "b".into(), name: "b".into(), context_window: None, max_output: None, efforts: Efforts::Unknown }]);
+        assert_eq!(
+            parse_models(&api_key),
+            [ModelInfo { id: "b".into(), name: "b".into(), context_window: None, max_output: None, efforts: Efforts::Unknown, finds_tools: FindsTools::Unknown }]
+        );
     }
 
     #[test]
@@ -299,6 +391,7 @@ mod tests {
             reasoning_summary: false,
             session_id: None,
             max_output_tokens: None,
+            hold_back: false,
         };
         assert_eq!(request_body(&request)["reasoning"]["effort"], "none");
     }

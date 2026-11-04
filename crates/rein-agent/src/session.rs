@@ -56,6 +56,11 @@ enum Line {
         call_id: String,
         output: String,
     },
+    /// What the tool search found, by name.
+    Found {
+        call_id: String,
+        names: Vec<String>,
+    },
     /// Provider data, with the format that can read it. Conversations
     /// saved before rein spoke more than one say none: OpenAI's.
     Opaque {
@@ -96,6 +101,7 @@ impl Line {
             Item::Assistant(text) => Line::Assistant { text: text.clone() },
             Item::ToolCall(call) => Line::ToolCall { call_id: call.call_id.clone(), name: call.name.clone(), arguments: call.arguments.clone() },
             Item::ToolResult { call_id, output } => Line::ToolResult { call_id: call_id.clone(), output: output.clone() },
+            Item::Found { call_id, names } => Line::Found { call_id: call_id.clone(), names: names.clone() },
             Item::Opaque(opaque) => Line::Opaque { api: opaque.api, value: opaque.value.clone() },
         }
     }
@@ -108,6 +114,7 @@ impl Line {
             Line::Assistant { text } => Item::Assistant(text),
             Line::ToolCall { call_id, name, arguments } => Item::ToolCall(ToolCall { call_id, name, arguments }),
             Line::ToolResult { call_id, output } => Item::ToolResult { call_id, output },
+            Line::Found { call_id, names } => Item::Found { call_id, names },
             Line::Opaque { api, value } => Item::Opaque(Opaque::new(api, value)),
         })
     }
@@ -336,6 +343,8 @@ mod tests {
             Item::User("hi".into()),
             Item::ToolCall(ToolCall { call_id: "c1".into(), name: "read".into(), arguments: "{}".into() }),
             Item::ToolResult { call_id: "c1".into(), output: "text".into() },
+            Item::ToolCall(ToolCall { call_id: "s1".into(), name: "tool_search".into(), arguments: r#"{"query":"issue"}"#.into() }),
+            Item::Found { call_id: "s1".into(), names: vec!["mcp__linear__create_issue".into()] },
             Item::Opaque(Opaque::new(Api::Responses, serde_json::json!({ "type": "reasoning", "encrypted_content": "xyz" }))),
             Item::Opaque(Opaque::new(Api::Anthropic, serde_json::json!({ "type": "thinking", "thinking": "", "signature": "s" }))),
             Item::Assistant("hello".into()),

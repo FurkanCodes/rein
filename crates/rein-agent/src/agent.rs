@@ -9,10 +9,11 @@ use std::task::Poll;
 
 use serde_json::{Value, json};
 
-use rein_llm::{Client, Error, ErrorKind, Event, Item, Request, Result, Tool, ToolCall, Usage};
+use rein_llm::{Client, Error, ErrorKind, Event, Item, Loading, Request, Result, Tool, ToolCall, Usage};
 
 use crate::compact;
 use crate::context;
+use crate::finding;
 use crate::mentions;
 use crate::permissions::{Decision, Permissions, Rule};
 use crate::session::{Loaded, Session};
@@ -311,6 +312,9 @@ pub struct Agent<M> {
     pub efforts: rein_llm::Efforts,
     /// The most one answer may take, when the model list says.
     pub max_output: Option<u64>,
+    /// Whether the model can have tools held back until it finds them, as
+    /// its list says: one that can't is shown every tool from the start.
+    pub finds_tools: rein_llm::FindsTools,
     /// How many steps (answers from the model) a turn may take before it's
     /// stopped, and the model asked to sum up: `None` while someone is
     /// watching, who can press Esc; a number when nobody is.
@@ -386,9 +390,18 @@ impl<M: Model> Agent<M> {
             ui.starting_servers();
         }
         let listing = servers.list().await;
-        self.specs.retain(|tool| !rein_mcp::is_mcp(&tool.name));
+        self.specs.retain(|tool| !rein_mcp::is_mcp(&tool.name) && tool.loading != Loading::Search);
         // A server's schema is as it wrote it, not to strict mode's rules.
-        self.specs.extend(listing.tools.into_iter().map(|tool| Tool { name: tool.name, description: tool.description, parameters: tool.parameters, strict: false }));
+        let loading = |held_back: bool| if held_back { Loading::Found } else { Loading::UpFront };
+        self.specs.extend(listing.tools.into_iter().map(|tool| Tool {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            strict: false,
+            loading: loading(tool.held_back),
+        }));
+        // Last, so what comes before it in every request stays the same.
+        self.specs.extend(finding::spec(&self.specs));
         self.permissions.allow_tools(listing.allowed);
         self.listed = true;
         if let Some(note) = listing.note {
@@ -541,6 +554,16 @@ impl<M: Model> Agent<M> {
                 }
                 continue;
             }
+            // So is finding the tools held back: what it finds, the model
+            // is shown from then on, as its provider loads them.
+            if ToolName::of(&call) == Some(ToolName::ToolSearch) {
+                ui.tool_started(&call);
+                let found = finding::search(&self.specs, &call.arguments);
+                if let Some(stuck) = self.found(&call, found, repeats, closing.as_deref(), ui)? {
+                    return self.stop_stuck(stuck, &calls[next..], ui);
+                }
+                continue;
+            }
             let approved = match self.permissions.decide(&call) {
                 Decision::Allow => Ok(()),
                 Decision::Deny(reason) => {
@@ -592,6 +615,26 @@ impl<M: Model> Agent<M> {
         let output = with_note(output, call, closing, times);
         ui.tool_finished(call, &output);
         self.record(Item::ToolResult { call_id: call.call_id.clone(), output })?;
+        Ok((times >= REPEATS_STOP).then(|| Ran::Stuck { call: call.clone(), times }))
+    }
+
+    /// Records what the tool search found for `call`, or why it found
+    /// nothing, as [`Agent::finish`] records a tool's result. What rein
+    /// has to tell the model with it, it can only say in words: then the
+    /// finding is said in words too, and loads nothing.
+    fn found(&mut self, call: &ToolCall, found: std::result::Result<Vec<String>, String>, repeats: &mut Repeats, closing: Option<&str>, ui: &mut impl Ui) -> Result<Option<Ran>> {
+        let names = match found {
+            Ok(names) => names,
+            Err(why) => return self.finish(call, why, repeats, closing, ui),
+        };
+        let times = repeats.add(call, &rein_llm::found_text(&names));
+        ui.tool_finished(call, &finding::said(&names));
+        if times >= REPEATS_NOTED || closing == Some(call.call_id.as_str()) {
+            let output = with_note(rein_llm::found_text(&names), call, closing, times);
+            self.record(Item::ToolResult { call_id: call.call_id.clone(), output })?;
+        } else {
+            self.record(Item::Found { call_id: call.call_id.clone(), names })?;
+        }
         Ok((times >= REPEATS_STOP).then(|| Ran::Stuck { call: call.clone(), times }))
     }
 
@@ -806,6 +849,9 @@ impl<M: Model> Agent<M> {
         let budget = compact::KEEP_RECENT.min(self.window.limit / 5);
         let start = compact::recent_start(&self.history, pinned, budget);
         let mut kept = self.history[start..].to_vec();
+        if let Some(again) = compact::found_again(&self.history[..start], &kept, format!("found_again_{}", self.window.full.len())) {
+            kept.splice(0..0, again);
+        }
         compact::retire(&mut kept, &retired);
         // The kept part follows the summary now, not what its thinking was
         // signed with.
@@ -840,6 +886,7 @@ impl<M> Agent<M> {
             reasoning_effort: None,
             efforts: rein_llm::Efforts::Unknown,
             max_output: None,
+            finds_tools: rein_llm::FindsTools::Unknown,
             step_limit: None,
             instructions: header.instructions,
             session_id: Some(header.id),
@@ -879,6 +926,7 @@ impl<M> Agent<M> {
             reasoning_effort,
             efforts,
             max_output,
+            finds_tools,
             step_limit,
             specs,
             listed,
@@ -897,6 +945,7 @@ impl<M> Agent<M> {
             reasoning_effort,
             efforts,
             max_output,
+            finds_tools,
             step_limit,
             specs,
             listed,
@@ -974,6 +1023,7 @@ impl<M> Agent<M> {
             reasoning_summary: true,
             session_id: self.session_id.as_deref(),
             max_output_tokens: self.max_output,
+            hold_back: self.finds_tools != rein_llm::FindsTools::No,
         }
     }
 
@@ -1042,7 +1092,7 @@ impl<M> Agent<M> {
             .history
             .iter()
             .filter_map(|item| match item {
-                Item::ToolResult { call_id, .. } => Some(call_id.clone()),
+                Item::ToolResult { call_id, .. } | Item::Found { call_id, .. } => Some(call_id.clone()),
                 _ => None,
             })
             .collect();
@@ -1159,11 +1209,12 @@ mod tests {
         input: Vec<Item>,
         tools: Vec<Tool>,
         session_id: Option<String>,
+        hold_back: bool,
     }
 
     impl From<&Request<'_>> for Seen {
         fn from(request: &Request<'_>) -> Self {
-            Seen { input: request.input.to_vec(), tools: request.tools.to_vec(), session_id: request.session_id.map(str::to_owned) }
+            Seen { input: request.input.to_vec(), tools: request.tools.to_vec(), session_id: request.session_id.map(str::to_owned), hold_back: request.hold_back }
         }
     }
 
@@ -1302,7 +1353,13 @@ mod tests {
             env: [("GIVEN".to_owned(), "FAKE-mcp-key-123".to_owned())].into(),
             access: crate::sandbox::Access::Outside,
         };
-        let server = rein_mcp::Server { name: "fake".into(), origin: rein_mcp::Origin::Yours, reach: rein_mcp::Reach::Local(local), allow: vec!["echo".into()] };
+        let server = rein_mcp::Server {
+            name: "fake".into(),
+            origin: rein_mcp::Origin::Yours,
+            reach: rein_mcp::Reach::Local(local),
+            allow: vec!["echo".into()],
+            offered: Default::default(),
+        };
         let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default(), web: None, tokens: None };
         let servers = std::sync::Arc::new(rein_mcp::Servers::start(vec![server], launch));
         agent.tools = Tools::new(&root).with_mcp(servers).with_secrets(crate::redact::Secrets::new(["FAKE-mcp-key-123".to_owned()]));
@@ -1321,6 +1378,52 @@ mod tests {
         assert!(requests[0].tools.iter().filter(|tool| rein_mcp::is_mcp(&tool.name)).all(|tool| !tool.strict));
     }
 
+    /// A server whose tools are held back is named in the search, which
+    /// rein runs itself: what it finds is recorded as found, and called as
+    /// any of the server's tools.
+    #[tokio::test]
+    async fn a_held_back_tool_is_found_with_the_search_and_then_called() {
+        let call = |id: &str, name: &str, arguments: Value| Item::ToolCall(ToolCall { call_id: id.into(), name: name.into(), arguments: arguments.to_string() });
+        let turns = vec![
+            vec![call("s1", "tool_search", json!({ "query": "select:echo", "limit": null }))],
+            vec![call("c1", "mcp__fake__echo", json!({ "text": "hello" }))],
+            vec![Item::Assistant("Done.".into())],
+        ];
+        let mut agent = agent("mcp-held-back", turns);
+        let root = agent.tools.root().to_owned();
+        std::fs::write(root.join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
+        let local = rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: crate::sandbox::Access::Outside };
+        let server = rein_mcp::Server {
+            name: "fake".into(),
+            origin: rein_mcp::Origin::Yours,
+            reach: rein_mcp::Reach::Local(local),
+            allow: vec!["echo".into()],
+            offered: rein_mcp::Offered::OnSearch,
+        };
+        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default(), web: None, tokens: None };
+        agent.tools = Tools::new(&root).with_mcp(std::sync::Arc::new(rein_mcp::Servers::start(vec![server], launch)));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("use the server".into(), &mut person).await.unwrap();
+        assert_eq!(person.log, ["ran tool_search", "result found fake: echo", "ran mcp__fake__echo", "result hello", "text Done."]);
+        {
+            let requests = agent.model.requests.borrow();
+            let first = &requests[0];
+            assert!(first.hold_back);
+            assert!(first.tools.iter().filter(|tool| rein_mcp::is_mcp(&tool.name)).all(|tool| tool.loading == Loading::Found), "all held back");
+            let search = first.tools.last().unwrap();
+            assert_eq!((search.name.as_str(), search.loading), ("tool_search", Loading::Search), "last, after what's always the same");
+            assert!(search.description.contains("- fake: echo, "), "{}", search.description);
+            assert_eq!(requests[1].input.last(), Some(&Item::Found { call_id: "s1".into(), names: vec!["mcp__fake__echo".into()] }));
+            assert!(requests.iter().all(|seen| seen.tools == first.tools), "the same tools all conversation");
+        }
+
+        // A model whose list says it can't is shown them all; the format leaves the search out.
+        agent.finds_tools = rein_llm::FindsTools::No;
+        agent.model.turns.borrow_mut().push_back(vec![Item::Assistant("Fine.".into())]);
+        agent.send("again".into(), &mut person).await.unwrap();
+        assert!(!agent.model.requests.borrow().last().unwrap().hold_back);
+    }
+
     /// A server you add or remove as rein runs changes the tools from the
     /// next message on, and only then.
     #[tokio::test]
@@ -1335,7 +1438,8 @@ mod tests {
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("one".into(), &mut person).await.unwrap();
         let local = rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: crate::sandbox::Access::Outside };
-        let server = rein_mcp::Server { name: "fake".into(), origin: rein_mcp::Origin::Yours, reach: rein_mcp::Reach::Local(local), allow: Vec::new() };
+        let server =
+            rein_mcp::Server { name: "fake".into(), origin: rein_mcp::Origin::Yours, reach: rein_mcp::Reach::Local(local), allow: Vec::new(), offered: Default::default() };
         servers.add(server);
         agent.send("two".into(), &mut person).await.unwrap();
         agent.servers_changed();
@@ -1550,6 +1654,7 @@ mod tests {
             reasoning_effort: None,
             efforts: rein_llm::Efforts::Unknown,
             max_output: None,
+            finds_tools: rein_llm::FindsTools::Unknown,
             step_limit: None,
             session_id: Some("session-1".into()),
             history: Vec::new(),
@@ -1613,6 +1718,45 @@ mod tests {
         let mut resumed = Agent { history: loaded.history, ..self::agent("save-resumed", vec![]) };
         resumed.repair();
         assert_eq!(resumed.history, agent.history, "a continued conversation sends exactly the same history");
+    }
+
+    #[tokio::test]
+    async fn a_search_rein_has_to_say_something_of_is_said_in_words() {
+        let search = |id: &str| vec![Item::ToolCall(ToolCall { call_id: id.into(), name: "tool_search".into(), arguments: json!({ "query": "echo", "limit": null }).to_string() })];
+        let mut agent = agent("search-noted", vec![search("s1"), search("s2"), search("s3"), vec![Item::Assistant("Stopping.".into())]]);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("find echo".into(), &mut person).await.unwrap();
+        // The same search over and over: the third is told so, which only words can carry.
+        assert!(matches!(&agent.history[2], Item::Found { call_id, .. } if call_id == "s1"));
+        assert!(matches!(&agent.history[4], Item::Found { call_id, .. } if call_id == "s2"));
+        assert!(matches!(&agent.history[6], Item::ToolResult { call_id, output } if call_id == "s3" && output.ends_with(REPEATING)), "{:?}", agent.history[6]);
+    }
+
+    #[tokio::test]
+    async fn a_tool_found_before_a_compaction_is_found_again_after_it() {
+        let call = |id: &str, name: &str, arguments: Value| Item::ToolCall(ToolCall { call_id: id.into(), name: name.into(), arguments: arguments.to_string() });
+        let mut agent = agent("compact-found", vec![vec![Item::Assistant("Goal: echo.".into())]]);
+        let echo = call("c1", "mcp__fake__echo", json!({ "text": "hi" }));
+        agent.history = vec![
+            Item::User("echo hi".into()),
+            call("s1", "tool_search", json!({ "query": "echo", "limit": null })),
+            Item::Found { call_id: "s1".into(), names: vec!["mcp__fake__echo".into()] },
+            Item::Assistant("x".repeat(8_000)),
+            echo.clone(),
+            Item::ToolResult { call_id: "c1".into(), output: "hi".into() },
+        ];
+        agent.window.limit = 2_000;
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.compact(None, true, &mut person).await.unwrap();
+        // The summary, the search found again, and what was kept, which calls it.
+        assert!(matches!(&agent.history[0], Item::User(text) if text.starts_with("<summary>")));
+        assert!(matches!(&agent.history[1], Item::ToolCall(search) if search.name == "tool_search" && search.arguments.contains("select:mcp__fake__echo")));
+        assert!(matches!(&agent.history[2], Item::Found { names, .. } if names == &["mcp__fake__echo".to_owned()]));
+        assert_eq!(agent.history[3..], [echo, Item::ToolResult { call_id: "c1".into(), output: "hi".into() }]);
+        // A search answered by what it found has its result: nothing to repair.
+        let before = agent.history.clone();
+        agent.repair();
+        assert_eq!(agent.history, before);
     }
 
     #[tokio::test]
@@ -1692,8 +1836,17 @@ mod tests {
         let client = Client::new(rein_llm::reqwest::Client::new(), rein_llm::Api::Responses, format!("http://127.0.0.1:{port}"), rein_llm::Auth::Bearer("test".into()));
         let model = Llm { client, record: None };
         let input = [Item::User("hi".into())];
-        let request =
-            Request { model: "m", instructions: None, input: &input, tools: &[], reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None };
+        let request = Request {
+            model: "m",
+            instructions: None,
+            input: &input,
+            tools: &[],
+            reasoning_effort: None,
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+            hold_back: false,
+        };
         let started = std::time::Instant::now();
         let (items, _) = model.respond(&request, &mut |_| {}).await.unwrap();
         assert!(items.iter().any(|item| matches!(item, Item::Assistant(_))));
