@@ -3168,8 +3168,15 @@ fn skills_are_loaded_by_the_model_and_called_by_name() {
     );
     let saved = std::fs::read_to_string(term.dir.join("home/skills-trusted.json")).unwrap();
     assert!(saved.contains("project"), "the yes kept: {saved}");
-    let used = std::fs::read_to_string(term.dir.join("home/skills-used.json")).unwrap();
-    assert!(used.contains("\"graphs\": 1") && used.contains("\"review\": 1"), "each use counted: {used}");
+    // Counted once the turn is over, which is just after its answer shows.
+    let counted = |used: &str| used.contains("\"graphs\": 1") && used.contains("\"review\": 1");
+    let started = std::time::Instant::now();
+    let mut used = String::new();
+    while !counted(&used) && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+        used = std::fs::read_to_string(term.dir.join("home/skills-used.json")).unwrap_or_default();
+    }
+    assert!(counted(&used), "each use counted: {used}");
 }
 
 /// What a skill's load gave the model, by the skill's name.
@@ -3233,6 +3240,39 @@ fn skills_are_picked_from_the_list_named_anywhere_and_found_as_they_come() {
     pick(&mut term, "caveman");
     pick(&mut term, "use it");
     term.wait_until("the skill put in the box", |screen| screen.contains("› /caveman-commit"));
+}
+
+/// A skill you turned off, called by name, is offered back: say no and
+/// what you typed is in the box again; yes, and it's on and called. One
+/// only the model loads says so, not "no such command".
+#[test]
+fn a_skill_turned_off_is_offered_back_when_you_call_it() {
+    let mut model = Model::start(vec![says("Drawn.")]);
+    model.home.push((".agents/skills/graphs/SKILL.md".into(), "---\nname: graphs\ndescription: Draw graphs.\nargument-hint: \"[path]\"\n---\nDraw $0.\n".into()));
+    model.home.push((".agents/skills/quiet/SKILL.md".into(), "---\nname: quiet\ndescription: The model's alone.\nuser-invocable: false\n---\nShh.\n".into()));
+    model.home.push(("skills.json".into(), r#"{"off": ["graphs"]}"#.into()));
+    let mut term = Term::start_with(&model, "skills-off", 30, 120, &[]);
+    term.wait_for(IDLE);
+    term.keys("/graphs src\r");
+    term.wait_for("/graphs is turned off. Turn it on, and send this with it?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("n");
+    term.wait_until("what you typed back in the box", |screen| screen.contains("› /graphs src"));
+    assert!(model.requests().is_empty(), "nothing sent");
+    term.keys("\r");
+    term.wait_for("/graphs is turned off. Turn it on, and send this with it?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Drawn.");
+    assert!(term.text().contains("✓ /graphs is on now"), "{}", term.text());
+    assert!(loaded(&model, 0, "graphs").is_some_and(|output| output.contains("Draw src.")), "{:?}", model.requests()[0]);
+    let chosen = std::fs::read_to_string(term.dir.join("home/skills.json")).unwrap();
+    assert!(!chosen.contains("graphs"), "on, and kept so: {chosen}");
+    term.wait_for(IDLE);
+    term.keys("/quiet\r");
+    term.wait_for("/quiet is the model's to load, not yours to call");
+    term.wait_until("what you typed back in the box", |screen| screen.contains("› /quiet"));
+    assert_eq!(model.requests().len(), 1, "nothing more sent");
 }
 
 /// A task run on its own calls a skill as a message does.

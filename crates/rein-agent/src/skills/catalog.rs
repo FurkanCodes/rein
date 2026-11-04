@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn the_tool_offers_only_what_the_model_may_load() {
-        let skills = Skills { found: vec![skill("a", "For a."), Skill { model: false, ..skill("b", "Only yours to call.") }], left_out: Vec::new() };
+        let skills = Skills { found: vec![skill("a", "For a."), Skill { model: false, ..skill("b", "Only yours to call.") }], ..Skills::default() };
         let tool = spec(&skills, LEAST_ROOM).unwrap();
         assert!(tool.description.ends_with("The skills there are:\n- a: For a."), "{}", tool.description);
         assert_eq!(tool.parameters["required"], json!(["name", "arguments", "file", "start_line"]));
@@ -204,11 +204,11 @@ mod tests {
     #[test]
     fn a_change_is_noted_as_what_is_new_changed_and_gone() {
         let listed = vec![skill("a", "For a."), skill("b", "For b."), skill("c", "For c.")];
-        let same = Skills { found: listed.clone(), left_out: Vec::new() };
+        let same = Skills { found: listed.clone(), ..Skills::default() };
         assert_eq!(changes(&listed, &same), None);
         let now = Skills {
             found: vec![skill("a", "For a."), skill("b", "Now for b and more."), skill("d", "For d."), Skill { model: false, ..skill("c", "For c.") }],
-            left_out: Vec::new(),
+            ..Skills::default()
         };
         assert_eq!(
             changes(&listed, &now).unwrap(),

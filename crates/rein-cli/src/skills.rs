@@ -131,11 +131,11 @@ fn used(dir: &Path) -> BTreeMap<String, u32> {
     rein_llm::store::read_json(&dir.join(USED_FILE)).ok().flatten().unwrap_or_default()
 }
 
-/// `skills` as you chose: those off left out, saying so; those only you
-/// call kept from the model; each with how often it's been used.
+/// `skills` as you chose: those off kept apart, offered to no one; those
+/// only you call kept from the model; each with how often it's been used.
 fn apply(skills: &mut Skills, chosen: &Chosen, used: &BTreeMap<String, u32>) {
     let (off, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut skills.found).into_iter().partition(|skill| chosen.off.contains(&skill.name));
-    skills.left_out.extend(off.into_iter().map(|skill| (skill.folder, format!("{}: you turned it off; /skills turns it on", skill.name))));
+    skills.off = off;
     skills.found = kept;
     for skill in &mut skills.found {
         if chosen.yours.contains(&skill.name) {
@@ -176,6 +176,69 @@ fn calls<'a>(word: &str, first: bool, skills: &'a Skills) -> Option<&'a Skill> {
         return None;
     }
     skills.found.iter().find(|skill| skill.name == name && skill.you)
+}
+
+/// The skill named by `line`'s first word that isn't yours to call as it
+/// is: one you turned off, or one only the model loads.
+pub(crate) fn not_callable<'a>(line: &str, skills: &'a Skills) -> Option<&'a Skill> {
+    let word = line.split_whitespace().next()?;
+    let explicit = word.strip_prefix("/skill:");
+    let name = explicit.or_else(|| word.strip_prefix('/'))?;
+    if explicit.is_none() && rein_has(name) {
+        return None;
+    }
+    let off = skills.off.iter().filter(|skill| skill.you);
+    off.chain(skills.found.iter().filter(|skill| !skill.you)).find(|skill| skill.name == name)
+}
+
+/// A message calls `skill`, which isn't yours to call as it is: one
+/// turned off is turned on if you say so, and then it's called; of one
+/// only the model loads, why. Says whether to send the message.
+pub(crate) async fn call_anyway(agent: &mut Agent<Llm>, terminal: &mut Terminal, root: &Path, room: usize, skill: &Skill) -> CliResult<bool> {
+    let name = &skill.name;
+    if !skill.you {
+        let why = format!("✗ /{name} is the model's to load, not yours to call: its SKILL.md says user-invocable: false");
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&why));
+        return Ok(false);
+    }
+    let question = Question {
+        title: format!("/{name} is turned off. Turn it on, and send this with it?"),
+        detail: Some("You turned it off in /skills: the model isn't told of it, and /name doesn't call it.".into()),
+        command: None,
+        answers: vec![("y", "Yes, turn it on and send".to_owned()), ("n", "No, keep it off".to_owned())],
+    };
+    if !terminal.yes(question).await {
+        return Ok(false);
+    }
+    offer(agent, terminal, root, room, name, Offered::On).await?;
+    Ok(true)
+}
+
+/// Offers the skill `name` as `offered` from your next message, as you
+/// chose, kept in rein's folder; and says so.
+async fn offer(agent: &mut Agent<Llm>, terminal: &mut Terminal, root: &Path, room: usize, name: &str, offered: Offered) -> CliResult {
+    let dir = config_dir()?;
+    let mut chosen = chosen(&dir);
+    chosen.off.retain(|n| n != name);
+    chosen.yours.retain(|n| n != name);
+    match offered {
+        Offered::On => {}
+        Offered::YoursToCall => chosen.yours.push(name.to_owned()),
+        Offered::Off => chosen.off.push(name.to_owned()),
+    }
+    rein_llm::store::write_json_private(&dir.join(CHOSEN_FILE), &chosen).map_err(crate::describe)?;
+    refresh(agent, terminal, root, room, Look::Chosen).await;
+    say!("{}{} /{name} is {} now, from your next message", " ".repeat(GUTTER), terminal.err.green("✓"), said(offered));
+    Ok(())
+}
+
+/// How `offered` is said.
+fn said(offered: Offered) -> &'static str {
+    match offered {
+        Offered::On => "on",
+        Offered::YoursToCall => "only when you call it",
+        Offered::Off => "off",
+    }
 }
 
 /// `line` starts with a skill: it's a message, not a command.
@@ -287,18 +350,11 @@ pub(crate) async fn refresh(agent: &mut Agent<Llm>, terminal: &mut Terminal, roo
 /// end of the list, to see why.
 pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal, root: &Path, room: usize) -> CliResult {
     let (pad, s) = (" ".repeat(GUTTER), terminal.err);
-    let dir = config_dir()?;
-    let mut picked_chosen = chosen(&dir);
+    let picked_chosen = chosen(&config_dir()?);
     let all = find(root, terminal, false).await;
     // Those turned off are still yours to turn on.
-    let mut names: Vec<(String, Whose, String)> = all.found.iter().map(|skill| (skill.name.clone(), skill.whose, skill.description.clone())).collect();
-    for name in &picked_chosen.off {
-        if !names.iter().any(|(n, ..)| n == name) {
-            names.push((name.clone(), Whose::Yours, String::new()));
-        }
-    }
-    let left_out: Vec<String> =
-        all.left_out.iter().filter(|(_, why)| !why.contains("you turned it off")).map(|(folder, why)| rein_mcp::clean::text(&format!("{}: {why}", folder.display()))).collect();
+    let names: Vec<(String, Whose, String)> = all.found.iter().chain(&all.off).map(|skill| (skill.name.clone(), skill.whose, skill.description.clone())).collect();
+    let left_out: Vec<String> = all.left_out.iter().map(|(folder, why)| rein_mcp::clean::text(&format!("{}: {why}", folder.display()))).collect();
     if names.is_empty() && left_out.is_empty() {
         say!("{pad}No skills yet: rein reads them from ~/.agents/skills and ~/.claude/skills, the plugins on in Claude Code, and the project's .agents/skills");
         return Ok(());
@@ -311,11 +367,6 @@ pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal, roo
         } else {
             Offered::On
         }
-    };
-    let said = |offered: Offered| match offered {
-        Offered::On => "on",
-        Offered::YoursToCall => "only when you call it",
-        Offered::Off => "off",
     };
     let mut items: Vec<(String, String)> = names
         .iter()
@@ -368,17 +419,7 @@ pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal, roo
         }
         Pick::Offer(offered) => offered,
     };
-    picked_chosen.off.retain(|n| *n != name);
-    picked_chosen.yours.retain(|n| *n != name);
-    match offered {
-        Offered::On => {}
-        Offered::YoursToCall => picked_chosen.yours.push(name.clone()),
-        Offered::Off => picked_chosen.off.push(name.clone()),
-    }
-    rein_llm::store::write_json_private(&dir.join(CHOSEN_FILE), &picked_chosen).map_err(crate::describe)?;
-    refresh(agent, terminal, root, room, Look::Chosen).await;
-    say!("{pad}{} /{name} is {} now, from your next message", s.green("✓"), said(offered));
-    Ok(())
+    offer(agent, terminal, root, room, &name, offered).await
 }
 
 #[cfg(test)]
@@ -390,7 +431,7 @@ mod tests {
     }
 
     fn skills(names: &[(&str, bool)]) -> Skills {
-        Skills { found: names.iter().map(|(name, you)| skill(name, *you)).collect(), left_out: Vec::new() }
+        Skills { found: names.iter().map(|(name, you)| skill(name, *you)).collect(), ..Skills::default() }
     }
 
     #[test]
@@ -428,7 +469,22 @@ mod tests {
         apply(&mut found, &Chosen { off: vec!["a".into()], yours: vec!["b".into()] }, &BTreeMap::from([("c".to_owned(), 4)]));
         let shown: Vec<(&str, bool, u32)> = found.found.iter().map(|s| (s.name.as_str(), s.model, s.used)).collect();
         assert_eq!(shown, [("b", false, 0), ("c", true, 4)]);
-        assert!(found.left_out[0].1.starts_with("a: you turned it off"));
+        assert_eq!(found.off.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["a"], "kept apart, to turn on");
+        assert!(found.left_out.is_empty());
+    }
+
+    #[test]
+    fn a_skill_turned_off_or_only_the_models_is_known_when_you_call_it() {
+        let mut found = skills(&[("graphs", true), ("quiet", false), ("search", true)]);
+        found.off = vec![skill("deploy", true), skill("hidden", false), skill("mode", true)];
+        let named = |line: &str| not_callable(line, &found).map(|skill| skill.name.as_str());
+        assert_eq!(named("/deploy staging"), Some("deploy"));
+        assert_eq!(named("/skill:deploy"), Some("deploy"));
+        assert_eq!(named("/quiet"), Some("quiet"), "the model's alone");
+        assert_eq!(named("/graphs src"), None, "yours to call");
+        assert_eq!(named("/hidden"), None, "off and the model's: nothing of yours to turn on");
+        assert_eq!(named("look at /deploy"), None, "the first word only");
+        assert_eq!(named("/mode trust"), None, "rein's command comes first");
     }
 
     #[test]

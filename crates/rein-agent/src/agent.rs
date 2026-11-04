@@ -2141,22 +2141,23 @@ mod tests {
         agent.send("second".into(), &mut person).await.unwrap();
         agent.set_skills(find(), crate::skills::LEAST_ROOM);
         agent.send("third".into(), &mut person).await.unwrap();
-        let requests = agent.model.requests.borrow();
-        assert_eq!(requests[1].tools, requests[0].tools, "the list stays");
-        assert_eq!(agent.specs, listed);
-        let notes: Vec<&String> = requests[2]
-            .input
-            .iter()
-            .filter_map(|item| match item {
-                Item::User(text) if text.starts_with("[The skills") => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(notes.len(), 1, "told once, not again while nothing more changed: {notes:?}");
-        assert!(notes[0].contains("New, to load as the listed ones are:\n- deploy: Ship it."), "{}", notes[0]);
-        let second = requests[1].input.iter().position(|item| matches!(item, Item::User(text) if text == "second")).unwrap();
-        assert!(matches!(&requests[1].input[second - 1], Item::User(text) if text == notes[0]), "just before your message");
-        drop(requests);
+        {
+            let requests = agent.model.requests.borrow();
+            assert_eq!(requests[1].tools, requests[0].tools, "the list stays");
+            assert_eq!(agent.specs, listed);
+            let notes: Vec<&String> = requests[2]
+                .input
+                .iter()
+                .filter_map(|item| match item {
+                    Item::User(text) if text.starts_with("[The skills") => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(notes.len(), 1, "told once, not again while nothing more changed: {notes:?}");
+            assert!(notes[0].contains("New, to load as the listed ones are:\n- deploy: Ship it."), "{}", notes[0]);
+            let second = requests[1].input.iter().position(|item| matches!(item, Item::User(text) if text == "second")).unwrap();
+            assert!(matches!(&requests[1].input[second - 1], Item::User(text) if text == notes[0]), "just before your message");
+        }
         // Nothing kept word for word: the note comes after the summary.
         let limit = agent.limit();
         agent.set_limit(5);

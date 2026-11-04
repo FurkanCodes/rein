@@ -70,10 +70,13 @@ pub struct Skill {
     pub used: u32,
 }
 
-/// The skills found, and those left out, each with why.
+/// The skills found, those you turned off, and those left out, each with
+/// why.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Skills {
     pub found: Vec<Skill>,
+    /// Found, but turned off: offered to no one, and yours to turn on.
+    pub off: Vec<Skill>,
     pub left_out: Vec<(PathBuf, String)>,
 }
 

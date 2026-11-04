@@ -571,7 +571,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
         let pad = " ".repeat(GUTTER);
         // A command is rein's; anything else is a message, and the skills
         // are looked at again for it: one added or changed since is there.
-        let parsed = match crate::commands::parse(line).filter(|_| !crate::skills::starts_with_skill(line, agent.skills())) {
+        let mut parsed = match crate::commands::parse(line).filter(|_| !crate::skills::starts_with_skill(line, agent.skills())) {
             Some(Ok(command)) => Some(Ok(command)),
             // Not one of rein's: maybe a skill added since.
             other => {
@@ -579,6 +579,24 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 other.filter(|_| !crate::skills::starts_with_skill(line, agent.skills()))
             }
         };
+        // A skill of yours that can't be called as it is: turned on if you
+        // say so, or why not; what you typed is back in the box otherwise.
+        if !matches!(parsed, Some(Ok(_)))
+            && let Some(skill) = crate::skills::not_callable(line, agent.skills()).cloned()
+        {
+            match crate::skills::call_anyway(agent, terminal, &setup.root, setup.skill_room(&agent.model_name), &skill).await {
+                Ok(true) => parsed = None,
+                Ok(false) => {
+                    terminal.input.insert(line);
+                    continue;
+                }
+                Err(e) => {
+                    say!("{pad}{}", terminal.err.red(&format!("✗ {e}")));
+                    terminal.input.insert(line);
+                    continue;
+                }
+            }
+        }
         if parsed.is_none() {
             for (skill, given) in crate::skills::called(line, agent.skills()) {
                 agent.call_skill(&skill, given);

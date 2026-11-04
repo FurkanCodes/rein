@@ -544,7 +544,9 @@ placeholder, which Claude Code fills regardless.
 
 `disable-model-invocation` keeps a skill from the model, `user-invocable:
 false` from you. `/skills` lists them all: pick one to put it in the box,
-turn it off, keep it for you to call, or turn it back on.
+turn it off, keep it for you to call, or turn it back on. Call one you
+turned off and rein asks to turn it on and send your message with it;
+say no, and what you typed is back in the box.
 
 A skill is someone's text: nothing in it runs because it's loaded, and
 its `allowed-tools` lets nothing run without asking. A name holds letters,
