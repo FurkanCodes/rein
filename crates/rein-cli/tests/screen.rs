@@ -610,6 +610,9 @@ impl Term {
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "test")
             .env("OPENAI_BASE_URL", &model.base)
+            // Asking, as most tests are about what asks; one that wants
+            // rein's own default sets it empty.
+            .env("REIN_MODE", "ask")
             .envs(model.env.iter().map(|(name, value)| (name, value)))
             // Copies go to the terminal (OSC 52), never this computer's clipboard.
             .env("SSH_CONNECTION", "screen-test")
@@ -1872,8 +1875,8 @@ fn lists_open_over_the_box_the_best_match_next_to_it() {
     term.keys("/mode\r");
     term.wait_for("› ask•");
     let screen = term.text();
-    assert_eq!(row(&screen, "› ask•"), border(&screen) - 1, "a picker's too:\n{screen}");
-    assert!(row(&screen, "edits") < row(&screen, "› ask•"), "{screen}");
+    assert_eq!(row(&screen, "trust"), border(&screen) - 1, "a picker's first right on the box too:\n{screen}");
+    assert!(row(&screen, "edits") < row(&screen, "› ask•") && row(&screen, "› ask•") < row(&screen, "trust"), "{screen}");
     term.keys("\x1b");
 }
 
@@ -1898,7 +1901,12 @@ fn a_menu_is_chosen_from_with_the_arrows_and_enter() {
     term.wait_for("› edits");
     term.keys("\r");
     term.wait_for("✓ edits: file changes in this folder");
+    // Asked whether to keep it: no, as most of the time.
+    term.wait_for("Start in edits from now on?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("n");
     term.wait_until("the bar says edits", |screen| screen.lines().last().is_some_and(|bar| bar.contains("edits")));
+    assert!(!term.dir.join("home/config").exists(), "nothing kept");
 
     // Esc changes nothing; what's typed narrows the list.
     term.keys("/effort\r");
@@ -2060,10 +2068,111 @@ fn shift_tab_goes_through_the_modes_auto_among_them() {
     let model = Model::start(Vec::new());
     let mut term = Term::start(&model, "mode-cycle", 30, 100);
     term.wait_for(IDLE);
-    for mode in ["edits: ", "auto: nothing asks", "read-only: ", "ask: "] {
+    for mode in ["edits: ", "auto: nothing asks", "read-only: ", "trust: ", "ask: "] {
         term.keys("\x1b[Z");
         term.wait_for(mode);
     }
+}
+
+#[test]
+fn rein_starts_in_trust_mode_and_asks_before_deleting() {
+    let turns = vec![Turn { out: vec![bash("touch made.txt", "write", None)] }, Turn { out: vec![bash("rm made.txt", "write", None)] }, says("Made it, and took it away.")];
+    // Rein's own default, with nothing set.
+    let model = Model::start(turns).with_env("REIN_MODE", "");
+    let mut term = Term::start(&model, "trust-default", 30, 120);
+    term.wait_for("rein runs everything without asking, but deleting (rm, git clean, git push --force and the like) asks first");
+    term.wait_for(IDLE);
+    assert!(term.text().lines().last().unwrap_or_default().contains("trust"), "the bar says so:\n{}", term.text());
+    let rules = std::fs::read_to_string(term.dir.join("home/permissions")).unwrap();
+    assert!(rules.lines().any(|line| line == "ask rm") && rules.lines().any(|line| line == "ask git push --force"), "{rules}");
+    term.keys("make a file, then take it away\r");
+    term.wait_for("Your rule `ask rm` asks first");
+    assert!(term.dir.join("project/made.txt").exists(), "made without asking");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Made it, and took it away.");
+    assert!(!term.dir.join("project/made.txt").exists());
+    assert_eq!(results(&model), ["[exit code 0]", "[exit code 0]"]);
+    term.wait_for(IDLE);
+    term.keys("\x04");
+    // Said once, the first time; your rules are kept as they are.
+    let term = term.again(&model);
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("rein runs everything"), "{}", term.text());
+}
+
+#[test]
+fn permissions_adds_your_rules_and_takes_them_out() {
+    let turns = vec![Turn { out: vec![bash("touch made.txt", "write", None)] }, says("Touched it."), Turn { out: vec![bash("rm made.txt", "write", None)] }, says("Removed it.")];
+    let model = Model::start(turns).with_env("REIN_MODE", "");
+    let mut term = Term::start(&model, "permissions", 30, 120);
+    term.wait_for(IDLE);
+    // Added from the list: "+ add" is first, next to the box.
+    term.keys("/permissions\r");
+    term.wait_for("› + add");
+    term.wait_for("ask rm");
+    term.keys("\r");
+    term.wait_for("A rule, like ask git push");
+    term.keys("ask touch\r");
+    term.wait_for("`ask touch` is one of your rules now, for every project");
+    let rules = std::fs::read_to_string(term.dir.join("home/permissions")).unwrap();
+    assert!(rules.ends_with("ask dropdb\nask touch\n") && rules.starts_with("# Your rules"), "added at the end, the rest kept:\n{rules}");
+    term.wait_for(IDLE);
+    term.keys("make it\r");
+    term.wait_for("Your rule `ask touch` asks first");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Touched it.");
+    term.wait_for(IDLE);
+    // Taken out from the list, once you say so.
+    term.keys("/permissions\r");
+    term.wait_for("› + add");
+    term.keys("ask rmdir");
+    term.wait_for("› ask rmdir");
+    term.keys("\r");
+    term.wait_for("Take `ask rmdir` out of your rules?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("`ask rmdir` is out of your rules");
+    term.wait_for(IDLE);
+    // And as typed: then rm runs without asking.
+    term.keys("/permissions remove ask rm\r");
+    term.wait_for("`ask rm` is out of your rules");
+    term.wait_for(IDLE);
+    let rules = std::fs::read_to_string(term.dir.join("home/permissions")).unwrap();
+    assert!(!rules.lines().any(|line| line == "ask rm" || line == "ask rmdir") && rules.lines().any(|line| line == "ask unlink"), "{rules}");
+    assert!(rules.starts_with("# Your rules") && rules.ends_with("ask touch\n"), "the rest kept:\n{rules}");
+    term.keys("take it away\r");
+    term.wait_for("Removed it.");
+    assert!(!term.dir.join("project/made.txt").exists() && !term.text().contains("`ask rm` asks"), "{}", term.text());
+    term.wait_for(IDLE);
+    term.keys("/permissions remove ask rm\r");
+    term.wait_for("`ask rm` isn't one of your rules; /permissions lists them");
+}
+
+#[test]
+fn a_mode_chosen_can_be_kept_for_new_conversations() {
+    let model = Model::start(Vec::new()).with_env("REIN_MODE", "");
+    let mut term = Term::start(&model, "mode-kept", 30, 120);
+    term.wait_for(IDLE);
+    term.keys("/mode edits\r");
+    term.wait_for("Start in edits from now on?");
+    term.wait_for("New conversations start in trust now");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("new conversations start in edits");
+    term.wait_for(IDLE);
+    let settings = std::fs::read_to_string(term.dir.join("home/config")).unwrap();
+    assert_eq!(settings, "mode = edits\n");
+    term.keys("\x04");
+    let mut term = term.again(&model);
+    term.wait_for("Mode: edits (");
+    term.wait_for(IDLE);
+    // Kept already: nothing to ask.
+    term.keys("/mode edits\r");
+    term.wait_for("✓ edits: ");
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("from now on?"), "{}", term.text());
 }
 
 #[cfg(target_os = "macos")]

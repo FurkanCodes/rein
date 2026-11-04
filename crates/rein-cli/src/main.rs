@@ -30,6 +30,7 @@ mod harden;
 mod input;
 mod mcp;
 mod peers;
+mod rules;
 mod settings;
 use settings::Settings;
 mod terminal;

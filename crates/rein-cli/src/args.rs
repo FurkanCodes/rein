@@ -56,14 +56,14 @@ Options:
   -r, --resume          Choose which saved conversation to continue
   -s, --system <text>   Standing instructions, added to rein's system prompt
       --mode <mode>     What runs without asking:
-                          ask        reading, and commands that only look (default)
+                          trust      everything, without the sandbox, but what
+                                     ask rules name, like deleting (default)
+                          ask        reading, and commands that only look
                           edits      file changes in this folder, and commands
                                      that stay in the sandbox
                           auto       the same, and nothing ever asks: what would
                                      go past the sandbox is refused
                           read-only  only reading: commands look, nothing changes
-                          trust      everything, without the sandbox, except what
-                                     deny rules block
       --max-steps <n>   How many steps a turn may take when nobody is
                         watching (auto mode, a one-shot task), or off;
                         default 200. While you watch there's no limit
@@ -73,15 +73,19 @@ Options:
       --worktree        Work in the workspace's own git worktree, beside this
                         repository, made on first use on a branch of its name
 
-Rules in .rein/permissions refine the mode for commands, one per line:
+Rules refine the mode for commands, one per line: yours, for every project,
+in ~/.config/rein/permissions (or /permissions), and a project's own in
+.rein/permissions:
   allow cargo test
   ask   git commit
   deny  git push
 Deny beats ask beats allow, and a command only runs without asking if every
-part of it is allowed. Rules decide when rein asks; they aren't a sandbox.
+part of it is allowed. Yours start by asking before deleting (rm, git clean,
+git push --force and the like). Rules decide when rein asks; they aren't a
+sandbox.
 
-Commands run in a sandbox: macOS's own, or on Linux Landlock and seccomp.
-Each says what it needs: look, write (files in this folder), network (and
+In every mode but trust, commands run in a sandbox: macOS's own, or on
+Linux Landlock and seccomp. Each says what it needs: look, write (files in this folder), network (and
 the internet) or outside (no sandbox), and the sandbox holds it to that.
 Even with write access a command can't change files outside this folder,
 read the keys and logins in your home folder, or change what runs code
@@ -181,7 +185,7 @@ impl AskArgs {
         let (mut effort, mut system, mut record, mut words) = (effort, None, None, Vec::new());
         let mut mode = match settings.get("mode", "REIN_MODE") {
             Some(name) => name.parse::<Mode>().map_err(|e| format!("{e} (in the settings)"))?,
-            None => Mode::Ask,
+            None => Mode::default(),
         };
         let switch = |key: &str, env: &str| match settings.get(key, env).as_deref() {
             None | Some("on") => Ok(true),
@@ -288,7 +292,12 @@ mod tests {
         let parsed = args("--mode edits fix the bug").unwrap();
         assert_eq!((parsed.mode, parsed.prompt.as_deref()), (Mode::Edits, Some("fix the bug")));
         assert_eq!(args("--mode edits").unwrap().prompt, None, "no task: a conversation");
-        assert_eq!(args("--mode yolo hi").err().as_deref(), Some("no mode called yolo; use ask, edits, auto, read-only or trust"));
+        assert_eq!(args("--mode yolo hi").err().as_deref(), Some("no mode called yolo; use trust, ask, edits, auto or read-only"));
+    }
+
+    #[test]
+    fn rein_starts_in_trust_mode() {
+        assert_eq!(args("hi").unwrap().mode, Mode::Trust);
     }
 
     #[test]

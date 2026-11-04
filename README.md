@@ -5,7 +5,8 @@ A tiny, fast agent harness. You hold the reins.
 rein is an open-source agent harness written in Rust, built to be the
 fastest and smallest harness around, and a smart one. It's early: today it holds
 a conversation in the folder you run it in, reading, writing and editing files
-and running commands, asking you first.
+and running commands, asking you first before deleting what may not come
+back (or before more, in the [mode](#modes) you pick).
 
 ## Build
 
@@ -205,7 +206,7 @@ message, so typing ahead can't answer it by accident.
 | Shift-Enter, Ctrl-J, or `\` at the end of a line | a new line in your message (Shift-Enter where the terminal tells it apart from Enter) |
 | `/` | the commands that match, as you type: ↑↓ pick one, Tab completes it, Enter runs it. `/help` lists them |
 | `@` | the project's files and folders that match, as you type, letters in order (`@prsr` finds `src/parser.rs`): ↑↓ pick, Tab puts the path in, Esc closes the list. What you point at goes with your message |
-| Shift-Tab | the next mode: ask → edits → auto → read-only |
+| Shift-Tab | the next mode: trust → ask → edits → auto → read-only |
 | Enter while rein works | steer it: your message goes into the turn at its next step, and steps rein had planned but not started are skipped. Commands wait for the end of the turn |
 | Tab while rein works | send your message after the turn instead. Esc puts what's waiting back in the box |
 | Esc or Ctrl-C while rein works | stop that turn; the conversation goes on |
@@ -215,7 +216,8 @@ message, so typing ahead can't answer it by accident.
 | Mouse wheel, PgUp / PgDn, Shift-↑ / ↓ | scroll the conversation |
 | Drag over text | select it and copy it to the clipboard |
 | Ctrl-L | draw the window again |
-| `/mode [ask\|edits\|auto\|read-only\|trust]` | show or change what runs without asking (also `/permissions`) |
+| `/mode [trust\|ask\|edits\|auto\|read-only]` | show or change what runs without asking, and keep it for new conversations if you like |
+| `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/mcp`, `/mcp add`, `/mcp import`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one by name from the MCP Registry, as you'd start it in a shell, or from the JSON its README gives; bring yours in from other apps; the same changes typed (see [MCP servers](#mcp-servers)) |
@@ -227,7 +229,7 @@ message, so typing ahead can't answer it by accident.
 
 A command given no choice shows what there is to choose from: `/model`
 lists every provider's models, `/login` the providers, and `/mode`,
-`/effort`, `/logout` and `/resume` theirs. ↑↓ move (PgUp/PgDn a page at a
+`/permissions`, `/effort`, `/logout` and `/resume` theirs. ↑↓ move (PgUp/PgDn a page at a
 time), typing narrows the list, as `@` finds files, Enter picks and Esc
 changes nothing. The one in use is marked •.
 
@@ -359,8 +361,8 @@ for anything but asking how it's doing, that are reins themselves. Sandboxed
 commands can't reach the sockets or read the files at all. A sender that
 writes too often or repeats itself is turned away, and once other reins
 have started 12 turns in a row without you, what they send waits in
-`/inbox`. A rein in trust mode, where nothing asks you, always holds what
-comes in; `peers = hold` does that in every mode, `refuse` takes nothing,
+`/inbox`. A rein in trust mode, where almost nothing asks you, always holds
+what comes in; `peers = hold` does that in every mode, `refuse` takes nothing,
 and `off` keeps a rein out of it. What a rein's own sub-agents send back,
 and the result of a task it handed out, always go in.
 
@@ -385,6 +387,8 @@ tab_command = "my-term --new-tab --title {title} -- {command}"
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`,
 `$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS`,
 `$REIN_SANDBOX`, `$REIN_PEERS` and `$REIN_STRIP`, which win over the file.
+`/mode` writes `mode` here when you keep the one you picked, and leaves the
+rest as it was.
 
 ## Small things that matter
 
@@ -471,8 +475,8 @@ don't ask again this run", or Esc to say no and tell rein what to do instead.
 
 ### The sandbox
 
-Commands run in a sandbox: the operating system holds each one, and
-everything it starts, to what it needs. The model says what that is when it
+In every mode but `trust`, commands run in a sandbox: the operating system
+holds each one, and everything it starts, to what it needs. The model says what that is when it
 asks to run one:
 
 | Access | The command may |
@@ -528,26 +532,38 @@ programs can't read it.
 
 ### Modes
 
-`--mode` sets what runs without asking, by what a command needs:
+rein starts in `trust`: everything runs without asking, commands without
+the sandbox, except what your rules say to ask about first, which starts
+as deleting. `--mode`, `mode` in the settings, or `/mode`, which offers to
+keep what you pick for new conversations, set what runs without asking, by
+what a command needs:
 
 | Mode | File changes | `look` | `write` | `network`, `outside` |
 |---|---|---|---|---|
-| `ask` (default) | ask | runs | ask | ask |
+| `trust` (default) | allowed | runs | runs | runs |
+| `ask` | ask | runs | ask | ask |
 | `edits` | allowed | runs | runs | ask |
 | `auto` | allowed | runs | runs | refused |
 | `read-only` | refused | runs | refused | refused |
-| `trust` | allowed | runs | runs | runs |
 
-`trust` runs every command without the sandbox, except what deny rules
-block. An MCP server keeps the walls it was added with, in every mode:
-`/mcp` lets one out.
+`trust` runs every command without the sandbox, except what an ask rule
+names, which asks, and what a deny rule blocks. What the model reads (a web
+page, an issue, a file in a cloned repository, an MCP server's answer) can
+lead it to run any command with your keys and the network, and the rules
+are about mistakes, not about that: for work you'd rather not watch, the
+other modes' walls hold whatever the model is told. An MCP server keeps
+the walls it was added with, in every mode: `/mcp` lets one out.
 `auto` never asks: it's for leaving rein to work on its own, and what would
 go past the sandbox is refused, so the model makes do or tells you what it
 needs. File changes to the protected paths above ask in every mode but
 `trust`, even in `edits`. Without a sandbox, commands ask in `ask` and
 `edits`, and `auto` and `read-only` run none.
 
-Rules in `.rein/permissions` refine this for commands:
+### Rules
+
+Rules refine the mode for commands, one per line: yours, for every
+project, in `~/.config/rein/permissions`, and a project's own, in its
+`.rein/permissions`:
 
 ```
 allow cargo test
@@ -555,15 +571,40 @@ ask   git commit
 deny  git push
 ```
 
-Deny beats ask beats allow. The file comes with the project, which may be
-anyone's, so an allow rule only spares asking about a command that stays in
-the sandbox: one that needs `outside` gets your keys, and always asks you.
-It counts only if every part of a command is allowed, so `allow cargo fetch`
-doesn't cover `cargo fetch && rm -rf x`; anything rein can't take apart, like
-`$(...)`, redirects or globs, no allow rule covers. Deny and ask rules still
-find the commands in it. An answer of "always" is for that command with as
-much access as that time. Rules decide when rein asks; they aren't a
-sandbox, so `deny rm` doesn't stop `/bin/rm`.
+Yours start as rules that ask before deleting what may not come back:
+`rm`, `rmdir`, `unlink`, `shred`, `rimraf`, `find -delete` and
+`rsync --delete`; git's `clean`, `reset --hard`, `checkout --` and
+`checkout .`, `restore`, `stash drop` and `stash clear`, `branch -D`,
+`push --force` (`-f`, `--delete`, `-d`) and `worktree remove`; and
+`docker rmi` and `prune`, `kubectl delete`, `terraform destroy` and
+`dropdb`. They ask in every mode; `auto`, which never asks, refuses them.
+`/permissions` lists your rules and the project's: pick "+ add" to add one,
+or one of yours to take it out, or type `/permissions add ask git push`
+and `/permissions remove ask rm`. rein writes the file the first time it
+starts, with a line about each, and after that only adds and takes out
+the lines you ask it to, so you can edit it too.
+
+An ask or deny rule finds its command anywhere in a line, by its name past
+any path and whatever the letters' case: after `sudo`, `xargs` or
+`find -exec`, as `/bin/rm`, inside `sh -c '…'`. Its other words come
+after it, in order, wherever they are, a long flag covering its longer
+forms and a short one the clusters it's in: `ask git push --force` finds
+`git push origin --force-with-lease`, and `ask git push -f` finds
+`git push -fu origin`. The question says which rule asked. An allow rule
+is strict: each part of a command has to start with an allow rule's words,
+so `allow cargo fetch` doesn't cover `cargo fetch && rm -rf x` or
+`sudo cargo fetch`, and anything rein can't take apart, like `$(...)`,
+redirects or globs, no allow rule covers. Deny beats ask beats allow. An
+answer of "always" is for that command with as much access as that time,
+even when an ask rule names it.
+
+A project's file comes with the project, which may be anyone's, so its
+allow rules only spare asking about a command that stays in the sandbox:
+one that needs `outside` gets your keys, and always asks you. Yours count
+wherever a command runs. Rules decide when rein asks; they aren't a
+sandbox: a script that deletes files itself, like `make clean`, or a
+command spelt to hide from them gets past. In `trust`, with any deny rule,
+a line rein can't take apart asks rather than run on a guess.
 
 ## MCP servers
 

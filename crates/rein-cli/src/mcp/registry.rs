@@ -10,7 +10,7 @@ use rein_agent::sandbox::Access;
 use rein_mcp::registry::{self, Found, Start};
 use rein_mcp::{Named, Origin};
 
-use super::{Mcp, add, yes};
+use super::{Mcp, add};
 use crate::CliResult;
 use crate::input::{Menu, Question, Read};
 use crate::terminal::Terminal;
@@ -138,7 +138,7 @@ async fn confirm(found: &Found, server: &rein_mcp::Server, mcp: &Mcp, terminal: 
         command: Some(server.command_line()),
         answers: vec![("y", "Yes, add it".to_owned()), ("n", "No".to_owned())],
     };
-    yes(question, terminal).await
+    terminal.yes(question).await
 }
 
 /// Whether `command` is a program on your `PATH`.

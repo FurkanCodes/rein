@@ -7,7 +7,8 @@ use rein_llm::Effort;
 /// Every command: its name, what it takes, and what it does.
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/help", "", "list these commands"),
-    ("/mode", "[ask|edits|read-only|trust]", "show or change what runs without asking"),
+    ("/mode", "[trust|ask|edits|auto|read-only]", "show or change what runs without asking"),
+    ("/permissions", "[add|remove rule]", "what asks first, or is refused: your rules, for every project, and this one's"),
     ("/model", "[id]", "list the models, or switch to one"),
     ("/login", "[provider]", "sign in to a provider, or see what pays for each"),
     ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
@@ -30,13 +31,14 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 ];
 
 /// Other names for the same commands, as other harnesses spell them.
-const ALIASES: &[(&str, &str)] = &[("/clear", "/new"), ("/quit", "/exit"), ("/permissions", "/mode")];
+const ALIASES: &[(&str, &str)] = &[("/clear", "/new"), ("/quit", "/exit")];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Slash {
     Help,
     /// `None` shows the mode.
     Mode(Option<Mode>),
+    Permissions(Rules),
     Model(Option<String>),
     /// `None` lists the providers and what pays for each.
     Login(Option<String>),
@@ -112,6 +114,32 @@ impl Mcp {
             ("allow", [name, tools @ ..]) if !tools.is_empty() => Ok(Mcp::Allow(name.clone(), tools.to_vec())),
             ("allow", _) => Err(Refused::Said("/mcp allow takes a server's name and its tools to run without asking, or * for all of them".into())),
             (other, _) => Err(Refused::Said(format!("/mcp takes add, import, remove or allow, not {other}; alone, it lists the servers"))),
+        }
+    }
+}
+
+/// What `/permissions` does.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Rules {
+    /// Lists every rule to pick one from, or add one.
+    Show,
+    /// `/permissions add ask git push`: one more of yours, as written.
+    Add(String),
+    /// `/permissions remove ask rm`: one of yours out.
+    Remove(String),
+}
+
+impl Rules {
+    fn parse(rest: &str) -> Result<Rules, Refused> {
+        let (word, rule) = rest.split_once(char::is_whitespace).map_or((rest, ""), |(word, rule)| (word, rule.trim()));
+        match (word, rule) {
+            ("", _) => Ok(Rules::Show),
+            ("add", "") | ("remove", "") => Err(Refused::Said(format!("/permissions {word} takes a rule, like ask git push"))),
+            ("add", rule) => Ok(Rules::Add(rule.to_owned())),
+            ("remove", rule) => Ok(Rules::Remove(rule.to_owned())),
+            // A rule alone is one to add.
+            ("allow" | "ask" | "deny", _) => Ok(Rules::Add(rest.to_owned())),
+            (other, _) => Err(Refused::Said(format!("/permissions takes add or remove and a rule, not {other}; alone, it lists the rules"))),
         }
     }
 }
@@ -249,6 +277,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
             None => Ok(Slash::Mode(None)),
             Some(name) => name.parse().map(|m| Slash::Mode(Some(m))).map_err(Refused::Said),
         },
+        "/permissions" => Rules::parse(rest).map(Slash::Permissions),
         "/model" => Ok(Slash::Model(arg)),
         "/login" => match words.as_slice() {
             [] => Ok(Slash::Login(None)),
@@ -349,7 +378,12 @@ mod tests {
     #[test]
     fn reads_commands_and_their_arguments() {
         assert_eq!(parse("/mode edits"), Some(Ok(Slash::Mode(Some(Mode::Edits)))));
-        assert_eq!(parse("  /permissions  "), Some(Ok(Slash::Mode(None))));
+        assert_eq!(parse("  /permissions  "), Some(Ok(Slash::Permissions(Rules::Show))));
+        assert_eq!(parse("/permissions add ask git  push"), Some(Ok(Slash::Permissions(Rules::Add("ask git  push".into())))));
+        assert_eq!(parse("/permissions deny curl"), Some(Ok(Slash::Permissions(Rules::Add("deny curl".into())))));
+        assert_eq!(parse("/permissions remove ask rm"), Some(Ok(Slash::Permissions(Rules::Remove("ask rm".into())))));
+        assert!(matches!(parse("/permissions remove"), Some(Err(Refused::Said(_)))));
+        assert!(matches!(parse("/permissions forget rm"), Some(Err(Refused::Said(_)))));
         assert_eq!(parse("/model gpt-6.1-terra"), Some(Ok(Slash::Model(Some("gpt-6.1-terra".into())))));
         assert_eq!(parse("/effort default"), Some(Ok(Slash::Effort(Some(EffortSetting::Default)))));
         assert_eq!(parse("/effort xhigh"), Some(Ok(Slash::Effort(Some(EffortSetting::Level(Effort::XHigh))))));
@@ -377,7 +411,7 @@ mod tests {
 
     #[test]
     fn says_what_went_wrong() {
-        assert_eq!(parse("/mode yolo"), Some(Err(Refused::Said("no mode called yolo; use ask, edits, auto, read-only or trust".into()))));
+        assert_eq!(parse("/mode yolo"), Some(Err(Refused::Said("no mode called yolo; use trust, ask, edits, auto or read-only".into()))));
         assert_eq!(parse("/frobnicate"), Some(Err(Refused::Said("there's no /frobnicate command; /help lists them".into()))));
     }
 
@@ -462,6 +496,6 @@ mod tests {
         assert_eq!(names("/"), COMMANDS.iter().map(|c| c.0).collect::<Vec<_>>());
         assert!(names("/mode ").is_empty());
         assert!(names("hello").is_empty());
-        assert!(help()[1].starts_with("/mode [ask|edits|read-only|trust]"));
+        assert!(help()[1].starts_with("/mode [trust|ask|edits|auto|read-only]"));
     }
 }

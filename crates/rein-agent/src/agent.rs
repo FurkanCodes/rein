@@ -14,7 +14,7 @@ use rein_llm::{Client, Error, ErrorKind, Event, Item, Request, Result, Tool, Too
 use crate::compact;
 use crate::context;
 use crate::mentions;
-use crate::permissions::{Decision, Permissions};
+use crate::permissions::{Decision, Permissions, Rule};
 use crate::session::{Loaded, Session};
 use crate::tools::{ToolName, Tools};
 
@@ -83,9 +83,10 @@ pub trait Ui {
     fn thought(&mut self, _delta: &str) {}
     /// Something to know about the answer: another model gave it, say.
     fn note(&mut self, _note: &str) {}
-    /// Asked when the permissions say to ask. It's async so that an
+    /// Asked when the permissions say to ask, with the rule that asks, if
+    /// one does (in trust mode, only a rule asks). It's async so that an
     /// interrupt can cancel the turn even while it waits for an answer.
-    fn approve(&mut self, call: &ToolCall) -> impl Future<Output = Approval>;
+    fn approve(&mut self, call: &ToolCall, rule: Option<&Rule>) -> impl Future<Output = Approval>;
     fn tool_started(&mut self, call: &ToolCall);
     /// Steps that only look, asked for together, starting at once.
     fn tools_started(&mut self, calls: &[ToolCall]) {
@@ -542,7 +543,7 @@ impl<M: Model> Agent<M> {
                     ui.tool_blocked(&call, &reason);
                     Err(reason)
                 }
-                Decision::Ask => match ui.approve(&call).await {
+                Decision::Ask => match ui.approve(&call, self.permissions.asked_by(&call)).await {
                     Approval::Yes => Ok(()),
                     Approval::Always => {
                         self.permissions.remember(&call);
@@ -1199,7 +1200,7 @@ mod tests {
         fn text(&mut self, delta: &str) {
             self.log.push(format!("text {delta}"));
         }
-        async fn approve(&mut self, call: &ToolCall) -> Approval {
+        async fn approve(&mut self, call: &ToolCall, _: Option<&Rule>) -> Approval {
             self.log.push(format!("asked {}", call.arguments));
             self.answer
         }
@@ -1225,7 +1226,7 @@ mod tests {
 
     impl Ui for Steerer {
         fn text(&mut self, _: &str) {}
-        async fn approve(&mut self, _: &ToolCall) -> Approval {
+        async fn approve(&mut self, _: &ToolCall, _: Option<&Rule>) -> Approval {
             Approval::Yes
         }
         fn tool_started(&mut self, call: &ToolCall) {
@@ -1509,7 +1510,8 @@ mod tests {
             specs: tool_specs(&tools),
             listed: false,
             tools,
-            permissions: Permissions::default(),
+            // Asking, so there's something for the person to answer.
+            permissions: Permissions::new(Mode::Ask, "").unwrap(),
             model_name: "m".into(),
             instructions: None,
             reasoning_effort: None,

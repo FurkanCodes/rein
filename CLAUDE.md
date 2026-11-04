@@ -110,6 +110,9 @@ finding. Each says why in a line.
 
 - Permission checks fail closed: what rein can't parse it doesn't allow on a
   guess. A `deny` rule was dodged by gluing the command to a `;`.
+- A rule that asks or refuses looks hard for what it names; one that allows
+  matches only exactly. `deny rm` once missed `/bin/rm`, `sudo rm` and
+  `sh -c 'rm …'`, while a looser `allow ls` would have let `sudo ls` run.
 - Secrets never reach `Debug`: types holding keys or tokens (`Auth`,
   `Credentials`) have a hand-written `Debug` that leaves them out. A derived
   `Debug` prints them into any log or panic message.

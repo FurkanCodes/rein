@@ -295,7 +295,7 @@ async fn sign_in(server: &Server, challenge: &str, mcp: &Mcp, terminal: &mut Ter
         command: None,
         answers: vec![("y", "Yes, open the browser".to_owned()), ("n", "No".to_owned())],
     };
-    if !yes(question, terminal).await {
+    if !terminal.yes(question).await {
         return Ok(false);
     }
     let pending = tokens.begin(&url, &found, yours).await.map_err(describe)?;
@@ -327,7 +327,7 @@ async fn let_out(server: &Server, terminal: &mut Terminal) -> bool {
         command: None,
         answers: vec![("y", "Yes, run it outside".to_owned()), ("n", "No, leave it in the sandbox".to_owned())],
     };
-    yes(question, terminal).await
+    terminal.yes(question).await
 }
 
 /// Asks for each variable `server` needs that isn't set, in dots, and
@@ -552,30 +552,13 @@ async fn say_yes(server: &Server, dir: &Path, key: &str, terminal: &mut Terminal
         command: Some(server.command_line()),
         answers: vec![("y", "Yes, start it".to_owned()), ("n", "No, not this time".to_owned())],
     };
-    if !yes(question, terminal).await {
+    if !terminal.yes(question).await {
         return false;
     }
     if let Err(e) = approve(dir, key, server) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&format!("✗ can't keep that yes: {e}")));
     }
     true
-}
-
-/// Asks `question`, whose answers are `y` and `n`: in the box, or on a
-/// line of its own without one. Only yes is yes.
-async fn yes(question: Question, terminal: &mut Terminal) -> bool {
-    if !terminal.input.pinned() {
-        let pad = " ".repeat(GUTTER);
-        say!("{}", question.title);
-        if let Some(command) = &question.command {
-            say!("{pad}{command}");
-        }
-        if let Some(detail) = &question.detail {
-            say!("{pad}{}", terminal.err.dim(detail));
-        }
-        return matches!(terminal.input.read(&format!("{pad}[y]es  [n]o › "), false).await, Read::Line(answer) if matches!(answer.trim(), "y" | "Y" | "yes"));
-    }
-    matches!(terminal.input.ask(question).await, Read::Line(key) if key == "y")
 }
 
 /// The project servers you said yes to, by project: each as it was then.

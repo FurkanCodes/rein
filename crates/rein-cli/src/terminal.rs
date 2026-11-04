@@ -14,7 +14,7 @@ use crate::ui::style::{GUTTER, Style, strip};
 use crate::ui::wrap::Wrap;
 use rein_agent::agent::{Approval, Compacted, Heard, Ui};
 use rein_agent::compact;
-use rein_agent::permissions::Mode;
+use rein_agent::permissions::{Mode, Rule, Whose};
 use rein_agent::sandbox::{Access, Sandbox};
 use rein_agent::tools::{BashCall, ToolName};
 use rein_llm::{Effort, ToolCall, Usage};
@@ -197,6 +197,23 @@ pub(crate) struct TurnStats {
 pub(crate) const ECHO_LINES: usize = 12;
 
 impl Terminal {
+    /// Asks `question`, whose answers are `y` and `n`: in the box, or on a
+    /// line of its own without one. Only yes is yes.
+    pub(crate) async fn yes(&mut self, question: Question) -> bool {
+        if !self.input.pinned() {
+            let pad = " ".repeat(GUTTER);
+            say!("{}", question.title);
+            if let Some(command) = &question.command {
+                say!("{pad}{command}");
+            }
+            if let Some(detail) = &question.detail {
+                say!("{pad}{}", self.err.dim(detail));
+            }
+            return matches!(self.input.read(&format!("{pad}[y]es  [n]o › "), false).await, Read::Line(answer) if matches!(answer.trim(), "y" | "Y" | "yes"));
+        }
+        matches!(self.input.ask(question).await, Read::Line(key) if key == "y")
+    }
+
     pub(crate) fn new(root: PathBuf, sandbox: std::sync::Arc<Sandbox>, mode: Mode, pinned: bool, history: History, bell: bool) -> Terminal {
         let interrupted: std::sync::Arc<tokio::sync::Notify> = Default::default();
         let input = Input::start(pinned, interrupted.clone(), history, bell, root.clone(), sandbox);
@@ -623,7 +640,7 @@ impl Ui for Terminal {
         say!("{lead}{}", self.err.dim(&format!("↳ {note}")));
     }
 
-    async fn approve(&mut self, call: &ToolCall) -> Approval {
+    async fn approve(&mut self, call: &ToolCall, rule: Option<&Rule>) -> Approval {
         self.end_line();
         self.input.busy(None, std::time::Instant::now());
         self.step = None;
@@ -638,8 +655,17 @@ impl Ui for Terminal {
             (None, Some((server, tool))) => (format!("Let {server}'s {tool} run?"), "Yes, and don't ask again for this tool"),
             _ => ("Allow this?".to_owned(), "Yes, and don't ask again"),
         };
-        // Why it needs to go past the sandbox, as the model put it.
-        let reason = bash.as_ref().and_then(BashCall::reason).map(|reason| format!("Why: {reason}"));
+        // Why it needs to go past the sandbox, as the model put it, and the
+        // rule that asks, which is yours to change.
+        let why = bash.as_ref().and_then(BashCall::reason).map(|reason| format!("Why: {reason}"));
+        let asks = rule.map(|rule| match rule.whose() {
+            Whose::Yours => format!("Your rule `{rule}` asks first · /permissions changes your rules"),
+            Whose::Project => format!("This project's rule `{rule}` asks first"),
+        });
+        let reason = match (why, asks) {
+            (Some(why), Some(asks)) => Some(format!("{why} · {asks}")),
+            (why, asks) => why.or(asks),
+        };
         if !self.input.pinned() {
             self.show_header(call);
             let pad = " ".repeat(steps::INDENT);

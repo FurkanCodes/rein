@@ -1,9 +1,10 @@
 //! What the model may do without asking. A mode sets the broad policy,
 //! the sandbox decides much of it (what runs inside the walls needs no
-//! asking), and rules in a project file refine it for specific commands:
+//! asking), and rules refine it for specific commands: yours, in rein's
+//! folder, for every project, and a project's own in `.rein/permissions`:
 //!
 //! ```text
-//! # .rein/permissions: one rule per line
+//! # one rule per line
 //! allow cargo test
 //! allow git status
 //! ask   git commit
@@ -11,19 +12,24 @@
 //! ```
 //!
 //! Deny beats ask beats allow. A command only runs without asking by an
-//! allow rule if every part of it is allowed: `allow cargo test` doesn't
-//! cover `cargo test && rm -rf target`. Anything the splitter can't take
-//! apart, like `$(...)`, redirects or globs, no allow rule covers, while
-//! deny and ask rules still find the commands in it.
+//! allow rule if every part of it starts with the rule's words: `allow
+//! cargo test` doesn't cover `cargo test && rm -rf target`. Anything the
+//! splitter can't take apart, like `$(...)`, redirects or globs, no allow
+//! rule covers. An ask or deny rule is looked for harder: its command
+//! anywhere in the line, by its name past any path (`/bin/rm`, after `sudo`
+//! or `xargs`, inside `sh -c '…'`), and its other words after it in order,
+//! wherever they are (`ask git push --force` finds `git push origin -f`
+//! too: see [`Rule::finds`]).
 //!
-//! Rules aren't a sandbox: `deny rm` doesn't stop `/bin/rm`, or a script
-//! that deletes files itself. They decide when rein asks you; the sandbox
-//! decides what a command can reach.
+//! Rules aren't a sandbox: a script that deletes files itself, or a
+//! command spelt to hide from them, gets past. They decide when rein asks
+//! you; the sandbox decides what a command can reach.
 //!
-//! The file comes with the project, which may be anyone's, so an allow
-//! rule only spares asking about a command that stays in the sandbox.
-//! Outside it a command has your keys: `allow cargo test` in a cloned repo
-//! would otherwise run its build script with them. Only you say yes to that.
+//! A project's file comes with the project, which may be anyone's, so its
+//! allow rules only spare asking about a command that stays in the
+//! sandbox. Outside it a command has your keys: `allow cargo test` in a
+//! cloned repo would otherwise run its build script with them. Only you
+//! say yes to that, and your own rules are you saying it.
 
 use rein_llm::ToolCall;
 use serde::Deserialize;
@@ -33,8 +39,12 @@ use crate::tools::{BashCall, ERROR, ToolName};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
-    /// Ask before file changes, and before commands that do more than look.
+    /// Run everything without asking, without the sandbox, except what ask
+    /// rules name (deleting, from the rules you start with) and what deny
+    /// rules block. Where rein starts.
     #[default]
+    Trust,
+    /// Ask before file changes, and before commands that do more than look.
     Ask,
     /// File changes inside the project are fine, and so are commands that
     /// stay in the sandbox; going past it asks.
@@ -45,13 +55,17 @@ pub enum Mode {
     /// Look, never change: commands run only with look access, in the
     /// sandbox, and file changes are refused.
     ReadOnly,
-    /// Run everything without asking, without the sandbox, except what deny
-    /// rules block.
-    Trust,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 5] = [Mode::Ask, Mode::Edits, Mode::Auto, Mode::ReadOnly, Mode::Trust];
+    pub const ALL: [Mode; 5] = [Mode::Trust, Mode::Ask, Mode::Edits, Mode::Auto, Mode::ReadOnly];
+
+    /// The one after this, for Shift-Tab: down from trust, one less at a
+    /// time, and back round.
+    pub fn next(self) -> Mode {
+        let at = Mode::ALL.iter().position(|&mode| mode == self).unwrap_or(0);
+        Mode::ALL[(at + 1) % Mode::ALL.len()]
+    }
 
     /// Its name, as `--mode` and `/mode` take it.
     pub const fn as_str(self) -> &'static str {
@@ -91,25 +105,208 @@ pub enum Decision {
     Deny(String),
 }
 
+/// What a rule does with the commands it's about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub enum Kind {
     Allow,
     Ask,
     Deny,
 }
 
+impl Kind {
+    /// Its word, as a rules file has it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Kind::Allow => "allow",
+            Kind::Ask => "ask",
+            Kind::Deny => "deny",
+        }
+    }
+}
+
+/// Whose a rule is, which decides how far an allow rule reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Whose {
+    /// Yours, in rein's folder: for every project.
+    Yours,
+    /// The project's own, in its `.rein/permissions`: it may be anyone's.
+    Project,
+}
+
+/// What your rules file starts with: deleting what may not come back asks
+/// first, in every mode, trust among them. Each line is yours to remove.
+pub const FIRST_RULES: &str = "\
+# Your rules, for every project: one a line, allow, ask or deny, then a
+# command. Deny beats ask beats allow. An ask or deny rule finds its
+# command wherever it is in a line (after sudo or xargs, or as /bin/rm),
+# and its other words after it: `ask git push --force` covers
+# `git push origin --force` too.
+#
+# These ask before deleting what may not come back. Take a line out to
+# stop being asked about it, or add your own; /permissions does both.
+
+# Files
+ask rm
+ask rmdir
+ask unlink
+ask shred
+ask rimraf
+ask find -delete
+ask rsync --delete
+ask rsync --remove-source-files
+
+# Work and history git can't give back
+ask git clean
+ask git reset --hard
+ask git checkout --
+ask git checkout .
+ask git restore
+ask git stash drop
+ask git stash clear
+ask git branch -D
+ask git push --force
+ask git push -f
+ask git push --delete
+ask git push -d
+ask git worktree remove
+
+# Containers, clusters, infrastructure and databases
+ask docker rmi
+ask docker system prune
+ask docker container prune
+ask docker image prune
+ask docker volume prune
+ask kubectl delete
+ask terraform destroy
+ask terraform apply -destroy
+ask dropdb
+";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Rule {
+pub struct Rule {
     kind: Kind,
-    /// The command's first words, e.g. `["cargo", "test"]`.
-    prefix: Vec<String>,
+    /// The command and the words that follow it: `["cargo", "test"]`.
+    words: Vec<String>,
+    whose: Whose,
 }
 
 impl Rule {
-    /// Whole words only: `ls` matches `ls -la` but not `lsof`.
-    fn matches(&self, command: &[String]) -> bool {
-        command.starts_with(&self.prefix)
+    /// One rule, as a line of a rules file says it: `ask git push`.
+    pub fn parse(line: &str, whose: Whose) -> Result<Rule, String> {
+        let line = line.trim();
+        let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let kind = match word {
+            "allow" => Kind::Allow,
+            "ask" => Kind::Ask,
+            "deny" => Kind::Deny,
+            _ => return Err("start with allow, ask or deny".into()),
+        };
+        match split_command(rest).as_deref() {
+            Some([one]) => Ok(Rule { kind, words: one.clone(), whose }),
+            _ => Err("give one plain command, like `cargo test`".into()),
+        }
     }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    pub fn whose(&self) -> Whose {
+        self.whose
+    }
+
+    /// The same rule, whoever's it is.
+    pub fn says_the_same(&self, other: &Rule) -> bool {
+        self.kind == other.kind && self.words == other.words
+    }
+
+    /// For an allow rule: `command` starts with its words, whole words
+    /// only, so `allow ls` covers `ls -la` but not `lsof`, nor `sudo ls`.
+    fn starts(&self, command: &[String]) -> bool {
+        command.starts_with(&self.words)
+    }
+
+    /// For an ask or deny rule, looking harder, as it should err towards
+    /// finding: its command anywhere in `command`, by its name past any
+    /// path and in any letters' case (macOS runs `/BIN/RM` as `rm`), so
+    /// after `sudo`, `xargs` or `find -exec` too; then each of its other
+    /// words after that, in order, wherever they are. A long flag covers
+    /// its longer forms (`--force` covers `--force-with-lease`), and a
+    /// short one the clusters it's in (`-f` is in `-fu`). What `sh -c` and
+    /// `eval` are given to run is looked through too.
+    fn finds(&self, command: &[String]) -> bool {
+        let words = run_words(command);
+        let Some((name, rest)) = self.words.split_first() else { return false };
+        (0..words.len()).filter(|&at| is_named(&words[at], name)).any(|at| {
+            let mut from = at + 1;
+            rest.iter().all(|wanted| match words[from..].iter().position(|word| covers(wanted, word)) {
+                Some(found) => {
+                    from += found + 1;
+                    true
+                }
+                None => false,
+            })
+        })
+    }
+}
+
+/// `ask git push`, as a rules file would have it.
+impl std::fmt::Display for Rule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let words: Vec<String> = self.words.iter().map(|word| quoted(word)).collect();
+        write!(f, "{} {}", self.kind.as_str(), words.join(" "))
+    }
+}
+
+/// `word` as the splitter would read it back: in single quotes when it
+/// holds anything but plain letters, digits and a few marks.
+fn quoted(word: &str) -> String {
+    if !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c)) { word.to_owned() } else { format!("'{}'", word.replace('\'', "")) }
+}
+
+/// Whether `word` runs the command `name`: it, or a path to it, whatever
+/// the letters' case.
+fn is_named(word: &str, name: &str) -> bool {
+    let base = word.rsplit('/').next().unwrap_or(word);
+    word.eq_ignore_ascii_case(name) || base.eq_ignore_ascii_case(name)
+}
+
+/// Whether `word` says what a rule's `wanted` word does: the same word, a
+/// longer form of a long flag (`--force-with-lease`, `--delete=x`), or a
+/// cluster of short flags with it in (`-fu` for `-f`).
+fn covers(wanted: &str, word: &str) -> bool {
+    if wanted == word {
+        return true;
+    }
+    if wanted.starts_with("--") {
+        return word.strip_prefix(wanted).is_some_and(|more| more.starts_with(['-', '=']));
+    }
+    match (short_flags(wanted), short_flags(word)) {
+        (Some(letter), Some(cluster)) if letter.len() == 1 => cluster.contains(letter),
+        _ => false,
+    }
+}
+
+/// The letters of `-abc`, a cluster of short flags; `None` for anything
+/// else (`--long`, `-5`, a plain word).
+fn short_flags(word: &str) -> Option<&str> {
+    word.strip_prefix('-').filter(|letters| !letters.is_empty() && letters.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// `command`'s words, with what a shell is given to run (`sh -c '…'`,
+/// `bash -lc "…"`, `eval '…'`) taken apart into words too.
+fn run_words(command: &[String]) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut runs_next = false;
+    for word in command {
+        if runs_next {
+            words.extend(loose_words(word));
+        } else {
+            words.push(word.clone());
+        }
+        runs_next = word == "eval" || short_flags(word).is_some_and(|letters| letters.contains('c'));
+    }
+    words
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,31 +356,32 @@ const READ_ONLY_COMMANDS: &str = "rein is in read-only mode: commands run with l
 const READ_ONLY_NO_SANDBOX: &str = "Commands are turned off: rein is in read-only mode, and there's no sandbox here \
                                     to keep them from changing things.";
 
+/// The rules in `text`, a file of them, each `whose`. Blank lines and `#`
+/// comments are skipped.
+pub fn parse_rules(text: &str, whose: Whose) -> Result<Vec<Rule>, String> {
+    let lines = text.lines().enumerate().map(|(n, line)| (n, line.trim())).filter(|(_, line)| !line.is_empty() && !line.starts_with('#'));
+    lines.map(|(n, line)| Rule::parse(line, whose).map_err(|e| format!("line {}: {e}", n + 1))).collect()
+}
+
 impl Permissions {
-    /// Reads rules in the format shown at the top of this file. Blank lines
-    /// and `#` comments are skipped. There's no sandbox until
+    /// The project's rules, in the format shown at the top of this file;
+    /// yours come with [`Permissions::set_yours`]. There's no sandbox until
     /// [`Permissions::with_sandbox`] gives one, so commands ask.
     pub fn new(mode: Mode, rules: &str) -> Result<Self, String> {
-        let mut parsed = Vec::new();
-        for (n, line) in rules.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-            let kind = match word {
-                "allow" => Kind::Allow,
-                "ask" => Kind::Ask,
-                "deny" => Kind::Deny,
-                _ => return Err(format!("line {}: start with allow, ask or deny", n + 1)),
-            };
-            let prefix = match split_command(rest).as_deref() {
-                Some([one]) => one.clone(),
-                _ => return Err(format!("line {}: give one plain command, like `cargo test`", n + 1)),
-            };
-            parsed.push(Rule { kind, prefix });
-        }
-        Ok(Permissions { mode, rules: parsed, ..Default::default() })
+        Ok(Permissions { mode, rules: parse_rules(rules, Whose::Project)?, ..Default::default() })
+    }
+
+    /// Your rules, from `text`, in place of those you had.
+    pub fn set_yours(&mut self, text: &str) -> Result<(), String> {
+        let yours = parse_rules(text, Whose::Yours)?;
+        self.rules.retain(|rule| rule.whose != Whose::Yours);
+        self.rules.splice(0..0, yours);
+        Ok(())
+    }
+
+    /// Every rule: yours, then the project's.
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
     }
 
     /// Decides with `sandbox`: what it can hold in, and what it protects.
@@ -209,8 +407,8 @@ impl Permissions {
         self.allowed_tools = names;
     }
 
-    pub fn rule_count(&self) -> usize {
-        self.rules.len()
+    pub fn rule_count(&self, whose: Whose) -> usize {
+        self.rules.iter().filter(|rule| rule.whose == whose).count()
     }
 
     pub fn decide(&self, call: &ToolCall) -> Decision {
@@ -272,34 +470,45 @@ impl Permissions {
         }
     }
 
+    /// The ask rule that has `call` asked about, if one does.
+    pub fn asked_by(&self, call: &ToolCall) -> Option<&Rule> {
+        BashCall::of(call).and_then(|c| self.found(Kind::Ask, c.command()))
+    }
+
+    /// The first rule of `kind` that finds a command in `line`. When the
+    /// splitter gives up, it looks through the line's words instead, cut at
+    /// anything that can start a command and with quotes taken off, so a
+    /// deny rule still can't be dodged by adding a `$` somewhere or gluing
+    /// the command to a `;`. Ask rules are looked for the same way: the
+    /// sandbox, or trust, would otherwise run what you asked to be asked
+    /// about.
+    fn found(&self, kind: Kind, line: &str) -> Option<&Rule> {
+        let candidates = split_command(line).unwrap_or_else(|| vec![loose_words(line)]);
+        self.rules.iter().filter(|r| r.kind == kind).find(|r| candidates.iter().any(|c| r.finds(c)))
+    }
+
     fn decide_command(&self, line: &str, access: Access) -> Decision {
         let parts = split_command(line);
-        // Deny first. When the splitter gives up, check every run of words
-        // in the line instead, cut at anything that can start a command
-        // and with quotes taken off, so a deny rule still can't be dodged
-        // by adding a `$` somewhere or gluing the command to a `;`. Ask
-        // rules are looked for the same way: the sandbox would otherwise
-        // run what you asked to be asked about.
-        let words = loose_words(line);
-        let fallback: Vec<&[String]> = (0..words.len()).map(|i| &words[i..]).collect();
-        let candidates: Vec<&[String]> = match &parts {
-            Some(parts) => parts.iter().map(Vec::as_slice).collect(),
-            None => fallback,
-        };
-        let covered = |kind: Kind| self.rules.iter().filter(|r| r.kind == kind).find(|r| candidates.iter().any(|c| r.matches(c)));
-        if let Some(rule) = covered(Kind::Deny) {
-            return Decision::Deny(format!("Blocked by a rule: `deny {}`.", rule.prefix.join(" ")));
+        // Deny first.
+        if let Some(rule) = self.found(Kind::Deny, line) {
+            return Decision::Deny(format!("Blocked by a rule: `{rule}`."));
         }
-        let denies = self.rules.iter().filter(|r| r.kind == Kind::Deny).count();
-        match self.mode {
-            // What rein couldn't take apart, it can't promise no deny rule
-            // covers: it asks, rather than trust a guess.
-            Mode::Trust if parts.is_none() && denies > 0 => return Decision::Ask,
-            Mode::Trust => return Decision::Allow,
-            _ => {}
-        }
+        let asked = self.found(Kind::Ask, line).is_some();
         let sandboxed = self.sandbox.available();
-        let asked = covered(Kind::Ask).is_some();
+        // What you said yes to for the rest of the conversation: exactly
+        // these commands, with as much access, or with any where there are
+        // no walls to hold a command to what it said it needs.
+        let walled = sandboxed && self.mode != Mode::Trust;
+        let said_yes = |part: &Vec<String>| self.approved.iter().any(|(words, granted)| words == part && (*granted >= access || !walled));
+        let you_said_yes = parts.as_ref().is_some_and(|parts| parts.iter().all(said_yes));
+        if self.mode == Mode::Trust {
+            // What rein couldn't take apart, it can't promise no deny rule
+            // covers: it asks, rather than trust a guess. Ask rules are
+            // only looked for in it, as they're about mistakes, not about
+            // hiding.
+            let denies = self.rules.iter().any(|r| r.kind == Kind::Deny);
+            return if (parts.is_none() && denies) || (asked && !you_said_yes) { Decision::Ask } else { Decision::Allow };
+        }
         // Inside the walls, nothing needs asking.
         let free = sandboxed
             && match access {
@@ -307,19 +516,19 @@ impl Permissions {
                 Access::Write => matches!(self.mode, Mode::Edits | Mode::Auto),
                 Access::Network | Access::Outside => false,
             };
-        // The rules come with the project, which may be anyone's: they only
+        // A project's rules come with it, and it may be anyone's: they only
         // spare you asking about what stays in the walls. Outside them a
-        // command gets your keys, so only you say yes to that.
+        // command gets your keys, so only you say yes to that, and your own
+        // rules count wherever it runs.
         let in_walls = sandboxed && access != Access::Outside;
-        let rule = |part: &Vec<String>, kind: Kind| in_walls && self.rules.iter().any(|r| r.kind == kind && r.matches(part));
-        // Without a sandbox, the access a command says it needs is only words.
-        let approved = |part: &Vec<String>| self.approved.iter().any(|(words, granted)| words == part && (*granted >= access || !sandboxed));
-        let allowed = parts.as_ref().is_some_and(|parts| parts.iter().all(|p| rule(p, Kind::Allow) || approved(p)));
+        let allows = |part: &Vec<String>| self.rules.iter().any(|r| r.kind == Kind::Allow && (in_walls || r.whose == Whose::Yours) && r.starts(part));
+        let allowed = parts.as_ref().is_some_and(|parts| parts.iter().all(|p| allows(p) || said_yes(p)));
         match self.mode {
             Mode::ReadOnly if !sandboxed => Decision::Deny(READ_ONLY_NO_SANDBOX.into()),
             Mode::ReadOnly if access > Access::Look => Decision::Deny(READ_ONLY_COMMANDS.into()),
             Mode::Auto if asked => Decision::Deny(AUTO_ASK_RULE.into()),
-            _ if asked => Decision::Ask,
+            // You asked to be asked, unless you've said yes to just this.
+            _ if asked && !you_said_yes => Decision::Ask,
             _ if free || allowed => Decision::Allow,
             Mode::Auto if !sandboxed => Decision::Deny(AUTO_NO_SANDBOX.into()),
             Mode::Auto => Decision::Deny(auto_refuses(access)),
@@ -346,8 +555,8 @@ impl Permissions {
     }
 }
 
-/// The words of a line rein couldn't take apart, for deny rules to look
-/// through: split at spaces and at everything that can start or end a
+/// The words of a line rein couldn't take apart, for ask and deny rules to
+/// look through: split at spaces and at everything that can start or end a
 /// command (`;`, `&`, `|`, brackets, backticks, `$`), quotes and escapes
 /// taken off. A guess, but one that errs towards finding a command.
 fn loose_words(line: &str) -> Vec<String> {
@@ -724,9 +933,150 @@ mod tests {
         assert!(why.starts_with("error: bad arguments") && why.contains("everything"), "{why}");
     }
 
+    /// Trust with the rules you start with: what deletes asks, wherever
+    /// in the line and however it's spelt; the rest runs.
+    fn trusting() -> Permissions {
+        let mut p = Permissions::new(Mode::Trust, "").unwrap();
+        p.set_yours(FIRST_RULES).unwrap();
+        p
+    }
+
+    #[test]
+    fn the_rules_you_start_with_ask_before_deleting_in_trust_mode() {
+        let p = trusting();
+        for deletes in [
+            "rm -rf target",
+            "/bin/rm x",
+            "\\rm x",
+            "sudo rm -rf /tmp/x",
+            "find . -name '*.o' -delete",
+            "find . -name x -exec rm {} ;",
+            "ls | xargs rm",
+            "cargo build && rm -rf dist",
+            "bash -lc 'cd x && rm -rf y'",
+            "sh -c \"rmdir old\"",
+            "npx rimraf dist",
+            "git clean -fdx",
+            "git -C ../other clean -f",
+            "git reset --hard HEAD~1",
+            "git checkout -- src/main.rs",
+            "git checkout .",
+            "git restore src/lib.rs",
+            "git stash drop",
+            "git branch -D feature",
+            "git push origin main --force",
+            "git push --force-with-lease",
+            "git push -fu origin main",
+            "git push origin --delete old",
+            "git rm src/old.rs",
+            "rsync -a --delete-after src/ dst/",
+            "docker system prune -af",
+            "docker volume rm data",
+            "kubectl -n prod delete pod web",
+            "terraform destroy",
+            "rm -rf target 2>/dev/null",
+            "echo $(rm x)",
+            "RM -RF x",
+        ] {
+            assert_eq!(p.decide(&bash(deletes)), Decision::Ask, "{deletes}");
+        }
+        for runs in [
+            "ls -la",
+            "cargo test 2>&1 | tail -20",
+            "git status",
+            "git push origin main",
+            "git checkout main",
+            "git commit -m 'drop the rm call'",
+            "git log --oneline -- src/clean.rs",
+            "git restorer",
+            "rsync -a src/ dst/",
+            "lsof -i",
+            "echo $HOME",
+            "docker ps",
+        ] {
+            assert_eq!(p.decide(&bash(runs)), Decision::Allow, "{runs}");
+        }
+    }
+
+    #[test]
+    fn an_ask_rules_other_words_come_after_its_command_in_order() {
+        let rule = Rule::parse("ask git push --force", Whose::Yours).unwrap();
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert!(rule.finds(&words("git -C x push origin --force")));
+        assert!(!rule.finds(&words("git --force push")), "the flag before the subcommand");
+        assert!(!rule.finds(&words("push --force git")), "the words before the command");
+    }
+
+    #[test]
+    fn yes_always_to_a_command_an_ask_rule_names_is_kept_for_exactly_it() {
+        let mut p = trusting();
+        p.remember(&bash("rm -rf target"));
+        assert_eq!(p.decide(&bash("rm -rf target")), Decision::Allow, "you said always");
+        assert_eq!(p.decide(&command("rm -rf target", "outside")), Decision::Allow, "trust has no walls: access is only words");
+        assert_eq!(p.decide(&bash("rm -rf src")), Decision::Ask, "only that one");
+        p.forget_approvals();
+        assert_eq!(p.decide(&bash("rm -rf target")), Decision::Ask);
+        // The same in a mode with walls, for as much access.
+        let mut edits = sandboxed(Mode::Edits, "", "always-ask-rule");
+        edits.set_yours("ask rm").unwrap();
+        assert_eq!(edits.decide(&command("rm -rf target", "write")), Decision::Ask, "the walls don't stop asking");
+        edits.remember(&command("rm -rf target", "write"));
+        assert_eq!(edits.decide(&command("rm -rf target", "write")), Decision::Allow);
+        assert_eq!(edits.decide(&command("rm -rf target", "outside")), Decision::Ask);
+        // Auto never asks: it's refused.
+        let mut auto = sandboxed(Mode::Auto, "", "auto-ask-rule");
+        auto.set_yours("ask rm").unwrap();
+        assert_eq!(auto.decide(&command("rm -rf target", "write")), Decision::Deny(AUTO_ASK_RULE.into()));
+    }
+
+    #[test]
+    fn your_allow_rules_count_where_a_projects_dont() {
+        // Without a sandbox, a project's rule spares nothing, yours does.
+        let mut bare = Permissions::new(Mode::Ask, "allow cargo test\n").unwrap();
+        assert_eq!(bare.decide(&bash("cargo test")), Decision::Ask);
+        bare.set_yours("allow cargo test").unwrap();
+        assert_eq!(bare.decide(&bash("cargo test")), Decision::Allow);
+        assert_eq!(bare.decide(&bash("sudo cargo test")), Decision::Ask, "allow is whole words from the start");
+        // Outside the walls, the same.
+        let mut walled = sandboxed(Mode::Edits, "allow cargo fetch\n", "yours-outside");
+        assert_eq!(walled.decide(&command("cargo fetch", "outside")), Decision::Ask);
+        walled.set_yours("allow cargo fetch").unwrap();
+        assert_eq!(walled.decide(&command("cargo fetch", "outside")), Decision::Allow);
+        // A project's ask rule still asks about what yours allows.
+        let mut both = sandboxed(Mode::Edits, "ask cargo fetch\n", "yours-and-theirs");
+        both.set_yours("allow cargo fetch").unwrap();
+        assert_eq!(both.decide(&command("cargo fetch", "network")), Decision::Ask);
+    }
+
+    #[test]
+    fn your_rules_are_replaced_and_the_projects_kept() {
+        let mut p = Permissions::new(Mode::Trust, "deny curl\n").unwrap();
+        p.set_yours("ask rm\nallow cargo test").unwrap();
+        p.set_yours("ask git commit -m 'a b'").unwrap();
+        let shown: Vec<(String, Whose)> = p.rules().iter().map(|rule| (rule.to_string(), rule.whose())).collect();
+        assert_eq!(shown, [("ask git commit -m 'a b'".to_owned(), Whose::Yours), ("deny curl".to_owned(), Whose::Project)]);
+        assert_eq!((p.rule_count(Whose::Yours), p.rule_count(Whose::Project)), (1, 1));
+        // As shown, it reads back the same.
+        let again = Rule::parse(&p.rules()[0].to_string(), Whose::Yours).unwrap();
+        assert!(again.says_the_same(&p.rules()[0]));
+        assert_eq!(p.set_yours("ask rm\npermit x").unwrap_err(), "line 2: start with allow, ask or deny");
+    }
+
+    #[test]
+    fn shift_tab_goes_round_every_mode_from_trust() {
+        let mut mode = Mode::default();
+        let mut seen = Vec::new();
+        for _ in Mode::ALL {
+            seen.push(mode);
+            mode = mode.next();
+        }
+        assert_eq!(seen, [Mode::Trust, Mode::Ask, Mode::Edits, Mode::Auto, Mode::ReadOnly]);
+        assert_eq!(mode, Mode::Trust, "and back round");
+    }
+
     #[test]
     fn a_misspelt_mode_names_them_all() {
-        assert_eq!("yolo".parse::<Mode>().unwrap_err(), "no mode called yolo; use ask, edits, auto, read-only or trust");
+        assert_eq!("yolo".parse::<Mode>().unwrap_err(), "no mode called yolo; use trust, ask, edits, auto or read-only");
     }
 
     #[test]
