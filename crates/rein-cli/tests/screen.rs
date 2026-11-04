@@ -1846,6 +1846,37 @@ fn signing_in_from_the_conversation_makes_a_provider_ready_to_switch_to() {
     assert!(!std::fs::read_to_string(term.dir.join("home/keys.json")).unwrap().contains("sk-ant-test"));
 }
 
+/// A list opens over the box, as menus over a box at the bottom of a
+/// window do: the best match right on the box, the rest going up from it,
+/// and the bar still under the box. The box doesn't move.
+#[test]
+fn lists_open_over_the_box_the_best_match_next_to_it() {
+    let model = Model::start(Vec::new());
+    let mut term = Term::start(&model, "lists-up", 30, 100);
+    term.wait_for(IDLE);
+    let row = |screen: &str, text: &str| screen.lines().position(|line| line.contains(text)).unwrap_or_else(|| panic!("no {text:?}:\n{screen}"));
+    let border = |screen: &str| screen.lines().position(|line| line.trim_start().starts_with('╭')).unwrap_or_else(|| panic!("no box:\n{screen}"));
+    let at_rest = border(&term.text());
+    // Three match: up and down go different ways.
+    term.keys("/m");
+    term.wait_for("› /mode");
+    term.wait_for("/mcp");
+    let screen = term.text();
+    assert_eq!(row(&screen, "› /mode"), border(&screen) - 1, "the first match right on the box:\n{screen}");
+    assert!(row(&screen, "/model") < row(&screen, "› /mode"), "the next one over it:\n{screen}");
+    assert_eq!(border(&screen), at_rest, "the box stayed where it was:\n{screen}");
+    assert!(screen.lines().last().unwrap_or_default().contains("context"), "the bar under the box:\n{screen}");
+    term.keys("\x1b[A");
+    term.wait_for("› /model");
+    term.keys("\x15");
+    term.keys("/mode\r");
+    term.wait_for("› ask•");
+    let screen = term.text();
+    assert_eq!(row(&screen, "› ask•"), border(&screen) - 1, "a picker's too:\n{screen}");
+    assert!(row(&screen, "edits") < row(&screen, "› ask•"), "{screen}");
+    term.keys("\x1b");
+}
+
 #[test]
 fn a_menu_is_chosen_from_with_the_arrows_and_enter() {
     let model = Model::start(vec![]);
@@ -1857,12 +1888,13 @@ fn a_menu_is_chosen_from_with_the_arrows_and_enter() {
     term.wait_for("› ask•");
     let screen = term.text();
     assert!(!screen.contains("edits: file"), "each says what it is once:\n{screen}");
-    // Down, and down again from the last comes back to the first.
-    term.keys("\x1b[B");
+    // The list goes up from the box: up, and up again from the last comes
+    // back to the first, next to the box.
+    term.keys("\x1b[A");
     term.wait_for("› edits");
-    term.keys("\x1b[B\x1b[B\x1b[B\x1b[B");
-    term.wait_for("› ask•");
     term.keys("\x1b[A\x1b[A\x1b[A\x1b[A");
+    term.wait_for("› ask•");
+    term.keys("\x1b[B\x1b[B\x1b[B\x1b[B");
     term.wait_for("› edits");
     term.keys("\r");
     term.wait_for("✓ edits: file changes in this folder");
@@ -3009,7 +3041,7 @@ fn a_server_is_added_by_name_from_the_mcp_registry() {
     term.wait_for("smithery.ai/thing");
     let list = term.text();
     let (real, copy) = (list.find("acme/thing-mcp").unwrap(), list.find("copycat/thing-mcp").unwrap());
-    assert!(real < copy, "the one whose package is its own comes first:\n{list}");
+    assert!(real > copy, "the one whose package is its own comes first, right over the box:\n{list}");
     assert!(list.contains("npm @thing/mcp@1.0.0 · Acme's own"), "{list}");
     assert!(list.contains("at x.example"), "one reached at a URL is listed too:\n{list}");
     term.keys("\r");

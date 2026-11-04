@@ -365,7 +365,8 @@ impl Boxed {
             let lines = if search.query.is_empty() { vec![s.dim("type words from a message you sent in this folder")] } else { lines };
             let (tone, mark) = if self.waiting == Waiting::Message { (Tone::Typing, s.bold(&s.blue("›"))) } else { (Tone::Busy, s.dim("›")) };
             let notes = ("finding a message you sent".to_owned(), "enter picks · esc goes back".to_owned());
-            return Bottom { above, tone, mark, lines, caret: Some(caret), notes, below: self.below(), compact: String::new() };
+            let above = [above, self.list()].concat();
+            return Bottom { above, tone, mark, lines, caret: Some(caret), notes, below: self.under(), compact: String::new() };
         }
         if self.secret && !self.editor.is_empty() {
             let width = self.pinned.text_width().max(2);
@@ -378,7 +379,7 @@ impl Boxed {
                 lines: vec!["•".repeat(dots)],
                 caret: Some((0, dots)),
                 notes,
-                below: self.below(),
+                below: self.under(),
                 compact: String::new(),
             };
         }
@@ -412,70 +413,45 @@ impl Boxed {
             (_, Tone::Asking) => s.bold(&s.yellow("?")),
             (_, Tone::Busy) => s.dim("›"),
         };
-        Bottom { above, tone, mark, lines, caret: Some((line - self.scroll, column)), notes, below: self.below(), compact: String::new() }
+        let above = [above, self.list()].concat();
+        Bottom { above, tone, mark, lines, caret: Some((line - self.scroll, column)), notes, below: self.under(), compact: String::new() }
     }
 
-    /// Under the box: the messages found, a note, the commands that match,
-    /// or the bar.
-    fn below(&self) -> Vec<String> {
+    /// Over the box: the messages found, the paths that match an `@` word,
+    /// or the commands that match what's typed; nothing else.
+    fn list(&self) -> Vec<String> {
         let s = Style::stderr();
         if let Some(search) = &self.search {
             return self.found(search);
         }
         let found = self.mention_menu();
         if !found.is_empty() {
-            let first = (self.picked + 1).saturating_sub(MENU_LINES);
-            let mut lines: Vec<String> = found
-                .iter()
-                .enumerate()
-                .skip(first)
-                .take(MENU_LINES)
-                .map(|(i, path)| if i == self.picked { format!(" {} {}", s.blue("›"), s.bold(&s.blue(path))) } else { format!("   {path}") })
-                .collect();
-            let hidden = found.len().saturating_sub(first + MENU_LINES);
-            if hidden > 0 {
-                lines.push(s.dim(&format!("   … {hidden} more")));
-            }
-            return lines;
-        }
-        if let Some((note, _)) = &self.notice {
-            return vec![format!(" {}", s.yellow(note))];
+            return upward(found.len(), self.picked, MENU_LINES, s, |i| {
+                if i == self.picked { format!(" {} {}", s.blue("›"), s.bold(&s.blue(&found[i]))) } else { format!("   {}", found[i]) }
+            });
         }
         let menu = self.menu();
-        if menu.is_empty() {
-            return vec![self.bar.clone()];
-        }
         let names = menu.iter().map(|(name, args, _)| width(name) + 1 + width(args)).max().unwrap_or(0);
-        let first = (self.picked + 1).saturating_sub(MENU_LINES);
-        let mut lines: Vec<String> = menu
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(MENU_LINES)
-            .map(|(i, (name, args, what))| {
-                let usage = format!("{name} {args}");
-                let pad = " ".repeat(names.saturating_sub(width(&usage)));
-                if i == self.picked {
-                    format!(" {} {}{}{pad}  {what}", s.blue("›"), s.bold(&s.blue(name)), s.dim(&format!(" {args}")))
-                } else {
-                    format!("   {name}{}{pad}  {}", s.dim(&format!(" {args}")), s.dim(what))
-                }
-            })
-            .collect();
-        let hidden = menu.len().saturating_sub(first + MENU_LINES);
-        if hidden > 0 {
-            lines.push(s.dim(&format!("   … {hidden} more")));
-        }
-        lines
+        upward(menu.len(), self.picked, MENU_LINES, s, |i| {
+            let (name, args, what) = menu[i];
+            let usage = format!("{name} {args}");
+            let pad = " ".repeat(names.saturating_sub(width(&usage)));
+            if i == self.picked {
+                format!(" {} {}{}{pad}  {what}", s.blue("›"), s.bold(&s.blue(name)), s.dim(&format!(" {args}")))
+            } else {
+                format!("   {name}{}{pad}  {}", s.dim(&format!(" {args}")), s.dim(what))
+            }
+        })
     }
 
-    /// Under the box while finding a message: the ones that match, newest
-    /// first, with the words found picked out and how long ago each was sent.
-    ///
-    /// ```text
-    ///  › run the tests and fix what fails                 2h
-    ///    add a test for the parser (+3 lines)             1d
-    /// ```
+    /// Under the box: a note, or the bar.
+    fn under(&self) -> Vec<String> {
+        match &self.notice {
+            Some((note, _)) => vec![format!(" {}", Style::stderr().yellow(note))],
+            None => vec![self.bar.clone()],
+        }
+    }
+
     fn found(&self, search: &Search) -> Vec<String> {
         let s = Style::stderr();
         let history = self.editor.history();
@@ -489,36 +465,25 @@ impl Boxed {
         }
         let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let cols = screen::size().1;
-        let first = (search.picked + 1).saturating_sub(MENU_LINES);
-        let mut lines: Vec<String> = found
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take(MENU_LINES)
-            .map(|(n, &i)| {
-                let shown = history.get(i).shown().replace('\t', " ");
-                let mut rows = shown.trim().lines();
-                let top = rows.next().unwrap_or_default();
-                let more = match rows.count() {
-                    0 => String::new(),
-                    1 => " (+1 line)".to_owned(),
-                    n => format!(" (+{n} lines)"),
-                };
-                let age = history::ago(history.sent(i));
-                let room = cols.saturating_sub(3 + width(&more) + 2 + width(&age) + 1);
-                let text = fit(top, room);
-                let pad = " ".repeat(room.saturating_sub(width(&text)));
-                let picked = n == search.picked;
-                let text = marked(&text, &words, s, picked);
-                let lead = if picked { format!(" {} ", s.blue("›")) } else { "   ".to_owned() };
-                format!("{lead}{text}{}{pad}  {}", s.dim(&more), s.dim(&age))
-            })
-            .collect();
-        let hidden = found.len().saturating_sub(first + MENU_LINES);
-        if hidden > 0 {
-            lines.push(s.dim(&format!("   … {hidden} more")));
-        }
-        lines
+        upward(found.len(), search.picked, MENU_LINES, s, |n| {
+            let i = found[n];
+            let shown = history.get(i).shown().replace('\t', " ");
+            let mut rows = shown.trim().lines();
+            let top = rows.next().unwrap_or_default();
+            let more = match rows.count() {
+                0 => String::new(),
+                1 => " (+1 line)".to_owned(),
+                n => format!(" (+{n} lines)"),
+            };
+            let age = history::ago(history.sent(i));
+            let room = cols.saturating_sub(3 + width(&more) + 2 + width(&age) + 1);
+            let text = fit(top, room);
+            let pad = " ".repeat(room.saturating_sub(width(&text)));
+            let picked = n == search.picked;
+            let text = marked(&text, &words, s, picked);
+            let lead = if picked { format!(" {} ", s.blue("›")) } else { "   ".to_owned() };
+            format!("{lead}{text}{}{pad}  {}", s.dim(&more), s.dim(&age))
+        })
     }
 
     /// A key while finding a message: the words to find, or picking one.
@@ -541,8 +506,9 @@ impl Boxed {
                 self.search = None;
                 self.editor.restore(&entry);
             }
-            Key::Up | Key::BackTab => search.picked = search.picked.saturating_sub(1),
-            Key::Down | Key::CtrlR => search.picked = (search.picked + 1).min(found.len().saturating_sub(1)),
+            // Older messages are further up the list, over the box.
+            Key::Up | Key::CtrlR => search.picked = (search.picked + 1).min(found.len().saturating_sub(1)),
+            Key::Down | Key::BackTab => search.picked = search.picked.saturating_sub(1),
             Key::Newline => {}
             Key::Paste(text) => {
                 search.query.key(&Key::Paste(text.replace(['\n', '\r'], " ")));
@@ -564,20 +530,22 @@ impl Boxed {
             Key::Esc | Key::CtrlC => Some(Read::Interrupted),
             // Nothing matches: Enter waits for typing that does.
             Key::Enter => matching.get(picking.picked).map(|&i| Read::Picked(i)),
-            Key::Up | Key::BackTab => {
-                picking.picked = if picking.picked == 0 { last } else { picking.picked - 1 };
-                None
-            }
-            Key::Down | Key::Tab => {
+            // The list goes up from the box: up is on down it, to the end
+            // and round again.
+            Key::Up | Key::Tab => {
                 picking.picked = if picking.picked >= last { 0 } else { picking.picked + 1 };
                 None
             }
+            Key::Down | Key::BackTab => {
+                picking.picked = if picking.picked == 0 { last } else { picking.picked - 1 };
+                None
+            }
             Key::PageUp => {
-                picking.picked = picking.picked.saturating_sub(PICK_LINES);
+                picking.picked = (picking.picked + PICK_LINES).min(last);
                 None
             }
             Key::PageDown => {
-                picking.picked = (picking.picked + PICK_LINES).min(last);
+                picking.picked = picking.picked.saturating_sub(PICK_LINES);
                 None
             }
             Key::Newline => None,
@@ -605,30 +573,24 @@ impl Boxed {
         let (lines, caret) = picking.filter.layout(self.pinned.text_width());
         let lines = if picking.filter.is_empty() { vec![s.dim("type to narrow the list · ↑↓ to move")] } else { lines };
         let matching = picking.matching();
-        let mut below = Vec::new();
+        let mut list = Vec::new();
         if matching.is_empty() {
-            below.push(s.dim(&format!("   nothing matches “{}”", picking.filter.text().trim())));
+            list.push(s.dim(&format!("   nothing matches “{}”", picking.filter.text().trim())));
         }
         let first = (picking.picked + 1).saturating_sub(PICK_LINES);
-        if first > 0 {
-            below.push(s.dim(&format!("   … {first} more above")));
-        }
         let names = matching.iter().skip(first).take(PICK_LINES).map(|&i| width(&picking.menu.items[i].0)).max().unwrap_or(0).min(64);
         let cols = screen::size().1;
-        for (n, &i) in matching.iter().enumerate().skip(first).take(PICK_LINES) {
-            let (name, about) = &picking.menu.items[i];
-            let mark = if picking.menu.current == Some(i) { "•" } else { " " };
+        list.extend(upward(matching.len(), picking.picked, PICK_LINES, s, |n| {
+            let (name, about) = &picking.menu.items[matching[n]];
+            let mark = if picking.menu.current == Some(matching[n]) { "•" } else { " " };
             let pad = " ".repeat(names.saturating_sub(width(name)));
             let line =
                 if n == picking.picked { format!(" {} {}{mark} {pad} {}", s.blue("›"), s.bold(&s.blue(name)), about) } else { format!("   {name}{mark} {pad} {}", s.dim(about)) };
-            below.push(fit(&line, cols.saturating_sub(1)));
-        }
-        let hidden = matching.len().saturating_sub(first + PICK_LINES);
-        if hidden > 0 {
-            below.push(s.dim(&format!("   … {hidden} more")));
-        }
+            fit(&line, cols.saturating_sub(1))
+        }));
         let notes = (picking.menu.title.clone(), "enter picks · esc cancels".to_owned());
-        Bottom { above, tone: Tone::Typing, mark: s.bold(&s.blue("›")), lines, caret: Some(caret), notes, below, compact: picking.menu.title.clone() }
+        let above = [above, list].concat();
+        Bottom { above, tone: Tone::Typing, mark: s.bold(&s.blue("›")), lines, caret: Some(caret), notes, below: vec![self.bar.clone()], compact: picking.menu.title.clone() }
     }
 
     /// You're not looking: the terminal says its window is behind another,
@@ -753,12 +715,12 @@ impl Boxed {
                 self.dismissed = typed;
                 edited = false;
             }
-            (_, Key::Up | Key::BackTab) if !found.is_empty() => {
-                self.picked = (self.picked + found.len() - 1) % found.len();
+            (_, Key::Up) if !found.is_empty() => {
+                self.picked = (self.picked + 1) % found.len();
                 edited = false;
             }
-            (_, Key::Down) if !found.is_empty() => {
-                self.picked = (self.picked + 1) % found.len();
+            (_, Key::Down | Key::BackTab) if !found.is_empty() => {
+                self.picked = (self.picked + found.len() - 1) % found.len();
                 edited = false;
             }
             (_, Key::Tab) if !found.is_empty() => self.editor.complete_mention(&pick.unwrap_or_default()),
@@ -789,13 +751,13 @@ impl Boxed {
             (Waiting::Answer, Key::Esc) if self.secret => self.reply(Read::Interrupted),
             (Waiting::Message, Key::CtrlD) if self.editor.is_empty() => self.reply(Read::Eof),
             (Waiting::Message, Key::BackTab) if menu.is_empty() => self.reply(Read::NextMode),
-            // The arrows pick among the matching commands.
-            (_, Key::Up | Key::BackTab) if !menu.is_empty() => {
-                self.picked = (self.picked + menu.len() - 1) % menu.len();
+            // The arrows pick among the matching commands, up the list.
+            (_, Key::Up) if !menu.is_empty() => {
+                self.picked = (self.picked + 1) % menu.len();
                 edited = false;
             }
-            (_, Key::Down) if !menu.is_empty() => {
-                self.picked = (self.picked + 1) % menu.len();
+            (_, Key::Down | Key::BackTab) if !menu.is_empty() => {
+                self.picked = (self.picked + menu.len() - 1) % menu.len();
                 edited = false;
             }
             // Tab while rein works: after this turn, not into it.
@@ -1037,6 +999,24 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// A list that opens over the box, as its rows are drawn, top to bottom:
+/// the first of `count` items, the best match, right over the box, and the
+/// rest going up from it, as many as `rows` around `picked`, with how many
+/// more there are at each end that's out of view. `row` draws an item.
+fn upward(count: usize, picked: usize, rows: usize, s: Style, row: impl Fn(usize) -> String) -> Vec<String> {
+    let first = (picked + 1).saturating_sub(rows);
+    let end = (first + rows).min(count);
+    let mut lines = Vec::new();
+    if count > end {
+        lines.push(s.dim(&format!("   … {} more", count - end)));
+    }
+    lines.extend((first..end).rev().map(&row));
+    if first > 0 {
+        lines.push(s.dim(&format!("   … {first} more")));
+    }
+    lines
 }
 
 /// `text` with each of `words` (lowercase) in it picked out: in blue, and
