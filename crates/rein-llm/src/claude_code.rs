@@ -213,9 +213,14 @@ fn schema(request: &Request<'_>) -> Value {
     let calls: Vec<Value> = shown(request)
         .into_iter()
         .map(|tool| {
+            // A schema that isn't kept to strict mode's rules, as an MCP
+            // server's, is said in the prompt and not held to here: the CLI
+            // turned a whole answer away for a null it didn't allow, and the
+            // model gave up on the call. Its server says what's wrong.
+            let arguments = if tool.strict { tool.parameters.clone() } else { json!({"type":"object"}) };
             json!({
                 "type": "object", "properties": {
-                    "name": {"type":"string", "enum":[tool.name]}, "arguments": tool.parameters
+                    "name": {"type":"string", "enum":[tool.name]}, "arguments": arguments
                 }, "required":["name", "arguments"], "additionalProperties": false
             })
         })
@@ -242,11 +247,18 @@ fn prompt(request: &Request<'_>) -> Value {
         })
         .collect();
     let tools: Vec<Value> = shown(request).into_iter().map(|t| json!({"name":t.name, "description":t.description, "parameters":t.parameters})).collect();
-    json!({
-        "task":"Continue this rein conversation. Follow its instructions. Return text and tool_calls using the output schema. To use a tool, put its name and arguments in tool_calls; rein executes it and supplies the result on the next request. Do not execute tools yourself. Return an empty tool_calls array when finished.",
-        "instructions":request.instructions, "conversation":history, "tools":tools
-    })
+    json!({"task":TASK, "instructions":request.instructions, "conversation":history, "tools":tools})
 }
+
+/// What the CLI is asked to do. It has no tools of its own but the one it
+/// answers with, and says so: told only not to run rein's tools, the model
+/// called a server's (`mcp__linear__list_teams`) as its own, was told
+/// there's no such tool, and often gave up on it.
+const TASK: &str = "Continue this rein conversation, following its instructions. You have one tool of your own, \
+                    StructuredOutput: answer only by calling it. The tools listed under \"tools\" are rein's, not \
+                    yours: you can't call them yourself, and calling one by its name fails. To use one, put its name \
+                    and arguments in StructuredOutput's tool_calls; rein runs it and gives you its result in the next \
+                    request. Return an empty tool_calls array when you're done.";
 
 #[derive(Deserialize)]
 struct Reply {
@@ -332,6 +344,24 @@ mod tests {
             max_output_tokens: None,
             hold_back: false,
         }
+    }
+
+    #[test]
+    fn the_cli_is_told_rein_runs_the_tools_and_held_only_to_strict_schemas() {
+        let strict = json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"], "additionalProperties": false});
+        let server = json!({"type": "object", "properties": {"query": {"type": "string"}}});
+        let tools = [
+            crate::Tool { loading: Loading::UpFront, strict: true, name: "read".into(), description: "Read".into(), parameters: strict.clone() },
+            crate::Tool { loading: Loading::UpFront, strict: false, name: "mcp__linear__list_teams".into(), description: "Teams".into(), parameters: server.clone() },
+        ];
+        let request = Request { tools: &tools, ..request() };
+        let calls = &schema(&request)["properties"]["tool_calls"]["items"]["anyOf"];
+        assert_eq!(calls[0]["properties"]["arguments"], strict, "rein's own: held to it");
+        assert_eq!(calls[1]["properties"]["arguments"], json!({"type": "object"}), "a server's: its server checks it");
+        let prompt = prompt(&request);
+        assert_eq!(prompt["tools"][1]["parameters"], server, "and the model is still told it");
+        assert!(prompt["task"].as_str().unwrap().contains("You have one tool of your own, StructuredOutput"), "{}", prompt["task"]);
+        assert!(prompt["task"].as_str().unwrap().contains("you can't call them yourself"));
     }
 
     #[test]

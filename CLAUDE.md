@@ -191,6 +191,13 @@ finding. Each says why in a line.
   loses the whole cache. A tool found mid-conversation joins after the
   conversation so far (`additional_tools`, `tool_reference`), and a format
   that can't do that shows every tool from the start.
+- A CLI used only as the model (`claude -p`) is told it has one tool, the
+  one it answers with, and that the tools listed are rein's: told only
+  "don't run tools yourself", the model called `mcp__linear__list_teams` as
+  its own, was told there's no such tool, and often gave up on the call.
+  A server's schema isn't held to there either: the CLI turned a whole
+  answer away for a null it didn't allow. `--output-format stream-json
+  --verbose` shows what the model did, turn by turn.
 
 ## Encapsulation
 
