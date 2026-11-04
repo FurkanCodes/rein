@@ -318,6 +318,11 @@ pub struct Agent<M> {
     /// Who searches the web for the model, if anyone: `web_search` is
     /// offered only then (see [`Agent::set_searcher`]).
     searcher: Option<crate::web::Searcher>,
+    /// Whether the model can see images, as its list says: one that can't
+    /// is told of them in words.
+    pub sees: rein_llm::Sees,
+    /// Images you pasted, to go with your next message.
+    pasted: Vec<rein_llm::Image>,
     /// How many steps (answers from the model) a turn may take before it's
     /// stopped, and the model asked to sum up: `None` while someone is
     /// watching, who can press Esc; a number when nobody is.
@@ -656,6 +661,7 @@ impl<M: Model> Agent<M> {
         let output = with_note(output, call, closing, times);
         ui.tool_finished(call, &output);
         self.record(Item::ToolResult { call_id: call.call_id.clone(), output })?;
+        self.record_images(&call.call_id)?;
         Ok((times >= REPEATS_STOP).then(|| Ran::Stuck { call: call.clone(), times }))
     }
 
@@ -734,6 +740,14 @@ impl<M: Model> Agent<M> {
     /// says so instead of a second copy. A mention inside a folder with
     /// its own AGENTS.md brings that along, once.
     async fn attach(&mut self, message: &str, ui: &mut impl Ui) -> Result<()> {
+        // What you pasted comes as a read made for you, as what you name
+        // with @ does: an image is always some call's.
+        for image in std::mem::take(&mut self.pasted) {
+            let call = self.mention_call("read", json!({ "path": "(pasted)", "start_line": null, "line_count": null }));
+            let call_id = call.call_id.clone();
+            self.attached(call, format!("[{}]", image.about), ui)?;
+            self.record(Item::Image { call_id, image })?;
+        }
         for mention in mentions::find(message) {
             let full = self.tools.root().join(&mention.path);
             // `@alice` is a word, not a file; `@src/gone.rs` is worth a word.
@@ -772,7 +786,21 @@ impl<M: Model> Agent<M> {
         ui.attached(&call, &output);
         let call_id = call.call_id.clone();
         self.record(Item::ToolCall(call))?;
-        self.record(Item::ToolResult { call_id, output })
+        self.record(Item::ToolResult { call_id: call_id.clone(), output })?;
+        self.record_images(&call_id)
+    }
+
+    /// `image`, which you pasted, goes with your next message.
+    pub fn paste(&mut self, image: rein_llm::Image) {
+        self.pasted.push(image);
+    }
+
+    /// Records the images the call `call_id` gave, right after its result.
+    fn record_images(&mut self, call_id: &str) -> Result<()> {
+        for image in self.tools.take_images(call_id) {
+            self.record(Item::Image { call_id: call_id.to_owned(), image })?;
+        }
+        Ok(())
     }
 
     /// A call of `tool` made for the user. Its ID is unique in the
@@ -930,6 +958,8 @@ impl<M> Agent<M> {
             max_output: None,
             finds_tools: rein_llm::FindsTools::Unknown,
             searcher: None,
+            sees: rein_llm::Sees::Unknown,
+            pasted: Vec::new(),
             step_limit: None,
             instructions: header.instructions,
             servers_say: Vec::new(),
@@ -972,6 +1002,8 @@ impl<M> Agent<M> {
             max_output,
             finds_tools,
             searcher,
+            sees,
+            pasted,
             step_limit,
             specs,
             listed,
@@ -993,6 +1025,8 @@ impl<M> Agent<M> {
             max_output,
             finds_tools,
             searcher,
+            sees,
+            pasted,
             step_limit,
             specs,
             listed,
@@ -1091,6 +1125,7 @@ impl<M> Agent<M> {
             session_id: self.session_id.as_deref(),
             max_output_tokens: self.max_output,
             hold_back: self.finds_tools != rein_llm::FindsTools::No,
+            images: self.sees != rein_llm::Sees::No,
         }
     }
 
@@ -1278,6 +1313,7 @@ mod tests {
         session_id: Option<String>,
         hold_back: bool,
         instructions: Option<String>,
+        images: bool,
     }
 
     impl From<&Request<'_>> for Seen {
@@ -1288,6 +1324,7 @@ mod tests {
                 session_id: request.session_id.map(str::to_owned),
                 hold_back: request.hold_back,
                 instructions: request.instructions.map(str::to_owned),
+                images: request.images,
             }
         }
     }
@@ -1734,6 +1771,8 @@ mod tests {
             max_output: None,
             finds_tools: rein_llm::FindsTools::Unknown,
             searcher: None,
+            sees: rein_llm::Sees::Unknown,
+            pasted: Vec::new(),
             step_limit: None,
             session_id: Some("session-1".into()),
             history: Vec::new(),
@@ -1855,6 +1894,73 @@ mod tests {
         drop(bodies);
         agent.set_searcher(None);
         assert!(!agent.specs.iter().any(|tool| tool.name == "web_search"), "taken away with nothing to search");
+    }
+
+    /// An image a tool gives, a file `read` opens or a server's, comes into
+    /// the conversation right after its result, kept as a file of rein's;
+    /// one named with `@` too. A model that can't see is told in words.
+    #[tokio::test]
+    async fn an_image_a_tool_gives_comes_after_its_result() {
+        let call = |id: &str, name: &str, arguments: Value| Item::ToolCall(ToolCall { call_id: id.into(), name: name.into(), arguments: arguments.to_string() });
+        let turns = vec![
+            vec![call("r1", "read", json!({ "path": "a.png", "start_line": null, "line_count": null })), call("e1", "mcp__fake__echo", json!({ "text": "picture" }))],
+            vec![Item::Assistant("A grey square and a dot.".into())],
+            vec![Item::Assistant("Seen.".into())],
+        ];
+        let mut agent = agent("images", turns);
+        let root = agent.tools.root().to_owned();
+        std::fs::write(root.join("a.png"), crate::image::tests::png(40, 30, png::Compression::Fast)).unwrap();
+        std::fs::write(root.join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
+        let local = rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: crate::sandbox::Access::Outside };
+        let server = rein_mcp::Server {
+            name: "fake".into(),
+            origin: rein_mcp::Origin::Yours,
+            reach: rein_mcp::Reach::Local(local),
+            allow: vec!["echo".into()],
+            offered: rein_mcp::Offered::UpFront,
+        };
+        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default(), web: None, tokens: None };
+        let kept = root.join(".images");
+        agent.tools = Tools::new(&root).with_mcp(std::sync::Arc::new(rein_mcp::Servers::start(vec![server], launch))).with_images(kept.clone());
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("look at them".into(), &mut person).await.unwrap();
+        let after = |id: &str| -> Option<(String, Option<&Item>)> {
+            let at = agent.history.iter().position(|item| matches!(item, Item::ToolResult { call_id, .. } if call_id == id))?;
+            Some((result_of(&agent, id).to_owned(), agent.history.get(at + 1)))
+        };
+        let (read, next) = after("r1").unwrap();
+        assert_eq!(read, "[image a.png, 40×30]");
+        assert!(matches!(next, Some(Item::Image { call_id, image }) if call_id == "r1" && image.width == 40 && image.file.starts_with(&kept)), "{next:?}");
+        let (echo, next) = after("e1").unwrap();
+        assert_eq!(echo, "a picture\n[an image fake's echo gave, 1×1]");
+        assert!(matches!(next, Some(Item::Image { call_id, .. }) if call_id == "e1"));
+        {
+            let requests = agent.model.requests.borrow();
+            assert!(requests[1].images, "shown to a model that may see");
+            assert_eq!(requests[1].input.iter().filter(|item| matches!(item, Item::Image { .. })).count(), 2);
+        }
+        // Named with @, it's read for the message, and comes the same way.
+        agent.sees = rein_llm::Sees::No;
+        agent.send("and @a.png?".into(), &mut person).await.unwrap();
+        let mentioned = agent.history.iter().any(|item| matches!(item, Item::Image { call_id, .. } if call_id.starts_with("mention_")));
+        assert!(mentioned, "{:?}", agent.history);
+        assert!(!agent.model.requests.borrow().last().unwrap().images, "a model that can't see: said in words");
+    }
+
+    /// An image you paste goes with your message, as a read made for you.
+    #[tokio::test]
+    async fn a_pasted_image_goes_with_the_message() {
+        let mut agent = agent("pasted", vec![vec![Item::Assistant("A dot.".into())]]);
+        let image =
+            rein_llm::Image { kind: rein_llm::ImageKind::Png, data: None, file: "/k/a.png".into(), width: 1, height: 1, about: "the image you pasted as [Image #1], 1×1".into() };
+        agent.paste(image.clone());
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("what's [Image #1]?".into(), &mut person).await.unwrap();
+        let input = &agent.model.requests.borrow()[0].input;
+        let at = input.iter().position(|item| matches!(item, Item::User(text) if text == "what's [Image #1]?")).unwrap();
+        assert!(matches!(&input[at + 1], Item::ToolCall(call) if call.name == "read" && call.arguments.contains("(pasted)")));
+        assert!(matches!(&input[at + 2], Item::ToolResult { output, .. } if output == "[the image you pasted as [Image #1], 1×1]"));
+        assert!(matches!(&input[at + 3], Item::Image { image: shown, .. } if *shown == image));
     }
 
     #[tokio::test]
@@ -1983,6 +2089,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         let started = std::time::Instant::now();
         let (items, _) = model.respond(&request, &mut |_| {}).await.unwrap();

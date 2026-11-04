@@ -84,6 +84,9 @@ pub fn size(item: &Item) -> usize {
         Item::ToolCall(call) => call.name.len() + call.arguments.len(),
         Item::ToolResult { output, .. } => output.len(),
         Item::Found { names, .. } => names.iter().map(String::len).sum(),
+        // About what a model counts for one (Anthropic's w·h/750 tokens),
+        // in characters.
+        Item::Image { image, .. } => (image.width as usize * image.height as usize / 750) * 4,
         Item::Opaque(opaque) => opaque.value.to_string().len(),
     }
 }
@@ -150,9 +153,22 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
     let typed: Vec<usize> = history.iter().enumerate().filter(|(_, item)| typed(item).is_some()).map(|(i, _)| i).collect();
     // Commands before the second-to-last message are old news.
     let recent = if typed.len() >= 2 { typed[typed.len() - 2] } else { 0 };
+    // A result's images, which weigh far more than its words.
+    let pictured: std::collections::HashSet<&str> = history
+        .iter()
+        .filter_map(|item| match item {
+            Item::Image { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut retired = Vec::new();
     for (i, item) in history.iter().enumerate() {
         let Item::ToolResult { call_id, output } = item else { continue };
+        if pictured.contains(call_id.as_str()) && i < recent {
+            let again = if calls.get(call_id.as_str()).is_some_and(|(_, call)| call.tool == Some(ToolName::Read)) { "Read it again" } else { "Call it again" };
+            retired.push((call_id.clone(), format!("{RETIRED} {}: its image, from before the user's last messages. {again} to see it.]", output.trim())));
+            continue;
+        }
         if output.len() < 400 || output.starts_with(RETIRED) {
             continue;
         }
@@ -183,10 +199,12 @@ pub fn stale(history: &[Item]) -> Vec<(String, String)> {
     retired
 }
 
-/// Swaps in the replacements from [`stale`]. Thinking after the first one
-/// was signed with what's been replaced, so it goes.
+/// Swaps in the replacements from [`stale`], each result's images going
+/// with what it said. Thinking after the first one was signed with what's
+/// been replaced, so it goes.
 pub fn retire(history: &mut Vec<Item>, retired: &[(String, String)]) {
     let by_id: HashMap<&str, &str> = retired.iter().map(|(id, text)| (id.as_str(), text.as_str())).collect();
+    history.retain(|item| !matches!(item, Item::Image { call_id, .. } if by_id.contains_key(call_id.as_str())));
     let mut first = None;
     for (i, item) in history.iter_mut().enumerate() {
         if let Item::ToolResult { call_id, output } = item
@@ -318,7 +336,7 @@ pub fn recent_start(history: &[Item], from: usize, budget: u64) -> usize {
     // Move later until every kept result has its call.
     while start < history.len() {
         let orphan = history[start..].iter().any(|item| match item {
-            Item::ToolResult { call_id, .. } | Item::Found { call_id, .. } => calls.get(call_id.as_str()).is_none_or(|(i, _)| *i < start),
+            Item::ToolResult { call_id, .. } | Item::Found { call_id, .. } | Item::Image { call_id, .. } => calls.get(call_id.as_str()).is_none_or(|(i, _)| *i < start),
             _ => false,
         });
         if !orphan {
@@ -402,7 +420,7 @@ pub fn recall(full: &[Item], arguments: &str) -> String {
             Item::ToolCall(call) => ("tool call", format!("{} {}", call.name, call.arguments)),
             Item::ToolResult { output, .. } => ("tool result", output.clone()),
             Item::Found { names, .. } => ("tools found", names.join(", ")),
-            Item::Opaque(_) => continue,
+            Item::Opaque(_) | Item::Image { .. } => continue,
         };
         let lower = text.to_lowercase();
         if words.iter().all(|w| lower.contains(w.as_str())) {
@@ -457,6 +475,31 @@ mod tests {
     use rein_llm::ToolCall;
 
     use super::*;
+
+    #[test]
+    fn an_image_from_before_the_last_messages_makes_room_with_a_note() {
+        let image = |id: &str| Item::Image {
+            call_id: id.into(),
+            image: rein_llm::Image { kind: rein_llm::ImageKind::Png, data: None, file: "/k/a.png".into(), width: 2000, height: 1000, about: "image a.png, 2000×1000".into() },
+        };
+        let mut history = vec![
+            Item::User("look".into()),
+            call("r1", "read", json!({"path": "a.png"})),
+            result("r1", "[image a.png, 2000×1000]"),
+            image("r1"),
+            Item::User("and now".into()),
+            call("r2", "read", json!({"path": "a.png"})),
+            result("r2", "[image a.png, 2000×1000]"),
+            image("r2"),
+            Item::User("again".into()),
+        ];
+        assert_eq!(size(&history[3]), 2000 * 1000 / 750 * 4, "it weighs what a model counts for it");
+        let retired = stale(&history);
+        assert_eq!(retired, [("r1".to_owned(), format!("{RETIRED} [image a.png, 2000×1000]: its image, from before the user's last messages. Read it again to see it.]"))]);
+        retire(&mut history, &retired);
+        assert_eq!(history.iter().filter(|item| matches!(item, Item::Image { .. })).count(), 1, "its image went with it");
+        assert!(matches!(&history[6], Item::Image { call_id, .. } if call_id == "r2"), "the recent one stays");
+    }
 
     #[test]
     fn a_tool_found_before_the_kept_part_is_found_again_at_its_start() {

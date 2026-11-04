@@ -95,6 +95,9 @@ pub(crate) struct Terminal {
     noted: Option<String>,
     /// What the step did to the project's files, to show under it.
     watched: Option<String>,
+    /// The images pasted with Ctrl-V into the message being typed, each by
+    /// its label in the box.
+    pub(crate) pasted: Vec<(String, rein_llm::Image)>,
     /// What was shown last, which says whether what comes next starts
     /// after a blank line.
     pub(crate) last: Last,
@@ -240,6 +243,7 @@ impl Terminal {
             step: None,
             noted: None,
             watched: None,
+            pasted: Vec::new(),
             last: Last::Nothing,
             labeled: false,
             thoughts: String::new(),
@@ -693,7 +697,7 @@ impl Ui for Terminal {
                     std::future::pending().await
                 }
                 // No answer (input has ended) means no.
-                Read::Eof | Read::NextMode | Read::Picked(_) => Approval::No,
+                Read::Eof | Read::NextMode | Read::Picked(_) | Read::Paste => Approval::No,
             };
         }
         // A command is asked about in full, in the box, and its line comes

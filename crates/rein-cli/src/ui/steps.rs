@@ -250,6 +250,11 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             Outcome { ok: Some(!failed), status, more: body.len() - shown.len(), details: shown.into_iter().map(str::to_owned).collect(), unit: "line" }
         }
         Some(ToolName::Read) if output.starts_with("[unchanged:") => plain(Some(true), style.dim("unchanged: already in the conversation")),
+        // An image, as rein said it: `[image a.png, 1280×800]`.
+        Some(ToolName::Read) if output.starts_with("[image ") && output.lines().count() == 1 => {
+            let size = output.trim_matches(['[', ']']).split(", ").skip(1).collect::<Vec<_>>().join(", ");
+            plain(Some(true), style.dim(&format!("image, {}", size.split(':').next().unwrap_or_default())))
+        }
         Some(ToolName::Read) => {
             // A partial read ends with a note saying which lines it holds.
             let note = output.lines().last().filter(|line| line.starts_with("[lines "));

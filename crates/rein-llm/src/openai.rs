@@ -7,7 +7,7 @@ pub mod signin;
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, EFFORT, HOLD_BACK, Optional};
+use crate::client::{Client, EFFORT, HOLD_BACK, IMAGES, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
 use crate::{Api, Effort, Efforts, Error, Event, FindsTools, Item, Loading, ModelInfo, Opaque, Request, Result, Tool, ToolCall, Usage, found_text};
@@ -15,7 +15,7 @@ use crate::{Api, Effort, Efforts, Error, Event, FindsTools, Item, Loading, Model
 /// What the Responses API may turn away: an effort level the model doesn't
 /// take, which OpenAI names as the error's `param`, and tools added partway
 /// through the conversation, for what the tool search found.
-pub(crate) const OPTIONAL: Optional = &[("reasoning.effort", "reasoning", EFFORT), ("additional_tools", "additional_tools", HOLD_BACK)];
+pub(crate) const OPTIONAL: Optional = &[("reasoning.effort", "reasoning", EFFORT), ("additional_tools", "additional_tools", HOLD_BACK), ("image", "input_image", IMAGES)];
 
 pub const API_BASE: &str = "https://api.openai.com/v1";
 
@@ -44,8 +44,9 @@ pub(crate) fn request_body(request: &Request<'_>) -> Value {
     // Only what the Responses API can read: another format's reasoning
     // means nothing here.
     let holds_back = request.holds_back();
+    let images = crate::images_of(request.input);
     let input: Vec<Value> =
-        request.input.iter().filter(|item| !matches!(item, Item::Opaque(o) if o.api != Api::Responses)).flat_map(|item| item_json(item, request, holds_back)).collect();
+        request.input.iter().filter(|item| !matches!(item, Item::Opaque(o) if o.api != Api::Responses)).flat_map(|item| item_json(item, request, holds_back, &images)).collect();
     // Sign in with ChatGPT requires `store: false` and `stream: true`, and
     // rejects fields like `temperature` and `max_output_tokens`. Sending only
     // what it accepts keeps one request shape for both ways of paying.
@@ -78,7 +79,7 @@ fn function(tool: &Tool) -> Value {
 /// One conversation item in the Responses API's input format. Where tools
 /// are held back, what the search found is added to the model's tools
 /// right after its answer (`additional_tools`), in a namespace of their own.
-fn item_json(item: &Item, request: &Request<'_>, holds_back: bool) -> Vec<Value> {
+fn item_json(item: &Item, request: &Request<'_>, holds_back: bool, images: &std::collections::HashMap<&str, Vec<&crate::Image>>) -> Vec<Value> {
     let one = match item {
         Item::User(text) => json!({ "role": "user", "content": text }),
         Item::Assistant(text) => json!({ "role": "assistant", "content": text }),
@@ -89,7 +90,22 @@ fn item_json(item: &Item, request: &Request<'_>, holds_back: bool) -> Vec<Value>
             "name": call.name,
             "arguments": call.arguments,
         }),
-        Item::ToolResult { call_id, output } => json!({ "type": "function_call_output", "call_id": call_id, "output": output }),
+        // Its images go in its output, each after what's said of it.
+        Item::ToolResult { call_id, output } => {
+            let (text, shown) = crate::split_images(output, images.get(call_id.as_str()).map(Vec::as_slice).unwrap_or_default(), request.images);
+            if shown.is_empty() {
+                json!({ "type": "function_call_output", "call_id": call_id, "output": text })
+            } else {
+                let mut parts = vec![json!({ "type": "input_text", "text": text })];
+                for image in shown {
+                    parts.push(json!({ "type": "input_text", "text": image.said() }));
+                    parts.push(json!({ "type": "input_image", "image_url": image.data_url(), "detail": "high" }));
+                }
+                json!({ "type": "function_call_output", "call_id": call_id, "output": parts })
+            }
+        }
+        // Said with the result it's part of.
+        Item::Image { .. } => return Vec::new(),
         Item::Found { call_id, names } => {
             let said = json!({ "type": "function_call_output", "call_id": call_id, "output": found_text(names) });
             let found: Vec<Value> = names.iter().filter_map(|name| request.held_back(name)).map(function).collect();
@@ -125,6 +141,7 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
                         Some(false) => FindsTools::No,
                         None => FindsTools::Unknown,
                     },
+                    sees: crate::sees_by(&m["input_modalities"]),
                 })
             })
             .collect();
@@ -238,6 +255,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         assert_eq!(
             request_body(&request),
@@ -278,6 +296,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         let body = request_body(&request);
         assert_eq!(body["tools"][0]["type"], "namespace");
@@ -312,6 +331,31 @@ mod tests {
         assert_eq!(body["input"][4]["namespace"], "mcp", "called where it was added");
         assert_eq!(body["input"][5], json!({"type": "function_call_output", "call_id": "c1", "output": "made"}));
         assert_eq!(body["input"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn an_image_goes_in_its_tools_output_after_whats_said_of_it() {
+        use crate::testing::*;
+        let input = pictured();
+        let body = request_body(&request(&input, &[], false));
+        assert_eq!(
+            body["input"][2]["output"],
+            json!([
+                {"type": "input_text", "text": "Image a.png, 2×1."},
+                {"type": "input_text", "text": "[image a.png, 2×1]"},
+                {"type": "input_image", "image_url": "data:image/png;base64,cG5nIQ==", "detail": "high"},
+            ])
+        );
+        assert_eq!(body["input"].as_array().unwrap().len(), 4, "the image is said with its result, not as an item of its own");
+        let blind = request_body(&Request { images: false, ..request(&input, &[], false) });
+        assert_eq!(blind["input"][2]["output"], "Image a.png, 2×1.\n[image a.png, 2×1: this model can't see images, so it isn't shown]");
+    }
+
+    #[test]
+    fn a_chatgpt_models_list_says_whether_it_sees() {
+        let chatgpt = json!({"models": [{"slug": "a", "input_modalities": ["text", "image"]}, {"slug": "b", "input_modalities": ["text"]}, {"slug": "c"}]});
+        let sees: Vec<crate::Sees> = parse_models(&chatgpt).iter().map(|m| m.sees).collect();
+        assert_eq!(sees, [crate::Sees::Yes, crate::Sees::No, crate::Sees::Unknown]);
     }
 
     #[test]
@@ -351,12 +395,28 @@ mod tests {
         ]});
         assert_eq!(
             parse_models(&chatgpt),
-            [ModelInfo { id: "a".into(), name: "Model A".into(), context_window: Some(500_000), max_output: None, efforts: Efforts::Unknown, finds_tools: FindsTools::Unknown }]
+            [ModelInfo {
+                id: "a".into(),
+                name: "Model A".into(),
+                context_window: Some(500_000),
+                max_output: None,
+                efforts: Efforts::Unknown,
+                finds_tools: FindsTools::Unknown,
+                sees: crate::Sees::Unknown
+            }]
         );
         let api_key = json!({"data": [{"id": "b"}]});
         assert_eq!(
             parse_models(&api_key),
-            [ModelInfo { id: "b".into(), name: "b".into(), context_window: None, max_output: None, efforts: Efforts::Unknown, finds_tools: FindsTools::Unknown }]
+            [ModelInfo {
+                id: "b".into(),
+                name: "b".into(),
+                context_window: None,
+                max_output: None,
+                efforts: Efforts::Unknown,
+                finds_tools: FindsTools::Unknown,
+                sees: crate::Sees::Unknown
+            }]
         );
     }
 
@@ -392,6 +452,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         assert_eq!(request_body(&request)["reasoning"]["effort"], "none");
     }

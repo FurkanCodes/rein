@@ -7,6 +7,7 @@ pub mod compact;
 pub mod context;
 mod files;
 mod finding;
+pub mod image;
 pub mod mentions;
 pub mod peers;
 pub mod permissions;

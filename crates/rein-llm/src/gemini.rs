@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, EFFORT, Optional};
+use crate::client::{Client, EFFORT, IMAGES, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
 use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage, in_words};
@@ -31,6 +31,7 @@ pub(crate) const OPTIONAL: Optional = &[
     ("thinking level", "thinkingLevel", EFFORT),
     ("includethoughts", "includeThoughts", "thoughts"),
     ("include_thoughts", "includeThoughts", "thoughts"),
+    ("image", "inlineData", IMAGES),
 ];
 
 pub(crate) fn endpoint(base_url: &str, model: &str) -> String {
@@ -64,6 +65,8 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
                 max_output: m["outputTokenLimit"].as_u64(),
                 efforts: efforts(m, id),
                 finds_tools: crate::FindsTools::Unknown,
+                // Its list doesn't say; its models see.
+                sees: crate::Sees::Unknown,
             })
         })
         .collect()
@@ -88,7 +91,7 @@ fn efforts(m: &Value, id: &str) -> Efforts {
 }
 
 pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str]) -> Value {
-    let mut body = json!({ "contents": contents(request.input) });
+    let mut body = json!({ "contents": contents(request.input, request.images) });
     if let Some(instructions) = &request.instructions {
         body["systemInstruction"] = json!({ "parts": [{ "text": instructions }] });
     }
@@ -120,7 +123,8 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str]) -> Value {
 /// rein's items as Gemini's turns. A signature goes on the part after it;
 /// a function call with none, when its turn has no signed call, gets the
 /// value that says so.
-fn contents(input: &[Item]) -> Vec<Value> {
+fn contents(input: &[Item], show: bool) -> Vec<Value> {
+    let images = crate::images_of(input);
     let names: HashMap<&str, &str> = input
         .iter()
         .filter_map(|item| match item {
@@ -133,10 +137,18 @@ fn contents(input: &[Item]) -> Vec<Value> {
     for item in input {
         let (role, mut part) = match &*in_words(item) {
             Item::User(text) if !text.is_empty() => ("user", json!({ "text": text })),
+            // What's said of its images is in its output; the images come
+            // after it, in the same turn, which every Gemini model takes.
             Item::ToolResult { call_id, output } => {
                 let name = names.get(call_id.as_str()).copied().unwrap_or("tool");
-                ("user", json!({ "functionResponse": { "id": call_id, "name": name, "response": { "output": output } } }))
+                let (mut text, shown) = crate::split_images(output, images.get(call_id.as_str()).map(Vec::as_slice).unwrap_or_default(), show);
+                for image in shown {
+                    text.push('\n');
+                    text.push_str(&image.said());
+                }
+                ("user", json!({ "functionResponse": { "id": call_id, "name": name, "response": { "output": text } } }))
             }
+            Item::Image { image, .. } if show && let Some(data) = image.base64() => ("user", json!({ "inlineData": { "mimeType": image.kind.media_type(), "data": data } })),
             Item::Assistant(text) => ("model", json!({ "text": text })),
             Item::ToolCall(call) => {
                 let args: Value = serde_json::from_str(&call.arguments).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
@@ -343,6 +355,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_image_comes_after_its_function_response_in_the_same_turn() {
+        use crate::testing::*;
+        let input = pictured();
+        let body = request_body(&request(&input, &[], false), &[]);
+        let turn = &body["contents"][2];
+        assert_eq!(turn["role"], "user");
+        assert_eq!(turn["parts"][0]["functionResponse"]["response"]["output"], "Image a.png, 2×1.\n[image a.png, 2×1]");
+        assert_eq!(turn["parts"][1], json!({"inlineData": {"mimeType": "image/png", "data": "cG5nIQ=="}}));
+        let blind = request_body(&Request { images: false, ..request(&input, &[], false) }, &[]);
+        assert_eq!(blind["contents"][2]["parts"].as_array().unwrap().len(), 1, "not shown: only said");
+    }
+
+    #[test]
     fn every_tool_is_declared_but_the_search_and_what_it_found_is_said_in_words() {
         use crate::testing::*;
         let (tools, input) = (held_back_tools(), found_and_called());
@@ -372,6 +397,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         }
     }
 
@@ -524,7 +550,8 @@ mod tests {
                 context_window: Some(1_048_576),
                 max_output: Some(65_536),
                 efforts: Efforts::Unknown,
-                finds_tools: crate::FindsTools::Unknown
+                finds_tools: crate::FindsTools::Unknown,
+                sees: crate::Sees::Unknown,
             }]
         );
     }

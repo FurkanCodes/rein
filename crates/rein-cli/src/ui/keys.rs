@@ -51,6 +51,8 @@ pub enum Key {
     DeleteToEnd,
     CtrlC,
     CtrlD,
+    /// Ctrl-V: an image from the clipboard (text comes as a paste).
+    CtrlV,
     CtrlO,
     /// Ctrl-R: find a message sent before.
     CtrlR,
@@ -148,6 +150,7 @@ fn decode(bytes: &[u8]) -> Decoded {
         0x0d => key(Key::Enter, 1),
         0x0e => key(Key::Down, 1),
         0x0f => key(Key::CtrlO, 1),
+        0x16 => key(Key::CtrlV, 1),
         0x10 => key(Key::Up, 1),
         0x12 => key(Key::CtrlR, 1),
         0x15 => key(Key::DeleteToStart, 1),
@@ -281,6 +284,7 @@ fn spelled(params: &[u8]) -> Option<Key> {
                 (true, false, 'l') => Key::Redraw,
                 (true, false, 'n') => Key::Down,
                 (true, false, 'o') => Key::CtrlO,
+                (true, false, 'v') => Key::CtrlV,
                 (true, false, 'p') => Key::Up,
                 (true, false, 'r') => Key::CtrlR,
                 (true, false, 'u') => Key::DeleteToStart,
@@ -326,6 +330,7 @@ mod tests {
         assert_eq!(keys(b"\x1b[1;3D\x1b[1;5C\x1bb\x1b[1;2D"), [Key::WordLeft, Key::WordRight, Key::WordLeft, Key::Left]);
         assert_eq!(keys(b"\x1b[Z"), [Key::BackTab]);
         assert_eq!(keys(b"\x12\x1b[114;5u"), [Key::CtrlR, Key::CtrlR]);
+        assert_eq!(keys(b"\x16\x1b[118;5u"), [Key::CtrlV, Key::CtrlV], "as a byte, and as the kitty protocol says it");
     }
 
     #[test]

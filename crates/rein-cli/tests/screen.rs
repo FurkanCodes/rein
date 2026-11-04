@@ -3071,6 +3071,67 @@ fn web_search_runs_on_the_model_in_use_and_says_what_it_went_by() {
     assert!(!offered.contains(&json!("web_search")), "taken away: {offered:?}");
 }
 
+/// A 1×1 PNG, as a screenshot tool would send a bigger one.
+const DOT: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 0x0d, 0x49,
+    0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x9f, 0xa1, 0x1e, 0, 0x07, 0x82, 0x02, 0x7f, 0x3d, 0xc8, 0x48, 0xef, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+    0x82,
+];
+
+/// An image a tool gives reaches the model inside that tool's result: a
+/// file `read` opens, and a server's screenshot. The conversation's file
+/// names where each is kept, never holding its bytes.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_image_a_tool_gives_reaches_the_model_inside_its_result() {
+    let turn =
+        Turn { out: vec![Out::Call("read", json!({ "path": "dot.png", "start_line": null, "line_count": null })), Out::Call("mcp__fake__echo", json!({ "text": "picture" }))] };
+    let mut model = Model::start(vec![turn, says("Two dots.")]);
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "allow": ["echo"], "access": "outside" } } }).to_string()));
+    let mut term = Term::start_with(&model, "images", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    std::fs::write(term.dir.join("project/dot.png"), DOT).unwrap();
+    term.wait_for(IDLE);
+    term.keys("what's in them?\r");
+    term.wait_for("Two dots.");
+    let text = term.text();
+    assert!(text.contains("Read   dot.png  image, 1×1"), "{text}");
+    let requests = model.requests();
+    let input = requests[1]["input"].as_array().cloned().unwrap_or_default();
+    let outputs: Vec<&Value> = input.iter().filter(|item| item["type"] == "function_call_output").map(|item| &item["output"]).collect();
+    assert_eq!(outputs.len(), 2, "{input:?}");
+    for output in outputs {
+        let parts = output.as_array().unwrap_or_else(|| panic!("an image in it: {output}"));
+        let image = parts.iter().find(|part| part["type"] == "input_image").unwrap();
+        assert!(image["image_url"].as_str().unwrap().starts_with("data:image/png;base64,iVBOR"));
+    }
+    let sessions = term.dir.join("home/sessions");
+    let mut kept = Vec::new();
+    let mut stack = vec![sessions];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.path().is_dir() { stack.push(entry.path()) } else { kept.push(entry.path()) }
+        }
+    }
+    let conversation = kept.iter().find(|path| path.extension().is_some_and(|e| e == "jsonl")).expect("the conversation's file");
+    let saved = std::fs::read_to_string(conversation).unwrap();
+    assert!(saved.contains("\"type\":\"image\"") && !saved.contains("iVBOR"), "named, never its bytes: {saved}");
+    assert_eq!(kept.iter().filter(|path| path.extension().is_some_and(|e| e == "png")).count(), 1, "the same dot kept once: {kept:?}");
+}
+
+/// Ctrl-V pastes an image from the clipboard; over SSH, where the
+/// clipboard is on the other computer, rein says so, and what's typed stays.
+#[test]
+fn ctrl_v_over_ssh_says_the_clipboard_is_elsewhere() {
+    let model = Model::start(Vec::new());
+    let mut term = Term::start_with(&model, "paste-ssh", 30, 110, &[]);
+    term.wait_for(IDLE);
+    term.keys("look at ");
+    term.keys("\x16");
+    term.wait_for("nothing pasted: the clipboard is on the computer you're connecting from");
+    assert!(term.text().contains("look at"), "what's typed stays\n{}", term.text());
+    assert!(model.requests().is_empty(), "nothing sent");
+}
+
 /// A project's .mcp.json may be anyone's: its server starts only once
 /// you've said yes to it as it is, and is asked about again once it
 /// changes.

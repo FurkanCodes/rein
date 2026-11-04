@@ -113,7 +113,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     let secrets = rein_agent::redact::Secrets::new(known_secrets(&keys).into_iter().chain(mcp.secrets()));
     // What `/undo` puts back is kept beside the conversations, by project.
     let undo = session::folder(&dir.join("undo"), &root);
-    let tools = Tools::new(root.clone()).with_sandbox(sandbox.clone()).with_secrets(secrets).with_mcp(mcp.servers.clone()).with_undo(undo);
+    let tools = Tools::new(root.clone()).with_sandbox(sandbox.clone()).with_secrets(secrets).with_mcp(mcp.servers.clone()).with_undo(undo).with_images(folder.join("images"));
     let mut setup = Setup {
         folder,
         personal: dir.join("AGENTS.md"),
@@ -158,6 +158,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     agent.reasoning_effort = args.effort;
     agent.efforts = setup.efforts(&agent.model_name);
     agent.finds_tools = setup.finds_tools(&agent.model_name);
+    agent.sees = setup.sees(&agent.model_name);
     crate::search::follow(&mut agent, &setup).await;
     terminal.effort = crate::effort::now(&agent);
     if let Some(why) = crate::effort::unlike_chosen(&agent) {
@@ -266,6 +267,11 @@ impl Setup {
         &self.keys
     }
 
+    /// Where the images shown in this folder's conversations are kept.
+    pub(crate) fn images(&self) -> std::path::PathBuf {
+        self.folder.join("images")
+    }
+
     pub(crate) fn search(&self) -> &crate::search::SearchWith {
         &self.search
     }
@@ -324,6 +330,11 @@ impl Setup {
         self.models.iter().find(|m| m.id == model).map(|m| m.finds_tools).unwrap_or_default()
     }
 
+    /// Whether `model` can see images, as its provider lists it.
+    fn sees(&self, model: &str) -> rein_llm::Sees {
+        self.models.iter().find(|m| m.id == model).map(|m| m.sees).unwrap_or_default()
+    }
+
     /// `spec` as saved: `provider/model`.
     fn canonical(&self, spec: &str) -> CliResult<String> {
         let (provider, model) = crate::connect::resolve(spec, &self.providers)?;
@@ -347,7 +358,13 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Te
     let effort = crate::effort::watch(agent);
     let work = async {
         match &start {
-            Start::You(prompt) => agent.send(prompt.clone(), terminal).await,
+            Start::You(prompt) => {
+                // What was pasted goes with it, if its label is still there.
+                for image in crate::paste::sent_with(prompt, std::mem::take(&mut terminal.pasted)) {
+                    agent.paste(image);
+                }
+                agent.send(prompt.clone(), terminal).await
+            }
             Start::Peer { from, text } => agent.hear(from, text, terminal).await,
         }
     };
@@ -522,6 +539,10 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 }
                 terminal.input.set_bar(terminal.bar());
                 terminal.input.notice(&format!("{} · shift-tab for the next", mode_description(mode, terminal.sandboxed)));
+                continue;
+            }
+            Said::Paste => {
+                crate::paste::paste(terminal, &setup.images()).await;
                 continue;
             }
             Said::Leave => break,
@@ -963,6 +984,7 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
     agent.max_output = setup.max_output(&model);
     agent.efforts = setup.efforts(&model);
     agent.finds_tools = setup.finds_tools(&model);
+    agent.sees = setup.sees(&model);
     terminal.model = provider::shown(&setup.provider, &model);
     agent.model_name = model;
     terminal.effort = crate::effort::now(agent);
@@ -1069,6 +1091,8 @@ pub(crate) enum Said {
     Peer(crate::peers::node::Incoming),
     /// Shift-Tab: on to the next mode.
     NextMode,
+    /// Ctrl-V: an image from the clipboard.
+    Paste,
     /// Ctrl-D, or Ctrl-C twice.
     Leave,
 }
@@ -1132,6 +1156,7 @@ pub(crate) async fn message(terminal: &mut Terminal, last_interrupt: &mut Option
             }
             Read::Eof => return Said::Leave,
             Read::NextMode => return Said::NextMode,
+            Read::Paste => return Said::Paste,
         }
     }
 }

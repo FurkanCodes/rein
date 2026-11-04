@@ -178,7 +178,7 @@ async fn a_stream_that_ends_ends_the_session_and_the_next_call_starts_another() 
         assert!(std::time::Instant::now() < deadline, "the session never ended: {:?}", servers.statuses());
         tokio::task::yield_now().await;
     }
-    let again = servers.call("mcp__old__echo", "{}").await.unwrap();
+    let again = servers.call("mcp__old__echo", "{}").await.unwrap().text;
     assert!(again.starts_with("said over the stream"), "{again}");
     assert_eq!(web.streams.load(Ordering::Relaxed), 2, "a stream of its own for the new session");
 }

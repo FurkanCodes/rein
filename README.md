@@ -206,6 +206,7 @@ message, so typing ahead can't answer it by accident.
 | Shift-Enter, Ctrl-J, or `\` at the end of a line | a new line in your message (Shift-Enter where the terminal tells it apart from Enter) |
 | `/` | the commands that match, as you type: ↑↓ pick one, Tab completes it, Enter runs it. `/help` lists them |
 | `@` | the project's files and folders that match, as you type, letters in order (`@prsr` finds `src/parser.rs`): ↑↓ pick, Tab puts the path in, Esc closes the list. What you point at goes with your message |
+| Ctrl-V | paste an image from the clipboard: `[Image #1]` in the box, and it goes with your message where its label still is (see [Images](#images)) |
 | Shift-Tab | the next mode: trust → ask → edits → auto → read-only |
 | Enter while rein works | steer it: your message goes into the turn at its next step, and steps rein had planned but not started are skipped. Commands wait for the end of the turn |
 | Tab while rein works | send your message after the turn instead. Esc puts what's waiting back in the box |
@@ -460,6 +461,39 @@ uncompressed, and nothing compressed after that; rein says so once.
   saved with the conversation, so a continued one starts with the same text.
 
 Credentials live in `~/.config/rein/` (or `$REIN_HOME`), readable only by you.
+
+## Images
+
+The model sees an image a tool gives: a screenshot from an MCP server
+(Chrome DevTools, Playwright), a `.png`, `.jpg`, `.gif` or `.webp` file
+`read` opens, one you name with `@`, or one you paste with Ctrl-V, which
+puts `[Image #1]` in the box. Each goes to the model inside its tool's
+result, as its provider takes it: in the result for OpenAI's API (a
+ChatGPT plan too), Anthropic's and Gemini's; in a message after the tool
+results for Chat Completions, whose tool messages take only text; and to
+`claude -p` as Claude Code's streamed JSON. A model whose list says it
+can't see, or that turns one down (learned per model), is told of it in
+words, and it stays in the conversation for one that can.
+
+```
+● Read   colors.png   image, 240×120
+```
+
+An image is checked once, as it arrives. A PNG bigger than 2,000 pixels a
+side or 5 MB, as screenshots are, is shrunk to fit, and the model told how
+much, so it can find a point in the original; a JPEG, GIF or WebP goes as
+it is when it fits what providers take. One that can't be shown is said
+so, never sent: an image a provider turns away would fail every request
+after it. Each is kept once, as a file named by what's in it, beside the
+project's conversations, which name it and hold none of its bytes. An
+image from before your last two messages makes room when the conversation
+is compacted, its result saying so and how to see it again.
+
+Ctrl-V reads the clipboard's PNG on macOS, or its TIFF (what a copied
+screenshot or an image copied from a browser holds) made a PNG, by a
+script macOS runs itself; on Linux, `wl-paste` or `xclip`. Over SSH the
+clipboard is on the other computer: put the image in the project and name
+it with `@`.
 
 ## Web search
 

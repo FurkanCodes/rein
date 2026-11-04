@@ -33,7 +33,8 @@ impl Backend {
     }
 
     async fn run(&self, program: &str, request: &Request<'_>, idle: Duration) -> Result<VecDeque<Result<Event>>> {
-        let job = Job { model: request.model, effort: request.reasoning_effort, tool: None, schema: schema(request), prompt: prompt(request).to_string() };
+        let images = shown_images(request);
+        let job = Job { model: request.model, effort: request.reasoning_effort, tool: None, schema: schema(request), prompt: prompt(request).to_string(), images };
         decode(&self.exec(program, &job, idle).await?, request)
     }
 
@@ -45,7 +46,7 @@ impl Backend {
     }
 
     async fn search_with(&self, program: &str, model: &str, question: &str, idle: Duration) -> Result<crate::search::Searched> {
-        let job = Job { model, effort: None, tool: Some("WebSearch"), schema: crate::search::schema(), prompt: crate::search::asked(question) };
+        let job = Job { model, effort: None, tool: Some("WebSearch"), schema: crate::search::schema(), prompt: crate::search::asked(question), images: Vec::new() };
         crate::search::from_cli(&self.exec(program, &job, idle).await?)
     }
 
@@ -69,8 +70,6 @@ impl Backend {
         }
         command.args([
             "-p",
-            "--output-format",
-            "json",
             "--tools",
             job.tool.unwrap_or_default(),
             "--strict-mcp-config",
@@ -92,6 +91,12 @@ impl Backend {
         if let Some(tool) = job.tool {
             command.args(["--allowedTools", tool]);
         }
+        // Images go only in streamed JSON, which the CLI then answers in too.
+        if job.images.is_empty() {
+            command.args(["--output-format", "json"]);
+        } else {
+            command.args(["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
+        }
         if let Some(effort) = job.effort {
             let effort = if effort == crate::Effort::Minimal { crate::Effort::Low } else { effort };
             command.args(["--effort", effort.as_str()]);
@@ -106,9 +111,10 @@ impl Backend {
         let mut stdin = child.stdin.take().ok_or_else(|| Error::Incomplete("Claude Code stdin unavailable".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Incomplete("Claude Code stdout unavailable".into()))?;
         let stderr = child.stderr.take().ok_or_else(|| Error::Incomplete("Claude Code stderr unavailable".into()))?;
+        let input = if job.images.is_empty() { job.prompt.clone() } else { streamed(&job.prompt, &job.images) };
         let work = async {
             let write = async {
-                stdin.write_all(job.prompt.as_bytes()).await?;
+                stdin.write_all(input.as_bytes()).await?;
                 stdin.shutdown().await?;
                 drop(stdin);
                 Ok::<_, Error>(())
@@ -120,6 +126,10 @@ impl Backend {
                 // Neither stderr nor error JSON is safe: the CLI or an auth
                 // helper may echo credentials. Keep failures deliberately terse.
                 return Err(Error::Auth(format!("Claude Code exited with {status}; check `claude auth status` or run `claude setup-token`")));
+            }
+            // Streamed, the answer is its last line, as `json` gives it.
+            if !job.images.is_empty() {
+                return Ok(answered(&out));
             }
             Ok(out)
         };
@@ -137,6 +147,40 @@ struct Job<'a> {
     tool: Option<&'a str>,
     schema: Value,
     prompt: String,
+    /// The images it's shown, after the prompt, in order.
+    images: Vec<&'a crate::Image>,
+}
+
+/// The prompt and its images as one streamed user message: the images
+/// each after what's said of it.
+fn streamed(prompt: &str, images: &[&crate::Image]) -> String {
+    let mut content = vec![json!({ "type": "text", "text": prompt })];
+    for (n, image) in images.iter().enumerate() {
+        content.push(json!({ "type": "text", "text": format!("Image {}: {}", n + 1, image.said()) }));
+        content.push(json!({ "type": "image", "source": { "type": "base64", "media_type": image.kind.media_type(), "data": image.base64() } }));
+    }
+    format!("{}\n", json!({ "type": "user", "message": { "role": "user", "content": content }, "parent_tool_use_id": null }))
+}
+
+/// The last `result` line of a streamed answer, which says what `json`
+/// output would: nothing when there's none.
+fn answered(out: &[u8]) -> Vec<u8> {
+    out.split(|&b| b == b'\n').rfind(|line| serde_json::from_slice::<Value>(line).is_ok_and(|v| v["type"] == "result")).map(<[u8]>::to_vec).unwrap_or_default()
+}
+
+/// The images `request` shows, in the order they come.
+fn shown_images<'a>(request: &'a Request<'_>) -> Vec<&'a crate::Image> {
+    if !request.images {
+        return Vec::new();
+    }
+    request
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            Item::Image { image, .. } if image.data.is_some() => Some(image),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Where the CLI reads the token rein hands it: a descriptor it inherits.
@@ -265,20 +309,27 @@ fn schema(request: &Request<'_>) -> Value {
 }
 
 fn prompt(request: &Request<'_>) -> Value {
-    let history: Vec<Value> = request
-        .input
-        .iter()
-        .filter_map(|item| {
-            Some(match item {
-                Item::User(text) => json!({"role":"user", "text":text}),
-                Item::Assistant(text) => json!({"role":"assistant", "text":text}),
-                Item::ToolCall(call) => json!({"role":"assistant", "call_id":call.call_id, "name":call.name, "arguments":call.arguments}),
-                Item::ToolResult { call_id, output } => json!({"role":"tool", "call_id":call_id, "output":output}),
-                Item::Found { call_id, names } => json!({"role":"tool", "call_id":call_id, "output":found_text(names)}),
-                Item::Opaque(_) => return None,
-            })
-        })
-        .collect();
+    let images = crate::images_of(request.input);
+    // The images shown come after the conversation, numbered in order.
+    let mut numbered = 0;
+    let mut history: Vec<Value> = Vec::new();
+    for item in request.input {
+        history.push(match item {
+            Item::User(text) => json!({"role":"user", "text":text}),
+            Item::Assistant(text) => json!({"role":"assistant", "text":text}),
+            Item::ToolCall(call) => json!({"role":"assistant", "call_id":call.call_id, "name":call.name, "arguments":call.arguments}),
+            Item::ToolResult { call_id, output } => {
+                let (mut text, shown) = crate::split_images(output, images.get(call_id.as_str()).map(Vec::as_slice).unwrap_or_default(), request.images);
+                for image in shown {
+                    numbered += 1;
+                    text.push_str(&format!("\n{} (image {numbered}, after the conversation)", image.said()));
+                }
+                json!({"role":"tool", "call_id":call_id, "output":text})
+            }
+            Item::Found { call_id, names } => json!({"role":"tool", "call_id":call_id, "output":found_text(names)}),
+            Item::Opaque(_) | Item::Image { .. } => continue,
+        });
+    }
     let tools: Vec<Value> = shown(request).into_iter().map(|t| json!({"name":t.name, "description":t.description, "parameters":t.parameters})).collect();
     json!({"task":TASK, "instructions":request.instructions, "conversation":history, "tools":tools})
 }
@@ -376,6 +427,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         }
     }
 
@@ -395,6 +447,34 @@ mod tests {
         assert_eq!(prompt["tools"][1]["parameters"], server, "and the model is still told it");
         assert!(prompt["task"].as_str().unwrap().contains("You have one tool of your own, StructuredOutput"), "{}", prompt["task"]);
         assert!(prompt["task"].as_str().unwrap().contains("you can't call them yourself"));
+    }
+
+    #[tokio::test]
+    async fn images_go_to_the_cli_streamed_after_the_conversation() {
+        let fake = Fake::new(
+            r#"
+printf '%s\n' "$@" > "$0.args"
+/bin/cat > "$0.input"
+printf '%s\n' '{"type":"system","subtype":"init"}'
+printf '%s\n' '{"type":"result","structured_output":{"text":"A dot.","tool_calls":[]},"usage":{"input_tokens":1,"output_tokens":1}}'
+"#,
+        );
+        let input = crate::testing::pictured();
+        let request = crate::testing::request(&input, &[], false);
+        let events = Backend::new(None).run(&fake.program, &request, Duration::from_secs(5)).await.unwrap();
+        assert!(matches!(events.front(), Some(Ok(Event::TextDelta(text))) if text == "A dot."), "read from the streamed result line");
+        let args = std::fs::read_to_string(format!("{}.args", fake.program)).unwrap();
+        assert!(args.contains("--input-format\nstream-json\n--output-format\nstream-json\n--verbose\n"), "{args}");
+        let sent: Value = serde_json::from_str(std::fs::read_to_string(format!("{}.input", fake.program)).unwrap().trim()).unwrap();
+        let content = &sent["message"]["content"];
+        let prompt: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(prompt["conversation"][2]["output"], "Image a.png, 2×1.\n[image a.png, 2×1] (image 1, after the conversation)");
+        assert_eq!(content[1]["text"], "Image 1: [image a.png, 2×1]");
+        assert_eq!(content[2]["source"]["data"], "cG5nIQ==");
+        // With no image to show, it runs as ever.
+        let blind = Request { images: false, ..request };
+        let _ = Backend::new(None).run(&fake.program, &blind, Duration::from_secs(5)).await;
+        assert!(std::fs::read_to_string(format!("{}.args", fake.program)).unwrap().contains("--output-format\njson\n"));
     }
 
     #[test]

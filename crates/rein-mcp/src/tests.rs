@@ -56,6 +56,9 @@ async fn a_server_lists_its_tools_cleaned_and_answers_calls() {
     assert_eq!(listing.instructions, [("fake".to_owned(), "Echo before peeking.[2J".to_owned())], "what it says of using it, cleaned");
     assert_eq!(servers.call("mcp__fake__echo", r#"{"text":"hi"}"#).await, Ok("hi".into()));
     assert_eq!(servers.call("mcp__fake__given", "{}").await, Ok("hello there".into()), "the environment it was given");
+    let picture = servers.call("mcp__fake__echo", r#"{"text":"picture"}"#).await.unwrap();
+    assert_eq!((picture.text.as_str(), picture.images.len(), picture.images[0].media_type.as_str()), ("a picture", 1, "image/png"), "an image handed on");
+    assert!(picture.images[0].data.starts_with(b"\x89PNG"));
     assert!(servers.call("mcp__fake__echo", "[1]").await.unwrap_err().contains("bad arguments"));
     assert!(servers.call("mcp__fake__nothing", "{}").await.unwrap_err().contains("no tool called"));
     assert_eq!(servers.statuses()[0].1, Status::Ready(vec!["echo".into(), "peek".into(), "given".into(), "has".into(), "quit".into()]));
@@ -71,7 +74,7 @@ async fn a_server_that_stops_says_why_and_is_started_again_on_its_next_call() {
     while servers.statuses()[0].1 != Status::Stopped {
         tokio::task::yield_now().await;
     }
-    let again = servers.call("mcp__fake__echo", r#"{"text":"back"}"#).await.unwrap();
+    let again = servers.call("mcp__fake__echo", r#"{"text":"back"}"#).await.unwrap().text;
     assert!(again.starts_with("back\n[rein: the fake server had stopped, so rein started it again"), "{again}");
     assert_eq!(servers.call("mcp__fake__echo", r#"{"text":"on"}"#).await, Ok("on".into()), "said once");
 }
@@ -282,7 +285,7 @@ async fn a_server_from_npm_starts_in_the_sandbox() {
     assert!(listing.tools.iter().any(|tool| tool.name == "mcp__everything__echo"), "{:?}", listing.note);
     let said = servers.call("mcp__everything__echo", r#"{"message":"from the sandbox"}"#).await;
     println!("{said:?}");
-    assert!(said.unwrap().contains("from the sandbox"));
+    assert!(said.unwrap().text.contains("from the sandbox"));
 }
 
 #[test]

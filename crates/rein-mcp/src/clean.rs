@@ -36,11 +36,41 @@ struct Called {
     is_error: bool,
 }
 
-/// A tool call's result as text for the model, cleaned; `Err` with the
-/// text when the server says the call failed.
-pub(crate) fn result(result: Value) -> Result<String, String> {
+/// What a tool gave: its text, cleaned, and its images, as it sent them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Said {
+    pub text: String,
+    pub images: Vec<Picture>,
+}
+
+/// What a tool gave that's only text.
+impl From<&str> for Said {
+    fn from(text: &str) -> Said {
+        Said { text: text.to_owned(), images: Vec::new() }
+    }
+}
+
+/// An image a tool gave: rein checks it before the model is shown it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Picture {
+    /// What the server says it is.
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+/// Never its bytes.
+impl std::fmt::Debug for Picture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Picture").field("media_type", &self.media_type).field("bytes", &self.data.len()).finish()
+    }
+}
+
+/// A tool call's result for the model: its text, cleaned, and its images;
+/// `Err` with the text when the server says the call failed.
+pub(crate) fn result(result: Value) -> Result<Said, String> {
     let called: Called = serde_json::from_value(result).map_err(|e| format!("its answer can't be read: {e}"))?;
-    let mut parts: Vec<String> = called.content.iter().map(block).collect();
+    let mut images = Vec::new();
+    let mut parts: Vec<String> = called.content.iter().filter_map(|piece| block(piece, &mut images)).collect();
     // Older servers send only structured content; newer ones send it as
     // text too, which is what's kept.
     if parts.is_empty()
@@ -49,17 +79,24 @@ pub(crate) fn result(result: Value) -> Result<String, String> {
         parts.push(structured.to_string());
     }
     let said = text(&parts.join("\n"));
-    if called.is_error { Err(said) } else { Ok(said) }
+    if called.is_error { Err(said) } else { Ok(Said { text: said, images }) }
 }
 
-/// One piece of a result. What isn't text the model is told about, since
-/// rein sends it only text.
-fn block(block: &Value) -> String {
+/// One piece of a result, as text; an image goes onto `images`, and has
+/// none. What isn't text or an image the model is told about.
+fn block(block: &Value, images: &mut Vec<Picture>) -> Option<String> {
+    use base64::Engine;
     let field = |name: &str| block.get(name).and_then(Value::as_str).unwrap_or_default();
     let size = |data: &str| format!("{} KB", data.len() * 3 / 4 / 1024);
-    match field("type") {
+    Some(match field("type") {
         "text" => field("text").to_owned(),
-        "image" => format!("[an image ({}, {}) rein can't pass on]", field("mimeType"), size(field("data"))),
+        "image" => match base64::engine::general_purpose::STANDARD.decode(field("data").trim()) {
+            Ok(data) => {
+                images.push(Picture { media_type: text(field("mimeType")), data });
+                return None;
+            }
+            Err(_) => format!("[an image ({}, {}) that isn't base64, so rein can't show it]", text(field("mimeType")), size(field("data"))),
+        },
         "audio" => format!("[a sound ({}, {}) rein can't pass on]", field("mimeType"), size(field("data"))),
         "resource" => {
             let resource = block.get("resource").cloned().unwrap_or_default();
@@ -71,7 +108,7 @@ fn block(block: &Value) -> String {
         }
         "resource_link" => format!("[a link to {}{}]", field("uri"), if field("name").is_empty() { String::new() } else { format!(": {}", field("name")) }),
         other => format!("[something of a kind rein doesn't know ({other})]"),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -100,13 +137,16 @@ mod tests {
         ] });
         let said = super::result(result).unwrap();
         assert_eq!(
-            said,
-            "two issues[31m\n[an image (image/png, 3 KB) rein can't pass on]\n[file:///a.txt]\nhello\n\
+            said.text,
+            "two issues[31m\n[file:///a.txt]\nhello\n\
              [file:///b.bin: data that isn't text, which rein can't pass on]\n[a link to https://x.dev/1: one]\n\
              [something of a kind rein doesn't know (hologram)]"
         );
+        assert_eq!(said.images, [Picture { media_type: "image/png".into(), data: vec![0; 3072] }], "the image handed on, decoded");
+        let broken = super::result(json!({ "content": [{ "type": "image", "mimeType": "image/png", "data": "not base64!" }] })).unwrap();
+        assert!(broken.images.is_empty() && broken.text.contains("isn't base64"), "{broken:?}");
         assert_eq!(super::result(json!({ "content": [{ "type": "text", "text": "no such repo" }], "isError": true })), Err("no such repo".into()));
-        assert_eq!(super::result(json!({ "structuredContent": { "n": 2 } })), Ok(r#"{"n":2}"#.into()));
+        assert_eq!(super::result(json!({ "structuredContent": { "n": 2 } })).map(|said| said.text), Ok(r#"{"n":2}"#.into()));
         assert!(super::result(json!("nonsense")).is_err());
     }
 }

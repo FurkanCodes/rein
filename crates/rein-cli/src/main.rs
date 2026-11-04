@@ -29,6 +29,7 @@ mod format;
 mod harden;
 mod input;
 mod mcp;
+mod paste;
 mod peers;
 mod rules;
 mod search;

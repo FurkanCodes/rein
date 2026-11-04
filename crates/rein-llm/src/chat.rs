@@ -14,7 +14,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::client::{Client, EFFORT, Optional};
+use crate::client::{Client, EFFORT, IMAGES, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
 use crate::{Api, Effort, Efforts, Error, Event, Item, ModelInfo, Opaque, Request, Result, ToolCall, Usage, in_words};
@@ -37,6 +37,7 @@ pub(crate) const OPTIONAL: Optional = &[
     ("reasoning_details", "reasoning_details", "replay"),
     ("reasoning_effort", "reasoning_effort", EFFORT),
     ("reasoning", "reasoning", EFFORT),
+    ("image", "image_url", IMAGES),
 ];
 
 /// The models a server offers, with their windows where it says.
@@ -58,6 +59,7 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
                 max_output: m["top_provider"]["max_completion_tokens"].as_u64(),
                 efforts: efforts(m),
                 finds_tools: crate::FindsTools::Unknown,
+                sees: crate::sees_by(&m["architecture"]["input_modalities"]),
             })
         })
         .collect()
@@ -175,7 +177,25 @@ fn messages(request: &Request<'_>, omitted: &[&str], quirks: Quirks) -> Vec<Valu
             messages.push(Value::Object(message));
         }
     };
+    // A tool's message takes only text: its images come in a message of
+    // their own, after the tool results, as other harnesses send them.
+    let images = crate::images_of(request.input);
+    let mut pending: Vec<&crate::Image> = Vec::new();
+    let flush = |pending: &mut Vec<&crate::Image>, messages: &mut Vec<Value>| {
+        if pending.is_empty() {
+            return;
+        }
+        let mut content = vec![json!({ "type": "text", "text": "The images from the tool results above:" })];
+        for image in pending.drain(..) {
+            content.push(json!({ "type": "text", "text": image.said() }));
+            content.push(json!({ "type": "image_url", "image_url": { "url": image.data_url() } }));
+        }
+        messages.push(json!({ "role": "user", "content": content }));
+    };
     for item in request.input {
+        if matches!(item, Item::User(_) | Item::Assistant(_) | Item::ToolCall(_)) {
+            flush(&mut pending, &mut messages);
+        }
         match &*in_words(item) {
             Item::User(text) => {
                 end(&mut turn, &mut messages);
@@ -183,6 +203,11 @@ fn messages(request: &Request<'_>, omitted: &[&str], quirks: Quirks) -> Vec<Valu
             }
             Item::ToolResult { call_id, output } => {
                 end(&mut turn, &mut messages);
+                let (mut output, shown) = crate::split_images(output, images.get(call_id.as_str()).map(Vec::as_slice).unwrap_or_default(), request.images);
+                for image in &shown {
+                    output.push_str(&format!("\n{} (shown in a message after the tool results)", image.said()));
+                }
+                pending.extend(shown);
                 let mut result = json!({ "role": "tool", "tool_call_id": tool_id(call_id, quirks), "content": output });
                 if quirks.tool_names
                     && let Some(name) = names.get(call_id.as_str())
@@ -218,9 +243,10 @@ fn messages(request: &Request<'_>, omitted: &[&str], quirks: Quirks) -> Vec<Valu
                     }
                 }
             }
-            Item::Opaque(_) | Item::Found { .. } => {}
+            Item::Opaque(_) | Item::Found { .. } | Item::Image { .. } => {}
         }
     }
+    flush(&mut pending, &mut messages);
     end(&mut turn, &mut messages);
     messages
 }
@@ -395,6 +421,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_tools_image_comes_in_a_message_after_the_tool_results() {
+        use crate::testing::*;
+        let input = pictured();
+        let body = request_body(&request(&input, &[], false), &[], Quirks::default());
+        let messages = body["messages"].as_array().unwrap();
+        let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "user", "assistant"]);
+        assert_eq!(messages[2]["content"], "Image a.png, 2×1.\n[image a.png, 2×1] (shown in a message after the tool results)");
+        assert_eq!(messages[3]["content"][2], json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5nIQ=="}}));
+        // The request right after the tool ran ends with the images.
+        let body = request_body(&request(&input[..4], &[], false), &[], Quirks::default());
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!((messages.len(), messages[3]["role"].clone()), (4, json!("user")), "{messages:?}");
+        let models = json!({"data": [{"id": "a", "architecture": {"input_modalities": ["text", "image"]}}, {"id": "b", "architecture": {"input_modalities": ["text"]}}]});
+        let sees: Vec<crate::Sees> = parse_models(&models).iter().map(|m| m.sees).collect();
+        assert_eq!(sees, [crate::Sees::Yes, crate::Sees::No]);
+    }
+
+    #[test]
     fn every_tool_is_sent_but_the_search_and_what_it_found_is_said_in_words() {
         use crate::testing::*;
         let (tools, input) = (held_back_tools(), found_and_called());
@@ -422,6 +467,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         }
     }
 
@@ -630,7 +676,8 @@ mod tests {
                 context_window: Some(262_144),
                 max_output: Some(65_536),
                 efforts: Efforts::Unknown,
-                finds_tools: crate::FindsTools::Unknown
+                finds_tools: crate::FindsTools::Unknown,
+                sees: crate::Sees::Unknown,
             }
         );
         let groq = json!({ "data": [{ "id": "llama-4", "context_window": 131072 }] });

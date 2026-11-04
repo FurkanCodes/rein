@@ -61,6 +61,16 @@ enum Line {
         call_id: String,
         names: Vec<String>,
     },
+    /// An image a call gave: where rein keeps it, never its bytes, which
+    /// would make the conversation's file grow by a screenshot each time.
+    Image {
+        call_id: String,
+        kind: rein_llm::ImageKind,
+        file: std::path::PathBuf,
+        width: u32,
+        height: u32,
+        about: String,
+    },
     /// Provider data, with the format that can read it. Conversations
     /// saved before rein spoke more than one say none: OpenAI's.
     Opaque {
@@ -102,6 +112,9 @@ impl Line {
             Item::ToolCall(call) => Line::ToolCall { call_id: call.call_id.clone(), name: call.name.clone(), arguments: call.arguments.clone() },
             Item::ToolResult { call_id, output } => Line::ToolResult { call_id: call_id.clone(), output: output.clone() },
             Item::Found { call_id, names } => Line::Found { call_id: call_id.clone(), names: names.clone() },
+            Item::Image { call_id, image } => {
+                Line::Image { call_id: call_id.clone(), kind: image.kind, file: image.file.clone(), width: image.width, height: image.height, about: image.about.clone() }
+            }
             Item::Opaque(opaque) => Line::Opaque { api: opaque.api, value: opaque.value.clone() },
         }
     }
@@ -115,6 +128,11 @@ impl Line {
             Line::ToolCall { call_id, name, arguments } => Item::ToolCall(ToolCall { call_id, name, arguments }),
             Line::ToolResult { call_id, output } => Item::ToolResult { call_id, output },
             Line::Found { call_id, names } => Item::Found { call_id, names },
+            // One whose file is gone, or isn't what it was, is said in words.
+            Line::Image { call_id, kind, file, width, height, about } => {
+                let data = std::fs::read(&file).ok().filter(|bytes| crate::image::kind_of(bytes) == Some(kind)).map(std::sync::Arc::from);
+                Item::Image { call_id, image: rein_llm::Image { kind, data, file, width, height, about } }
+            }
             Line::Opaque { api, value } => Item::Opaque(Opaque::new(api, value)),
         })
     }
@@ -332,6 +350,31 @@ mod tests {
 
     fn header(id: &str) -> Header {
         Header { id: id.into(), cwd: "/work".into(), started: "2026-11-01 10:00".into(), model: "m".into(), instructions: Some("be brief".into()) }
+    }
+
+    #[test]
+    fn an_image_is_saved_by_where_its_kept_and_said_in_words_once_gone() {
+        let dir = dir("image");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("abc.png");
+        let bytes = crate::image::tests::png(2, 2, png::Compression::Fast);
+        std::fs::write(&file, &bytes).unwrap();
+        let image = rein_llm::Image {
+            kind: rein_llm::ImageKind::Png,
+            data: Some(std::sync::Arc::from(bytes.clone())),
+            file: file.clone(),
+            width: 2,
+            height: 2,
+            about: "image a.png, 2×2".into(),
+        };
+        let mut session = Session::new(&dir, "2026-11-01T10-00-00", header("img123456789"));
+        session.append(&Item::Image { call_id: "r1".into(), image: image.clone() }).unwrap();
+        let text = std::fs::read_to_string(session.path()).unwrap();
+        assert!(!text.contains("iVBOR") && text.len() < 400, "never its bytes: {text}");
+        assert_eq!(Session::load(session.path()).unwrap().history, [Item::Image { call_id: "r1".into(), image: image.clone() }]);
+        std::fs::write(&file, b"not a png").unwrap();
+        let Item::Image { image: gone, .. } = &Session::load(session.path()).unwrap().history[0] else { panic!("an image") };
+        assert_eq!((gone.data.is_none(), gone.about.as_str()), (true, "image a.png, 2×2"), "a file that isn't what it was: in words");
     }
 
     #[test]

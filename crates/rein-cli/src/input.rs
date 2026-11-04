@@ -44,6 +44,8 @@ pub enum Read {
     Eof,
     /// Shift-Tab: on to the next mode.
     NextMode,
+    /// Ctrl-V: an image from the clipboard, to go with the message.
+    Paste,
 }
 
 /// What the keyboard is for right now.
@@ -751,6 +753,11 @@ impl Boxed {
             (Waiting::Answer, Key::Esc) if self.secret => self.reply(Read::Interrupted),
             (Waiting::Message, Key::CtrlD) if self.editor.is_empty() => self.reply(Read::Eof),
             (Waiting::Message, Key::BackTab) if menu.is_empty() => self.reply(Read::NextMode),
+            (Waiting::Message, Key::CtrlV) => self.reply(Read::Paste),
+            (_, Key::CtrlV) => {
+                self.notice = Some(("ctrl-v pastes an image while rein waits for your message".into(), Instant::now()));
+                edited = false;
+            }
             // The arrows pick among the matching commands, up the list.
             (_, Key::Up) if !menu.is_empty() => {
                 self.picked = (self.picked + 1) % menu.len();
@@ -1391,6 +1398,14 @@ impl Input {
     /// Shows `bar` under the box.
     pub fn set_bar(&self, bar: String) {
         self.with(|boxed| boxed.bar = bar);
+    }
+
+    /// Puts `text` in the box at the cursor, as if typed.
+    pub fn insert(&self, text: &str) {
+        self.with(|boxed| {
+            boxed.editor.insert(text);
+            boxed.draw();
+        });
     }
 }
 

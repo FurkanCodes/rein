@@ -102,6 +102,7 @@ impl Client {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         match self.api {
             Api::Responses => {

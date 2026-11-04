@@ -66,10 +66,124 @@ pub enum Item {
     /// it can call from then on. Each format says it its own way: where it
     /// holds tools back, as the provider loads them; elsewhere, in words.
     Found { call_id: String, names: Vec<String> },
+    /// An image that's part of what the call `call_id` gave, which comes
+    /// right after its result: shown with it, as each format can, or said
+    /// in words to a model that can't see.
+    Image { call_id: String, image: Image },
     /// Provider data that has to be sent back unchanged, such as OpenAI's
     /// encrypted reasoning or Claude's signed thinking. rein never looks
     /// inside.
     Opaque(Opaque),
+}
+
+/// An image, as the model is shown it: its bytes, which rein keeps in a
+/// file of its own, and what the model is told of it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Image {
+    pub kind: ImageKind,
+    /// Its bytes: `None` once its file is gone, and it's said in words.
+    pub data: Option<std::sync::Arc<[u8]>>,
+    /// Where rein keeps it.
+    pub file: std::path::PathBuf,
+    pub width: u32,
+    pub height: u32,
+    /// What the model is told with it: what it is, its size, and how it
+    /// was scaled.
+    pub about: String,
+}
+
+/// Never its bytes: a screenshot is hundreds of kilobytes.
+impl fmt::Debug for Image {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Image").field("kind", &self.kind).field("bytes", &self.data.as_ref().map(|data| data.len())).field("file", &self.file).field("about", &self.about).finish()
+    }
+}
+
+/// The kinds of image every provider rein speaks takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageKind {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+impl ImageKind {
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            ImageKind::Png => "image/png",
+            ImageKind::Jpeg => "image/jpeg",
+            ImageKind::Gif => "image/gif",
+            ImageKind::Webp => "image/webp",
+        }
+    }
+
+    /// What its files end in.
+    pub const fn extension(self) -> &'static str {
+        match self {
+            ImageKind::Png => "png",
+            ImageKind::Jpeg => "jpg",
+            ImageKind::Gif => "gif",
+            ImageKind::Webp => "webp",
+        }
+    }
+}
+
+impl Image {
+    /// Its bytes in base64, where it still has them.
+    pub(crate) fn base64(&self) -> Option<String> {
+        use base64::Engine;
+        self.data.as_ref().map(|data| base64::engine::general_purpose::STANDARD.encode(data))
+    }
+
+    /// As a `data:` URL, for the OpenAI formats.
+    pub(crate) fn data_url(&self) -> Option<String> {
+        self.base64().map(|data| format!("data:{};base64,{data}", self.kind.media_type()))
+    }
+
+    /// What's said of it with it shown: what it is.
+    pub(crate) fn said(&self) -> String {
+        format!("[{}]", self.about)
+    }
+
+    /// What's said of it in its place, when it isn't shown: to a model
+    /// that can't see, or once its file is gone.
+    pub(crate) fn in_words(&self, shown: bool) -> String {
+        match (&self.data, shown) {
+            (None, _) => format!("[{}: rein no longer keeps it, so it isn't shown]", self.about),
+            (Some(_), false) => format!("[{}: this model can't see images, so it isn't shown]", self.about),
+            (Some(_), true) => self.said(),
+        }
+    }
+}
+
+/// The images in `input`, by the call they're part of, in order.
+pub(crate) fn images_of(input: &[Item]) -> std::collections::HashMap<&str, Vec<&Image>> {
+    let mut images: std::collections::HashMap<&str, Vec<&Image>> = std::collections::HashMap::new();
+    for item in input {
+        if let Item::Image { call_id, image } = item {
+            images.entry(call_id.as_str()).or_default().push(image);
+        }
+    }
+    images
+}
+
+/// A tool's `output` and its `images`, as a request that shows images
+/// (`show`) or not says them: the text, with each image it doesn't show
+/// said in words, and those it shows, each with what's said of it.
+pub(crate) fn split_images<'a>(output: &str, images: &[&'a Image], show: bool) -> (String, Vec<&'a Image>) {
+    let mut text = output.to_owned();
+    let mut shown = Vec::new();
+    for image in images {
+        if show && image.data.is_some() {
+            shown.push(*image);
+        } else {
+            text.push('\n');
+            text.push_str(&image.in_words(show));
+        }
+    }
+    (text, shown)
 }
 
 /// Data only the format that produced it can read, so only requests in
@@ -216,6 +330,10 @@ pub struct Request<'a> {
     /// and the search isn't offered: for a model whose list says it can't,
     /// or that turned it down.
     pub hold_back: bool,
+    /// Show the model the images in `input`. Otherwise each is said in
+    /// words: for a model whose list says it can't see, or that turned one
+    /// down.
+    pub images: bool,
 }
 
 impl Request<'_> {
@@ -252,6 +370,16 @@ pub fn found_text(names: &[String]) -> String {
         "No tools matched. Search again with other words, or with select: and the names listed.".to_owned()
     } else {
         format!("Found: {}. Call them as any other tool.", names.join(", "))
+    }
+}
+
+/// Whether a list's `modalities` (as OpenRouter's and ChatGPT's say what a
+/// model takes in) have images: `Unknown` where it doesn't say.
+pub(crate) fn sees_by(modalities: &serde_json::Value) -> Sees {
+    match modalities.as_array() {
+        Some(modalities) if modalities.iter().any(|m| m == "image") => Sees::Yes,
+        Some(_) => Sees::No,
+        None => Sees::Unknown,
     }
 }
 
@@ -421,13 +549,34 @@ pub struct ModelInfo {
     pub efforts: Efforts,
     /// Whether it can have tools held back until it finds them.
     pub finds_tools: FindsTools,
+    /// Whether it can see images.
+    pub sees: Sees,
 }
 
 impl ModelInfo {
     /// `id`, of which nothing else is known.
     pub fn named(id: &str) -> ModelInfo {
-        ModelInfo { id: id.to_owned(), name: id.to_owned(), context_window: None, max_output: None, efforts: Efforts::Unknown, finds_tools: FindsTools::Unknown }
+        ModelInfo {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            context_window: None,
+            max_output: None,
+            efforts: Efforts::Unknown,
+            finds_tools: FindsTools::Unknown,
+            sees: Sees::Unknown,
+        }
     }
+}
+
+/// Whether a model can see images, as its provider's list says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Sees {
+    /// The list doesn't say: images are shown, and if the server turns one
+    /// down, they're said in words to this model from then on.
+    #[default]
+    Unknown,
+    Yes,
+    No,
 }
 
 /// Whether a model can have tools held back until it finds them with the
@@ -655,14 +804,54 @@ pub(crate) mod testing {
         ]
     }
 
+    /// A conversation in which a read gave an image.
+    pub(crate) fn pictured() -> Vec<Item> {
+        let image =
+            Image { kind: ImageKind::Png, data: Some(std::sync::Arc::from(&b"png!"[..])), file: "/kept/abc.png".into(), width: 2, height: 1, about: "image a.png, 2×1".into() };
+        vec![
+            Item::User("look".into()),
+            Item::ToolCall(ToolCall { call_id: "r1".into(), name: "read".into(), arguments: r#"{"path":"a.png"}"#.into() }),
+            Item::ToolResult { call_id: "r1".into(), output: "Image a.png, 2×1.".into() },
+            Item::Image { call_id: "r1".into(), image },
+            Item::Assistant("A dot.".into()),
+        ]
+    }
+
     pub(crate) fn request<'a>(input: &'a [Item], tools: &'a [Tool], hold_back: bool) -> Request<'a> {
-        Request { model: "m", instructions: None, input, tools, reasoning_effort: None, reasoning_summary: false, session_id: None, max_output_tokens: None, hold_back }
+        Request {
+            model: "m",
+            instructions: None,
+            input,
+            tools,
+            reasoning_effort: None,
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+            hold_back,
+            images: true,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_not_shown_is_said_in_words_and_never_lost() {
+        let mut image = match &testing::pictured()[3] {
+            Item::Image { image, .. } => image.clone(),
+            _ => unreachable!("the fourth is the image"),
+        };
+        assert_eq!(image.data_url().as_deref(), Some("data:image/png;base64,cG5nIQ=="));
+        let (text, shown) = split_images("out", &[&image], true);
+        assert_eq!((text.as_str(), shown.len()), ("out", 1));
+        let (text, shown) = split_images("out", &[&image], false);
+        assert_eq!((text.as_str(), shown.len()), ("out\n[image a.png, 2×1: this model can't see images, so it isn't shown]", 0));
+        image.data = None;
+        assert_eq!(split_images("out", &[&image], true).0, "out\n[image a.png, 2×1: rein no longer keeps it, so it isn't shown]");
+        assert!(!format!("{image:?}").contains("png!"), "never its bytes in Debug");
+    }
 
     #[test]
     fn a_model_gets_the_closest_level_it_has_without_going_over() {

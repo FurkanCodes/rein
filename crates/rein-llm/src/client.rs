@@ -89,6 +89,8 @@ struct Wire {
     /// Models that turned held-back tools down: they're sent every tool
     /// from the start.
     shown_all: Mutex<Vec<String>>,
+    /// Models that turned an image down: they're told of images in words.
+    blind: Mutex<Vec<String>>,
 }
 
 /// What requests have cost on the wire so far.
@@ -124,6 +126,10 @@ pub(crate) const EFFORT: &str = "effort";
 /// that turns it down gets every tool from the start: per model, as some
 /// of a provider's models have it and others don't.
 pub(crate) const HOLD_BACK: &str = "hold back";
+
+/// What every format calls showing the model images. A model that turns
+/// one down is told of them in words from then on, per model.
+pub(crate) const IMAGES: &str = "images";
 
 impl Client {
     /// A client for the server at `base_url` (like `https://api.anthropic.com/v1`),
@@ -319,6 +325,9 @@ impl Client {
         if self.wire.shown_all.lock().is_ok_and(|models| models.iter().any(|model| model == request.model)) {
             request.hold_back = false;
         }
+        if self.wire.blind.lock().is_ok_and(|models| models.iter().any(|model| model == request.model)) {
+            request.images = false;
+        }
         loop {
             let body = self.body(&request, &omitted);
             match self.send(&request, &body, &omitted).await {
@@ -344,6 +353,13 @@ impl Client {
                     }
                     // Nothing's held back already: it's about something else.
                     (HOLD_BACK, _) => return Err(e),
+                    (IMAGES, _) if request.images => {
+                        if let Ok(mut blind) = self.wire.blind.lock() {
+                            blind.push(request.model.to_owned());
+                        }
+                        request.images = false;
+                    }
+                    (IMAGES, _) => return Err(e),
                     _ => {
                         omitted.push(field);
                         if let Ok(mut learned) = self.wire.omitted.lock() {
@@ -571,6 +587,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         assert!(client.stream(&request("picky")).await.is_ok());
         assert_eq!(client.turned_down("picky"), [Effort::Minimal]);
@@ -627,6 +644,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_model_that_turns_an_image_down_is_told_of_images_in_words_from_then_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 65536];
+                while !bytes.windows(4).any(|w| w == b"\r\n\r\n") || !bytes.ends_with(b"}") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let body: Value = serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                let reply = if body["model"] == "blind" && body.to_string().contains("input_image") {
+                    let error = r#"{"error":{"message":"Invalid content type. image_url is only supported by certain models.","type":"invalid_request_error","param":"input[2].output","code":"invalid_value"}}"#;
+                    format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}", error.len())
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                };
+                seen.lock().unwrap().push(body);
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None).without_compression();
+        let input = crate::testing::pictured();
+        let request = |model| Request { model, ..crate::testing::request(&input, &[], false) };
+        assert!(client.stream(&request("blind")).await.is_ok());
+        assert!(client.stream(&request("blind")).await.is_ok());
+        assert!(client.stream(&request("sees")).await.is_ok());
+        let bodies = bodies.lock().unwrap();
+        let shown: Vec<bool> = bodies.iter().map(|b| b.to_string().contains("input_image")).collect();
+        // Turned down, sent again in words; then in words from the start; another model is still shown it.
+        assert_eq!(shown, [true, false, false, true]);
+        assert!(bodies[1]["input"][2]["output"].as_str().unwrap().contains("this model can't see images"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn an_answer_that_goes_quiet_is_given_up_on() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -651,6 +710,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         let mut stream = client.stream(&request).await.unwrap();
         assert!(matches!(stream.next().await, Some(Ok(Event::TextDelta(_)))));
@@ -682,6 +742,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         assert!(client.stream(&request).await.is_ok());
         assert_eq!(renewals.lock().unwrap().len(), 1);
@@ -708,6 +769,7 @@ mod tests {
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         };
         assert!(client.stream(&request).await.is_ok());
         let seen = seen.lock().unwrap();

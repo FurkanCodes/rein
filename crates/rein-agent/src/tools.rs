@@ -35,6 +35,11 @@ pub struct Tools {
     secrets: Secrets,
     /// The MCP servers rein started, whose tools run through them.
     mcp: Option<std::sync::Arc<rein_mcp::Servers>>,
+    /// Where the images tools give are kept, once each.
+    images: PathBuf,
+    /// The images each call gave, by its ID, until the agent takes them
+    /// into the conversation after its result.
+    pictures: std::sync::Mutex<std::collections::HashMap<String, Vec<rein_llm::Image>>>,
 }
 
 /// A file the model named, found inside the project: the project, resolved,
@@ -314,7 +319,43 @@ impl Tools {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let undo = std::sync::Arc::new(std::sync::Mutex::new(Undo::new(root.clone())));
-        Tools { root, timeout: Duration::from_secs(60), undo, watched: Default::default(), sandbox: Default::default(), secrets: Secrets::default(), mcp: None }
+        Tools {
+            root,
+            timeout: Duration::from_secs(60),
+            undo,
+            watched: Default::default(),
+            sandbox: Default::default(),
+            secrets: Secrets::default(),
+            mcp: None,
+            images: std::env::temp_dir().join(format!("rein-images-{}", std::process::id())),
+            pictures: Default::default(),
+        }
+    }
+
+    /// Keeps the images tools give in `folder`, beside the project's
+    /// conversations, which name them.
+    pub fn with_images(mut self, folder: PathBuf) -> Self {
+        self.images = folder;
+        self
+    }
+
+    /// The images the call `call_id` gave, taken: they go into the
+    /// conversation after its result.
+    pub fn take_images(&self, call_id: &str) -> Vec<rein_llm::Image> {
+        self.pictures.lock().map(|mut pictures| pictures.remove(call_id)).ok().flatten().unwrap_or_default()
+    }
+
+    /// Readies `bytes`, said to be `what`, to show the model with the
+    /// call `call_id`'s result, off the loop's thread: what's said of it in
+    /// the result, or why it can't be shown.
+    async fn picture(&self, call_id: &str, bytes: Vec<u8>, what: String) -> Result<String, String> {
+        let folder = self.images.clone();
+        let image = tokio::task::spawn_blocking(move || crate::image::prepare(&bytes, &what, &folder)).await.unwrap_or_else(|e| Err(e.to_string()))?;
+        let said = format!("[{}]", image.about);
+        if let Ok(mut pictures) = self.pictures.lock() {
+            pictures.entry(call_id.to_owned()).or_default().push(image);
+        }
+        Ok(said)
     }
 
     /// Keeps the copies `/undo` puts back in `folder`, rein's folder for
@@ -548,7 +589,7 @@ impl Tools {
     /// themselves, and run as they always do.
     pub async fn run(&self, call: &ToolCall, how: Run) -> String {
         let result = match ToolName::of(call) {
-            Some(ToolName::Read) => self.read(&call.arguments).await,
+            Some(ToolName::Read) => self.read(&call.call_id, &call.arguments).await,
             Some(ToolName::Grep) => self.grep(&call.arguments).await,
             Some(ToolName::Glob) => self.glob(&call.arguments).await,
             Some(ToolName::Bash) => self.bash(&call.arguments, how).await,
@@ -565,7 +606,27 @@ impl Tools {
                 Err(format!("there is no tool called {}", call.name))
             }
             None => match &self.mcp {
-                Some(servers) if rein_mcp::is_mcp(&call.name) => return self.servers_said(servers.call(&call.name, &call.arguments).await),
+                Some(servers) if rein_mcp::is_mcp(&call.name) => {
+                    let said = servers.call(&call.name, &call.arguments).await;
+                    let (server, tool) = rein_mcp::parts(&call.name).unwrap_or_default();
+                    let mut text = Vec::new();
+                    let said = match said {
+                        Ok(said) => {
+                            for picture in said.images {
+                                let said = self.picture(&call.call_id, picture.data, format!("an image {server}'s {tool} gave")).await;
+                                text.push(said.unwrap_or_else(|why| format!("[an image rein can't show: {why}]")));
+                            }
+                            Ok(said.text)
+                        }
+                        Err(why) => Err(why),
+                    };
+                    let mut output = self.servers_said(said);
+                    for line in text {
+                        output.push_str(if output.is_empty() { "" } else { "\n" });
+                        output.push_str(&line);
+                    }
+                    return output;
+                }
                 _ => Err(format!("there is no tool called {}", call.name)),
             },
         };
@@ -590,10 +651,14 @@ impl Tools {
         truncate(text) + &note
     }
 
-    async fn read(&self, arguments: &str) -> Result<String, String> {
+    async fn read(&self, call_id: &str, arguments: &str) -> Result<String, String> {
         let args: ReadArgs = parse(arguments)?;
         let spot = self.inside_root(&args.path)?;
         let bytes = spot.read().await.map_err(|e| format!("can't read {}: {e}", args.path))?;
+        // An image is shown, not read as text.
+        if crate::image::kind_of(&bytes).is_some() {
+            return self.picture(call_id, bytes, format!("image {}", args.path)).await;
+        }
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
         lines(&text, &args)
     }

@@ -214,6 +214,12 @@ finding. Each says why in a line.
 
 ## Files on disk
 
+- Never put an image's bytes in a conversation's file: keep it once, as a
+  file named by what's in it, and name the file. Codex kept them inline,
+  copied again at each compaction, and session folders reached 165 GB.
+- An image that can't be shown becomes a note saying so, never bytes sent
+  as they are: one a provider turned away failed every request after it,
+  in Claude Code.
 - Write files whole: a temp file with a name of its own (process and counter),
   then rename. A fixed `.tmp` name let two rein windows rename each other's
   half-written file into place.

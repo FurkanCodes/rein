@@ -33,6 +33,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub use clean::text as cleaned;
+pub use clean::{Picture, Said};
 pub use config::{Local, Named, Offered, Origin, Reach, Remote, Server, Skipped, Unfilled, Wire};
 pub use rpc::Error;
 
@@ -69,7 +70,7 @@ const MOST_PAGES: usize = 50;
 
 /// A small MCP server in `sh`, for tests, so it runs anywhere, the sandbox
 /// too. It answers by what each line asks for: `echo` says its text back
-/// (as an error if it starts with `!`),
+/// (as an error if it starts with `!`, and with a 1×1 PNG for `picture`),
 /// `peek` whether it could read a path, `given` what `$GIVEN` is, `has`
 /// whether a variable is set, and `quit` stops it.
 #[cfg(any(test, feature = "test-support"))]
@@ -387,7 +388,7 @@ impl Connection {
 
     /// Calls `tool`: what it said, or that it failed, in its words; or
     /// what kept rein from asking.
-    async fn call(&self, tool: &str, arguments: Value) -> Result<Result<String, String>, Error> {
+    async fn call(&self, tool: &str, arguments: Value) -> Result<Result<clean::Said, String>, Error> {
         let result = self.channel.request("tools/call", json!({ "name": tool, "arguments": arguments }), CALL).await;
         match result {
             Ok(result) => Ok(clean::result(result)),
@@ -714,7 +715,7 @@ impl Servers {
     /// it gave, or why it failed. A server that stopped is started again
     /// first, and the model is told. One whose session ended is called
     /// again in a new one: the call wasn't taken.
-    pub async fn call(&self, name: &str, arguments: &str) -> Result<String, String> {
+    pub async fn call(&self, name: &str, arguments: &str) -> Result<Said, String> {
         let Some((entry, tool)) = lock(&self.offered).get(name).cloned() else { return Err(format!("there is no tool called {name}")) };
         let arguments: Value = match serde_json::from_str(arguments) {
             Ok(Value::Object(arguments)) => Value::Object(arguments),
@@ -751,7 +752,7 @@ impl Servers {
                 walls(access)
             ));
         }
-        said.map(|said| said + &note).map_err(|said| said + &note)
+        said.map(|said| Said { text: said.text + &note, ..said }).map_err(|said| said + &note)
     }
 
     /// `entry`'s server, ready to call: started again first if it stopped,

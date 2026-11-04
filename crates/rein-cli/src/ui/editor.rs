@@ -259,7 +259,8 @@ impl Editor {
         Action::Edited
     }
 
-    fn insert(&mut self, text: &str) {
+    /// Puts `text` in at the cursor, as if typed.
+    pub fn insert(&mut self, text: &str) {
         for c in text.chars() {
             self.text.insert(self.cursor, c);
             self.cursor += 1;

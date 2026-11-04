@@ -19,7 +19,7 @@
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, EFFORT, HOLD_BACK, Optional};
+use crate::client::{Client, EFFORT, HOLD_BACK, IMAGES, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
 use crate::{Api, Effort, Efforts, Error, Event, Item, Loading, ModelInfo, Opaque, Request, Result, ToolCall, Usage, found_text};
@@ -52,6 +52,7 @@ pub(crate) const OPTIONAL: Optional = &[
     ("cache_control", "cache_control", "cache_control"),
     ("defer_loading", "defer_loading", HOLD_BACK),
     ("tool_reference", "tool_reference", HOLD_BACK),
+    ("image", "media_type", IMAGES),
 ];
 
 pub(crate) fn headers(request: Option<(&Request<'_>, &Value)>) -> Vec<(&'static str, String)> {
@@ -88,6 +89,11 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
                 max_output: m["max_tokens"].as_u64(),
                 efforts: efforts(&m["capabilities"]),
                 finds_tools: crate::FindsTools::Unknown,
+                sees: match m["capabilities"]["image_input"]["supported"].as_bool() {
+                    Some(true) => crate::Sees::Yes,
+                    Some(false) => crate::Sees::No,
+                    None => crate::Sees::Unknown,
+                },
             })
         })
         .collect()
@@ -225,12 +231,25 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], base_url: &s
 /// model is shown those tools.
 fn messages(request: &Request<'_>, holds_back: bool) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
+    let images = crate::images_of(request.input);
     for item in request.input {
         let (role, block) = match item {
             Item::User(text) if !text.is_empty() => ("user", json!({ "type": "text", "text": text })),
             Item::ToolResult { call_id, output } => {
                 let output = if output.is_empty() { "(no output)" } else { output };
-                ("user", json!({ "type": "tool_result", "tool_use_id": tool_id(call_id), "content": output }))
+                let (text, shown) = crate::split_images(output, images.get(call_id.as_str()).map(Vec::as_slice).unwrap_or_default(), request.images);
+                // Its images go in its content, each after what's said of it.
+                let content = if shown.is_empty() {
+                    json!(text)
+                } else {
+                    let mut blocks = vec![json!({ "type": "text", "text": text })];
+                    for image in shown {
+                        blocks.push(json!({ "type": "text", "text": image.said() }));
+                        blocks.push(json!({ "type": "image", "source": { "type": "base64", "media_type": image.kind.media_type(), "data": image.base64() } }));
+                    }
+                    json!(blocks)
+                };
+                ("user", json!({ "type": "tool_result", "tool_use_id": tool_id(call_id), "content": content }))
             }
             Item::Found { call_id, names } => {
                 // A name it doesn't have would turn the request away.
@@ -471,6 +490,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_image_goes_in_its_tool_result_after_whats_said_of_it() {
+        use crate::testing::*;
+        let input = pictured();
+        let body = request_body(&request(&input, &[], false), &[], "https://gateway.example");
+        let result = &body["messages"][2]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"][0], json!({"type": "text", "text": "Image a.png, 2×1."}));
+        assert_eq!(result["content"][1], json!({"type": "text", "text": "[image a.png, 2×1]"}));
+        assert_eq!(result["content"][2], json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "cG5nIQ=="}}));
+        assert_eq!(body["messages"][2]["content"].as_array().unwrap().len(), 1, "nothing else in that message");
+        let models = json!({"data": [{"id": "a", "capabilities": {"image_input": {"supported": true}}}, {"id": "b"}]});
+        let sees: Vec<crate::Sees> = parse_models(&models).iter().map(|m| m.sees).collect();
+        assert_eq!(sees, [crate::Sees::Yes, crate::Sees::Unknown]);
+    }
+
+    #[test]
     fn held_back_tools_are_deferred_and_what_the_search_found_is_referenced() {
         use crate::testing::*;
         let (tools, input) = (held_back_tools(), found_and_called());
@@ -508,6 +543,7 @@ mod tests {
             session_id: Some("s"),
             max_output_tokens: None,
             hold_back: false,
+            images: false,
         }
     }
 
@@ -732,7 +768,8 @@ mod tests {
                 context_window: Some(1_000_000),
                 max_output: Some(128_000),
                 efforts: Efforts::Unknown,
-                finds_tools: crate::FindsTools::Unknown
+                finds_tools: crate::FindsTools::Unknown,
+                sees: crate::Sees::Unknown,
             }]
         );
     }
