@@ -125,11 +125,32 @@ pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, http: r
 pub(crate) async fn command(command: Command, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
     match command {
         Command::Show => panel::panel(mcp, agent, terminal).await,
-        Command::Find(word) => registry::find(word, mcp, agent, terminal).await,
+        Command::Find(Some(word)) => registry::find(word, mcp, agent, terminal).await,
+        Command::Find(None) => ask_to_add(mcp, agent, terminal).await,
         Command::Import => import::import(mcp, agent, terminal).await,
         Command::Add(named) => add(named, mcp, agent, terminal).await,
         Command::Remove(name) => remove(&name, mcp, agent, terminal),
         Command::Allow(name, tools) => allow(&name, &tools, mcp, agent, terminal),
+    }
+}
+
+/// What `/mcp add` alone, and "+ add" in `/mcp`, ask for: whatever `/mcp
+/// add` takes, typed or pasted, read as it reads it. A name is looked up
+/// in the registry; a URL, a command or a README's JSON is added as it is.
+/// What's typed here isn't kept for ↑, nor shown again: it may hold a key.
+async fn ask_to_add(mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
+    let line = match terminal.input.read("A name to look up in the MCP Registry, a URL, a command, or JSON from a README:", false).await {
+        Read::Line(line) if !line.trim().is_empty() => line,
+        _ => return Ok(()),
+    };
+    // `/mcp add` typed here too is what follows it.
+    let line = line.trim();
+    let line = line.strip_prefix("/mcp add").filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)).unwrap_or(line);
+    match crate::commands::parse(&format!("/mcp add {}", line.trim())) {
+        Some(Ok(crate::commands::Slash::Mcp(Command::Add(named)))) => add(named, mcp, agent, terminal).await,
+        Some(Ok(crate::commands::Slash::Mcp(Command::Find(Some(word))))) => registry::find(word, mcp, agent, terminal).await,
+        Some(Err(refused)) => Err(refused.to_string()),
+        _ => Ok(()),
     }
 }
 

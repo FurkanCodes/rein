@@ -609,7 +609,9 @@ README gives after `/mcp add`, as it is:
 ```
 
 rein starts it at once and says how it did, and the model is offered its
-tools from your next message.
+tools from your next message. `/mcp add` alone, or "+ add" in `/mcp`,
+asks for any of these: a name to look up, a URL, a command, or a
+README's JSON pasted as it is, which isn't kept for ↑ or shown again.
 
 `/mcp` lists the servers to pick one and change it: choose the
 tools that run without asking, change its walls, restart it, turn it off

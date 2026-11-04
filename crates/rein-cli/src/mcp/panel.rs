@@ -215,12 +215,15 @@ pub(super) async fn panel(mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut 
         return Ok(());
     }
     // After the servers, a new one: looked up, or brought from other apps.
-    let more = [("+ add", "a server, looked up in the MCP Registry"), ("+ import", "yours, from Claude Code, Claude Desktop, Cursor, Codex, VS Code, Windsurf, Gemini CLI")];
+    let more = [
+        ("+ add", "a server: looked up by name, or its URL, command or README's JSON"),
+        ("+ import", "yours, from Claude Code, Claude Desktop, Cursor, Codex, VS Code, Windsurf, Gemini CLI"),
+    ];
     let items = rows.iter().map(|row| (row.name().to_owned(), row.about())).chain(more.iter().map(|(name, about)| ((*name).to_owned(), (*about).to_owned()))).collect();
     let title = if rows.is_empty() { "add a server" } else { "change which server" };
     let Some(picked) = terminal.input.choose(Menu { title: title.into(), items, current: None, at: None }).await else { return Ok(()) };
     match picked.checked_sub(rows.len()) {
-        Some(0) => return super::registry::find(None, mcp, agent, terminal).await,
+        Some(0) => return super::ask_to_add(mcp, agent, terminal).await,
         Some(_) => return super::import::import(mcp, agent, terminal).await,
         None => {}
     }

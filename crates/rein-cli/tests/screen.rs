@@ -2803,10 +2803,11 @@ fn mcp_add_allow_and_remove_change_the_servers_without_editing_a_file() {
     term.wait_for(IDLE);
     term.keys("/mcp\r");
     term.wait_for("No MCP servers yet. /mcp add <name> looks one up in the MCP Registry");
-    term.wait_for(PICKING);
-    term.keys("\x1b");
-    term.wait_for(IDLE);
-    term.keys("/mcp add fake sh server.sh\r");
+    // "+ add" takes the JSON a server's README gives, pasted as it is.
+    pick(&mut term, "add");
+    term.wait_for("A name to look up in the MCP Registry, a URL, a command, or JSON from a README:");
+    term.keys("\x1b[200~{ \"mcpServers\": {\n  \"fake\": { \"command\": \"sh\", \"args\": [\"server.sh\"] }\n} }\x1b[201~");
+    term.keys("\r");
     term.wait_for("✓ fake added to ~/mcp.json");
     term.wait_for("fake  5 tools: echo, peek, given, has, quit");
     term.wait_for(IDLE);
@@ -3000,7 +3001,10 @@ fn a_server_is_added_by_name_from_the_mcp_registry() {
     let model = Model::start(Vec::new()).with_registry(page).with_env("PATH", &path);
     let mut term = Term::start_with(&model, "mcp-registry", 34, 140, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
-    term.keys("/mcp add thing\r");
+    // Alone, /mcp add asks: a name is looked up.
+    term.keys("/mcp add\r");
+    term.wait_for("A name to look up in the MCP Registry");
+    term.keys("thing\r");
     term.wait_for("add which thing server");
     term.wait_for("smithery.ai/thing");
     let list = term.text();

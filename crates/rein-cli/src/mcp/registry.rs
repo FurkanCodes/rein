@@ -26,17 +26,10 @@ const LONGEST: usize = 8 << 20;
 /// How many of those that don't start here are named.
 const NAMED: usize = 5;
 
-/// Looks `word` up in the registry, or what you're asked to look up, and
-/// adds the server you pick, once you've seen what it runs.
-pub(super) async fn find(word: Option<String>, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
+/// Looks `word` up in the registry, and adds the server you pick, once
+/// you've seen what it runs.
+pub(super) async fn find(word: String, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
     let (pad, s) = (" ".repeat(GUTTER), terminal.err);
-    let word = match word {
-        Some(word) => word,
-        None => match terminal.input.read("Look up which server in the MCP Registry? A word, like playwright:", false).await {
-            Read::Line(line) if !line.trim().is_empty() => line.trim().to_owned(),
-            _ => return Ok(()),
-        },
-    };
     if rein_mcp::config::looks_like_a_key(&word) {
         return Err("that looks like a key, not a server's name, so rein doesn't look it up".into());
     }
