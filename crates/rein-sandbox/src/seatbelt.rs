@@ -154,6 +154,12 @@ pub(super) fn profile(places: &Places, walls: Walls) -> (String, Vec<OsString>) 
     }
     text.push_str("\n; Never read: keys, logins and tokens, wherever they are.\n");
     rule(&mut text, "deny file-read*", &hidden);
+    text.push_str("\n; But skills kept among them, which hold none: read, and the way to them.\n");
+    if let Some(home) = places.home() {
+        let ways: Vec<String> = leading(places.unhidden(), home).iter().map(|path| format!("(literal {})", param(path))).collect();
+        rule(&mut text, "allow file-read-metadata", &ways);
+    }
+    rule(&mut text, "allow file-read*", &subpaths(places.unhidden(), &mut param));
 
     if walls.network {
         text.push_str(NETWORK);
@@ -253,9 +259,11 @@ mod tests {
         let home_text = home.to_str().unwrap();
         let walled =
             text.find(&format!("(deny file-read*\n  (subpath (param \"P{}\"))", params.iter().position(|p| p.to_str().unwrap().ends_with(&format!("={home_text}"))).unwrap()));
-        let readable = text.rfind("(allow file-read*");
+        let readable = walled.and_then(|at| text[at..].find("(allow file-read*").map(|found| at + found));
         let hidden = text.rfind("(deny file-read*");
-        assert!(walled.is_some() && walled < readable && readable < hidden, "{text}");
+        let skills = text.rfind("(allow file-read*");
+        assert!(walled.is_some() && walled < readable && readable < hidden && hidden < skills, "skills, in what's hidden, read last: {text}");
+        assert!(value(&params, &text, "(allow file-read*").last().is_some_and(|path| path.ends_with("/.claude/plugins/cache")), "{text}");
         assert!(value(&params, &text, "(allow file-read*\n").iter().any(|path| path.ends_with("/.cargo")), "{text}");
         assert!(value(&params, &text, "(allow file-read-metadata").contains(&home_text), "the way to what's readable: {text}");
         // Other processes' details: denied in so many words, and no sysctl
@@ -349,6 +357,40 @@ mod tests {
         let (worked, said) = run(&s, "git add readme.txt && git -c user.email=a@b -c user.name=a commit -qm first && git log --oneline | wc -l", WRITE).await;
         assert!(worked, "{said}");
         assert_eq!(said.trim(), "1");
+    }
+
+    /// Claude Code keeps its skills, and the plugins you install, among its
+    /// logins and settings, all hidden: a skill's script is read, and
+    /// nothing else there, nor through a link from a skill.
+    #[tokio::test]
+    async fn skills_in_a_hidden_folder_are_read_and_nothing_else_there() {
+        let Some(s) = setup("skills").await else { return };
+        let claude = s.home.join(".claude");
+        for (file, text) in [
+            ("skills/graphs/run.sh", "echo drawn\n"),
+            ("plugins/cache/market/kit/1.0.0/skills/lint/SKILL.md", "lint\n"),
+            (".credentials.json", "FAKE-token\n"),
+            ("plugins/data/kit/token", "FAKE-data\n"),
+            ("settings.json", "{}\n"),
+        ] {
+            std::fs::create_dir_all(claude.join(file).parent().unwrap()).unwrap();
+            std::fs::write(claude.join(file), text).unwrap();
+        }
+        std::os::unix::fs::symlink(claude.join(".credentials.json"), claude.join("skills/graphs/leak")).unwrap();
+        let (worked, said) = run(&s, &format!("sh '{}'", claude.join("skills/graphs/run.sh").display()), LOOK).await;
+        assert!(worked && said.trim() == "drawn", "{said}");
+        assert!(run(&s, &format!("cat '{}'", claude.join("plugins/cache/market/kit/1.0.0/skills/lint/SKILL.md").display()), LOOK).await.0);
+        for secret in [".credentials.json", "plugins/data/kit/token", "settings.json", "skills/graphs/leak"] {
+            let (worked, said) = run(&s, &format!("cat '{}'", claude.join(secret).display()), NET).await;
+            assert!(!worked && !said.contains("FAKE"), "{secret}: {said}");
+        }
+        assert!(!run(&s, &format!("ls '{}'", claude.display()), LOOK).await.0, "nor what's in the folder");
+        assert!(!run(&s, &format!("echo x > '{}'", claude.join("skills/graphs/run.sh").display()), WRITE).await.0, "read, never changed");
+        let places = s.sandbox.places();
+        assert!(
+            !places.hides(&claude.join("skills/graphs/run.sh")) && places.hides(&claude.join(".credentials.json")) && places.hides(&claude.join("skills/graphs/leak")),
+            "rein's own tools agree"
+        );
     }
 
     #[tokio::test]

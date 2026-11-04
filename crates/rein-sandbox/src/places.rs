@@ -76,8 +76,8 @@ const READABLE: &[&str] = &[
     // Caches.
     ".cache",
     // Skills, whose scripts a skill has commands run: read, never changed.
+    // Claude Code's are in what's hidden: see `SKILLS_IN_HIDDEN`.
     ".agents/skills",
-    ".claude/skills",
     // Git's and Go's own settings, and the text encoding macOS programs
     // read at start.
     ".gitconfig",
@@ -141,6 +141,12 @@ const HIDDEN: &[&str] = &[
     "Library/Application Support/Microsoft Edge",
     "Library/Application Support/Arc",
 ];
+
+/// In what [`HIDDEN`] names, what may be read all the same: Claude Code's
+/// skills, and the plugins you installed in it, skills among them. They're
+/// code you chose, which a skill has commands run, and hold no keys; what
+/// a plugin keeps of its own is in `plugins/data`, which stays hidden.
+const SKILLS_IN_HIDDEN: &[&str] = &[".claude/skills", ".claude/plugins/cache"];
 
 /// Variables that move something [`READABLE`] or [`HIDDEN`] names, maybe
 /// out of your home folder, and what each stands for there: wherever one
@@ -209,6 +215,8 @@ pub struct Places {
     own: Vec<PathBuf>,
     /// Never read or written, wherever they are.
     hidden: Vec<PathBuf>,
+    /// In what's hidden, what may be read all the same: skills.
+    unhidden: Vec<PathBuf>,
     /// Your home folder: none of it is read but what `readable` names.
     home: Option<PathBuf>,
     /// In your home folder, what may be read all the same, but for what's
@@ -261,6 +269,7 @@ impl Places {
         // Not the root folder as a home: walling it off would leave nothing.
         let home = home.map(resolve).filter(|home| home.parent().is_some());
         places.hidden.extend(HIDDEN.iter().flat_map(|name| locations(home.as_deref(), name, env)));
+        places.unhidden = SKILLS_IN_HIDDEN.iter().flat_map(|name| locations(home.as_deref(), name, env)).collect();
         if let Some(rein) = rein {
             places.hidden.push(resolve(rein));
         }
@@ -316,6 +325,11 @@ impl Places {
         &self.hidden
     }
 
+    /// In what's hidden, what may be read all the same.
+    pub(crate) fn unhidden(&self) -> &[PathBuf] {
+        &self.unhidden
+    }
+
     pub(crate) fn home(&self) -> Option<&Path> {
         self.home.as_deref()
     }
@@ -354,6 +368,9 @@ impl Places {
     /// the same, as on macOS, where it can't.
     pub fn hides(&self, path: &Path) -> bool {
         let full = resolve(path);
+        if self.unhidden.iter().any(|place| lower(&full).starts_with(lower(place))) {
+            return false;
+        }
         let hidden = self.hidden.iter().any(|hidden| lower(&full).starts_with(lower(hidden)));
         let walled = self.home.as_ref().is_some_and(|home| {
             let full = as_compared(&full);

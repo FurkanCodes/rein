@@ -163,6 +163,23 @@ async fn all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     outputs.into_iter().flatten().collect()
 }
 
+/// The skills, as this conversation has them.
+#[derive(Default)]
+struct SkillsHere {
+    /// Those found now: the model loads them with `skill`.
+    found: crate::skills::Skills,
+    /// Those the tool lists, as they were when it was made: `None` until
+    /// it's made for this conversation.
+    listed: Option<Vec<crate::skills::Skill>>,
+    /// What the model was last told had changed since, if anything.
+    noted: Option<String>,
+    /// Those you called with `/name`, with what you gave them, to load
+    /// with your next message.
+    called: Vec<(String, Option<String>)>,
+    /// Those loaded since you last asked, to count.
+    loaded: Vec<String>,
+}
+
 /// What the model is told of skills, when there are some.
 const SKILLS: &str = "# Skills\nThe skill tool lists skills: instructions for kinds of task, the user's own or the project's. \
                       Before you start a task, small ones too, check whether one fits it; if one does, load it first and \
@@ -328,11 +345,8 @@ pub struct Agent<M> {
     pub sees: rein_llm::Sees,
     /// Images you pasted, to go with your next message.
     pasted: Vec<rein_llm::Image>,
-    /// The skills found: the model loads them with `skill` (see
-    /// [`Agent::set_skills`]).
-    skills: crate::skills::Skills,
-    /// The skills you called with `/name`, to load with your next message.
-    called: Vec<String>,
+    /// The skills: those found, those the tool lists, and those called.
+    skills: SkillsHere,
     /// How many steps (answers from the model) a turn may take before it's
     /// stopped, and the model asked to sum up: `None` while someone is
     /// watching, who can press Esc; a number when nobody is.
@@ -367,6 +381,7 @@ impl<M: Model> Agent<M> {
     pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
         self.begin(&prompt).await?;
         self.offer_servers_tools(ui).await;
+        self.note_skills()?;
         self.record(Item::User(prompt.clone()))?;
         self.attach(&prompt, ui).await?;
         self.work(ui).await
@@ -445,27 +460,58 @@ impl<M: Model> Agent<M> {
         self.searcher = searcher;
     }
 
-    /// The skills the model may load with `skill`, and you with `/name`:
-    /// offered from the next request. Set before the first, it changes
-    /// nothing that's cached.
-    pub fn set_skills(&mut self, skills: crate::skills::Skills) {
+    /// The skills the model may load with `skill`, and you with `/name`.
+    /// The tool's list of them is made once for a conversation, before its
+    /// first request, in `room` characters; from then on what changes is
+    /// told at the end of the conversation, with your next message, so
+    /// what's cached stays. Only a list that had none to offer, and has
+    /// some now, is made again.
+    pub fn set_skills(&mut self, skills: crate::skills::Skills, room: usize) {
         let named = ToolName::Skill.as_str();
-        self.specs.retain(|tool| tool.name != named);
-        if let Some(spec) = crate::skills::spec(&skills) {
-            let at = self.specs.iter().position(|tool| rein_mcp::is_mcp(&tool.name) || tool.loading == Loading::Search).unwrap_or(self.specs.len());
-            self.specs.insert(at, spec);
+        let offered = || skills.found.iter().filter(|skill| skill.model).cloned().collect::<Vec<_>>();
+        let none_listed = !self.specs.iter().any(|tool| tool.name == named);
+        if self.skills.listed.is_none() || (none_listed && !offered().is_empty()) {
+            self.specs.retain(|tool| tool.name != named);
+            if let Some(spec) = crate::skills::spec(&skills, room) {
+                let at = self.specs.iter().position(|tool| rein_mcp::is_mcp(&tool.name) || tool.loading == Loading::Search).unwrap_or(self.specs.len());
+                self.specs.insert(at, spec);
+            }
+            self.skills.listed = Some(offered());
+            self.skills.noted = None;
         }
-        self.skills = skills;
+        self.skills.found = skills;
     }
 
     /// The skills found, and those left out.
     pub fn skills(&self) -> &crate::skills::Skills {
-        &self.skills
+        &self.skills.found
     }
 
-    /// The skill `name`, which you called, goes with your next message.
-    pub fn call_skill(&mut self, name: &str) {
-        self.called.push(name.to_owned());
+    /// The skill `name`, which you called, goes with your next message,
+    /// given `arguments`.
+    pub fn call_skill(&mut self, name: &str, arguments: Option<String>) {
+        self.skills.called.push((name.to_owned(), arguments));
+    }
+
+    /// The skills loaded, by the model or for you, since this was last
+    /// asked: how often each is used.
+    pub fn take_loaded(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.skills.loaded)
+    }
+
+    /// Tells the model what's changed of the skills since its tool listed
+    /// them, when that's not what it was last told: at the end of the
+    /// conversation, where it costs nothing cached.
+    fn note_skills(&mut self) -> Result<()> {
+        let Some(listed) = &self.skills.listed else { return Ok(()) };
+        let now = crate::skills::changes(listed, &self.skills.found);
+        if now == self.skills.noted {
+            return Ok(());
+        }
+        let said = now.clone().unwrap_or_else(|| crate::skills::AS_LISTED.to_owned());
+        self.record(Item::User(said))?;
+        self.skills.noted = now;
+        Ok(())
     }
 
     /// Who searches the web for the model, if anyone.
@@ -783,8 +829,8 @@ impl<M: Model> Agent<M> {
     /// its own AGENTS.md brings that along, once.
     async fn attach(&mut self, message: &str, ui: &mut impl Ui) -> Result<()> {
         // A skill you called comes as a load made for you.
-        for name in std::mem::take(&mut self.called) {
-            let arguments = json!({ "name": name, "file": null, "start_line": null }).to_string();
+        for (name, given) in std::mem::take(&mut self.skills.called) {
+            let arguments = json!({ "name": name, "arguments": given, "file": null, "start_line": null }).to_string();
             let call = ToolCall { call_id: format!("mention_{}", self.window.full.len()), name: ToolName::Skill.as_str().into(), arguments };
             let output = self.skill_output(&call.arguments);
             self.attached(call, output, ui)?;
@@ -845,10 +891,19 @@ impl<M: Model> Agent<M> {
     }
 
     /// What loading a skill as `arguments` ask gives, or that it's as it
-    /// was when it was loaded before: it's in the conversation already.
-    fn skill_output(&self, arguments: &str) -> String {
-        let output = crate::skills::load(&self.skills, arguments);
+    /// was when it was loaded before: it's in the conversation already. A
+    /// skill's instructions loaded count as a use.
+    fn skill_output(&mut self, arguments: &str) -> String {
+        let output = crate::skills::load(&self.skills.found, arguments);
         let before = self.history.iter().any(|item| matches!(item, Item::ToolResult { output: earlier, .. } if *earlier == output));
+        if let Ok(asked) = serde_json::from_str::<Value>(arguments)
+            && !output.starts_with(crate::tools::ERROR)
+            && asked["file"].is_null()
+            && asked["start_line"].is_null()
+            && let Some(name) = asked["name"].as_str()
+        {
+            self.skills.loaded.push(name.to_owned());
+        }
         match serde_json::from_str::<Value>(arguments) {
             Ok(asked) if before && !output.starts_with(crate::tools::ERROR) => {
                 format!(
@@ -990,6 +1045,12 @@ impl<M: Model> Agent<M> {
         }
         let skills = compact::skills_again(&self.history[..start], &kept, &format!("skill_again_{}", self.window.full.len()));
         kept.splice(0..0, skills);
+        // What changed of the skills, if the summary took the note away.
+        if let Some(note) = &self.skills.noted
+            && !kept.iter().any(|item| matches!(item, Item::User(text) if text == note))
+        {
+            kept.insert(0, Item::User(note.clone()));
+        }
         compact::retire(&mut kept, &retired);
         // The kept part follows the summary now, not what its thinking was
         // signed with.
@@ -1028,8 +1089,7 @@ impl<M> Agent<M> {
             searcher: None,
             sees: rein_llm::Sees::Unknown,
             pasted: Vec::new(),
-            skills: Default::default(),
-            called: Vec::new(),
+            skills: SkillsHere::default(),
             step_limit: None,
             instructions: header.instructions,
             servers_say: Vec::new(),
@@ -1056,8 +1116,11 @@ impl<M> Agent<M> {
         self.permissions.forget_approvals();
         self.tools.open_undo(&self.session_id.clone().unwrap_or_default());
         // A new conversation, a new list: servers that started late, or
-        // list other tools now, are in it.
+        // list other tools now, are in it, and so are the skills there are.
         self.listed = false;
+        self.skills.listed = None;
+        self.skills.noted = None;
+        self.skills.called.clear();
     }
 
     /// The same agent, in the same conversation, answered by `model`.
@@ -1075,7 +1138,6 @@ impl<M> Agent<M> {
             sees,
             pasted,
             skills,
-            called,
             step_limit,
             specs,
             listed,
@@ -1100,7 +1162,6 @@ impl<M> Agent<M> {
             sees,
             pasted,
             skills,
-            called,
             step_limit,
             specs,
             listed,
@@ -1849,8 +1910,7 @@ mod tests {
             searcher: None,
             sees: rein_llm::Sees::Unknown,
             pasted: Vec::new(),
-            skills: Default::default(),
-            called: Vec::new(),
+            skills: SkillsHere::default(),
             step_limit: None,
             session_id: Some("session-1".into()),
             history: Vec::new(),
@@ -2038,7 +2098,7 @@ mod tests {
         let home = agent.tools.root().join("home");
         std::fs::create_dir_all(home.join(".agents/skills/graphs")).unwrap();
         std::fs::write(home.join(".agents/skills/graphs/SKILL.md"), "---\nname: graphs\ndescription: Draw graphs.\n---\nUse boxes and arrows.\n").unwrap();
-        agent.set_skills(crate::skills::find(&crate::skills::folders(&home, Some(&home), false)));
+        agent.set_skills(crate::skills::find(&crate::skills::folders(&home, Some(&home), false)), crate::skills::LEAST_ROOM);
         assert!(agent.specs.iter().any(|tool| tool.name == "skill" && tool.description.contains("- graphs: Draw graphs.")));
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("draw the modules".into(), &mut person).await.unwrap();
@@ -2048,7 +2108,7 @@ mod tests {
             "told in its instructions too"
         );
         assert!(result_of(&agent, "k2").starts_with(compact::UNCHANGED), "not twice: {}", result_of(&agent, "k2"));
-        agent.call_skill("graphs");
+        agent.call_skill("graphs", None);
         agent.send("/graphs the tests".into(), &mut person).await.unwrap();
         let at = agent.history.iter().position(|item| matches!(item, Item::User(text) if text == "/graphs the tests")).unwrap();
         assert!(matches!(&agent.history[at + 1], Item::ToolCall(call) if call.name == "skill" && call.call_id.starts_with("mention_")), "{:?}", agent.history[at + 1]);
@@ -2057,6 +2117,66 @@ mod tests {
             "loaded already this conversation: {:?}",
             agent.history[at + 2]
         );
+        assert_eq!(agent.take_loaded(), ["graphs", "graphs", "graphs"], "each a use, to count");
+        assert!(agent.take_loaded().is_empty());
+    }
+
+    /// A skill added, changed or turned off mid-conversation is told at its
+    /// end, with your next message: the tool's list, before everything,
+    /// stays as it was, and so does what's cached. A summary keeps it.
+    #[tokio::test]
+    async fn skills_that_change_are_told_at_the_end_not_in_the_list() {
+        let answer = |text: &str| vec![Item::Assistant(text.into())];
+        let mut agent = agent("skills-change", vec![answer("one"), answer("two"), answer("three"), answer("Summary."), answer("four")]);
+        let home = agent.tools.root().join("home");
+        let skills = home.join(".agents/skills");
+        crate::skills::tests::skill(&skills, "graphs", "name: graphs\ndescription: Draw graphs.", "Boxes.");
+        let find = || crate::skills::find(&crate::skills::folders(&home, Some(&home), false));
+        agent.set_skills(find(), crate::skills::LEAST_ROOM);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("first".into(), &mut person).await.unwrap();
+        let listed = agent.specs.clone();
+        crate::skills::tests::skill(&skills, "deploy", "name: deploy\ndescription: Ship it.", "Ship.");
+        agent.set_skills(find(), crate::skills::LEAST_ROOM);
+        agent.send("second".into(), &mut person).await.unwrap();
+        agent.set_skills(find(), crate::skills::LEAST_ROOM);
+        agent.send("third".into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        assert_eq!(requests[1].tools, requests[0].tools, "the list stays");
+        assert_eq!(agent.specs, listed);
+        let notes: Vec<&String> = requests[2]
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                Item::User(text) if text.starts_with("[The skills") => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1, "told once, not again while nothing more changed: {notes:?}");
+        assert!(notes[0].contains("New, to load as the listed ones are:\n- deploy: Ship it."), "{}", notes[0]);
+        let second = requests[1].input.iter().position(|item| matches!(item, Item::User(text) if text == "second")).unwrap();
+        assert!(matches!(&requests[1].input[second - 1], Item::User(text) if text == notes[0]), "just before your message");
+        drop(requests);
+        // Nothing kept word for word: the note comes after the summary.
+        let limit = agent.limit();
+        agent.set_limit(5);
+        agent.compact(None, true, &mut person).await.unwrap();
+        agent.set_limit(limit);
+        assert!(!agent.history.iter().any(|item| matches!(item, Item::User(text) if text == "third")), "summarized");
+        assert!(agent.history.iter().any(|item| matches!(item, Item::User(text) if text.contains("- deploy: Ship it."))), "a summary keeps it");
+        let summary = agent
+            .history
+            .iter()
+            .find_map(|item| match item {
+                Item::User(text) if compact::is_summary(item) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!summary.contains("Ship it."), "not as something you said: {summary}");
+        std::fs::remove_dir_all(skills.join("deploy")).unwrap();
+        agent.set_skills(find(), crate::skills::LEAST_ROOM);
+        agent.send("fourth".into(), &mut person).await.unwrap();
+        assert!(agent.history.iter().any(|item| matches!(item, Item::User(text) if text == crate::skills::AS_LISTED)), "as listed again");
     }
 
     /// An image you paste goes with your message, as a read made for you.

@@ -161,8 +161,8 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     agent.sees = setup.sees(&agent.model_name);
     crate::search::follow(&mut agent, &setup).await;
     // A task run with -p asks nothing: a project's skills wait for a yes.
-    let skills = crate::skills::find(&root, &mut terminal, args.prompt.is_none()).await;
-    agent.set_skills(skills);
+    let room = setup.skill_room(&agent.model_name);
+    crate::skills::refresh(&mut agent, &mut terminal, &root, room, crate::skills::Look::Start { ask: args.prompt.is_none() }).await;
     terminal.effort = crate::effort::now(&agent);
     if let Some(why) = crate::effort::unlike_chosen(&agent) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("({why})")));
@@ -176,7 +176,12 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         // rein exits, for whatever started it.
         Some(prompt) => {
             terminal.start_turn(Some(&prompt));
-            match turn(&mut agent, Start::You(prompt), &mut terminal).await? {
+            for (skill, given) in crate::skills::called(&prompt, agent.skills()) {
+                agent.call_skill(&skill, given);
+            }
+            let outcome = turn(&mut agent, Start::You(prompt), &mut terminal).await;
+            crate::skills::count(agent.take_loaded());
+            match outcome? {
                 Outcome::StepLimit(_) | Outcome::Stuck { .. } => Err("the task isn't finished".into()),
                 Outcome::Done | Outcome::Stopped => Ok(()),
             }
@@ -313,8 +318,17 @@ impl Setup {
 
     /// When to compact with `model`: see [`compact_limit`].
     fn limit(&self, model: &str) -> CliResult<u64> {
-        let window = self.models.iter().find(|m| m.id == model).and_then(|m| m.context_window).or(self.provider.context);
-        compact_limit(window, self.compact_at.as_deref())
+        compact_limit(self.window(model), self.compact_at.as_deref())
+    }
+
+    /// How many tokens `model` takes, when its provider says.
+    fn window(&self, model: &str) -> Option<u64> {
+        self.models.iter().find(|m| m.id == model).and_then(|m| m.context_window).or(self.provider.context)
+    }
+
+    /// The room the list of skills gets with `model`.
+    pub(crate) fn skill_room(&self, model: &str) -> usize {
+        rein_agent::skills::room(self.window(model))
     }
 
     /// The most one answer from `model` may take, when its provider says.
@@ -555,14 +569,21 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
             continue;
         }
         let pad = " ".repeat(GUTTER);
-        // A skill called by name goes with the message, as it was typed.
-        let parsed = match crate::skills::called(line, agent.skills()) {
-            Some(skill) => {
-                agent.call_skill(&skill);
-                None
+        // A command is rein's; anything else is a message, and the skills
+        // are looked at again for it: one added or changed since is there.
+        let parsed = match crate::commands::parse(line).filter(|_| !crate::skills::starts_with_skill(line, agent.skills())) {
+            Some(Ok(command)) => Some(Ok(command)),
+            // Not one of rein's: maybe a skill added since.
+            other => {
+                crate::skills::refresh(agent, terminal, &setup.root, setup.skill_room(&agent.model_name), crate::skills::Look::Message).await;
+                other.filter(|_| !crate::skills::starts_with_skill(line, agent.skills()))
             }
-            None => crate::commands::parse(line),
         };
+        if parsed.is_none() {
+            for (skill, given) in crate::skills::called(line, agent.skills()) {
+                agent.call_skill(&skill, given);
+            }
+        }
         match parsed {
             Some(Ok(Slash::Exit)) => break,
             Some(parsed) => {
@@ -584,6 +605,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 let echo = terminal.input.pinned().then_some(line);
                 terminal.start_turn(echo);
                 let outcome = turn(agent, Start::You(line.to_owned()), terminal).await;
+                crate::skills::count(agent.take_loaded());
                 // A task that came in during the turn gets its result.
                 crate::peers::talk::report(agent, terminal, outcome.as_ref().ok()).await;
                 crate::peers::talk::close_finished(terminal).await;
@@ -736,7 +758,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             }
         }
         Slash::Undo => crate::undo::command(agent, terminal).await?,
-        Slash::Skills => crate::skills::command(agent, terminal, &setup.root).await?,
+        Slash::Skills => crate::skills::command(agent, terminal, &setup.root, setup.skill_room(&agent.model_name)).await?,
         Slash::Search(with) => crate::search::command(with, agent, terminal, setup).await?,
         Slash::New => {
             let (loaded, context) = setup.open(None, &setup.current(agent))?;

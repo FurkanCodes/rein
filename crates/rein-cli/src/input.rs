@@ -27,6 +27,7 @@ use crate::ui::fuzzy;
 use crate::ui::history::{self, History};
 use crate::ui::keys::{Key, Keys};
 use crate::ui::screen::{self, Bottom, Drag, Pinned, Raw, Tone};
+use crate::ui::slash::{self, Entry as Listed, Offer};
 use crate::ui::style::{GUTTER, Style, fit, width};
 use crate::ui::viewer::Viewer;
 use crate::ui::wrap::Wrap;
@@ -211,8 +212,10 @@ struct Boxed {
     /// What `@` can point at in the project, files and folders, as last
     /// looked at.
     paths: Vec<String>,
-    /// The `@` word Esc closed the list for.
+    /// The `@` word Esc closed the list for, or the `/` word, with its `/`.
     dismissed: Option<String>,
+    /// The skills you may call, for the list a `/` word opens.
+    skills: Vec<Offer>,
     /// Whether the window is in front, once the terminal has said.
     focused: Option<bool>,
     /// When you last pressed a key, scrolled or clicked.
@@ -247,13 +250,25 @@ impl Boxed {
         }
     }
 
-    /// The commands that match what's typed, while a command's name is
-    /// being typed.
-    fn menu(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+    /// The commands and skills that match what's typed, while the first
+    /// word is being typed.
+    fn menu(&self) -> Vec<Listed> {
         if self.waiting == Waiting::Answer || self.search.is_some() {
             return Vec::new();
         }
-        commands::matching(&self.editor.text())
+        slash::matching(&self.editor.text(), &self.skills)
+    }
+
+    /// The skills that match a `/` word being typed after the first, which
+    /// loads one with the message: none once Esc closed the list for it.
+    fn later_menu(&self) -> Vec<Listed> {
+        if self.waiting == Waiting::Answer || self.search.is_some() {
+            return Vec::new();
+        }
+        match self.editor.word('/') {
+            Some((start, typed)) if start > 0 && self.dismissed.as_deref() != Some(&format!("/{typed}")) => slash::later(&typed, &self.skills),
+            _ => Vec::new(),
+        }
     }
 
     /// The paths that match the `@` word being typed, best first: none
@@ -268,10 +283,14 @@ impl Boxed {
         }
     }
 
-    /// Picks the command named exactly, or else the first.
+    /// Picks the command or skill named exactly, or else the first.
     fn pick_default(&mut self) {
-        let typed = self.editor.text();
-        self.picked = self.menu().iter().position(|(name, _, _)| *name == typed).unwrap_or(0);
+        let later = self.later_menu();
+        let (menu, typed) = match self.editor.word('/') {
+            Some((_, typed)) if !later.is_empty() => (later, format!("/{typed}")),
+            _ => (self.menu(), self.editor.text()),
+        };
+        self.picked = menu.iter().position(|entry| entry.name == typed).unwrap_or(0);
     }
 
     fn draw(&mut self) {
@@ -432,16 +451,20 @@ impl Boxed {
                 if i == self.picked { format!(" {} {}", s.blue("›"), s.bold(&s.blue(&found[i]))) } else { format!("   {}", found[i]) }
             });
         }
-        let menu = self.menu();
-        let names = menu.iter().map(|(name, args, _)| width(name) + 1 + width(args)).max().unwrap_or(0);
+        let later = self.later_menu();
+        let menu = if later.is_empty() { self.menu() } else { later };
+        // A long skill's name doesn't push every description out of view.
+        let names = menu.iter().map(|entry| width(&entry.name) + 1 + width(&entry.args)).max().unwrap_or(0).min(40);
+        let room = screen::size().1.saturating_sub(names + 6).max(10);
         upward(menu.len(), self.picked, MENU_LINES, s, |i| {
-            let (name, args, what) = menu[i];
+            let Listed { name, args, what, .. } = &menu[i];
             let usage = format!("{name} {args}");
             let pad = " ".repeat(names.saturating_sub(width(&usage)));
+            let what = fit(what, room);
             if i == self.picked {
                 format!(" {} {}{}{pad}  {what}", s.blue("›"), s.bold(&s.blue(name)), s.dim(&format!(" {args}")))
             } else {
-                format!("   {name}{}{pad}  {}", s.dim(&format!(" {args}")), s.dim(what))
+                format!("   {name}{}{pad}  {}", s.dim(&format!(" {args}")), s.dim(&what))
             }
         })
     }
@@ -702,6 +725,9 @@ impl Boxed {
         // A question too new to take keys: they go to the box, as typing ahead.
         let waiting = if self.waiting == Waiting::Answer && self.asking.is_some() { Waiting::Nothing } else { self.waiting };
         let menu = self.menu();
+        let later = self.later_menu();
+        let later_pick = later.get(self.picked.min(later.len().saturating_sub(1))).map(|entry| entry.name.clone());
+        let later_typed = self.editor.word('/').map(|(_, typed)| format!("/{typed}"));
         let found = self.mention_menu();
         let pick = found.get(self.picked.min(found.len().saturating_sub(1))).cloned();
         let typed = self.editor.mention().map(|(_, typed)| typed);
@@ -727,6 +753,21 @@ impl Boxed {
             }
             (_, Key::Tab) if !found.is_empty() => self.editor.complete_mention(&pick.unwrap_or_default()),
             (_, Key::Enter) if !found.is_empty() && pick != typed => self.editor.complete_mention(&pick.unwrap_or_default()),
+            // So do the skills that match a later `/` word.
+            (_, Key::Esc) if !later.is_empty() => {
+                self.dismissed = later_typed;
+                edited = false;
+            }
+            (_, Key::Up) if !later.is_empty() => {
+                self.picked = (self.picked + 1) % later.len();
+                edited = false;
+            }
+            (_, Key::Down | Key::BackTab) if !later.is_empty() => {
+                self.picked = (self.picked + later.len() - 1) % later.len();
+                edited = false;
+            }
+            (_, Key::Tab) if !later.is_empty() => self.editor.complete_slash(later_pick.unwrap_or_default().trim_start_matches('/')),
+            (_, Key::Enter) if !later.is_empty() && later_pick != later_typed => self.editor.complete_slash(later_pick.unwrap_or_default().trim_start_matches('/')),
             (Waiting::Nothing, Key::CtrlC | Key::Esc) => {
                 // What was waiting comes back to the box, to change or send.
                 let mut waiting: Vec<String> = std::mem::take(&mut self.steering);
@@ -769,15 +810,16 @@ impl Boxed {
             }
             // Tab while rein works: after this turn, not into it.
             (Waiting::Nothing, Key::Tab) if menu.is_empty() && !self.editor.is_empty() => self.submit_later(),
-            // Tab completes the picked command's name.
+            // Tab completes the picked command's name, or skill's, with a
+            // space to go on if it takes something: a skill, what to do.
             (_, Key::Tab) if !menu.is_empty() => {
-                let (name, args, _) = menu[self.picked.min(menu.len() - 1)];
-                self.editor.replace(&format!("{name}{}", if args.is_empty() { "" } else { " " }));
+                let entry = &menu[self.picked.min(menu.len() - 1)];
+                self.editor.replace(&format!("{}{}", entry.name, if entry.args.is_empty() && !entry.skill { "" } else { " " }));
             }
-            // Enter sends the picked command.
+            // Enter sends the picked command, or calls the picked skill.
             (_, Key::Enter) if !menu.is_empty() => {
-                let (name, _, _) = menu[self.picked.min(menu.len() - 1)];
-                self.editor.replace(name);
+                let name = menu[self.picked.min(menu.len() - 1)].name.clone();
+                self.editor.replace(&name);
                 self.submit(waiting);
             }
             _ => {
@@ -1120,6 +1162,7 @@ impl Input {
                 search: None,
                 paths: Vec::new(),
                 dismissed: None,
+                skills: Vec::new(),
                 focused: None,
                 touched: Instant::now(),
                 bell,
@@ -1398,6 +1441,11 @@ impl Input {
     /// Shows `bar` under the box.
     pub fn set_bar(&self, bar: String) {
         self.with(|boxed| boxed.bar = bar);
+    }
+
+    /// The skills you may call, offered when you type `/`.
+    pub fn set_skills(&self, skills: Vec<Offer>) {
+        self.with(|boxed| boxed.skills = skills);
     }
 
     /// Puts `text` in the box at the cursor, as if typed.

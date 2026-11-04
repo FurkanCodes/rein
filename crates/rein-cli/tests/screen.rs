@@ -3153,19 +3153,115 @@ fn skills_are_loaded_by_the_model_and_called_by_name() {
     let requests = model.requests();
     let tools = requests[0]["tools"][0]["tools"].as_array().cloned().unwrap_or_default();
     let tool = tools.iter().find(|tool| tool["name"] == "skill").expect("offered");
-    assert_eq!(tool["parameters"]["properties"]["name"]["enum"], json!(["review", "graphs"]), "the project's first, once said yes to");
-    assert!(tool["description"].as_str().unwrap().contains("- review (the project's): How this project is reviewed."));
+    let description = tool["description"].as_str().unwrap();
+    let (review, graphs) = (description.find("- review (the project's): How this project is reviewed."), description.find("- graphs: Draw a project's modules"));
+    assert!(review.is_some() && review < graphs, "the project's first, once said yes to: {description}");
     assert!(results(&model)[0].contains("Use boxes and arrows."));
     term.wait_for(IDLE);
     term.keys("/review the last change\r");
     term.wait_for("Reviewed.");
     let input = model.requests()[2]["input"].as_array().cloned().unwrap_or_default();
     assert!(
-        input.iter().any(|item| item["type"] == "function_call_output" && item["output"].as_str().is_some_and(|o| o.contains("Check the tests."))),
-        "called with the message: {input:?}"
+        input.iter().any(|item| item["type"] == "function_call_output"
+            && item["output"].as_str().is_some_and(|o| o.contains("Check the tests.") && o.ends_with("ARGUMENTS: the last change\n</skill>"))),
+        "called with the message, and given what followed: {input:?}"
     );
     let saved = std::fs::read_to_string(term.dir.join("home/skills-trusted.json")).unwrap();
     assert!(saved.contains("project"), "the yes kept: {saved}");
+    let used = std::fs::read_to_string(term.dir.join("home/skills-used.json")).unwrap();
+    assert!(used.contains("\"graphs\": 1") && used.contains("\"review\": 1"), "each use counted: {used}");
+}
+
+/// What a skill's load gave the model, by the skill's name.
+fn loaded(model: &Model, request: usize, name: &str) -> Option<String> {
+    let input = model.requests()[request]["input"].as_array().cloned().unwrap_or_default();
+    input.iter().filter_map(|item| item["output"].as_str()).find(|output| output.starts_with(&format!("<skill name=\"{name}\""))).map(str::to_owned)
+}
+
+/// Typing `/` lists the skills under rein's commands, to pick with Tab; a
+/// `/name` later in a message loads that one too; a skill added while rein
+/// runs is there at the next message, told to the model at the end; and
+/// `/skills` puts one in the box to use.
+#[test]
+fn skills_are_picked_from_the_list_named_anywhere_and_found_as_they_come() {
+    let mut model = Model::start(vec![says("Drawn."), says("Committed."), says("Shipped."), says("Moderated.")]);
+    let skill = |name: &str, more: &str, body: &str| (format!(".agents/skills/{name}/SKILL.md"), format!("---\nname: {name}\n{more}\n---\n{body}\n"));
+    model.home.push(skill("graphs", "description: Draw a project's modules as a graph.\nargument-hint: \"[path]\"", "Use boxes and arrows for $0."));
+    model.home.push(skill("caveman-commit", "description: Write terse commit messages.", "Few words."));
+    // Its name starts rein's /mode and /model: typed out, it's the skill.
+    model.home.push(skill("mod", "description: Moderate a thread.", "Be kind."));
+    let mut term = Term::start_with(&model, "skills-picked", 30, 120, &[]);
+    term.wait_for(IDLE);
+    term.keys("/grap");
+    term.wait_for("/graphs [path]");
+    assert!(term.text().contains("Draw a project's modules as a graph."), "{}", term.text());
+    term.keys("\t");
+    term.wait_until("the name put in", |screen| screen.contains("› /graphs") && !screen.contains("[path]  "));
+    term.keys("src\r");
+    term.wait_for("Drawn.");
+    assert!(loaded(&model, 0, "graphs").is_some_and(|output| output.contains("Use boxes and arrows for src.")), "{:?}", model.requests()[0]);
+    term.wait_for(IDLE);
+    term.keys("fix the login, then /cave");
+    term.wait_for("/caveman-commit");
+    term.keys("\t");
+    term.keys("\r");
+    term.wait_for("Committed.");
+    assert!(loaded(&model, 1, "caveman-commit").is_some_and(|output| output.contains("Few words.")));
+    let message = model.requests()[1]["input"].as_array().unwrap().iter().any(|item| item.to_string().contains("fix the login, then /caveman-commit"));
+    assert!(message, "the message as typed");
+    term.wait_for(IDLE);
+    // Added while rein runs: there at the next message, and told.
+    let (path, text) = skill("deploy", "description: Ship it.\nargument-hint: \"[where]\"", "Ship to $0.");
+    let home = term.dir.join("home");
+    std::fs::create_dir_all(home.join(&path).parent().unwrap()).unwrap();
+    std::fs::write(home.join(&path), text).unwrap();
+    term.keys("/deploy staging\r");
+    term.wait_for("Shipped.");
+    assert!(term.text().contains("skills · new: deploy"), "{}", term.text());
+    assert!(loaded(&model, 2, "deploy").is_some_and(|output| output.contains("Ship to staging.")));
+    let input = model.requests()[2]["input"].to_string();
+    assert!(input.contains("New, to load as the listed ones are:\\n- deploy [where]: Ship it."), "told at the end: {input}");
+    assert_eq!(model.requests()[2]["tools"], model.requests()[0]["tools"], "the list stays, and what's cached with it");
+    term.wait_for(IDLE);
+    term.keys("/mod");
+    term.wait_for("/mod  ");
+    term.keys("\r");
+    term.wait_for("Moderated.");
+    assert!(loaded(&model, 3, "mod").is_some_and(|output| output.contains("Be kind.")), "the skill, not /mode");
+    term.wait_for(IDLE);
+    term.keys("/skills\r");
+    pick(&mut term, "caveman");
+    pick(&mut term, "use it");
+    term.wait_until("the skill put in the box", |screen| screen.contains("› /caveman-commit"));
+}
+
+/// A task run on its own calls a skill as a message does.
+#[test]
+fn a_task_run_on_its_own_calls_a_skill_too() {
+    let model = Model::start(vec![says("Drawn.")]);
+    let dir = std::env::temp_dir().join(format!("rein-skill-task-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (project, home) = (dir.join("project"), dir.join("home"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(home.join(".agents/skills/graphs")).unwrap();
+    std::fs::write(home.join(".agents/skills/graphs/SKILL.md"), "---\nname: graphs\ndescription: Draw graphs.\n---\nUse boxes.\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rein"))
+        .args(["--mode", "trust", "/graphs src"])
+        .current_dir(&project)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("REIN_HOME", &home)
+        .env("OPENAI_API_KEY", "test")
+        .env("OPENAI_BASE_URL", &model.base)
+        .env("BROWSER", "false")
+        .env("SSH_CONNECTION", "test")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(loaded(&model, 0, "graphs").is_some_and(|output| output.contains("Use boxes.\n\nARGUMENTS: src")), "{:?}", model.requests()[0]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A project's .mcp.json may be anyone's: its server starts only once

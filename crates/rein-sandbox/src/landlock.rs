@@ -122,7 +122,7 @@ pub(super) fn ruleset(places: &Places, walls: Walls, version: u32) -> io::Result
     except.extend(places.home().map(Path::to_path_buf));
     except.push(PathBuf::from("/dev"));
     let (mut whole, mut listed) = cover(Path::new("/"), &except);
-    for place in places.readable().iter().chain(places.own()) {
+    for place in places.readable().iter().chain(places.own()).chain(places.unhidden()) {
         let (more, more_listed) = cover(place, places.hidden());
         whole.extend(more);
         listed.extend(more_listed);
@@ -415,6 +415,39 @@ mod tests {
         assert!(!run(&s, &format!("echo x > '{}'", outside.display()), WRITE).await.0);
         assert!(!run(&s, &format!("echo x > '{}'", s.home.join(".profile").display()), WRITE).await.0);
         assert!(!outside.exists() && !s.home.join(".profile").exists());
+    }
+
+    /// Claude Code keeps its skills, and the plugins you install, among its
+    /// logins and settings, all hidden: a skill's script is read, and
+    /// nothing else there, nor through a link from a skill.
+    #[tokio::test]
+    async fn skills_in_a_hidden_folder_are_read_and_nothing_else_there() {
+        let Some(s) = setup("skills").await else { return };
+        let claude = s.home.join(".claude");
+        for (file, text) in [
+            ("skills/graphs/run.sh", "echo drawn\n"),
+            ("plugins/cache/market/kit/1.0.0/skills/lint/SKILL.md", "lint\n"),
+            (".credentials.json", "FAKE-token\n"),
+            ("plugins/data/kit/token", "FAKE-data\n"),
+            ("settings.json", "{}\n"),
+        ] {
+            std::fs::create_dir_all(claude.join(file).parent().unwrap()).unwrap();
+            std::fs::write(claude.join(file), text).unwrap();
+        }
+        std::os::unix::fs::symlink(claude.join(".credentials.json"), claude.join("skills/graphs/leak")).unwrap();
+        let (worked, said) = run(&s, &format!("sh '{}'", claude.join("skills/graphs/run.sh").display()), LOOK).await;
+        assert!(worked && said.trim() == "drawn", "{said}");
+        assert!(run(&s, &format!("cat '{}'", claude.join("plugins/cache/market/kit/1.0.0/skills/lint/SKILL.md").display()), LOOK).await.0);
+        for secret in [".credentials.json", "plugins/data/kit/token", "settings.json", "skills/graphs/leak"] {
+            let (worked, said) = run(&s, &format!("cat '{}'", claude.join(secret).display()), NET).await;
+            assert!(!worked && !said.contains("FAKE"), "{secret}: {said}");
+        }
+        assert!(!run(&s, &format!("echo x > '{}'", claude.join("skills/graphs/run.sh").display()), WRITE).await.0, "read, never changed");
+        let places = s.sandbox.places();
+        assert!(
+            !places.hides(&claude.join("skills/graphs/run.sh")) && places.hides(&claude.join(".credentials.json")) && places.hides(&claude.join("skills/graphs/leak")),
+            "rein's own tools agree"
+        );
     }
 
     #[tokio::test]

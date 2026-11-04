@@ -148,9 +148,26 @@ impl Editor {
     /// The `@` word the cursor is at the end of, if it's at one: where it
     /// starts, and what's typed after the `@`.
     pub fn mention(&self) -> Option<(usize, String)> {
+        self.word('@')
+    }
+
+    /// The word starting with `mark` that the cursor is at the end of, if
+    /// it's at one: where it starts, and what's typed after the mark.
+    pub fn word(&self, mark: char) -> Option<(usize, String)> {
         let start = self.text[..self.cursor].iter().rposition(|c| c.is_whitespace()).map_or(0, |i| i + 1);
         let at_end = self.text.get(self.cursor).is_none_or(|c| c.is_whitespace());
-        (self.text.get(start) == Some(&'@') && at_end).then(|| (start, self.text[start + 1..self.cursor].iter().collect()))
+        (self.text.get(start) == Some(&mark) && at_end).then(|| (start, self.text[start + 1..self.cursor].iter().collect()))
+    }
+
+    /// Puts `/name ` in place of the `/` word being typed, to go on with
+    /// the message.
+    pub fn complete_slash(&mut self, name: &str) {
+        let Some((start, _)) = self.word('/') else { return };
+        let new: Vec<char> = format!("/{name} ").chars().collect();
+        let end = self.cursor;
+        self.cursor = start + new.len();
+        self.text.splice(start..end, new);
+        self.browsing = None;
     }
 
     /// Puts `@path` in place of the `@` word being typed: with a space

@@ -3,52 +3,54 @@
 //! call with `/name`.
 //!
 //! rein finds them in your `~/.agents/skills` (the folder every harness
-//! shares) and `~/.claude/skills` (Claude Code's), and in the project's
-//! `.agents/skills` and `.claude/skills` once you've said yes to them. The
-//! model is offered one tool, `skill`, whose description lists every skill
-//! by name with what it's for, and loads one with it: its instructions, and
-//! the files beside them, read inside its folder only.
+//! shares) and `~/.claude/skills` (Claude Code's), in the plugins you've
+//! turned on in Claude Code (named `plugin:skill`, as there), and in the
+//! project's `.agents/skills` and `.claude/skills`, from where rein starts
+//! up to the repository's root, once you've said yes to them. The model is
+//! offered one tool, `skill`, whose description lists every skill by name
+//! with what it's for ([`catalog`]), and loads one with it ([`load`]): its
+//! instructions, and the files beside them, read inside its folder only.
 //!
-//! Every name stays in the list; descriptions are shortened evenly to fit
-//! [`CATALOG`], as Codex does, since 74 skills' come to 20,000 characters,
-//! sent with every request. Nothing in a skill runs because it's loaded,
-//! and what it says it may use (`allowed-tools`) lets nothing run without
-//! asking: a skill is someone's text, and a project's may be anyone's.
+//! Nothing in a skill runs because it's loaded, and what it says it may use
+//! (`allowed-tools`) lets nothing run without asking: a skill is someone's
+//! text, and a project's may be anyone's. So its name is held to letters,
+//! digits and `-_.:`, and what it says is cleaned of what a terminal would
+//! act on, before you or the model see it.
 
-use std::collections::HashSet;
+mod catalog;
+mod load;
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rein_llm::{Loading, Tool};
 use serde::Deserialize;
-use serde_json::json;
 
-use crate::tools::{ERROR, ToolName};
+pub use catalog::{AS_LISTED, LEAST_ROOM, MOST_ROOM, changes, is_note, room, spec};
+pub use load::load;
 
-/// The most of every request the list of skills takes, in characters:
-/// about 2,500 tokens.
-pub const CATALOG: usize = 10_000;
+/// The most a name may have, as the spec says, a plugin's apart.
+const NAME_LONGEST: usize = 64;
 
-/// The least of its description a skill keeps in the list.
-const SHORTEST: usize = 60;
-
-/// The most of a skill's text one load gives: the rest comes from
-/// `start_line`, as `read` gives a long file in parts.
-const LONGEST: usize = 60_000;
-
-/// The most of a skill's files named when it's loaded.
-const FILES_NAMED: usize = 30;
+/// The most of a description kept, with its `when_to_use`, as Claude Code
+/// keeps.
+const DESCRIPTION_LONGEST: usize = 1_536;
 
 /// Whose a skill is, which decides whether it's offered at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Whose {
+    #[default]
     Yours,
     /// The project's: it came with it, and may be anyone's.
     Project,
+    /// A Claude Code plugin's that you turned on there: yours, as you
+    /// installed it.
+    Plugin,
 }
 
 /// A skill, as its `SKILL.md` says.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Skill {
+    /// Its name; a plugin's is `plugin:skill`.
     pub name: String,
     pub description: String,
     /// Its folder, resolved.
@@ -60,6 +62,12 @@ pub struct Skill {
     pub you: bool,
     /// What it takes after `/name`, as it says (`argument-hint`).
     pub hint: Option<String>,
+    /// The names its arguments go by, in order (`arguments`), each `$name`
+    /// in its text.
+    pub arguments: Vec<String>,
+    /// How often it's been loaded, which keeps its description whole when
+    /// the list must be cut.
+    pub used: u32,
 }
 
 /// The skills found, and those left out, each with why.
@@ -69,79 +77,242 @@ pub struct Skills {
     pub left_out: Vec<(PathBuf, String)>,
 }
 
+impl Skills {
+    pub fn named(&self, name: &str) -> Option<&Skill> {
+        self.found.iter().find(|skill| skill.name == name)
+    }
+}
+
+/// A folder skills are found in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Folder {
+    pub path: PathBuf,
+    pub whose: Whose,
+    /// The plugin its skills are named after, `plugin:skill`.
+    pub plugin: Option<String>,
+    /// It's a skill's own folder, not a folder of them: a plugin may name
+    /// one.
+    pub single: bool,
+}
+
+impl Folder {
+    fn of(path: PathBuf, whose: Whose) -> Folder {
+        Folder { path, whose, plugin: None, single: false }
+    }
+}
+
 /// The folders skills are found in, first first: the project's before
-/// yours, as the spec has it, and the shared folder before Claude Code's.
-pub fn folders(root: &Path, home: Option<&Path>, project: bool) -> Vec<(PathBuf, Whose)> {
+/// yours, as the spec has it, nearest first; the shared folder before
+/// Claude Code's; plugins' last, whose names can't clash with the others'.
+pub fn folders(root: &Path, home: Option<&Path>, project: bool) -> Vec<Folder> {
     let mut folders = Vec::new();
     if project {
-        folders.extend([(root.join(".agents/skills"), Whose::Project), (root.join(".claude/skills"), Whose::Project)]);
+        folders.extend(project_folders(root, home).into_iter().map(|path| Folder::of(path, Whose::Project)));
     }
     if let Some(home) = home {
-        folders.extend([(home.join(".agents/skills"), Whose::Yours), (home.join(".claude/skills"), Whose::Yours)]);
+        folders.extend([Folder::of(home.join(".agents/skills"), Whose::Yours), Folder::of(home.join(".claude/skills"), Whose::Yours)]);
+        folders.extend(plugins(&home.join(".claude")));
+    }
+    folders
+}
+
+/// The project's skill folders: in `root`, and in each folder above it up
+/// to the repository's root, as Codex and pi look, nearest first. Never
+/// your home folder or above it, whose skills are yours, nor anywhere
+/// above `root` outside a repository.
+pub fn project_folders(root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = vec![root.to_owned()];
+    let mut at = root;
+    while !at.join(".git").exists() {
+        match at.parent() {
+            Some(up) if !home.is_some_and(|home| home.starts_with(up)) => {
+                dirs.push(up.to_owned());
+                at = up;
+            }
+            _ => {
+                dirs.truncate(1);
+                break;
+            }
+        }
+    }
+    dirs.iter().flat_map(|dir| [dir.join(".agents/skills"), dir.join(".claude/skills")]).collect()
+}
+
+/// The skill folders of the plugins turned on in Claude Code, whose own
+/// folder is `claude`: its settings say which are on, and its list of
+/// what's installed where each is. A plugin's skills are in its `skills`
+/// folder, and any its manifest names inside it. One installed only for a
+/// project is that project's settings' to turn on, so it's left out.
+fn plugins(claude: &Path) -> Vec<Folder> {
+    #[derive(Deserialize)]
+    struct Settings {
+        #[serde(default, rename = "enabledPlugins")]
+        enabled: HashMap<String, serde_json::Value>,
+    }
+    #[derive(Deserialize)]
+    struct Installed {
+        #[serde(default)]
+        plugins: HashMap<String, Vec<Install>>,
+    }
+    #[derive(Deserialize)]
+    struct Install {
+        #[serde(default)]
+        scope: String,
+        #[serde(rename = "installPath")]
+        path: PathBuf,
+    }
+    #[derive(Deserialize, Default)]
+    struct Manifest {
+        name: Option<String>,
+        #[serde(default)]
+        skills: Paths,
+    }
+    #[derive(Deserialize, Default)]
+    #[serde(untagged)]
+    enum Paths {
+        #[default]
+        None,
+        One(String),
+        Many(Vec<String>),
+    }
+    let read = |path: PathBuf| std::fs::read(path).ok();
+    let Some(settings) = read(claude.join("settings.json")).and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok()) else { return Vec::new() };
+    let Some(installed) = read(claude.join("plugins/installed_plugins.json")).and_then(|bytes| serde_json::from_slice::<Installed>(&bytes).ok()) else { return Vec::new() };
+    let mut on: Vec<&String> = settings.enabled.iter().filter(|(_, value)| **value == serde_json::Value::Bool(true)).map(|(key, _)| key).collect();
+    on.sort();
+    let mut folders = Vec::new();
+    for key in on {
+        let Some(install) = installed.plugins.get(key).and_then(|installs| installs.iter().find(|install| install.scope == "user")) else { continue };
+        let Ok(base) = install.path.canonicalize() else { continue };
+        let manifest: Manifest = read(base.join(".claude-plugin/plugin.json")).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        let fallback = key.split('@').next().unwrap_or(key);
+        let name = manifest.name.filter(|name| fit_name(name)).unwrap_or_else(|| fallback.to_owned());
+        if !fit_name(&name) {
+            continue;
+        }
+        let named = match manifest.skills {
+            Paths::None => Vec::new(),
+            Paths::One(path) => vec![path],
+            Paths::Many(paths) => paths,
+        };
+        let inside = |path: &str| {
+            let path = Path::new(path);
+            !path.is_absolute() && !path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+        };
+        let paths = std::iter::once(base.join("skills")).chain(named.iter().filter(|path| inside(path)).map(|path| base.join(path)));
+        for path in paths {
+            if path.is_dir() {
+                let single = path.join("SKILL.md").is_file();
+                folders.push(Folder { path, whose: Whose::Plugin, plugin: Some(name.clone()), single });
+            }
+        }
     }
     folders
 }
 
 /// The skills in `folders`, each a folder in one with a `SKILL.md`. One
 /// reached twice, through a link, counts once; a later one of a name taken
-/// is left out, and so is one whose `SKILL.md` can't be read, each said why.
-pub fn find(folders: &[(PathBuf, Whose)]) -> Skills {
+/// is left out, and so is one whose `SKILL.md` can't be read, or whose name
+/// a skill's can't be, each said why.
+pub fn find(folders: &[Folder]) -> Skills {
     let (mut skills, mut seen) = (Skills::default(), HashSet::new());
-    for (folder, whose) in folders {
-        let Ok(entries) = std::fs::read_dir(folder) else { continue };
-        let mut entries: Vec<PathBuf> = entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
-        entries.sort();
+    for folder in folders {
+        let entries = if folder.single {
+            vec![folder.path.clone()]
+        } else {
+            let Ok(entries) = std::fs::read_dir(&folder.path) else { continue };
+            let mut entries: Vec<PathBuf> = entries.filter_map(Result::ok).map(|entry| entry.path()).collect();
+            entries.sort();
+            entries
+        };
         for path in entries {
+            // Kept out of sight, as Claude Code's trash is.
+            if !folder.single && path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.')) {
+                continue;
+            }
             let Ok(real) = path.canonicalize() else { continue };
             if !real.is_dir() || !seen.insert(real.clone()) {
                 continue;
             }
-            let file = real.join("SKILL.md");
-            let Ok(text) = std::fs::read_to_string(&file) else {
-                skills.left_out.push((path, "it has no SKILL.md".into()));
-                continue;
-            };
-            let said = match frontmatter(&text) {
-                Some(said) => said,
-                None => {
-                    skills.left_out.push((path, "its SKILL.md has no frontmatter between --- lines".into()));
-                    continue;
-                }
-            };
-            let Some(description) = said.get("description").filter(|d| !d.trim().is_empty()) else {
-                skills.left_out.push((path, "its SKILL.md says nothing in description, which says when to use it".into()));
-                continue;
-            };
-            let folder_name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-            let name = said.get("name").map(|name| name.trim().to_owned()).filter(|name| !name.is_empty()).unwrap_or(folder_name);
-            if let Some(first) = skills.found.iter().find(|skill| skill.name == name) {
-                skills.left_out.push((path, format!("a skill called {name} in {} comes first", first.folder.display())));
+            if path.ends_with(".claude/skills/synced") && !real.join("SKILL.md").exists() {
+                skills.left_out.push((path, "claude.ai's skills, which Claude Code keeps in step with your account: left to it".into()));
                 continue;
             }
-            let no = |key: &str| said.get(key).is_some_and(|value| value.trim() == "false");
-            let yes = |key: &str| said.get(key).is_some_and(|value| value.trim() == "true");
-            skills.found.push(Skill {
-                name,
-                description: description.split_whitespace().collect::<Vec<_>>().join(" "),
-                folder: real,
-                whose: *whose,
-                model: !yes("disable-model-invocation"),
-                you: !no("user-invocable"),
-                hint: said.get("argument-hint").map(|hint| hint.trim().to_owned()).filter(|hint| !hint.is_empty()),
-            });
+            match read(&path, &real, folder) {
+                Ok(skill) => match skills.named(&skill.name) {
+                    Some(first) => skills.left_out.push((path, format!("a skill called {} in {} comes first", skill.name, first.folder.display()))),
+                    None => skills.found.push(skill),
+                },
+                Err(why) => skills.left_out.push((path, why)),
+            }
         }
     }
     skills
 }
 
+/// The skill in the folder `path`, resolved as `real`, from `folder`; or
+/// why it can't be one.
+fn read(path: &Path, real: &Path, folder: &Folder) -> Result<Skill, String> {
+    let text = std::fs::read_to_string(real.join("SKILL.md")).map_err(|_| "it has no SKILL.md".to_owned())?;
+    let said = frontmatter(&text).ok_or("its SKILL.md has no frontmatter between --- lines")?;
+    let tidy = |value: &str, longest: usize| {
+        let words = rein_mcp::clean::text(value).split_whitespace().collect::<Vec<_>>().join(" ");
+        words.chars().take(longest).collect::<String>()
+    };
+    let mut description = tidy(said.get("description").map_or("", String::as_str), DESCRIPTION_LONGEST);
+    if description.is_empty() {
+        return Err("its SKILL.md says nothing in description, which says when to use it".into());
+    }
+    if let Some(when) = said.get("when_to_use").map(|when| tidy(when, DESCRIPTION_LONGEST)).filter(|when| !when.is_empty()) {
+        description = format!("{description} {when}").chars().take(DESCRIPTION_LONGEST).collect();
+    }
+    let folder_name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = said.get("name").map(|name| name.trim().to_owned()).filter(|name| !name.is_empty()).unwrap_or(folder_name);
+    if !fit_name(&name) {
+        return Err(format!("its name, {}, holds more than letters, digits and - _ . :, or is over {NAME_LONGEST} long", shown_name(&name)));
+    }
+    let no = |key: &str| said.get(key).is_some_and(|value| value.trim() == "false");
+    let yes = |key: &str| said.get(key).is_some_and(|value| value.trim() == "true");
+    let arguments = said.get("arguments").map(|named| named.split([' ', ',']).filter(|name| is_word(name)).map(str::to_owned).collect()).unwrap_or_default();
+    Ok(Skill {
+        name: folder.plugin.as_ref().map_or_else(|| name.clone(), |plugin| format!("{plugin}:{name}")),
+        description,
+        folder: real.to_owned(),
+        whose: folder.whose,
+        model: !yes("disable-model-invocation"),
+        you: !no("user-invocable"),
+        hint: said.get("argument-hint").map(|hint| tidy(hint, 100)).filter(|hint| !hint.is_empty()),
+        arguments,
+        used: 0,
+    })
+}
+
+/// A name a skill may have: letters, digits and `-_.:`, not starting with
+/// a dot, [`NAME_LONGEST`] at most. Nothing a terminal acts on, nothing
+/// that turns text around, no space.
+pub fn fit_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && name.chars().count() <= NAME_LONGEST && name.chars().all(|c| c.is_alphanumeric() || "-_.:".contains(c))
+}
+
+/// `name`, safe to show: anything but letters, digits and punctuation
+/// written as its code.
+fn shown_name(name: &str) -> String {
+    name.chars().take(NAME_LONGEST + 1).map(|c| if c.is_alphanumeric() || c.is_ascii_punctuation() { c.to_string() } else { c.escape_unicode().to_string() }).collect()
+}
+
+/// A word an argument's name may be: `$name` in the skill's text.
+fn is_word(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// What the project's skills are, as one value: every file in its skill
 /// folders, by path and content, so a change to any (a script, say)
 /// asks for your yes again. `None` when it has none.
-pub fn fingerprint(root: &Path) -> Option<String> {
+pub fn fingerprint(root: &Path, home: Option<&Path>) -> Option<String> {
     use sha2::Digest;
     let mut hash = sha2::Sha256::new();
     let mut any = false;
-    for folder in [root.join(".agents/skills"), root.join(".claude/skills")] {
+    for folder in project_folders(root, home) {
         let mut stack = vec![folder.clone()];
         let mut seen = 0;
         while let Some(dir) = stack.pop() {
@@ -169,15 +340,16 @@ pub fn fingerprint(root: &Path) -> Option<String> {
 
 /// The top-level keys of `text`'s frontmatter, between a first line of
 /// `---` and the next such line, read as leniently as the spec asks: a
-/// value plain, quoted, or a block (`>` folds its lines, `|` keeps them),
-/// and what's nested under a key skipped. `None` without frontmatter.
-fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> {
+/// value plain (begun on its key's line or the next), quoted, a block (`>`
+/// folds its lines, `|` keeps them), or a list (its items, spaced), and a
+/// map nested under a key skipped. `None` without frontmatter.
+fn frontmatter(text: &str) -> Option<HashMap<String, String>> {
     let mut lines = text.lines();
     if lines.next()?.trim_end() != "---" {
         return None;
     }
     let body: Vec<&str> = lines.by_ref().take_while(|line| line.trim_end() != "---").collect();
-    let mut said = std::collections::HashMap::new();
+    let mut said = HashMap::new();
     let mut at = 0;
     while at < body.len() {
         let line = body[at];
@@ -196,19 +368,35 @@ fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> 
         while more.last().is_some_and(|line| line.is_empty()) {
             more.pop();
         }
+        let lines: Vec<&str> = more.iter().copied().filter(|line| !line.is_empty()).collect();
+        let joined = || std::iter::once(value).chain(lines.iter().copied()).filter(|line| !line.is_empty()).collect::<Vec<_>>().join(" ");
         let value = match value.chars().next() {
             Some('|') => more.join("\n"),
-            Some('>') => more.iter().filter(|line| !line.is_empty()).copied().collect::<Vec<_>>().join(" "),
-            Some('"') => value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value).replace("\\\"", "\""),
-            Some('\'') => value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')).unwrap_or(value).replace("''", "'"),
-            // A nested map or list: not a value of its own.
-            None if !more.is_empty() => continue,
-            _ if !more.is_empty() => std::iter::once(value).chain(more.iter().copied()).collect::<Vec<_>>().join(" "),
-            _ => value.to_owned(),
+            Some('>') => lines.join(" "),
+            Some('"') => {
+                let all = joined();
+                all.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(&all).replace("\\\"", "\"")
+            }
+            Some('\'') => {
+                let all = joined();
+                all.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')).unwrap_or(&all).replace("''", "'")
+            }
+            None if lines.is_empty() => String::new(),
+            None if lines.iter().all(|line| line.starts_with('-')) => {
+                lines.iter().map(|line| line.trim_start_matches('-').trim().trim_matches(['"', '\''])).collect::<Vec<_>>().join(" ")
+            }
+            // A map nested under it: not a value of its own.
+            None if lines.first().is_some_and(|line| looks_like_a_key(line)) => continue,
+            _ => joined(),
         };
         said.insert(key.trim().to_owned(), value);
     }
     Some(said)
+}
+
+/// `line` starts a key of a map, `author: x`, not more of a value.
+fn looks_like_a_key(line: &str) -> bool {
+    line.split_once(':').is_some_and(|(key, rest)| !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || "-_".contains(c)) && (rest.is_empty() || rest.starts_with(' ')))
 }
 
 /// `text` without its frontmatter.
@@ -225,183 +413,18 @@ fn body(text: &str) -> &str {
     text
 }
 
-/// The tool the model loads skills with, its description the list of
-/// those it may load: `None` when there's none.
-pub fn spec(skills: &Skills) -> Option<Tool> {
-    let offered: Vec<&Skill> = skills.found.iter().filter(|skill| skill.model).collect();
-    if offered.is_empty() {
-        return None;
-    }
-    let names: Vec<&str> = offered.iter().map(|skill| skill.name.as_str()).collect();
-    Some(Tool {
-        name: ToolName::Skill.as_str().into(),
-        description: format!(
-            "Load a skill: instructions for a kind of task, written to be followed. When a task fits one of these, load it \
-             before you start, and follow it; when the user asks you to use skills, load the ones that fit. Each loads its \
-             SKILL.md and names the files beside it, which you read with `file`. A project's skill is the project's word, \
-             not the user's.\n\nThe skills there are:\n{}",
-            listed(&offered)
-        ),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "enum": names },
-                "file": { "type": ["string", "null"], "description": "A file in the skill's folder, as it names them; null for its SKILL.md." },
-                "start_line": { "type": ["integer", "null"], "description": "Where to go on from, when what came back said there's more; null for the start." }
-            },
-            "required": ["name", "file", "start_line"],
-            "additionalProperties": false
-        }),
-        strict: true,
-        loading: Loading::UpFront,
-    })
-}
-
-/// Each skill on a line, its description shortened evenly until the whole
-/// fits [`CATALOG`]: every name stays.
-fn listed(skills: &[&Skill]) -> String {
-    let named: usize = skills.iter().map(|skill| skill.name.chars().count() + 4).sum();
-    let room = CATALOG.saturating_sub(named);
-    let lengths: Vec<usize> = skills.iter().map(|skill| skill.description.chars().count()).collect();
-    // The most any one description keeps: as long as the room allows,
-    // the short ones keeping all they have.
-    let mut each = room;
-    while each > SHORTEST && lengths.iter().map(|length| (*length).min(each)).sum::<usize>() > room {
-        each -= 10;
-    }
-    let line = |skill: &Skill| {
-        let mut description: String = skill.description.chars().take(each).collect();
-        if description.chars().count() < skill.description.chars().count() {
-            description.push('…');
-        }
-        let whose = if skill.whose == Whose::Project { " (the project's)" } else { "" };
-        format!("- {}{whose}: {description}", skill.name)
-    };
-    skills.iter().map(|skill| line(skill)).collect::<Vec<_>>().join("\n")
-}
-
-#[derive(Deserialize)]
-struct Asked {
-    name: String,
-    file: Option<String>,
-    start_line: Option<usize>,
-}
-
-/// What loading a skill as `arguments` ask gives: its instructions, with
-/// where its folder is and what's in it, or one of its files; or what's
-/// wrong.
-pub fn load(skills: &Skills, arguments: &str) -> String {
-    let asked: Asked = match serde_json::from_str(arguments) {
-        Ok(asked) => asked,
-        Err(e) => return format!("{ERROR}bad arguments: {e}"),
-    };
-    let Some(skill) = skills.found.iter().find(|skill| skill.name == asked.name) else {
-        return format!("{ERROR}there is no skill called {}", asked.name);
-    };
-    let text = match asked.file.as_deref().filter(|file| !file.is_empty() && *file != "SKILL.md") {
-        // Only what's in its folder, opened never through a link out of it.
-        Some(file) => match read_inside(&skill.folder, file) {
-            Ok(text) => text,
-            Err(why) => return format!("{ERROR}{why}"),
-        },
-        None => match std::fs::read_to_string(skill.folder.join("SKILL.md")) {
-            Ok(text) => body(&text).trim().to_owned(),
-            Err(e) => return format!("{ERROR}can't read {}'s SKILL.md: {e}", skill.name),
-        },
-    };
-    let (shown, more) = part(&text, asked.start_line.unwrap_or(1));
-    let file = asked.file.as_deref().unwrap_or("SKILL.md");
-    let mut said = format!("<skill name=\"{}\" file=\"{file}\" folder=\"{}\">\n{shown}\n</skill>", skill.name, skill.folder.display());
-    if let Some(next) = more {
-        said.push_str(&format!("\n[more of it: load it again with start_line {next}]"));
-    }
-    if asked.file.is_none() && asked.start_line.is_none() {
-        let files = files_in(&skill.folder);
-        if !files.is_empty() {
-            said.push_str(&format!("\nIts files, read with `file` as they're named here: {}", files.join(", ")));
-        }
-    }
-    said
-}
-
-/// `text` from line `first`, as much as [`LONGEST`] holds, and the line to
-/// go on from when there's more.
-fn part(text: &str, first: usize) -> (String, Option<usize>) {
-    let lines: Vec<&str> = text.lines().collect();
-    let first = first.max(1);
-    let mut shown = String::new();
-    for (at, line) in lines.iter().enumerate().skip(first - 1) {
-        if shown.len() + line.len() > LONGEST && !shown.is_empty() {
-            return (shown, Some(at + 1));
-        }
-        shown.push_str(line);
-        shown.push('\n');
-    }
-    (shown.trim_end().to_owned(), None)
-}
-
-/// `file`, inside `folder`: never above it, and never through a link that
-/// leads out.
-fn read_inside(folder: &Path, file: &str) -> Result<String, String> {
-    let path = Path::new(file);
-    if path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
-        return Err(format!("{file} isn't in the skill's folder: name it as the skill does"));
-    }
-    let mut opened = crate::files::open(folder, path).map_err(|e| format!("can't read {file}: {e}"))?;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut opened, &mut bytes).map_err(|e| format!("can't read {file}: {e}"))?;
-    String::from_utf8(bytes).map_err(|_| format!("{file} isn't a UTF-8 text file"))
-}
-
-/// The files in `folder` but its SKILL.md, by their paths in it, a few
-/// levels down, [`FILES_NAMED`] at most.
-fn files_in(folder: &Path) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut stack = vec![(folder.to_owned(), 0)];
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == "node_modules" {
-                continue;
-            }
-            let Ok(kind) = entry.file_type() else { continue };
-            if kind.is_dir() && depth < 3 {
-                stack.push((path, depth + 1));
-            } else if kind.is_file()
-                && let Ok(rel) = path.strip_prefix(folder)
-            {
-                let rel = rel.to_string_lossy().into_owned();
-                if rel != "SKILL.md" {
-                    found.push(rel);
-                }
-            }
-        }
-    }
-    found.sort();
-    let more = found.len().saturating_sub(FILES_NAMED);
-    found.truncate(FILES_NAMED);
-    if more > 0 {
-        found.push(format!("and {more} more"));
-    }
-    found
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn dir(name: &str) -> PathBuf {
+    pub(crate) fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rein-skills-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
     }
 
-    fn skill(folder: &Path, name: &str, frontmatter: &str, body: &str) {
+    pub(crate) fn skill(folder: &Path, name: &str, frontmatter: &str, body: &str) {
         std::fs::create_dir_all(folder.join(name)).unwrap();
         std::fs::write(folder.join(name).join("SKILL.md"), format!("---\n{frontmatter}\n---\n{body}")).unwrap();
     }
@@ -422,6 +445,20 @@ mod tests {
         assert_eq!(body("---\nname: a---b\n---\nkept"), "kept", "it ends at a --- line, not a --- inside one");
     }
 
+    /// As two of the skills Vercel publishes write it: a plain value begun
+    /// on the line after its key, which rein once read as nothing and left
+    /// the skill out.
+    #[test]
+    fn a_value_begun_on_the_next_line_or_a_list_is_read_too() {
+        let said = frontmatter(
+            "---\nname: rn\ndescription:\n  React Native and Expo best practices. Use\n  when building apps.\narguments:\n  - issue\n  - \"branch\"\nquoted: \"over\n  two\"\n---\n",
+        )
+        .unwrap();
+        assert_eq!(said["description"], "React Native and Expo best practices. Use when building apps.");
+        assert_eq!(said["arguments"], "issue branch");
+        assert_eq!(said["quoted"], "over two");
+    }
+
     #[test]
     fn skills_are_found_once_the_projects_first_and_what_cant_be_read_said_why() {
         let (project, home) = (dir("project"), dir("home"));
@@ -432,91 +469,97 @@ mod tests {
         skill(&mine, "quiet", "name: quiet\ndescription: Only when asked.\ndisable-model-invocation: true\nargument-hint: \"[what]\"", "Quiet.");
         skill(&mine, "empty", "name: empty", "Nothing says when.");
         std::fs::create_dir_all(mine.join("synced")).unwrap();
-        std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+        std::fs::create_dir_all(home.join(".claude/skills/.trash/old")).unwrap();
+        skill(&home.join(".claude/skills/synced/account"), "pdf", "name: pdf\ndescription: claude.ai's.", "");
         std::os::unix::fs::symlink(mine.join("graphs"), home.join(".claude/skills/graphs")).unwrap();
         let skills = find(&folders(&project, Some(&home), true));
         let found: Vec<(&str, Whose, bool, bool)> = skills.found.iter().map(|s| (s.name.as_str(), s.whose, s.model, s.you)).collect();
         assert_eq!(found, [("review", Whose::Project, true, true), ("graphs", Whose::Yours, true, false), ("quiet", Whose::Yours, false, true)]);
         assert_eq!(skills.found[2].hint.as_deref(), Some("[what]"));
         let why: Vec<String> = skills.left_out.iter().map(|(path, why)| format!("{}: {why}", path.file_name().unwrap().to_string_lossy())).collect();
-        assert_eq!(why.len(), 3, "the link to graphs counts once, not as a clash: {why:?}");
+        assert_eq!(why.len(), 4, "the link to graphs counts once, not as a clash, and trash isn't said: {why:?}");
         assert!(why[0].starts_with("empty: its SKILL.md says nothing in description"), "{why:?}");
         assert!(why[1].starts_with("review: a skill called review in") && why[1].contains("project"), "{why:?}");
-        assert_eq!(why[2], "synced: it has no SKILL.md");
+        assert_eq!(why[2], "synced: it has no SKILL.md", "only Claude Code's synced is claude.ai's");
+        assert!(why[3].starts_with("synced: claude.ai's skills"), "{why:?}");
         let without = find(&folders(&project, Some(&home), false));
-        let review = without.found.iter().find(|skill| skill.name == "review").unwrap();
+        let review = without.named("review").unwrap();
         assert_eq!((review.description.as_str(), review.whose), ("My way to review.", Whose::Yours), "the project's only once you've said yes to them");
     }
 
+    /// A project's skill is someone else's text, shown in your terminal
+    /// before you've said yes to it.
     #[test]
-    fn every_name_stays_in_the_list_and_descriptions_share_the_room() {
-        let folder = PathBuf::from("/s");
-        let many: Vec<Skill> = (0..80)
-            .map(|n| Skill { name: format!("skill-{n}"), description: "word ".repeat(100 + n), folder: folder.clone(), whose: Whose::Yours, model: true, you: true, hint: None })
-            .collect();
-        let refs: Vec<&Skill> = many.iter().collect();
-        let list = listed(&refs);
-        assert!(list.chars().count() <= CATALOG + 200, "{}", list.chars().count());
-        assert!((0..80).all(|n| list.contains(&format!("- skill-{n}: "))), "every name");
-        assert!(list.lines().all(|line| line.ends_with('…')), "each shortened alike");
-        let few = [Skill { name: "one".into(), description: "Short.".into(), folder, whose: Whose::Project, model: true, you: true, hint: None }];
-        assert_eq!(listed(&few.iter().collect::<Vec<_>>()), "- one (the project's): Short.", "what fits isn't cut");
+    fn what_a_terminal_would_act_on_never_gets_through() {
+        let home = dir("names");
+        let mine = home.join(".agents/skills");
+        skill(&mine, "bell", "name: \"bell\u{7}\u{1b}[2J\"\ndescription: Rings.", "");
+        skill(&mine, "spaced", "name: two words\ndescription: Spaced.", "");
+        skill(&mine, "flipped", "name: flipped\ndescription: \"Safe \u{1b}]52;c;eA==\u{7}\u{202e}text\"\nargument-hint: \"[x]\u{1b}[31m\"", "");
+        let skills = find(&folders(&home, Some(&home), false));
+        assert_eq!(skills.found.len(), 1, "{skills:?}");
+        assert_eq!(skills.found[0].description, "Safe ]52;c;eA==text");
+        assert_eq!(skills.found[0].hint.as_deref(), Some("[x][31m"));
+        let why: Vec<&str> = skills.left_out.iter().map(|(_, why)| why.as_str()).collect();
+        assert!(why.iter().all(|why| !why.contains('\u{1b}') && !why.contains('\u{7}')), "{why:?}");
+        assert!(why[0].contains(r"bell\u{7}\u{1b}[2J"), "said as its codes: {why:?}");
+        assert!(why[1].contains("two\\u{20}words"), "{why:?}");
     }
 
     #[test]
-    fn a_skill_loads_its_text_and_its_files_but_nothing_outside_its_folder() {
-        let home = dir("load");
-        let mine = home.join(".agents/skills");
-        skill(&mine, "graphs", "name: graphs\ndescription: Draw graphs.", "Step one.\nStep two.");
-        std::fs::create_dir_all(mine.join("graphs/references")).unwrap();
-        std::fs::write(mine.join("graphs/references/styles.md"), "Use blue.").unwrap();
-        std::fs::write(home.join("secret.txt"), "FAKE-secret").unwrap();
-        std::os::unix::fs::symlink(home.join("secret.txt"), mine.join("graphs/leak.md")).unwrap();
-        let skills = find(&folders(&home, Some(&home), false));
-        let loaded = load(&skills, r#"{"name":"graphs","file":null,"start_line":null}"#);
-        assert!(loaded.starts_with(&format!("<skill name=\"graphs\" file=\"SKILL.md\" folder=\"{}\">\nStep one.\nStep two.\n</skill>", mine.join("graphs").display())), "{loaded}");
-        assert!(loaded.ends_with("Its files, read with `file` as they're named here: references/styles.md"), "a link isn't named: {loaded}");
-        assert!(load(&skills, r#"{"name":"graphs","file":"references/styles.md","start_line":null}"#).contains("Use blue."));
-        for outside in ["../../../secret.txt", "/etc/passwd", "leak.md"] {
-            let refused = load(&skills, &format!(r#"{{"name":"graphs","file":"{outside}","start_line":null}}"#));
-            assert!(refused.starts_with(ERROR) && !refused.contains("FAKE"), "{outside}: {refused}");
+    fn a_plugin_on_in_claude_code_brings_its_skills_named_after_it() {
+        let home = dir("plugins");
+        let claude = home.join(".claude");
+        let installed = |name: &str| claude.join(format!("plugins/cache/market/{name}/1.0.0"));
+        for name in ["kit", "off", "theirs"] {
+            skill(&installed(name).join("skills"), "lint", "name: lint\ndescription: Lint things.", "Lint.");
         }
-        let above = load(&skills, r#"{"name":"graphs","file":"../../../secret.txt","start_line":null}"#);
-        assert!(above.contains("isn't in the skill's folder"), "said why: {above}");
-        assert!(load(&skills, r#"{"name":"nope","file":null,"start_line":null}"#).contains("no skill called nope"));
-        let long = format!("{}\n", "a line of the skill\n".repeat(4_000));
-        let (first, next) = part(&long, 1);
-        assert!(first.len() <= LONGEST && next.is_some(), "a long one comes in parts");
-        let (rest, after) = part(&long, next.unwrap());
-        assert_eq!((first.lines().count() + rest.lines().count(), after), (4_000, None));
+        skill(&installed("kit").join("extra"), "deploy", "name: deploy\ndescription: Ship it.", "Ship.");
+        std::fs::create_dir_all(installed("kit").join(".claude-plugin")).unwrap();
+        std::fs::write(installed("kit").join(".claude-plugin/plugin.json"), r#"{"name": "tools", "skills": ["./extra/deploy", "../../escape"]}"#).unwrap();
+        std::fs::write(claude.join("settings.json"), r#"{"enabledPlugins": {"kit@market": true, "off@market": false, "theirs@market": true}}"#).unwrap();
+        let entry = |name: &str, scope: &str| format!(r#""{name}@market": [{{"scope": "{scope}", "installPath": "{}"}}]"#, installed(name).display());
+        std::fs::write(
+            claude.join("plugins/installed_plugins.json"),
+            format!(r#"{{"version": 2, "plugins": {{{}, {}, {}}}}}"#, entry("kit", "user"), entry("off", "user"), entry("theirs", "project")),
+        )
+        .unwrap();
+        let skills = find(&folders(&home, Some(&home), false));
+        let found: Vec<(&str, Whose)> = skills.found.iter().map(|s| (s.name.as_str(), s.whose)).collect();
+        assert_eq!(found, [("tools:lint", Whose::Plugin), ("tools:deploy", Whose::Plugin)], "named as its manifest says; one turned off, or a project's, isn't");
+        std::fs::write(claude.join("settings.json"), "{not json").unwrap();
+        assert!(find(&folders(&home, Some(&home), false)).found.is_empty(), "settings that can't be read turn nothing on");
+    }
+
+    #[test]
+    fn a_projects_skills_are_found_up_to_its_repository_and_never_at_home() {
+        let home = dir("up");
+        let repo = home.join("work/repo");
+        let deep = repo.join("crates/one");
+        std::fs::create_dir_all(&deep).unwrap();
+        let shown = |folders: Vec<PathBuf>| folders.iter().map(|path| path.strip_prefix(&home).unwrap().display().to_string()).collect::<Vec<_>>();
+        assert_eq!(shown(project_folders(&deep, Some(&home))), ["work/repo/crates/one/.agents/skills", "work/repo/crates/one/.claude/skills"], "outside a repository: here only");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(shown(project_folders(&deep, Some(&home)))[4..], ["work/repo/.agents/skills".to_owned(), "work/repo/.claude/skills".to_owned()]);
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        std::fs::remove_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(project_folders(&deep, Some(&home)).len(), 2, "a repository at home doesn't make your skills the project's");
+        skill(&repo.join(".agents/skills"), "up", "name: up\ndescription: Found from below.", "");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        assert!(fingerprint(&deep, Some(&home)).is_some(), "the yes covers what's found above too");
+        assert_eq!(find(&folders(&deep, Some(&home), true)).found[0].whose, Whose::Project);
     }
 
     #[test]
     fn a_change_to_any_of_a_projects_skill_files_changes_its_fingerprint() {
         let project = dir("fingerprint");
-        assert_eq!(fingerprint(&project), None, "no skills: nothing to say yes to");
+        assert_eq!(fingerprint(&project, None), None, "no skills: nothing to say yes to");
         skill(&project.join(".agents/skills"), "deploy", "name: deploy\ndescription: Ship it.", "Run scripts/go.sh.");
         std::fs::create_dir_all(project.join(".agents/skills/deploy/scripts")).unwrap();
         std::fs::write(project.join(".agents/skills/deploy/scripts/go.sh"), "echo go").unwrap();
-        let before = fingerprint(&project).unwrap();
-        assert_eq!(fingerprint(&project).unwrap(), before);
+        let before = fingerprint(&project, None).unwrap();
+        assert_eq!(fingerprint(&project, None).unwrap(), before);
         std::fs::write(project.join(".agents/skills/deploy/scripts/go.sh"), "echo no").unwrap();
-        assert_ne!(fingerprint(&project).unwrap(), before, "a script changed, its length the same: asked again");
-    }
-
-    #[test]
-    fn the_tool_offers_only_what_the_model_may_load_and_names_them_strictly() {
-        let folder = PathBuf::from("/s");
-        let skills = Skills {
-            found: vec![
-                Skill { name: "a".into(), description: "For a.".into(), folder: folder.clone(), whose: Whose::Yours, model: true, you: true, hint: None },
-                Skill { name: "b".into(), description: "Only yours to call.".into(), folder, whose: Whose::Yours, model: false, you: true, hint: None },
-            ],
-            left_out: Vec::new(),
-        };
-        let tool = spec(&skills).unwrap();
-        assert_eq!(tool.parameters["properties"]["name"]["enum"], json!(["a"]));
-        assert!(tool.description.ends_with("The skills there are:\n- a: For a."), "{}", tool.description);
-        assert!(spec(&Skills::default()).is_none(), "no skills: no tool");
+        assert_ne!(fingerprint(&project, None).unwrap(), before, "a script changed, its length the same: asked again");
     }
 }

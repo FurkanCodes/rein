@@ -14,7 +14,7 @@
 //! change what the model was told.
 
 mod added;
-mod clean;
+pub mod clean;
 pub mod config;
 pub mod import;
 pub mod registry;

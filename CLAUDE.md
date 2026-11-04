@@ -173,6 +173,11 @@ finding. Each says why in a line.
 - Between fork and exec, only system calls on what's ready: no allocating,
   no locks. The Landlock ruleset is built in rein's process; the command's
   only takes it on.
+- An exception to what's hidden is a list of its own, allowed after the
+  hidden rule (`SKILLS_IN_HIDDEN`), never a readable place inside a hidden
+  one: those are dropped, and `~/.claude/skills` was readable on paper for
+  a release while no command could read it. Test it with a command that
+  reads it, and one that reads a key beside it.
 - Landlock allows whole folders and can't wall off part of one, so on Linux
   what's protected inside the project is guarded (noted, then put back), and
   a rule on `/tmp` reaches a project in it: grant around what's excepted.
@@ -194,6 +199,13 @@ finding. Each says why in a line.
 - What the model should do before a task goes in its instructions, not
   only in a tool's description: told of skills only in the `skill` tool,
   a model left one unloaded for a small task that fit it.
+- A note rein adds to the conversation isn't something you said: mark it
+  with a `const` (`skills::is_note`). Compaction's record lists every
+  message as yours, and kept a note of skills changed as your words.
+- Check a convention against the files people have before following it:
+  Claude Code fills `$1` in any skill called with arguments, and in the
+  skills on this Mac every `$1` was money (`$2.4M ARR`) or SQL
+  (`VALUES ($1, $2)`). rein fills it only where a skill says it takes some.
 - What a tool brings into the conversation is sent again with every
   request after it. A lookup that pulls in pages runs in a request of its
   own and keeps only its answer: OpenAI's web search, run in the

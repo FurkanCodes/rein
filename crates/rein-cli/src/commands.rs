@@ -14,7 +14,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
     ("/effort", "[level|default]", "change how hard the model thinks"),
     ("/search", "[auto|off|model]", "choose which model searches the web for the model"),
-    ("/skills", "", "your skills and the project's: pick one to turn off, keep for you to call, or turn on; /name calls one"),
+    ("/skills", "", "your skills, your plugins' and the project's: pick one to use, turn off, keep for you to call, or turn on; /name calls one"),
     ("/status", "", "the model, mode, context and conversation"),
     ("/mcp", "[add|import|remove|allow …]", "the MCP servers: add one by name from the MCP Registry, bring yours from other apps, or change one"),
     ("/compact", "[focus]", "make room in the conversation now"),

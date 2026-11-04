@@ -221,7 +221,7 @@ message, so typing ahead can't answer it by accident.
 | `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/search [auto\|off\|model]` | which model searches the web for the model: the one in use as rein decides, one you pick, or none (see [Web search](#web-search)) |
-| `/skills`, `/<skill> [args]`, `/skill:<name>` | your skills and the project's, to turn one off, keep it for you to call, or turn it on; call one with your message (see [Skills](#skills)) |
+| `/skills`, `/<skill> [args]`, `/skill:<name>` | your skills, your Claude Code plugins' and the project's, to put one in the box, turn one off, keep it for you to call, or turn it on; call one with your message, or name one anywhere in it (see [Skills](#skills)) |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/mcp`, `/mcp add`, `/mcp import`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one by name from the MCP Registry, as you'd start it in a shell, or from the JSON its README gives; bring yours in from other apps; the same changes typed (see [MCP servers](#mcp-servers)) |
 | `/undo` | put back what rein did to the project's files since a turn you pick, its commands' changes too (see [Undo](#undo)) |
@@ -500,32 +500,59 @@ it with `@`.
 
 rein reads Agent Skills (agentskills.io): a folder with a `SKILL.md`,
 instructions for a kind of task. Yours are in `~/.agents/skills`, the
-folder harnesses share, and `~/.claude/skills`, Claude Code's; a
-project's in its `.agents/skills` and `.claude/skills`, used once you've
-said yes to them as they are (a change to any of their files asks again,
-and a task run with `-p` doesn't ask). A folder reached twice through a
-link counts once; where two skills share a name, the project's comes
-before yours, and `~/.agents` before `~/.claude`; `/skills` says what was
-left out and why.
+folder harnesses share, and `~/.claude/skills`, Claude Code's; so are the
+skills of the plugins you turned on in Claude Code, named as there
+(`engineering-skills:senior-backend`). A project's are in its
+`.agents/skills` and `.claude/skills`, from where rein starts up to the
+repository's root, used once you've said yes to them as they are (a change
+to any of their files asks again, and a task run with `-p` doesn't ask).
+A folder reached twice through a link counts once; where two skills share
+a name, the project's comes before yours, and `~/.agents` before
+`~/.claude`. claude.ai's skills, which Claude Code keeps in step with your
+account, are left to it. `/skills` says what was left out and why.
+
+They're looked at again before each message: one you add, change or turn
+off is there without starting again, and the model is told what changed
+at the end of the conversation, so the list it was given, and the cache
+behind it, stay as they were.
 
 The model is offered one tool, `skill`, which lists every skill with what
 it's for, and loads one when a task fits it, or when you ask it to use
 skills: the skill's text, where its folder is and what's in it, whose
 files it reads with the same tool, never outside the folder. A long one
 comes in parts; one loaded already isn't sent again. Every name stays in
-the list, and descriptions are shortened alike to fit about 2,500 tokens
-of each request: 74 skills' come to 20,000 characters. A skill loaded
-before a compaction is loaded again after it.
+the list, which gets 2% of the model's window (about 5,400 tokens of a
+272,000-token one); when the descriptions don't all fit, the skills you
+load most keep theirs whole and the rest are shortened alike. A skill
+loaded before a compaction is loaded again after it.
 
-`/name` calls one with your message (`/graphify src`), and `/skill:name`
-does where rein has a command of that name. `disable-model-invocation`
-keeps a skill from the model, `user-invocable: false` from you.
-`/skills` turns one off, keeps it for you to call, or back on.
+Typing `/` lists the skills you may call under rein's commands, with what
+each takes; Tab puts one in. `/name` at the start of a message calls it
+with what follows (`/graphify src`), as does `/skill:name` where rein has a
+command of that name; several at the start load together, each given the
+rest. `/name` anywhere else in a message loads that skill with it
+(`fix the login, then /caveman-commit`), and `/` there lists them too. A
+task run on its own (`rein "/graphify src"`) calls one the same way.
+
+What you give a skill goes where it says, as Claude Code's skills expect:
+`$ARGUMENTS` all of it, `$ARGUMENTS[0]` a word of it, `$name` one its
+`arguments` name, `${CLAUDE_SKILL_DIR}` its folder; given something
+nothing took, it's said at the end. A bare `$0` or `$1` is filled only in
+a skill that says it takes something, and never in a sum like `$1,234`:
+in the skills people have, it's money or SQL far more often than a
+placeholder, which Claude Code fills regardless.
+
+`disable-model-invocation` keeps a skill from the model, `user-invocable:
+false` from you. `/skills` lists them all: pick one to put it in the box,
+turn it off, keep it for you to call, or turn it back on.
 
 A skill is someone's text: nothing in it runs because it's loaded, and
-its `allowed-tools` lets nothing run without asking. Its scripts run as
+its `allowed-tools` lets nothing run without asking. A name holds letters,
+digits and `-_.:` only, and what a skill says is cleaned of what a
+terminal would act on before you or the model see it. Its scripts run as
 commands do, in the sandbox, which reads the skill folders but never
-changes them.
+changes them; Claude Code's are read though the rest of `~/.claude`,
+logins and settings, stays hidden.
 
 ## Web search
 
