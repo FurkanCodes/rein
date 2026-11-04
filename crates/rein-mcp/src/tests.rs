@@ -53,6 +53,7 @@ async fn a_server_lists_its_tools_cleaned_and_answers_calls() {
     assert_eq!(listing.tools[2].parameters, json!({ "type": "object", "properties": {} }), "what providers want of an empty one");
     assert_eq!(listing.allowed, ["mcp__fake__echo"]);
     assert_eq!(listing.note.as_deref(), Some("MCP servers: fake (5 tools)"));
+    assert_eq!(listing.instructions, [("fake".to_owned(), "Echo before peeking.[2J".to_owned())], "what it says of using it, cleaned");
     assert_eq!(servers.call("mcp__fake__echo", r#"{"text":"hi"}"#).await, Ok("hi".into()));
     assert_eq!(servers.call("mcp__fake__given", "{}").await, Ok("hello there".into()), "the environment it was given");
     assert!(servers.call("mcp__fake__echo", "[1]").await.unwrap_err().contains("bad arguments"));

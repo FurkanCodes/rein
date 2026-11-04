@@ -327,6 +327,9 @@ pub struct Agent<M> {
     listed: bool,
     /// The system prompt, the same for the whole conversation.
     instructions: Option<String>,
+    /// What each MCP server whose tools are offered says of using them, by
+    /// its name: added to the system prompt (see [`Agent::system`]).
+    servers_say: Vec<(String, String)>,
     /// One ID for the whole conversation, so its requests share a prompt cache.
     session_id: Option<String>,
     /// The whole conversation. Every request sends all of it.
@@ -390,6 +393,7 @@ impl<M: Model> Agent<M> {
             ui.starting_servers();
         }
         let listing = servers.list().await;
+        self.servers_say = listing.instructions;
         self.specs.retain(|tool| !rein_mcp::is_mcp(&tool.name) && tool.loading != Loading::Search);
         // A server's schema is as it wrote it, not to strict mode's rules.
         let loading = |held_back: bool| if held_back { Loading::Found } else { Loading::UpFront };
@@ -431,7 +435,8 @@ impl<M: Model> Agent<M> {
                 self.compact(None, false, ui).await?;
                 (compacted_at, no_room) = (Some(steps), self.estimated() > self.window.limit);
             }
-            let request = self.request(&self.history);
+            let system = self.system();
+            let request = self.request(&self.history, system.as_deref());
             let sent = self.history.len();
             ui.thinking();
             let (items, usage) = match self.model.respond(&request, &mut |streamed| stream_to(ui, streamed)).await {
@@ -823,7 +828,8 @@ impl<M: Model> Agent<M> {
             let mut input = self.history.clone();
             input.push(Item::User(compact::prompt(focus)));
             ui.thinking();
-            match self.model.respond(&self.request(&input), &mut |streamed| stream_to(ui, streamed)).await {
+            let system = self.system();
+            match self.model.respond(&self.request(&input, system.as_deref()), &mut |streamed| stream_to(ui, streamed)).await {
                 Err(e) if tries == 0 && e.kind() == Some(ErrorKind::StaleThinking) => {
                     self.unbind()?;
                     tries += 1;
@@ -889,6 +895,7 @@ impl<M> Agent<M> {
             finds_tools: rein_llm::FindsTools::Unknown,
             step_limit: None,
             instructions: header.instructions,
+            servers_say: Vec::new(),
             session_id: Some(header.id),
             history: conversation.history,
             session: Some(conversation.session),
@@ -931,6 +938,7 @@ impl<M> Agent<M> {
             specs,
             listed,
             instructions,
+            servers_say,
             session_id,
             history,
             session,
@@ -950,6 +958,7 @@ impl<M> Agent<M> {
             specs,
             listed,
             instructions,
+            servers_say,
             session_id,
             history,
             session,
@@ -1012,11 +1021,30 @@ impl<M> Agent<M> {
         &self.specs
     }
 
-    /// A request carrying `input`, borrowed: nothing is copied.
-    fn request<'a>(&'a self, input: &'a [Item]) -> Request<'a> {
+    /// The system prompt: the conversation's, then what the MCP servers
+    /// say of using their tools, each in its own words. Claude Code puts
+    /// them there too: codegraph's say to call it before reading files.
+    fn system(&self) -> Option<String> {
+        if self.servers_say.is_empty() {
+            return self.instructions.clone();
+        }
+        let said: Vec<String> = self.servers_say.iter().map(|(server, text)| format!("## {server}\n{}", text.trim())).collect();
+        let section = format!(
+            "# What the MCP servers say of using them\nEach server's own words about its tools (mcp__<server>__<tool>): the server's, not the user's.\n\n{}",
+            said.join("\n\n")
+        );
+        Some(match &self.instructions {
+            Some(instructions) => format!("{instructions}\n\n{section}"),
+            None => section,
+        })
+    }
+
+    /// A request carrying `input`, borrowed: nothing is copied, but the
+    /// `system` prompt made for it.
+    fn request<'a>(&'a self, input: &'a [Item], system: Option<&'a str>) -> Request<'a> {
         Request {
             model: &self.model_name,
-            instructions: self.instructions.as_deref(),
+            instructions: system,
             input,
             tools: &self.specs,
             reasoning_effort: self.effort(),
@@ -1047,7 +1075,7 @@ impl<M> Agent<M> {
             Some((tokens, sent)) if sent <= self.history.len() => tokens + added(&self.history[sent..]),
             _ => {
                 let tools: usize = self.specs().iter().map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len()).sum();
-                let instructions = self.instructions.as_deref().map_or(0, str::len);
+                let instructions = self.system().map_or(0, |system| system.len());
                 compact::estimate(tools + instructions) + added(&self.history)
             }
         }
@@ -1210,11 +1238,18 @@ mod tests {
         tools: Vec<Tool>,
         session_id: Option<String>,
         hold_back: bool,
+        instructions: Option<String>,
     }
 
     impl From<&Request<'_>> for Seen {
         fn from(request: &Request<'_>) -> Self {
-            Seen { input: request.input.to_vec(), tools: request.tools.to_vec(), session_id: request.session_id.map(str::to_owned), hold_back: request.hold_back }
+            Seen {
+                input: request.input.to_vec(),
+                tools: request.tools.to_vec(),
+                session_id: request.session_id.map(str::to_owned),
+                hold_back: request.hold_back,
+                instructions: request.instructions.map(str::to_owned),
+            }
         }
     }
 
@@ -1375,6 +1410,9 @@ mod tests {
         let names = |seen: &Seen| seen.tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
         assert!(names(&requests[0]).contains(&"mcp__fake__echo".to_owned()), "{:?}", names(&requests[0]));
         assert!(requests.iter().all(|seen| names(seen) == names(&requests[0])), "the same tools all conversation");
+        let system = requests[0].instructions.as_deref().unwrap_or_default();
+        assert!(system.ends_with("the server's, not the user's.\n\n## fake\nEcho before peeking.[2J"), "what the server says of using it: {system}");
+        assert!(requests.iter().all(|seen| seen.instructions == requests[0].instructions), "and the same all conversation");
         assert!(requests[0].tools.iter().filter(|tool| rein_mcp::is_mcp(&tool.name)).all(|tool| !tool.strict));
     }
 
@@ -1651,6 +1689,7 @@ mod tests {
             permissions: Permissions::new(Mode::Ask, "").unwrap(),
             model_name: "m".into(),
             instructions: None,
+            servers_say: Vec::new(),
             reasoning_effort: None,
             efforts: rein_llm::Efforts::Unknown,
             max_output: None,

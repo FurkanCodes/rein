@@ -333,6 +333,8 @@ struct Connection {
     _process: Option<Process>,
     channel: Channel,
     tools: Vec<Listed>,
+    /// What the server says of using it, as it starts, cleaned and cut.
+    instructions: Option<String>,
 }
 
 /// A tool as its server lists it, cleaned.
@@ -364,6 +366,7 @@ impl Connection {
         if let Channel::Http(session) = &channel {
             session.speaks(version);
         }
+        let instructions = hello.get("instructions").and_then(Value::as_str).map(|text| cut(clean::text(text))).filter(|text| !text.trim().is_empty());
         channel.notify("notifications/initialized", None).await;
         let mut tools = Vec::new();
         // One with no tools to give says so by not saying it has them.
@@ -379,7 +382,7 @@ impl Connection {
                 }
             }
         }
-        Ok(Connection { _process: process, channel, tools })
+        Ok(Connection { _process: process, channel, tools, instructions })
     }
 
     /// Calls `tool`: what it said, or that it failed, in its words; or
@@ -399,11 +402,7 @@ impl Connection {
 /// and its schema one every provider takes. `None` without a name.
 fn listed(tool: &Value) -> Option<Listed> {
     let name = tool.get("name").and_then(Value::as_str).filter(|name| !name.is_empty())?.to_owned();
-    let mut description = clean::text(tool.get("description").and_then(Value::as_str).unwrap_or_default());
-    if let Some((cut, _)) = description.char_indices().nth(LONGEST_DESCRIPTION) {
-        description.truncate(cut);
-        description.push('…');
-    }
+    let description = cut(clean::text(tool.get("description").and_then(Value::as_str).unwrap_or_default()));
     let mut schema = match tool.get("inputSchema") {
         Some(Value::Object(schema)) => schema.clone(),
         _ => serde_json::Map::new(),
@@ -414,6 +413,16 @@ fn listed(tool: &Value) -> Option<Listed> {
     schema.insert("type".into(), json!("object"));
     schema.entry("properties").or_insert_with(|| json!({}));
     Some(Listed { name, description, schema: Value::Object(schema) })
+}
+
+/// `text` cut to [`LONGEST_DESCRIPTION`] characters, with a … to say so:
+/// one server can't fill the conversation with its own words.
+fn cut(mut text: String) -> String {
+    if let Some((at, _)) = text.char_indices().nth(LONGEST_DESCRIPTION) {
+        text.truncate(at);
+        text.push('…');
+    }
+    text
 }
 
 /// Whether a server's `tools` are held back until the model finds them: as
@@ -505,6 +514,9 @@ pub struct Tool {
 #[derive(Debug, Default)]
 pub struct Listing {
     pub tools: Vec<Tool>,
+    /// What each server whose tools are offered says of using it, by its
+    /// name: its own words, cleaned and cut.
+    pub instructions: Vec<(String, String)>,
     /// The tools that run without asking, as your file allows, by the
     /// names the model knows them by.
     pub allowed: Vec<String>,
@@ -676,6 +688,9 @@ impl Servers {
                 }
                 listing.tools.push(Tool { name: name.clone(), description: tool.description.clone(), parameters: tool.schema.clone(), held_back: false });
                 offered.insert(name, (entry.clone(), tool.name.clone()));
+            }
+            if let Some(instructions) = &connection.instructions {
+                listing.instructions.push((entry.server.name.clone(), instructions.clone()));
             }
             let theirs = &mut listing.tools[first..];
             if holds_back(entry.server.offered, theirs) {
