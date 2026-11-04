@@ -17,7 +17,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/mcp", "[add|import|remove|allow …]", "the MCP servers: add one by name from the MCP Registry, bring yours from other apps, or change one"),
     ("/compact", "[focus]", "make room in the conversation now"),
     ("/copy", "", "copy rein's last answer, as it wrote it"),
-    ("/undo", "", "put back the files rein changed in its last turn"),
+    ("/undo", "", "put back what rein did to the project's files since a turn you pick, commands' changes too"),
     ("/new", "", "start a fresh conversation (also /clear)"),
     ("/resume", "", "continue a saved conversation from this folder"),
     ("/peers", "", "the reins in your other terminals, and what each is doing"),

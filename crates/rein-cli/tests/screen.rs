@@ -1958,6 +1958,74 @@ fn undo_in_a_new_conversation_doesnt_reach_into_the_last_one() {
     assert_eq!(std::fs::read_to_string(term.dir.join("project/a.txt")).unwrap(), "changed\n", "the last conversation's change stays");
 }
 
+#[test]
+fn what_a_command_did_is_shown_under_it_and_undo_puts_it_back() {
+    let turns = vec![Turn { out: vec![bash("echo two > a.txt && mv b.txt c.txt", "write", None)] }, says("Tidied."), says("Noted.")];
+    let model = Model::start(turns).with_env("REIN_MODE", "trust");
+    let mut term = Term::start_with(&model, "undo-command", 30, 120, &[("a.txt", "one\n"), ("b.txt", "keep me\n")]);
+    term.wait_for(IDLE);
+    term.keys("tidy up\r");
+    term.wait_for("↳ changed a.txt, made c.txt, removed b.txt");
+    term.wait_for("Tidied.");
+    term.wait_for(IDLE);
+    // One turn to undo: straight to the question, which says what it does.
+    term.keys("/undo\r");
+    term.wait_for("Undo what rein did after “tidy up”?");
+    term.wait_for("Puts back a.txt and b.txt · takes away c.txt, which rein made");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("✓ put back a.txt and b.txt; took away c.txt");
+    let project = term.dir.join("project");
+    assert_eq!(std::fs::read_to_string(project.join("a.txt")).unwrap(), "one\n");
+    assert_eq!(std::fs::read_to_string(project.join("b.txt")).unwrap(), "keep me\n");
+    assert!(!project.join("c.txt").exists());
+    // The model is told with the next message.
+    term.wait_for(IDLE);
+    term.keys("thanks\r");
+    term.wait_for("Noted.");
+    let told = model.requests().last().map(|request| request["input"].to_string()).unwrap_or_default();
+    assert!(told.contains("[rein: the user undid what your last turn did to the project's files, back to before \\\"tidy up\\\". Back as they were: a.txt, b.txt."), "{told}");
+    term.keys("/undo\r");
+    term.wait_for("nothing to undo");
+}
+
+#[test]
+fn undo_picks_the_turn_to_go_back_to_and_works_after_rein_starts_again() {
+    let turns = vec![
+        Turn { out: vec![bash("echo two > a.txt", "write", None)] },
+        says("First done."),
+        Turn { out: vec![bash("echo three > a.txt && echo new > b.txt", "write", None)] },
+        says("Second done."),
+    ];
+    let model = Model::start(turns).with_env("REIN_MODE", "trust");
+    let mut term = Term::start_with(&model, "undo-pick", 30, 120, &[("a.txt", "one\n")]);
+    term.wait_for(IDLE);
+    term.keys("the first\r");
+    term.wait_for("First done.");
+    term.wait_for(IDLE);
+    term.keys("the second\r");
+    term.wait_for("Second done.");
+    term.wait_for(IDLE);
+    term.keys("\x04");
+    // Continued: what it kept is there still.
+    let mut term = term.again_with(&model, &["-c"]);
+    term.wait_for(IDLE);
+    term.keys("/undo\r");
+    // The latest next to the box; up to the one before.
+    term.wait_for("› “the second”");
+    term.wait_for("“the first”");
+    term.keys("\x1b[A");
+    term.wait_for("› “the first”");
+    term.keys("\r");
+    term.wait_for("Undo rein's last 2 turns, back to before “the first”?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("✓ put back a.txt; took away b.txt");
+    let project = term.dir.join("project");
+    assert_eq!(std::fs::read_to_string(project.join("a.txt")).unwrap(), "one\n");
+    assert!(!project.join("b.txt").exists());
+}
+
 /// A command as the model asks for one: what it needs, and why.
 fn bash(command: &str, access: &str, reason: Option<&str>) -> Out {
     Out::Call("bash", json!({ "command": command, "timeout_seconds": null, "access": access, "reason": reason }))

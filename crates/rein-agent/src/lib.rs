@@ -14,6 +14,7 @@ pub mod redact;
 pub mod search;
 pub mod session;
 pub mod tools;
+pub mod undo;
 
 /// The walls commands run inside: its own crate, so it can be built and
 /// tested alone, on every system it supports.

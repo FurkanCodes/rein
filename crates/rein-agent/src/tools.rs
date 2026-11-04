@@ -10,6 +10,7 @@ use rein_llm::{Tool, ToolCall};
 
 use crate::redact::{self, Secrets};
 use crate::sandbox::{self, Access, Run};
+use crate::undo::{Listed, Plan, Undo, Watched};
 use crate::{files, search};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -24,9 +25,10 @@ pub struct Tools {
     root: PathBuf,
     /// How long a command may run before it's stopped.
     timeout: Duration,
-    /// What files looked like before rein changed them, one list per turn,
-    /// for `undo`.
-    checkpoints: std::sync::Mutex<Vec<Checkpoint>>,
+    /// What rein changed in the project, turn by turn, for `/undo`.
+    undo: std::sync::Arc<std::sync::Mutex<Undo>>,
+    /// What the last command did to the project's files, for showing.
+    watched: std::sync::Mutex<Option<Watched>>,
     /// What holds commands in: `bash` runs in it, when it's told to.
     sandbox: sandbox::Shared,
     /// The keys rein knows, hidden from what every tool says.
@@ -34,10 +36,6 @@ pub struct Tools {
     /// The MCP servers rein started, whose tools run through them.
     mcp: Option<std::sync::Arc<rein_mcp::Servers>>,
 }
-
-/// Each file a turn changed, as it was before: its bytes, or `None` if the
-/// turn created it.
-type Checkpoint = Vec<(PathBuf, Option<Vec<u8>>)>;
 
 /// A file the model named, found inside the project: the project, resolved,
 /// and the way to the file from it, also resolved, to be opened a folder at
@@ -293,7 +291,20 @@ impl Tools {
     /// Tools for the project at `root`, with no sandbox: commands told to
     /// run in one are refused until [`Tools::with_sandbox`] gives one.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Tools { root: root.into(), timeout: Duration::from_secs(60), checkpoints: Default::default(), sandbox: Default::default(), secrets: Secrets::default(), mcp: None }
+        let root = root.into();
+        let undo = std::sync::Arc::new(std::sync::Mutex::new(Undo::new(root.clone())));
+        Tools { root, timeout: Duration::from_secs(60), undo, watched: Default::default(), sandbox: Default::default(), secrets: Secrets::default(), mcp: None }
+    }
+
+    /// Keeps the copies `/undo` puts back in `folder`, rein's folder for
+    /// this project, so what commands do can be undone too, and after
+    /// rein starts again. Without it, only `write` and `edit` are undone,
+    /// and only while rein runs.
+    pub fn with_undo(mut self, folder: PathBuf) -> Self {
+        let mut undo = Undo::new(self.root.clone());
+        undo.keep_in(folder);
+        self.undo = std::sync::Arc::new(std::sync::Mutex::new(undo));
+        self
     }
 
     /// Runs the tools of these MCP servers too: see [`rein_mcp`].
@@ -324,55 +335,44 @@ impl Tools {
         self
     }
 
-    /// Starts a new turn: file changes from now on are undone together.
-    pub fn checkpoint(&self) {
-        self.saved().push(Vec::new());
+    /// Follows the conversation `session` for `/undo`: the turns it kept,
+    /// if it's one continued. What's from the last one goes.
+    pub fn open_undo(&self, session: &str) {
+        locked(&self.undo).open(session);
     }
 
-    /// Forgets the file changes there are to undo: they were another
-    /// conversation's.
-    pub fn forget_changes(&self) {
-        self.saved().clear();
+    /// Starts a new turn, started by `said`: what changes from now on is
+    /// undone together.
+    pub async fn turn(&self, said: &str) {
+        let said = said.to_owned();
+        self.on_undo(move |undo, hides| undo.turn(&said, hides)).await;
     }
 
-    /// Puts back the files the latest turn that changed any wrote or edited,
-    /// and returns their paths. Commands it ran aren't undone: rein can't
-    /// know what they did.
-    pub fn undo(&self) -> Result<Vec<String>, String> {
-        let mut saved = self.saved();
-        while saved.last().is_some_and(Vec::is_empty) {
-            saved.pop();
-        }
-        let Some(checkpoint) = saved.pop() else { return Ok(Vec::new()) };
-        // The paths were resolved, symlinks and all; so is the root here.
-        let root = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
-        let mut undone = Vec::new();
-        // Newest first, so a file changed twice ends up as it was at first.
-        for (path, before) in checkpoint.into_iter().rev() {
-            // Put back only where it was, never through a link swapped in since.
-            let rel = path.strip_prefix(&root).map_err(|_| format!("can't put back {}: it's outside the project", path.display()))?;
-            match &before {
-                Some(bytes) => files::create(&root, rel).and_then(|mut file| std::io::Write::write_all(&mut file, bytes)),
-                None => files::remove(&root, rel),
-            }
-            .map_err(|e| format!("can't put back {}: {e}", path.display()))?;
-            undone.push(rel.display().to_string());
-        }
-        undone.sort();
-        undone.dedup();
-        Ok(undone)
+    /// The turns there are to undo, the latest first.
+    pub async fn undo_list(&self) -> Vec<Listed> {
+        self.on_undo(|undo, hides| undo.listed(hides)).await
     }
 
-    fn saved(&self) -> std::sync::MutexGuard<'_, Vec<Checkpoint>> {
-        self.checkpoints.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// What undoing back to before `turn` (from [`Tools::undo_list`]) would do.
+    pub async fn undo_plan(&self, turn: usize) -> Plan {
+        self.on_undo(move |undo, hides| undo.plan(turn, hides)).await
     }
 
-    /// Keeps the file at `spot` as it is now, before it changes.
-    async fn remember(&self, spot: &Spot) {
-        let before = spot.read().await.ok();
-        if let Some(checkpoint) = self.saved().last_mut() {
-            checkpoint.push((spot.full(), before));
-        }
+    /// Undoes `turn` and every one after it: what it did.
+    pub async fn undo(&self, turn: usize) -> Plan {
+        self.on_undo(move |undo, hides| undo.undo(turn, hides)).await
+    }
+
+    /// What the last command did to the project's files, once.
+    pub fn take_watched(&self) -> Option<Watched> {
+        locked(&self.watched).take()
+    }
+
+    /// Runs `work` on what `/undo` keeps, off the loop's thread: it reads
+    /// and copies files.
+    async fn on_undo<T: Default + Send + 'static>(&self, work: impl FnOnce(&mut Undo, search::Hides) -> T + Send + 'static) -> T {
+        let (undo, sandbox) = (self.undo.clone(), self.sandbox.clone());
+        tokio::task::spawn_blocking(move || work(&mut locked(&undo), &|path: &Path| sandbox.places().hides(path))).await.unwrap_or_default()
     }
 
     /// The project folder.
@@ -661,8 +661,7 @@ impl Tools {
         no_hidden_key(&args.content)?;
         let spot = self.writable(&args.path)?;
         let existed = spot.full().exists();
-        self.remember(&spot).await;
-        spot.write(args.content.clone().into_bytes()).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
+        self.changing(&spot, spot.write(args.content.clone().into_bytes())).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
         let verb = if existed { "replaced" } else { "created" };
         let lines = args.content.lines().count();
         Ok(format!("{verb} {} ({lines} line{})", args.path, if lines == 1 { "" } else { "s" }))
@@ -675,14 +674,41 @@ impl Tools {
         let bytes = spot.read().await.map_err(|e| format!("can't read {}: {e}", args.path))?;
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
         let edited = replace(&text, &args.old_text, &args.new_text, args.replace_all).map_err(|e| format!("{e} in {}", args.path))?;
-        self.remember(&spot).await;
-        spot.write(edited.text.into_bytes()).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
+        self.changing(&spot, spot.write(edited.text.into_bytes())).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
         let times = if edited.count == 1 { "1 place".to_owned() } else { format!("{} places", edited.count) };
         Ok(format!("edited {}: replaced {times}", args.path))
     }
 
+    /// Does `change` to the file at `spot`, kept for `/undo` before and after.
+    async fn changing<T>(&self, spot: &Spot, change: impl std::future::Future<Output = T>) -> T {
+        let rel = spot.rel.to_string_lossy().into_owned();
+        let before = rel.clone();
+        self.on_undo(move |undo, _| undo.before_one(&before)).await;
+        let done = change.await;
+        self.on_undo(move |undo, _| undo.after_one(&rel)).await;
+        done
+    }
+
     async fn bash(&self, arguments: &str, how: Run) -> Result<String, String> {
         let args: BashCall = parse(arguments)?;
+        // What it does to the project's files is followed for `/undo`,
+        // unless its walls keep it from changing any.
+        let follows = !matches!(how, Run::Sandboxed(walls) if !walls.write);
+        *locked(&self.watched) = None;
+        if follows && let Some(off) = self.on_undo(|undo, hides| undo.before_all(hides)).await {
+            *locked(&self.watched) = Some(Watched::NotHere(off));
+        }
+        let ran = self.command(&args, how).await;
+        if follows {
+            let changed = self.on_undo(|undo, hides| undo.after_all(hides)).await;
+            if !changed.is_empty() {
+                *locked(&self.watched) = Some(Watched::Changed(changed));
+            }
+        }
+        ran
+    }
+
+    async fn command(&self, args: &BashCall, how: Run) -> Result<String, String> {
         let timeout = args.timeout_seconds.map_or(self.timeout, |s| Duration::from_secs(s).clamp(Duration::from_secs(1), MAX_TIMEOUT));
         // Where the sandbox can't keep a command from what runs code later,
         // that's noted now and put back once it's done, or dropped (Esc).
@@ -740,6 +766,11 @@ impl Tools {
         };
         Ok(format!("{text}{status}{note}"))
     }
+}
+
+/// `mutex`'s guard: one a panic left behind still holds what it held.
+fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Reads all of `pipe`, keeping the first `MAX_OUTPUT` bytes: a command
@@ -1078,20 +1109,52 @@ mod tests {
     async fn undo_puts_back_the_last_turns_changes() {
         let dir = project("undo", &[("a.txt", "one\n")]);
         let tools = Tools::new(&dir);
-        tools.checkpoint();
+        tools.turn("first").await;
         run(&tools, &call("edit", json!({"path": "a.txt", "old_text": "one", "new_text": "two", "replace_all": false}))).await;
-        tools.checkpoint();
+        tools.turn("second").await;
         run(&tools, &call("edit", json!({"path": "a.txt", "old_text": "two", "new_text": "three", "replace_all": false}))).await;
         run(&tools, &call("edit", json!({"path": "a.txt", "old_text": "three", "new_text": "four", "replace_all": false}))).await;
         run(&tools, &call("write", json!({"path": "new/b.txt", "content": "made"}))).await;
-        tools.checkpoint(); // a turn that changed nothing
+        tools.turn("a turn that changed nothing").await;
 
-        assert_eq!(tools.undo().unwrap(), ["a.txt", "new/b.txt"]);
+        let listed = tools.undo_list().await;
+        assert_eq!(listed.iter().map(|turn| turn.said.as_str()).collect::<Vec<_>>(), ["second", "first"], "the latest first");
+        let done = tools.undo(listed[0].turn).await;
+        assert_eq!((done.put_back, done.take_away), (vec!["a.txt".to_owned()], vec!["new/b.txt".to_owned()]));
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "two\n", "back to before that turn");
         assert!(!dir.join("new/b.txt").exists(), "a created file goes away");
-        assert_eq!(tools.undo().unwrap(), ["a.txt"]);
+        let listed = tools.undo_list().await;
+        assert_eq!(tools.undo(listed[0].turn).await.put_back, ["a.txt"]);
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
-        assert!(tools.undo().unwrap().is_empty());
+        assert!(tools.undo_list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_a_command_did_is_undone_too_with_a_folder_for_copies() {
+        let dir = project("undo-command", &[("a.txt", "one\n"), ("b.txt", "keep me\n")]);
+        let folder = std::env::temp_dir().join(format!("rein-tools-{}-undo-command-copies", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let tools = Tools::new(&dir).with_undo(folder.clone());
+        tools.open_undo("s1");
+        tools.turn("tidy up").await;
+        run(&tools, &call("bash", json!({"command": "rm b.txt; echo two > a.txt; echo new > c.txt"}))).await;
+        let Some(Watched::Changed(changed)) = tools.take_watched() else { panic!("the command's changes weren't seen") };
+        assert_eq!((changed.changed, changed.made, changed.removed), (vec!["a.txt".to_owned()], vec!["c.txt".to_owned()], vec!["b.txt".to_owned()]));
+        assert_eq!(tools.take_watched(), None, "said once");
+        // Without a folder for copies, a command isn't followed.
+        let bare = Tools::new(&dir);
+        bare.turn("x").await;
+        run(&bare, &call("bash", json!({"command": "echo three > a.txt"}))).await;
+        assert_eq!(bare.take_watched(), None);
+        run(&tools, &call("bash", json!({"command": "echo two > a.txt"}))).await;
+
+        let listed = tools.undo_list().await;
+        let done = tools.undo(listed[0].turn).await;
+        assert_eq!((done.put_back.len(), done.take_away, done.left), (2, vec!["c.txt".to_owned()], Vec::<String>::new()));
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "keep me\n");
+        assert!(!dir.join("c.txt").exists());
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[tokio::test]
@@ -1124,6 +1187,25 @@ mod tests {
         let answer = tools.run(&bash_call("echo x > a.txt", None), look).await;
         assert!(answer.contains("Operation not permitted") && answer.contains("[exit code 1]\n[It ran in the sandbox with look access"), "{answer}");
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "hi\n");
+    }
+
+    #[tokio::test]
+    async fn a_command_its_walls_keep_from_writing_isnt_looked_at() {
+        let root = project("undo-walls", &[("a.txt", "hi\n")]);
+        let sandbox = sandbox::Sandbox::detect(sandbox::Places::new(&root, None, None)).await;
+        if !sandbox.available() {
+            return;
+        }
+        let folder = std::env::temp_dir().join(format!("rein-tools-{}-undo-walls-copies", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let tools = Tools::new(&root).with_sandbox(std::sync::Arc::new(sandbox)).with_undo(folder.clone());
+        tools.open_undo("s1");
+        tools.turn("look").await;
+        tools.run(&bash_call("cat a.txt", None), Run::Sandboxed(Access::Look.walls().unwrap())).await;
+        assert!(!folder.exists(), "nothing kept for a command that can only look");
+        tools.run(&bash_call("echo changed > a.txt", None), Run::Sandboxed(Access::Write.walls().unwrap())).await;
+        assert!(matches!(tools.take_watched(), Some(Watched::Changed(changed)) if changed.changed == ["a.txt"]));
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

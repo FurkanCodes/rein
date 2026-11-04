@@ -399,6 +399,12 @@ pub fn paths(root: &Path, hides: Hides) -> Vec<String> {
     files.into_iter().chain(folders).collect()
 }
 
+/// Every file in the project the `.gitignore` files don't leave out,
+/// relative to `root`, sorted: what `/undo` keeps copies of.
+pub(crate) fn files(root: &Path, hides: Hides) -> Vec<String> {
+    walk(root, root, hides)
+}
+
 /// Every file under `start` that the `.gitignore` files don't leave out,
 /// relative to `root`, sorted. The rules of the folders above `start` count
 /// too, from the root down, and so does the repository's own

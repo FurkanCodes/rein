@@ -17,6 +17,7 @@ use crate::mentions;
 use crate::permissions::{Decision, Permissions, Rule};
 use crate::session::{Loaded, Session};
 use crate::tools::{ToolName, Tools};
+use crate::undo::{Listed, Plan, Watched};
 
 /// How many steps a turn nobody is watching may take: in auto mode, or a
 /// one-shot task. While you watch there's no limit; you can press Esc.
@@ -96,6 +97,8 @@ pub trait Ui {
     }
     /// A call the permissions refused without asking, and why.
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str);
+    /// What a command did to the project's files, before it's finished.
+    fn watched(&mut self, _call: &ToolCall, _what: &Watched) {}
     fn tool_finished(&mut self, call: &ToolCall, output: &str);
     fn usage(&mut self, usage: &Usage);
     /// A request is on its way to the model; nothing to show yet.
@@ -337,7 +340,7 @@ impl<M: Model> Agent<M> {
     /// Dropping the future cancels the turn; [`Agent::repair`] then makes
     /// the history valid again, and `send` calls it first anyway.
     pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
-        self.begin()?;
+        self.begin(&prompt).await?;
         self.offer_servers_tools(ui).await;
         self.record(Item::User(prompt.clone()))?;
         self.attach(&prompt, ui).await?;
@@ -348,17 +351,18 @@ impl<M: Model> Agent<M> {
     /// on the user's message: framed as not the user's, and nothing it
     /// points at with `@` is read.
     pub async fn hear(&mut self, from: &str, text: &str, ui: &mut impl Ui) -> Result<Outcome> {
-        self.begin()?;
+        self.begin(&format!("{from}: {text}")).await?;
         self.offer_servers_tools(ui).await;
         self.record(Item::User(crate::peers::heard(from, text)))?;
         self.work(ui).await
     }
 
-    /// What every turn starts with: the history made valid again, a
-    /// checkpoint for `/undo`, and the context, before the first message.
-    fn begin(&mut self) -> Result<()> {
+    /// What every turn starts with: the history made valid again, a turn
+    /// of its own for `/undo`, started by `said`, and the context, before
+    /// the first message.
+    async fn begin(&mut self, said: &str) -> Result<()> {
         self.repair();
-        self.tools.checkpoint();
+        self.tools.turn(said).await;
         if let Some(context) = self.context.take() {
             if let Some(session) = &mut self.session {
                 session.append_context(&context)?;
@@ -565,7 +569,11 @@ impl<M: Model> Agent<M> {
             let output = match approved {
                 Ok(()) => {
                     ui.tool_started(&call);
-                    self.tools.run(&call, self.permissions.how(&call)).await
+                    let output = self.tools.run(&call, self.permissions.how(&call)).await;
+                    if let Some(watched) = self.tools.take_watched() {
+                        ui.watched(&call, &watched);
+                    }
+                    output
                 }
                 Err(reason) => reason,
             };
@@ -821,6 +829,7 @@ impl<M> Agent<M> {
     /// the model first.
     pub fn new(model: M, tools: Tools, permissions: Permissions, model_name: String, limit: u64, conversation: Loaded, context: Option<String>) -> Self {
         let header = conversation.session.header().clone();
+        tools.open_undo(&header.id);
         Agent {
             specs: tool_specs(&tools),
             listed: false,
@@ -843,7 +852,7 @@ impl<M> Agent<M> {
 
     /// Moves to another conversation. The settings stay; what was only
     /// true of the last one goes with it: what you said "always" to, and
-    /// the file changes there are to undo.
+    /// its turns to undo, as this one's come back if it kept any.
     pub fn resume(&mut self, conversation: Loaded, context: Option<String>) {
         let header = conversation.session.header().clone();
         self.session_id = Some(header.id);
@@ -854,7 +863,7 @@ impl<M> Agent<M> {
         self.window.full = conversation.full;
         self.window.measured = None;
         self.permissions.forget_approvals();
-        self.tools.forget_changes();
+        self.tools.open_undo(&self.session_id.clone().unwrap_or_default());
         // A new conversation, a new list: servers that started late, or
         // list other tools now, are in it.
         self.listed = false;
@@ -1005,19 +1014,24 @@ impl<M> Agent<M> {
         Ok(())
     }
 
-    /// Undoes the file changes of the latest turn that made any, and tells
-    /// the model, so it doesn't go on as if they were still there. Returns
-    /// the files put back.
-    pub fn undo(&mut self) -> Result<Vec<String>> {
-        let undone = self.tools.undo().map_err(std::io::Error::other)?;
-        if !undone.is_empty() {
-            self.record(Item::User(format!(
-                "[rein: the user undid your file changes from your last turn: {}. Those files are back as they were \
-                 before it. Commands you ran then were not undone.]",
-                undone.join(", ")
-            )))?;
+    /// The turns there are to undo, the latest first.
+    pub async fn undo_list(&self) -> Vec<Listed> {
+        self.tools.undo_list().await
+    }
+
+    /// What undoing back to before `turn` would do now.
+    pub async fn undo_plan(&self, turn: usize) -> Plan {
+        self.tools.undo_plan(turn).await
+    }
+
+    /// Undoes `turn` and every one after it, and tells the model, so it
+    /// doesn't go on as if what they did were still there: what was done.
+    pub async fn undo(&mut self, turn: usize) -> Result<Plan> {
+        let done = self.tools.undo(turn).await;
+        if done.does_anything() || !done.left.is_empty() {
+            self.record(Item::User(undone(&done)))?;
         }
-        Ok(undone)
+        Ok(done)
     }
 
     /// Gives every tool call that never got a result one now. A turn cut
@@ -1107,6 +1121,25 @@ impl Model for Llm {
         // The stream only ends after `Completed` or an error, both handled above.
         Err(Error::Interrupted)
     }
+}
+
+/// What the model is told when the user undoes its turns: what's back,
+/// and what was left, so it doesn't go on as if its work were still there.
+fn undone(done: &Plan) -> String {
+    let list = |paths: &[String]| paths.join(", ");
+    let turns = if done.turns == 1 { "your last turn".to_owned() } else { format!("your last {} turns", done.turns) };
+    let mut told = format!("[rein: the user undid what {turns} did to the project's files, back to before \"{}\".", done.said);
+    if !done.put_back.is_empty() {
+        told.push_str(&format!(" Back as they were: {}.", list(&done.put_back)));
+    }
+    if !done.take_away.is_empty() {
+        told.push_str(&format!(" Gone again, as they were made then: {}.", list(&done.take_away)));
+    }
+    if !done.left.is_empty() {
+        told.push_str(&format!(" Changed since, so left as they are: {}.", list(&done.left)));
+    }
+    told.push_str(" What commands did outside the project, or to anything but its files, wasn't undone.]");
+    told
 }
 
 #[cfg(test)]

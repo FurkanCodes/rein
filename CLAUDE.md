@@ -196,6 +196,14 @@ finding. Each says why in a line.
 - Write files whole: a temp file with a name of its own (process and counter),
   then rename. A fixed `.tmp` name let two rein windows rename each other's
   half-written file into place.
+- A copy kept to put back later is checked to be the file that was looked
+  at (inode and times), opened never through a symlink: a link swapped in
+  would have copied your keys, and `/undo` written them into the project.
+  And it's a copy or a clone of its own, never a hard link to the file,
+  which an edit in place would change too.
+- Measure what a file system costs before building on it: hard links take
+  about 200 µs each on APFS, and a pool linked from each conversation made
+  the first look at 20,000 files 7 s; clones alone made it 2 s.
 
 ## unsafe and FFI
 

@@ -81,6 +81,29 @@ pub(crate) fn bytes(n: u64) -> String {
 }
 
 /// `12345` → `12k`: token counts read at a glance.
+/// `paths` in words: `a.rs`, `a.rs and b.rs`, `a.rs, b.rs and c.rs`, or
+/// `5 files` past three.
+pub(crate) fn files(paths: &[String]) -> String {
+    match paths {
+        [one] => one.clone(),
+        [first @ .., last] if paths.len() <= 3 => format!("{} and {last}", first.join(", ")),
+        _ => format!("{} files", paths.len()),
+    }
+}
+
+/// What a command did to the project's files, in a few words: `changed
+/// a.rs, made b.rs and c.rs, removed 4 files`, and what `/undo` couldn't
+/// put back.
+pub(crate) fn changes(changed: &rein_agent::undo::Changed) -> String {
+    let groups = [("changed", &changed.changed), ("made", &changed.made), ("removed", &changed.removed)];
+    let mut line = groups.iter().filter(|(_, paths)| !paths.is_empty()).map(|(verb, paths)| format!("{verb} {}", files(paths))).collect::<Vec<_>>().join(", ");
+    if !changed.unkept.is_empty() {
+        let it = if changed.unkept.len() == 1 { "it" } else { "them" };
+        line.push_str(&format!(" · rein had no copy of {}, too big to keep, so /undo can't put {it} back", files(&changed.unkept)));
+    }
+    line
+}
+
 pub(crate) fn thousands(n: u64) -> String {
     if n < 1000 { n.to_string() } else { format!("{}k", (n + 500) / 1000) }
 }

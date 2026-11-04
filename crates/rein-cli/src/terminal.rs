@@ -17,6 +17,7 @@ use rein_agent::compact;
 use rein_agent::permissions::{Mode, Rule, Whose};
 use rein_agent::sandbox::{Access, Sandbox};
 use rein_agent::tools::{BashCall, ToolName};
+use rein_agent::undo::Watched;
 use rein_llm::{Effort, ToolCall, Usage};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -92,6 +93,8 @@ pub(crate) struct Terminal {
     /// A note to show under the step once its line is up, like that it
     /// won't be asked about again.
     noted: Option<String>,
+    /// What the step did to the project's files, to show under it.
+    watched: Option<String>,
     /// What was shown last, which says whether what comes next starts
     /// after a blank line.
     pub(crate) last: Last,
@@ -236,6 +239,7 @@ impl Terminal {
             spinner: None,
             step: None,
             noted: None,
+            watched: None,
             last: Last::Nothing,
             labeled: false,
             thoughts: String::new(),
@@ -304,7 +308,14 @@ impl Terminal {
     /// `call` changed a file: the others in this folder hear which.
     fn changed_file(&mut self, call: &ToolCall) {
         let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).unwrap_or_default();
-        let Some(path) = args["path"].as_str().map(|path| path.trim_start_matches("./").to_owned()) else { return };
+        if let Some(path) = args["path"].as_str() {
+            self.changed_path(path.trim_start_matches("./").to_owned());
+        }
+    }
+
+    /// Notes that this turn changed `path`, for a task's result and the
+    /// other reins.
+    fn changed_path(&mut self, path: String) {
         if !self.changed.contains(&path) {
             self.changed.push(path.clone());
         }
@@ -848,6 +859,7 @@ impl Ui for Terminal {
             }
         };
         let note = self.noted.take().map(|note| format!("{}{} {}", " ".repeat(steps::INDENT), s.green("✓"), s.dim(&note)));
+        let watched = self.watched.take().map(|watched| format!("{}{}", " ".repeat(steps::INDENT), s.dim(&format!("↳ {watched}"))));
         // Reads in a row share a line.
         if ToolName::of(call) == Some(ToolName::Read)
             && outcome.ok == Some(true)
@@ -868,6 +880,7 @@ impl Ui for Terminal {
                 None => format!("{}{dot} {}", " ".repeat(steps::INDENT), outcome.status),
             }];
             lines.extend(steps::detail_lines(&outcome, s, width, viewer));
+            lines.extend(watched.iter().map(|line| crate::ui::style::fit(line, width)));
             lines.extend(note.clone());
             lines.extend(diff.iter().map(|line| crate::ui::style::fit(line, width)));
             lines
@@ -886,6 +899,19 @@ impl Ui for Terminal {
         if self.input.pinned() {
             self.input.set_bar(self.bar());
         }
+    }
+
+    /// What a command did to the project's files: said under its line.
+    fn watched(&mut self, _call: &ToolCall, what: &Watched) {
+        self.watched = Some(match what {
+            Watched::Changed(changed) => {
+                for path in changed.changed.iter().chain(&changed.made).chain(&changed.removed) {
+                    self.changed_path(path.clone());
+                }
+                crate::format::changes(changed)
+            }
+            Watched::NotHere(off) => format!("/undo won't put back what commands do here: {off}"),
+        });
     }
 
     /// Lookups asked for together: one line over the box says so.

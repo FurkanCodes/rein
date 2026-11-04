@@ -111,7 +111,9 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     };
     let (client, models) = connected.models().await;
     let secrets = rein_agent::redact::Secrets::new(known_secrets(&keys).into_iter().chain(mcp.secrets()));
-    let tools = Tools::new(root.clone()).with_sandbox(sandbox.clone()).with_secrets(secrets).with_mcp(mcp.servers.clone());
+    // What `/undo` puts back is kept beside the conversations, by project.
+    let undo = session::folder(&dir.join("undo"), &root);
+    let tools = Tools::new(root.clone()).with_sandbox(sandbox.clone()).with_secrets(secrets).with_mcp(mcp.servers.clone()).with_undo(undo);
     let mut setup = Setup {
         folder,
         personal: dir.join("AGENTS.md"),
@@ -656,15 +658,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 crate::input::Copied::AskedTerminal => say!("{pad}{} asked the terminal to copy rein's last answer ({lines}); some terminals don't allow it", s.green("✓")),
             }
         }
-        Slash::Undo => {
-            let undone = agent.undo().map_err(describe)?;
-            if undone.is_empty() {
-                say!("{pad}nothing to undo: rein hasn't changed any files in this session");
-            } else {
-                say!("{pad}{} put back {}", s.green("✓"), undone.join(", "));
-                say!("{pad}{}", s.dim("Commands rein ran aren't undone; the model has been told."));
-            }
-        }
+        Slash::Undo => crate::undo::command(agent, terminal).await?,
         Slash::New => {
             let (loaded, context) = setup.open(None, &setup.current(agent))?;
             agent.resume(loaded, context);

@@ -35,6 +35,7 @@ mod settings;
 use settings::Settings;
 mod terminal;
 mod ui;
+mod undo;
 use args::{AskArgs, HELP};
 use connect::KeyFrom;
 use conversation::ask;

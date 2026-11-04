@@ -221,7 +221,7 @@ message, so typing ahead can't answer it by accident.
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/mcp`, `/mcp add`, `/mcp import`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one by name from the MCP Registry, as you'd start it in a shell, or from the JSON its README gives; bring yours in from other apps; the same changes typed (see [MCP servers](#mcp-servers)) |
-| `/undo` | put back the files rein changed in its last turn (not what commands did) |
+| `/undo` | put back what rein did to the project's files since a turn you pick, its commands' changes too (see [Undo](#undo)) |
 | `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
 | `/copy` | copy rein's last answer as it wrote it, Markdown and all |
@@ -472,6 +472,36 @@ ask, in any mode, and they're how the model finds its way around instead of
 leave out, binary files, `.git` and anything behind a symlink, and they
 search on every core at once. At each question, answer `y`, `n`, `a` for "yes, and
 don't ask again this run", or Esc to say no and tell rein what to do instead.
+
+### Undo
+
+`/undo` puts back what rein did to the project's files: what `write` and
+`edit` changed, and what its commands did, made and removed. It lists the
+turns there are to undo, the latest next to the box (with only one, it goes
+straight to the question), says what it would put back and take away, and
+asks first. Going back to before an earlier turn undoes the later ones too.
+A file that changed after rein last did, in your editor say, is left as it
+is and named. The model is told what was undone.
+
+A command that changed files says so under its line: `↳ changed a.rs, made
+b.rs, removed c.txt`. To know that, rein looks at the project's files
+before and after each command that may change them (one the sandbox lets
+only look is skipped), and keeps a copy of each that's new or changed since
+it last looked. After the first look only what changed is read: with
+20,000 files, the first look takes about 2 s on a Mac and each one after
+about 50 ms. The copies are in `~/.config/rein/undo/`, readable only by
+you, as clones where the file system makes them (APFS, Btrfs, XFS), which
+take no room until the file changes: 500 MB of files took 40 KB. A
+conversation keeps its last 30 turns to undo, also once it's continued, and
+another conversation's copies go once it's a week unused or ten more have
+been used since.
+
+It's files in the project only: not what a command did outside it, nor to
+anything but files (a database, a branch, a package it installed). What
+the `.gitignore` files leave out and files over 10 MB aren't kept (a step
+that changed one says `/undo` can't put it back), nor symlinks, and in a
+project with more than 20,000 files, or over 1 GB of them, rein says once
+that it only undoes what `write` and `edit` did.
 
 ### The sandbox
 
