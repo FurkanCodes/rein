@@ -8,11 +8,13 @@
 //! and the command is shown before anything is added. Fetching it is
 //! rein's, which has the HTTP client; this only reads what came back.
 
+use std::collections::BTreeMap;
+
 use rein_sandbox::Access;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::{Origin, Server};
+use crate::config::{Local, Origin, Reach, Remote, Server};
 
 /// Where the registry is.
 pub const URL: &str = "https://registry.modelcontextprotocol.io";
@@ -60,30 +62,38 @@ pub struct Found {
 /// How a server found starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Start {
-    /// On this computer, as this says.
+    /// Here, or at its URL, as this says.
     Here(Plan),
-    /// It's reached at a URL, which rein doesn't do yet.
-    AtUrl,
-    /// On this computer, but not in a way rein knows: why.
+    /// Not in a way rein knows: why.
     Not(String),
 }
 
-/// How a server found runs here: what rein would write in your mcp.json,
-/// but for the settings it needs you to give as it's added.
+/// How a server found runs, or is reached: what rein would write in your
+/// mcp.json, but for the settings it needs you to give as it's added.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
-    /// What it's fetched as, for the list: `npm @playwright/mcp@0.0.41`.
+    /// What it's fetched as, or where it's reached, for the list: `npm
+    /// @playwright/mcp@0.0.41`, `at mcp.linear.app`.
     pub package: String,
-    /// What runs it: `npx`, `uvx` or `docker`.
-    pub command: String,
-    args: Vec<Piece>,
-    env: Vec<(String, Piece)>,
-    /// Its walls: the sandbox's, but for Docker, which the sandbox can't
-    /// reach and which walls in its containers itself.
-    pub access: Access,
+    how: How,
     /// The settings it needs that aren't keys, in order: a key is a
     /// `${NAME}` of yours instead, asked for in dots as it starts.
     pub asks: Vec<Ask>,
+}
+
+/// A command and its words, or a URL and its headers, of pieces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum How {
+    Local {
+        command: String,
+        args: Vec<Piece>,
+        env: Vec<(String, Piece)>,
+        /// Its walls: the sandbox's, but for Docker, which the sandbox
+        /// can't reach and which walls in its containers itself.
+        access: Access,
+    },
+    /// Each joined from its pieces: `https://{slug}.inite.ai/mcp` is three.
+    Remote { url: Vec<Piece>, headers: Vec<(String, Vec<Piece>)> },
 }
 
 /// A setting a server needs you to give.
@@ -104,6 +114,24 @@ enum Piece {
 }
 
 impl Plan {
+    /// What runs it, `npx`, `uvx` or `docker`: `None` for one reached at a
+    /// URL.
+    pub fn command(&self) -> Option<&str> {
+        match &self.how {
+            How::Local { command, .. } => Some(command),
+            How::Remote { .. } => None,
+        }
+    }
+
+    /// Its walls: `None` for one reached at a URL, whose code doesn't run
+    /// here.
+    pub fn access(&self) -> Option<Access> {
+        match &self.how {
+            How::Local { access, .. } => Some(*access),
+            How::Remote { .. } => None,
+        }
+    }
+
     /// The server called `name` this adds, with `answers` to its asks, in
     /// order: `None` unless there's one for each.
     pub fn server(&self, name: &str, answers: &[String]) -> Option<Server> {
@@ -111,15 +139,19 @@ impl Plan {
             Piece::Fixed(text) => Some(text.clone()),
             Piece::Asked(i) => answers.get(*i).cloned(),
         };
-        Some(Server {
-            name: name.to_owned(),
-            origin: Origin::Yours,
-            command: self.command.clone(),
-            args: self.args.iter().map(fill).collect::<Option<_>>()?,
-            env: self.env.iter().map(|(name, piece)| Some((name.clone(), fill(piece)?))).collect::<Option<_>>()?,
-            access: self.access,
-            allow: Vec::new(),
-        })
+        let join = |pieces: &[Piece]| pieces.iter().map(fill).collect::<Option<String>>();
+        let reach = match &self.how {
+            How::Local { command, args, env, access } => Reach::Local(Local {
+                command: command.clone(),
+                args: args.iter().map(fill).collect::<Option<_>>()?,
+                env: env.iter().map(|(name, piece)| Some((name.clone(), fill(piece)?))).collect::<Option<_>>()?,
+                access: *access,
+            }),
+            How::Remote { url, headers } => {
+                Reach::Remote(Remote { url: join(url)?, headers: headers.iter().map(|(name, value)| Some((name.clone(), join(value)?))).collect::<Option<_>>()? })
+            }
+        };
+        Some(Server { name: name.to_owned(), origin: Origin::Yours, reach, allow: Vec::new() })
     }
 }
 
@@ -158,14 +190,13 @@ impl Found {
     }
 }
 
-/// `found` with those that start here first, those reached at a URL
-/// last, and within each what matches `word` best, then the shorter names.
+/// `found` with those that start first, and within each what matches
+/// `word` best, then the shorter names.
 pub fn rank(found: &mut [Found], word: &str) {
     let word = searchable(word).unwrap_or_default();
     let place = |found: &Found| match found.start {
         Start::Here(_) => 0,
         Start::Not(_) => 1,
-        Start::AtUrl => 2,
     };
     found.sort_by(|a, b| place(a).cmp(&place(b)).then(b.score(&word).cmp(&a.score(&word))).then(a.short.len().cmp(&b.short.len())).then(a.name.cmp(&b.name)));
 }
@@ -234,6 +265,20 @@ struct Transport {
     kind: String,
 }
 
+/// A URL a server is reached at, as the registry gives it: `{name}`s in it
+/// are its `variables`.
+#[derive(Deserialize)]
+struct RemoteEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    headers: Vec<Variable>,
+    #[serde(default)]
+    variables: BTreeMap<String, Variable>,
+}
+
 /// A word, or a flag and its value, of a command.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -260,11 +305,14 @@ enum ArgumentKind {
     Named,
 }
 
-/// A variable of a server's environment.
+/// A variable of a server's environment, a header, or a part of its URL.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Variable {
+    #[serde(default)]
     name: String,
+    #[serde(default)]
+    choices: Vec<String>,
     value: Option<String>,
     default: Option<String>,
     description: Option<String>,
@@ -277,19 +325,21 @@ struct Variable {
 impl From<Detail> for Found {
     fn from(detail: Detail) -> Found {
         let (publisher, owner) = publisher(&detail.name);
+        let short = short(&detail.name);
         let packages: Vec<Package> = detail.packages.into_iter().filter_map(|package| serde_json::from_value(package).ok()).collect();
         // npm's first, as most are, then PyPI's, then Docker's.
         let order = |package: &Package| ["npm", "pypi", "oci"].iter().position(|kind| *kind == package.registry_type).unwrap_or(usize::MAX);
         let mut packages: Vec<&Package> = packages.iter().collect();
         packages.sort_by_key(|package| order(package));
-        let plans: Vec<Result<Plan, String>> = packages.iter().map(|package| plan(package, detail.version.as_deref())).collect();
+        let remotes: Vec<RemoteEntry> = detail.remotes.into_iter().filter_map(|remote| serde_json::from_value(remote).ok()).collect();
+        // One reached at a URL first: none of its code runs here.
+        let plans: Vec<Result<Plan, String>> =
+            remotes.iter().map(|remote| remote_plan(remote, &short)).chain(packages.iter().map(|package| plan(package, detail.version.as_deref()))).collect();
         let start = match plans.iter().find_map(|plan| plan.as_ref().ok()) {
             Some(plan) => Start::Here(plan.clone()),
-            None if packages.is_empty() && !detail.remotes.is_empty() => Start::AtUrl,
             None => Start::Not(plans.into_iter().find_map(Result::err).unwrap_or_else(|| "it doesn't say how it starts".into())),
         };
         let package = packages.first().map(|package| package_owner(package));
-        let short = short(&detail.name);
         let mut description = crate::clean::text(&detail.description);
         if let Some((cut, _)) = description.char_indices().nth(LONGEST_DESCRIPTION) {
             description.truncate(cut);
@@ -298,6 +348,81 @@ impl From<Detail> for Found {
         let repository = detail.repository.map(|repository| crate::clean::text(&repository.url)).filter(|url| !url.is_empty());
         Found { name: crate::clean::text(&detail.name), short, publisher, description, repository, start, owner, package }
     }
+}
+
+/// How the server named `short` is reached at `remote`: its URL and
+/// headers of fixed pieces, keys of yours (`${NAME}`), and settings to ask.
+fn remote_plan(remote: &RemoteEntry, short: &str) -> Result<Plan, String> {
+    match remote.kind.as_str() {
+        "streamable-http" => {}
+        "sse" => return Err("it's reached over MCP's old SSE transport, which rein doesn't speak".into()),
+        kind => return Err(format!("it's reached over {}, which rein doesn't speak", crate::clean::text(kind))),
+    }
+    crate::remote::reachable(&remote.url)?;
+    let mut asks = Vec::new();
+    // A `{name}` of the URL's is one of its variables.
+    let url = template(
+        &remote.url,
+        &mut |name, asks| {
+            let variable = remote.variables.get(name);
+            let secret = variable.is_some_and(|variable| variable.is_secret);
+            input(variable, name, secret, asks)
+        },
+        &mut asks,
+    );
+    let mut headers = Vec::new();
+    for header in &remote.headers {
+        let value = match &header.value {
+            // A `{name}` in a header's value is a key if the header is.
+            Some(value) => template(value, &mut |name, asks| input(None, name, header.is_secret, asks), &mut asks),
+            None if header.name.eq_ignore_ascii_case("authorization") && header.is_secret => vec![Piece::Fixed(format!("Bearer ${{{}_TOKEN}}", variable(short)))],
+            None if header.is_required || header.default.is_some() => vec![input(Some(header), &header.name, header.is_secret, &mut asks)],
+            None => continue,
+        };
+        headers.push((header.name.clone(), value));
+    }
+    let host = remote.url.split_once("://").map_or(remote.url.as_str(), |(_, rest)| rest).split(['/', '?']).next().unwrap_or_default();
+    Ok(Plan { package: format!("at {}", crate::clean::text(host)), how: How::Remote { url, headers }, asks })
+}
+
+/// `text` in pieces: what's written, and each `{name}` in it as `input`
+/// makes it.
+fn template(text: &str, input: &mut dyn FnMut(&str, &mut Vec<Ask>) -> Piece, asks: &mut Vec<Ask>) -> Vec<Piece> {
+    let (mut pieces, mut rest) = (Vec::new(), text);
+    while let Some(at) = rest.find('{') {
+        let Some(end) = rest[at..].find('}').map(|end| at + end) else { break };
+        if at > 0 {
+            pieces.push(Piece::Fixed(rest[..at].to_owned()));
+        }
+        pieces.push(input(&rest[at + 1..end], asks));
+        rest = &rest[end + 1..];
+    }
+    if !rest.is_empty() {
+        pieces.push(Piece::Fixed(rest.to_owned()));
+    }
+    pieces
+}
+
+/// The piece a setting called `name` is: its value if it has one, a key
+/// of yours if it's `secret`, its default, or else asked for.
+fn input(variable: Option<&Variable>, name: &str, secret: bool, asks: &mut Vec<Ask>) -> Piece {
+    if let Some(value) = variable.and_then(|variable| variable.value.clone()) {
+        return Piece::Fixed(value);
+    }
+    if secret {
+        return Piece::Fixed(format!("${{{}}}", self::variable(name)));
+    }
+    if let Some(default) = variable.and_then(|variable| variable.default.clone()) {
+        return Piece::Fixed(default);
+    }
+    let described = variable.and_then(|variable| variable.description.clone()).map_or_else(|| name.to_owned(), |about| format!("{name} ({about})"));
+    let choices = variable.map(|variable| variable.choices.join(", ")).filter(|choices| !choices.is_empty());
+    let about = match choices {
+        Some(choices) => format!("{described}, one of {choices}"),
+        None => described,
+    };
+    asks.push(Ask { about: crate::clean::text(&about), default: None });
+    Piece::Asked(asks.len() - 1)
 }
 
 /// How `package` runs, as `command` and its words: the version pinned, the
@@ -351,7 +476,7 @@ fn plan(package: &Package, version: Option<&str>) -> Result<Plan, String> {
         "oci" => format!("docker {pinned}"),
         kind => format!("{kind} {pinned}"),
     };
-    Ok(Plan { package: crate::clean::text(&shown), command: command.to_owned(), args, env, access, asks })
+    Ok(Plan { package: crate::clean::text(&shown), how: How::Local { command: command.to_owned(), args, env, access }, asks })
 }
 
 /// The words `argument` adds: none for one it doesn't need, the flag
@@ -474,6 +599,7 @@ fn short(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::tests::command;
     use serde_json::json;
 
     /// A page as the registry gives one, of servers named like "playwright".
@@ -516,13 +642,12 @@ mod tests {
         let names: Vec<&str> = found.iter().map(|found| found.name.as_str()).collect();
         assert_eq!(names[0], "io.github.microsoft/playwright-mcp", "its package is playwright's own: {names:?}");
         assert_eq!(names[1], "io.github.someone/playwright-mcp");
-        assert_eq!(found[2].start, Start::Not("it's a mcpb package, which rein doesn't start yet".into()));
-        assert_eq!(found[3].start, Start::AtUrl, "reached at a URL: last");
+        assert_eq!(names[2], "ai.smithery/playwright", "reached at a URL: it starts too");
+        assert_eq!(found[3].start, Start::Not("it's a mcpb package, which rein doesn't start yet".into()), "what doesn't start: last");
         let microsoft = &found[0];
         assert_eq!((microsoft.short.as_str(), microsoft.publisher.as_str(), microsoft.label()), ("playwright", "github.com/microsoft", "microsoft/playwright-mcp".to_owned()));
         assert_eq!(microsoft.description, "Playwright Tools for MCP[2J", "escape codes taken out");
-        assert_eq!(found[3].publisher, "smithery.ai");
-        assert_eq!(found[3].label(), "smithery.ai/playwright");
+        assert_eq!((found[2].publisher.as_str(), found[2].label()), ("smithery.ai", "smithery.ai/playwright".to_owned()));
     }
 
     #[test]
@@ -546,17 +671,17 @@ mod tests {
                 { "type": "positional", "valueHint": "database_url", "isRequired": true, "isSecret": true },
                 { "type": "named", "name": "--out", "isRequired": true, "format": "filepath", "description": "where it writes" }] }]));
         let plan = plan_of(&npm);
-        assert_eq!((plan.package.as_str(), plan.command.as_str(), plan.access), ("npm @acme/thing@1.2.3", "npx", Access::Network));
+        assert_eq!((plan.package.as_str(), plan.command(), plan.access()), ("npm @acme/thing@1.2.3", Some("npx"), Some(Access::Network)));
         let asks: Vec<&str> = plan.asks.iter().map(|ask| ask.about.as_str()).collect();
         assert_eq!(asks, ["ACME_SITE (your site's address)", "where it writes"], "only what isn't a key and has no value");
         assert_eq!(plan.server("thing", &["one".into()]), None, "an answer for each ask");
         let server = plan.server("thing", &["https://acme.example".into(), "./out".into()]).unwrap();
         assert_eq!(
-            server.args,
+            command(&server).args,
             ["-y", "@acme/thing@1.2.3", "mcp", "--transport", "stdio", "--headless", "${DATABASE_URL}", "--out", "./out"],
             "an optional --port and --dev left out"
         );
-        let env = &server.env;
+        let env = &command(&server).env;
         assert_eq!(env["ACME_TOKEN"], "${ACME_TOKEN}", "a key is asked for in dots as it starts, and kept out of your mcp.json");
         assert_eq!((env["ACME_REGION"].as_str(), env["ACME_MODE"].as_str(), env["ACME_SITE"].as_str()), ("eu", "fast", "https://acme.example"));
         assert!(!env.contains_key("ACME_VERBOSE") && !env.contains_key("ACME_OPTIONAL_KEY"), "nothing it doesn't need: {env:?}");
@@ -564,19 +689,46 @@ mod tests {
         let pypi = detail(
             json!([{ "registryType": "pypi", "identifier": "thing-mcp", "runtimeHint": "uvx", "runtimeArguments": [{ "type": "named", "name": "--with", "value": "extra>=1" }] }]),
         );
-        assert_eq!(plan_of(&pypi).server("t", &[]).unwrap().args, ["--with", "extra>=1", "thing-mcp==2.0.0"], "the server's version, when the package doesn't say");
+        assert_eq!(command(&plan_of(&pypi).server("t", &[]).unwrap()).args, ["--with", "extra>=1", "thing-mcp==2.0.0"], "the server's version, when the package doesn't say");
         let docker = detail(
             json!([{ "registryType": "oci", "identifier": "ghcr.io/acme/thing:3.1", "environmentVariables": [{ "name": "ACME_TOKEN", "isSecret": true, "isRequired": true }] }]),
         );
         let docker = plan_of(&docker);
-        assert_eq!(docker.access, Access::Outside, "the sandbox can't reach Docker; Docker walls in its container itself");
-        assert_eq!(docker.server("t", &[]).unwrap().args, ["run", "-i", "--rm", "-e", "ACME_TOKEN", "ghcr.io/acme/thing:3.1"]);
+        assert_eq!(docker.access(), Some(Access::Outside), "the sandbox can't reach Docker; Docker walls in its container itself");
+        assert_eq!(command(&docker.server("t", &[]).unwrap()).args, ["run", "-i", "--rm", "-e", "ACME_TOKEN", "ghcr.io/acme/thing:3.1"]);
         let both = detail(json!([{ "registryType": "oci", "identifier": "acme/thing" }, { "registryType": "npm", "identifier": "thing" }]));
-        assert_eq!(plan_of(&both).command, "npx", "npm's before Docker's");
+        assert_eq!(plan_of(&both).command(), Some("npx"), "npm's before Docker's");
         let http = detail(json!([{ "registryType": "npm", "identifier": "thing", "transport": { "type": "streamable-http", "url": "http://localhost:3000" } }]));
         assert!(matches!(&http.start, Start::Not(why) if why.contains("streamable-http")), "{:?}", http.start);
         let bun = detail(json!([{ "registryType": "npm", "identifier": "thing", "runtimeHint": "bunx" }]));
         assert!(matches!(&bun.start, Start::Not(why) if why.contains("bunx")), "{:?}", bun.start);
+    }
+
+    #[test]
+    fn one_reached_at_a_url_is_preferred_its_keys_yours_and_its_settings_asked() {
+        let detail = |remotes: Value| {
+            let packages = json!([{ "registryType": "npm", "identifier": "@acme/thing", "version": "1.0.0" }]);
+            Found::from(serde_json::from_value::<Detail>(json!({ "name": "io.github.acme/thing-mcp", "packages": packages, "remotes": remotes })).unwrap())
+        };
+        let found = detail(json!([{ "type": "streamable-http", "url": "https://{region}.acme.example/mcp/{workspace}",
+            "headers": [{ "name": "Authorization", "value": "Bearer {acme_api_key}", "isSecret": true, "isRequired": true },
+                        { "name": "X-Mode", "value": "fast" }, { "name": "X-Optional" }],
+            "variables": { "region": { "description": "where your data is", "choices": ["eu", "us"], "isRequired": true }, "workspace": { "default": "main" } } }]));
+        let plan = plan_of(&found);
+        assert_eq!((plan.package.as_str(), plan.command(), plan.access()), ("at {region}.acme.example", None, None), "none of its code runs here");
+        let asks: Vec<&str> = plan.asks.iter().map(|ask| ask.about.as_str()).collect();
+        assert_eq!(asks, ["region (where your data is), one of eu, us"]);
+        let server = plan.server("thing", &["eu".into()]).unwrap();
+        let headers = BTreeMap::from([("Authorization".to_owned(), "Bearer ${ACME_API_KEY}".to_owned()), ("X-Mode".to_owned(), "fast".to_owned())]);
+        assert_eq!(server.reach, Reach::Remote(Remote { url: "https://eu.acme.example/mcp/main".into(), headers }), "the key a variable of yours, the optional header left out");
+        let bare =
+            detail(json!([{ "type": "streamable-http", "url": "https://mcp.acme.example/mcp", "headers": [{ "name": "Authorization", "isSecret": true, "isRequired": true }] }]));
+        let Reach::Remote(remote) = plan_of(&bare).server("thing", &[]).unwrap().reach else { panic!("a URL") };
+        assert_eq!(remote.headers["Authorization"], "Bearer ${THING_TOKEN}", "a token of yours, named for the server");
+        let old = detail(json!([{ "type": "sse", "url": "https://mcp.acme.example/sse" }]));
+        assert_eq!(plan_of(&old).command(), Some("npx"), "not reached over the old SSE: its package instead");
+        let plain = detail(json!([{ "type": "streamable-http", "url": "http://mcp.acme.example/mcp" }]));
+        assert_eq!(plan_of(&plain).command(), Some("npx"), "nor over plain http, across the network");
     }
 
     #[test]

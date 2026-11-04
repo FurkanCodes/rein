@@ -183,6 +183,13 @@ struct CodexServer {
     #[serde(default)]
     env_vars: Vec<String>,
     url: Option<String>,
+    /// The variable of yours whose value is its bearer token.
+    bearer_token_env_var: Option<String>,
+    #[serde(default)]
+    http_headers: BTreeMap<String, String>,
+    /// Headers, each given a variable of yours by name.
+    #[serde(default)]
+    env_http_headers: BTreeMap<String, String>,
     enabled: Option<bool>,
 }
 
@@ -210,7 +217,15 @@ fn codex(text: &str) -> Result<(BTreeMap<String, Value>, Vec<Skipped>), String> 
             entry["command"] = json!(command);
         }
         if let Some(url) = server.url {
+            let mut headers = server.http_headers;
+            for (header, variable) in server.env_http_headers {
+                headers.insert(header, format!("${{{variable}}}"));
+            }
+            if let Some(variable) = server.bearer_token_env_var {
+                headers.insert("Authorization".into(), format!("Bearer ${{{variable}}}"));
+            }
             entry["url"] = json!(url);
+            entry["headers"] = json!(headers);
         }
         entries.insert(name, entry);
     }
@@ -220,6 +235,8 @@ fn codex(text: &str) -> Result<(BTreeMap<String, Value>, Vec<Skipped>), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::tests::command;
+    use crate::config::{Reach, Remote};
 
     fn names(named: &Named) -> Vec<&str> {
         named.servers.iter().map(|server| server.name.as_str()).collect()
@@ -233,26 +250,27 @@ mod tests {
                           "projects": { "/work/app": { "mcpServers": { "gh": { "command": "gh-local" }, "db": { "command": "uvx", "args": ["db-mcp"] } } },
                                         "/work/other": { "mcpServers": { "theirs": { "command": "x" } } } } }"#;
         let named = App::ClaudeCode.read(claude, home, root).unwrap();
-        assert_eq!(names(&named), ["db", "gh"], "this project's, not another's");
-        assert_eq!(named.servers[1].command, "gh-local", "this project's own wins its name, as in Claude Code");
-        assert!(named.skipped.iter().any(|skipped| skipped.name == "linear" && skipped.why.contains("URL")));
+        assert_eq!(names(&named), ["db", "gh", "linear"], "this project's, not another's");
+        assert_eq!(command(&named.servers[1]).command, "gh-local", "this project's own wins its name, as in Claude Code");
+        assert_eq!(named.servers[2].reach, Reach::Remote(Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new() }));
 
         let cursor =
             r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["fs", "${workspaceFolder}", "${userHome}/notes"], "env": { "K": "${env:FS_KEY}", "L": "${unknown}" } } } }"#;
-        let fs = &App::Cursor.read(cursor, home, root).unwrap().servers[0];
+        let named = App::Cursor.read(cursor, home, root).unwrap();
+        let fs = command(&named.servers[0]);
         assert_eq!(fs.args, ["fs", ".", "/home/me/notes"], "the project is where rein starts it");
         assert_eq!((fs.env["K"].as_str(), fs.env["L"].as_str()), ("${FS_KEY}", "${unknown}"));
 
         let vscode = r#"{ "inputs": [{ "id": "github-token", "type": "promptString", "password": true }],
                           "servers": { "gh": { "type": "stdio", "command": "docker", "args": ["run"], "env": { "T": "${input:github-token}" } } } }"#;
-        assert_eq!(App::VsCode.read(vscode, home, root).unwrap().servers[0].env["T"], "${GITHUB_TOKEN}", "what VS Code asks for, rein asks for in dots");
+        assert_eq!(command(&App::VsCode.read(vscode, home, root).unwrap().servers[0]).env["T"], "${GITHUB_TOKEN}", "what VS Code asks for, rein asks for in dots");
 
         let gemini = r#"{ "theme": "x", "mcpServers": { "g": { "command": "node", "args": ["s.js"], "env": { "K": "$API_KEY", "M": "${MODE}", "P": "a$" } },
                           "web": { "httpUrl": "https://x.example/mcp" } } }"#;
         let named = App::GeminiCli.read(gemini, home, root).unwrap();
-        let env = &named.servers[0].env;
+        let env = &command(&named.servers[0]).env;
         assert_eq!((env["K"].as_str(), env["M"].as_str(), env["P"].as_str()), ("${API_KEY}", "${MODE}", "a$"));
-        assert!(named.skipped.iter().any(|skipped| skipped.name == "web" && skipped.why.contains("URL")), "httpUrl is a URL");
+        assert_eq!(named.servers[1].reach, Reach::Remote(Remote { url: "https://x.example/mcp".into(), headers: BTreeMap::new() }), "httpUrl is its URL");
 
         let desktop = r#"{ "mcpServers": { "d": { "command": "uvx", "args": ["d"], "disabled": true } } }"#;
         assert_eq!(App::ClaudeDesktop.read(desktop, home, root).unwrap().off.len(), 1);
@@ -281,15 +299,18 @@ LEVEL = "info"
 
 [mcp_servers.figma]
 url = "https://mcp.figma.com/mcp"
+bearer_token_env_var = "FIGMA_TOKEN"
+env_http_headers = { "X-Team" = "FIGMA_TEAM" }
 
 [mcp_servers.broken]
 command = 3
 "#;
         let named = App::Codex.read(toml, home, root).unwrap();
-        assert_eq!(names(&named), ["context7"]);
-        assert_eq!(named.servers[0].env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}", "a variable it's given by name is yours");
-        assert_eq!((named.off[0].name.as_str(), named.off[0].env["LEVEL"].as_str()), ("docs", "info"), "enabled = false is off");
-        assert!(named.skipped.iter().any(|skipped| skipped.name == "figma" && skipped.why.contains("URL")));
+        assert_eq!(names(&named), ["context7", "figma"]);
+        assert_eq!(command(&named.servers[0]).env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}", "a variable it's given by name is yours");
+        assert_eq!((named.off[0].name.as_str(), command(&named.off[0]).env["LEVEL"].as_str()), ("docs", "info"), "enabled = false is off");
+        let figma = BTreeMap::from([("Authorization".to_owned(), "Bearer ${FIGMA_TOKEN}".to_owned()), ("X-Team".to_owned(), "${FIGMA_TEAM}".to_owned())]);
+        assert_eq!(named.servers[1].reach, Reach::Remote(Remote { url: "https://mcp.figma.com/mcp".into(), headers: figma }), "its token, a variable of yours");
         assert!(named.skipped.iter().any(|skipped| skipped.name == "broken" && skipped.why.starts_with("can't be read")), "{:?}", named.skipped);
         assert!(App::Codex.read("[mcp_servers", home, root).unwrap_err().starts_with("isn't TOML"));
     }

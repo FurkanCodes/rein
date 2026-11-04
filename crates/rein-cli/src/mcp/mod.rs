@@ -6,17 +6,18 @@
 //! `/mcp` says how each server is doing, then lets you pick one and change
 //! it: its tools that run without asking, its walls, on or off. One that
 //! didn't start is offered what would fix it there and then, a key it
-//! needs or room the sandbox keeps from it, rather than told a command to
-//! type. `/mcp add`, `remove` and `allow` do it typed. Each writes your
-//! file, which stays the record, so you needn't.
+//! needs, room the sandbox keeps from it, or a sign-in for one at a URL,
+//! rather than told a command to type. `/mcp add`, `remove` and `allow` do
+//! it typed. Each writes your file, which stays the record, so you needn't.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rein_agent::agent::{Agent, Llm};
 use rein_agent::sandbox::{Access, Sandbox};
-use rein_mcp::{Failure, Keys, Named, Origin, Server, Servers, Skipped, Status};
+use rein_mcp::{Failure, Keys, Named, Origin, Reach, Server, Servers, Skipped, Status};
 use serde_json::{Value, json};
 
 use crate::commands::Mcp as Command;
@@ -28,6 +29,7 @@ use crate::{CliResult, describe};
 mod import;
 mod panel;
 mod registry;
+mod web;
 
 /// Your own servers, in rein's folder.
 pub(crate) const FILE: &str = "mcp.json";
@@ -41,6 +43,12 @@ const APPROVED_FILE: &str = "mcp-approved.json";
 /// The values you gave rein for servers' variables, by name. Only you can
 /// read it, and the sandbox hides it with the rest of rein's folder.
 const KEYS_FILE: &str = "mcp-keys.json";
+
+/// Your sign-ins to servers at a URL, kept the same way.
+const TOKENS_FILE: &str = "mcp-tokens.json";
+
+/// How long a sign-in in the browser may take.
+const SIGN_IN: Duration = Duration::from_secs(600);
 
 /// The servers rein started, and those it didn't, with why.
 pub(crate) struct Mcp {
@@ -57,8 +65,10 @@ pub(crate) struct Mcp {
     /// The project's, which has its file, and by which your yes to its
     /// servers is kept.
     root: PathBuf,
-    /// For looking servers up in the MCP Registry.
+    /// For looking servers up in the MCP Registry, and signing in.
     http: rein_llm::reqwest::Client,
+    /// Your sign-ins to servers at a URL.
+    tokens: Arc<rein_llm::mcp::Tokens>,
 }
 
 impl Mcp {
@@ -104,8 +114,11 @@ pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, http: r
         let count = not.len();
         say!("{}", terminal.err.dim(&format!("({count} MCP server{} not started: /mcp says why)", if count == 1 { "" } else { "s" })));
     }
-    let launch = rein_mcp::Launch { sandbox, root: root.to_owned(), caches: caches(), keys };
-    Mcp { servers: Arc::new(Servers::start(servers, launch)), off: named.off, waiting, skipped: named.skipped, dir: dir.to_owned(), root: root.to_owned(), http }
+    let tokens = Arc::new(rein_llm::mcp::Tokens::new(dir.join(TOKENS_FILE), http.clone()));
+    let (web, signins): (Arc<dyn rein_mcp::remote::Web>, Arc<dyn rein_mcp::remote::Tokens>) = (Arc::new(web::Http(http.clone())), Arc::new(web::SignIns(tokens.clone())));
+    let launch = rein_mcp::Launch { sandbox, root: root.to_owned(), caches: caches(), keys, web: Some(web), tokens: Some(signins) };
+    let servers = Arc::new(Servers::start(servers, launch));
+    Mcp { servers, off: named.off, waiting, skipped: named.skipped, dir: dir.to_owned(), root: root.to_owned(), http, tokens }
 }
 
 /// `/mcp`, and what follows it.
@@ -171,6 +184,8 @@ enum Fix {
     Give(String),
     /// Room the sandbox keeps from it: running it outside.
     Outside,
+    /// A sign-in, where its 401 says.
+    SignIn(String),
 }
 
 impl Fix {
@@ -178,9 +193,11 @@ impl Fix {
     /// project's server is never let out of the sandbox: the project
     /// doesn't decide that, and you can only change your own.
     fn of(server: &Server, failure: &Failure) -> Option<Fix> {
+        let walled = server.access().is_some_and(|access| access != Access::Outside);
         match failure {
             Failure::Needs(name) => Some(Fix::Give(name.clone())),
-            Failure::InWalls(_) | Failure::NoSandbox if server.origin == Origin::Yours && server.access != Access::Outside => Some(Fix::Outside),
+            Failure::InWalls(_) | Failure::NoSandbox if server.origin == Origin::Yours && walled => Some(Fix::Outside),
+            Failure::SignIn(challenge) => Some(Fix::SignIn(challenge.clone())),
             Failure::InWalls(_) | Failure::NoSandbox | Failure::Other(_) => None,
         }
     }
@@ -214,11 +231,67 @@ async fn settle(name: &str, mcp: &Mcp, agent: &mut Agent<Llm>, terminal: &mut Te
             }
             Fix::Outside if let_out(&server, terminal).await => Some(set_access(&server, Access::Outside, mcp)?),
             Fix::Outside => None,
+            Fix::SignIn(challenge) => sign_in(&server, &challenge, mcp, terminal).await?.then_some(server),
         };
         let Some(server) = fixed else { return Ok(()) };
         mcp.servers.add(server);
         agent.servers_changed();
     }
+}
+
+/// Signs in to `server`, at a URL, where its 401 said (`challenge`): finds
+/// where, asks, opens the browser there, and waits for you. Whether you
+/// signed in. A sign-in server that won't have rein register itself takes
+/// a client ID you registered with it, never another app's.
+async fn sign_in(server: &Server, challenge: &str, mcp: &Mcp, terminal: &mut Terminal) -> CliResult<bool> {
+    let (pad, s) = (" ".repeat(GUTTER), terminal.err);
+    let Ok(Reach::Remote(remote)) = server.filled(&|variable| mcp.servers.keys().get(variable)) else { return Ok(false) };
+    let (http, tokens, url) = (mcp.http.clone(), mcp.tokens.clone(), remote.url);
+    let finding = async { rein_llm::mcp::discover(&http, &tokens, &url, challenge).await.map_err(describe) };
+    let Some(found) = crate::conversation::waiting(terminal, &format!("Finding where to sign in to {}", server.name), finding).await? else { return Ok(false) };
+    let yours = if found.registers() {
+        None
+    } else {
+        say!("{pad}{} doesn't let rein register itself to sign in. If you registered an app with it, rein can sign in as that.", found.issuer);
+        let id = match terminal.input.read("Its client ID (Esc to stop):", false).await {
+            Read::Line(id) if !id.trim().is_empty() => id.trim().to_owned(),
+            _ => return Ok(false),
+        };
+        let secret = match terminal.input.read_secret("Its client secret, if it has one (Enter if not):").await {
+            Some(Read::Line(secret)) => Some(secret.trim().to_owned()).filter(|secret| !secret.is_empty()),
+            Some(_) => return Ok(false),
+            None => None,
+        };
+        Some((id, secret))
+    };
+    let question = Question {
+        title: format!("Sign in to {}?", server.name),
+        detail: Some(format!(
+            "rein opens {} in your browser, where you sign in and say what rein may do. The token is for {} alone, kept in rein's folder, where only you can read it.",
+            found.issuer,
+            rein_mcp::config::shown_url(&url)
+        )),
+        command: None,
+        answers: vec![("y", "Yes, open the browser".to_owned()), ("n", "No".to_owned())],
+    };
+    if !yes(question, terminal).await {
+        return Ok(false);
+    }
+    let pending = tokens.begin(&url, &found, yours).await.map_err(describe)?;
+    if !crate::open_browser(&pending.link).await {
+        say!("{pad}Couldn't open a browser. Open this link to sign in:\n\n{}\n", pending.link);
+    }
+    let waited = async {
+        match tokio::time::timeout(SIGN_IN, pending.finish(&tokens)).await {
+            Ok(done) => done.map_err(describe),
+            Err(_) => Err("the sign-in timed out after 10 minutes; /mcp starts it again".to_owned()),
+        }
+    };
+    if crate::conversation::waiting(terminal, &format!("Waiting for you to sign in to {} in the browser", server.name), waited).await?.is_none() {
+        return Ok(false);
+    }
+    say!("{pad}{} signed in to {}", s.green("✓"), server.name);
+    Ok(true)
 }
 
 /// Asks whether to run your `server`, which didn't start in the sandbox,
@@ -296,7 +369,11 @@ fn set_access(server: &Server, access: Access, mcp: &Mcp) -> CliResult<Server> {
         }
         Ok(())
     })?;
-    Ok(Server { access, ..server.clone() })
+    let mut server = server.clone();
+    if let Reach::Local(local) = &mut server.reach {
+        local.access = access;
+    }
+    Ok(server)
 }
 
 /// Stops your `server`, keeping it in your file, turned off.
@@ -439,7 +516,10 @@ fn read(path: &Path, origin: Origin) -> Named {
 /// Asks whether to start a project's `server`, saying what it runs, with
 /// what, and in which walls, and keeps a yes in the project `key`.
 async fn say_yes(server: &Server, dir: &Path, key: &str, terminal: &mut Terminal) -> bool {
-    let mut detail = format!("It runs {}", rein_mcp::walls(server.access));
+    let mut detail = match server.access() {
+        Some(access) => format!("It runs {}", rein_mcp::walls(access)),
+        None => "It's reached at its URL, and none of its code runs here".to_owned(),
+    };
     let takes = server.takes();
     if !takes.is_empty() {
         detail.push_str(&format!(", and gets your {}", takes.join(", ")));

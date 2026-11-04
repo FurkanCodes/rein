@@ -14,6 +14,7 @@ pub mod client;
 pub mod decode;
 pub mod gemini;
 pub mod http;
+pub mod mcp;
 mod oauth;
 pub mod openai;
 pub mod openrouter;

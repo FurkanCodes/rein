@@ -57,8 +57,8 @@ pub(super) async fn find(word: Option<String>, mcp: &mut Mcp, agent: &mut Agent<
     let menu = Menu { title: format!("add which {word} server"), items, current: None, at: None };
     let Some(found) = terminal.input.choose(menu).await.and_then(|picked| here.into_iter().nth(picked)) else { return Ok(()) };
     let Start::Here(plan) = &found.start else { return Ok(()) };
-    if !on_path(&plan.command) {
-        return Err(format!("{} starts with {}, which isn't installed here: {}", found.label(), plan.command, installed_with(&plan.command)));
+    if let Some(command) = plan.command().filter(|command| !on_path(command)) {
+        return Err(format!("{} starts with {command}, which isn't installed here: {}", found.label(), installed_with(command)));
     }
     let mut answers = Vec::new();
     for ask in &plan.asks {
@@ -99,32 +99,23 @@ async fn fetch(http: &rein_llm::reqwest::Client, url: &str) -> CliResult<String>
 /// runs, and what it says it does.
 fn about(found: &Found) -> String {
     let Start::Here(plan) = &found.start else { return found.description.clone() };
-    let docker = if plan.command == "docker" { " · in Docker" } else { "" };
-    let missing = if on_path(&plan.command) { String::new() } else { format!(" · needs {}", plan.command) };
+    let docker = if plan.command() == Some("docker") { " · in Docker" } else { "" };
+    let missing = plan.command().filter(|command| !on_path(command)).map_or_else(String::new, |command| format!(" · needs {command}"));
     format!("{}{docker}{missing} · {}", plan.package, found.description)
 }
 
-/// Says which servers found don't start here, and why, in a line.
+/// Says which servers found don't start, and why, in a line.
 fn say_elsewhere(elsewhere: &[Found], terminal: &Terminal) {
-    let (urls, others): (Vec<&Found>, Vec<&Found>) = elsewhere.iter().partition(|found| found.start == Start::AtUrl);
-    let named = |found: &[&Found]| {
-        let mut names: Vec<String> = found.iter().take(NAMED).map(|found| found.label()).collect();
-        if found.len() > NAMED {
-            names.push(format!("{} more", found.len() - NAMED));
-        }
-        names.join(", ")
+    let Some(first) = elsewhere.first() else { return };
+    let mut names: Vec<String> = elsewhere.iter().take(NAMED).map(Found::label).collect();
+    if elsewhere.len() > NAMED {
+        names.push(format!("{} more", elsewhere.len() - NAMED));
+    }
+    let why = match &first.start {
+        Start::Not(why) => format!(" ({}: {why})", first.label()),
+        Start::Here(_) => String::new(),
     };
-    let pad = " ".repeat(GUTTER);
-    if !urls.is_empty() {
-        say!("{pad}{}", terminal.err.dim(&format!("Reached at a URL, which rein starts later: {}", named(&urls))));
-    }
-    if !others.is_empty() {
-        let why = match &others[0].start {
-            Start::Not(why) => format!(" ({}: {why})", others[0].label()),
-            _ => String::new(),
-        };
-        say!("{pad}{}", terminal.err.dim(&format!("Started in a way rein doesn't know yet: {}{why}", named(&others))));
-    }
+    say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("Started in a way rein doesn't know yet: {}{why}", names.join(", "))));
 }
 
 /// Asks whether to add `server`, `found` in the registry: what it runs,
@@ -137,8 +128,11 @@ async fn confirm(found: &Found, server: &rein_mcp::Server, mcp: &Mcp, terminal: 
     if let Some(repository) = &found.repository {
         detail.push_str(&format!(", its code at {repository}"));
     }
-    detail.push_str(&format!(". It runs {}", rein_mcp::walls(server.access)));
-    if server.command == "docker" && server.access == Access::Outside {
+    match server.access() {
+        Some(access) => detail.push_str(&format!(". It runs {}", rein_mcp::walls(access))),
+        None => detail.push_str(". It's reached at its URL: none of its code runs here"),
+    }
+    if server.local().is_some_and(|local| local.command == "docker" && local.access == Access::Outside) {
         detail.push_str(": Docker, which the sandbox can't reach, runs it in a container of its own");
     }
     detail.push('.');

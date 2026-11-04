@@ -183,6 +183,8 @@ impl Model {
                     // As OpenRouter does at the end of its browser sign-in.
                     heard.lock().unwrap().push(format!("{head}{}", String::from_utf8_lossy(&body)));
                     http(200, "application/json", br#"{"key":"good-key","user_id":"u1"}"#)
+                } else if let Some(reply) = far(&head, &body) {
+                    reply
                 } else if head.starts_with("GET /v0.1/servers?") {
                     heard.lock().unwrap().push(head.lines().next().unwrap_or_default().to_owned());
                     let page = listing.lock().unwrap().clone().unwrap_or_else(|| json!({ "servers": [] }));
@@ -286,6 +288,53 @@ fn read_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
         data.extend_from_slice(&buf[..n]);
     }
     Some((head, data[head_end..].to_vec()))
+}
+
+/// An MCP server at a URL, `/mcp` here, and the sign-in in front of it, as
+/// MCP's spec has them: without its token, a 401 that says where to sign
+/// in. With it, it has one tool, `hello`. `None` for what isn't its.
+fn far(head: &str, body: &[u8]) -> Option<Vec<u8>> {
+    let line = head.lines().next().unwrap_or_default();
+    let host = head.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("host:").map(|host| host.trim().to_owned())).unwrap_or_default();
+    let base = format!("http://{host}");
+    let json = |status: u16, value: Value, extra: &[(&str, &str)]| {
+        let text = value.to_string();
+        let extra: String = extra.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect();
+        let mut reply = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", text.len()).into_bytes();
+        reply.extend_from_slice(text.as_bytes());
+        reply
+    };
+    if line.starts_with("GET /.well-known/oauth-protected-resource/mcp ") {
+        return Some(json(200, json!({ "resource": format!("{base}/mcp"), "authorization_servers": [base] }), &[]));
+    }
+    if line.starts_with("GET /.well-known/oauth-authorization-server ") {
+        let metadata = json!({ "issuer": base, "authorization_endpoint": format!("{base}/authorize"), "token_endpoint": format!("{base}/token"),
+                               "registration_endpoint": format!("{base}/register"), "code_challenge_methods_supported": ["S256"] });
+        return Some(json(200, metadata, &[]));
+    }
+    if line.starts_with("POST /register ") {
+        return Some(json(201, json!({ "client_id": "rein-far-client" }), &[]));
+    }
+    if line.starts_with("POST /token ") {
+        return Some(json(200, json!({ "access_token": "FAKE-far-token", "refresh_token": "FAKE-far-refresh", "expires_in": 3600 }), &[]));
+    }
+    if !line.starts_with("POST /mcp ") {
+        return None;
+    }
+    if !head.to_ascii_lowercase().contains("authorization: bearer fake-far-token") {
+        let challenge = format!(r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/mcp""#);
+        return Some(json(401, json!({ "error": "invalid_token" }), &[("www-authenticate", &challenge)]));
+    }
+    let message: Value = serde_json::from_slice(body).unwrap_or_default();
+    let answer = |result: Value| json!({ "jsonrpc": "2.0", "id": message["id"], "result": result });
+    Some(match message["method"].as_str().unwrap_or_default() {
+        "initialize" => {
+            json(200, answer(json!({ "protocolVersion": "2025-11-25", "capabilities": { "tools": {} }, "serverInfo": { "name": "far" } })), &[("mcp-session-id", "far-1")])
+        }
+        "tools/list" => json(200, answer(json!({ "tools": [{ "name": "hello", "description": "Says hello.", "inputSchema": { "type": "object" } }] })), &[]),
+        "tools/call" => json(200, answer(json!({ "content": [{ "type": "text", "text": "hello from far away" }] })), &[]),
+        _ => b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+    })
 }
 
 fn http(status: u16, kind: &str, body: &[u8]) -> Vec<u8> {
@@ -2921,12 +2970,13 @@ fn a_server_is_added_by_name_from_the_mcp_registry() {
     let mut term = Term::start_with(&model, "mcp-registry", 34, 140, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
     term.keys("/mcp add thing\r");
-    term.wait_for("Reached at a URL, which rein starts later: smithery.ai/thing");
     term.wait_for("add which thing server");
+    term.wait_for("smithery.ai/thing");
     let list = term.text();
     let (real, copy) = (list.find("acme/thing-mcp").unwrap(), list.find("copycat/thing-mcp").unwrap());
     assert!(real < copy, "the one whose package is its own comes first:\n{list}");
     assert!(list.contains("npm @thing/mcp@1.0.0 · Acme's own"), "{list}");
+    assert!(list.contains("at x.example"), "one reached at a URL is listed too:\n{list}");
     term.keys("\r");
     term.wait_for("thing needs ACME_SITE (your site):");
     term.keys("https://acme.example\r");
@@ -2956,16 +3006,17 @@ fn a_server_is_added_by_name_from_the_mcp_registry() {
 #[test]
 fn mcp_import_brings_your_servers_from_other_apps() {
     let mut model = Model::start(Vec::new());
-    let cursor = json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "env": { "GIVEN": "${env:REIN_IMPORT_GIVEN}" } }, "linear": { "url": "https://mcp.linear.app/mcp" } } });
+    let cursor = json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "env": { "GIVEN": "${env:REIN_IMPORT_GIVEN}" } }, "far": { "url": "http://127.0.0.1:9/mcp" }, "old": { "type": "sse", "url": "http://127.0.0.1:9/sse" } } });
     model.home.push((".cursor/mcp.json".into(), cursor.to_string()));
     model.home.push((".codex/config.toml".into(), "[mcp_servers.other]\ncommand = \"sh\"\nargs = [\"server.sh\"]\nenabled = false\n".into()));
     let mut term = Term::start_with(&model, "mcp-import", 34, 140, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
     term.keys("/mcp import\r");
-    term.wait_for("linear from Cursor isn't brought in: it's reached at a URL");
+    term.wait_for("old from Cursor isn't brought in: it speaks MCP's old SSE transport");
     term.wait_for("bring in which servers");
     let list = term.text();
     assert!(list.contains("✓ fake") && list.contains("from Cursor · sh server.sh (with GIVEN)"), "{list}");
+    assert!(list.contains("✓ far") && list.contains("from Cursor · http://127.0.0.1:9/mcp"), "one at a URL is brought in too\n{list}");
     assert!(list.contains("  other") && list.contains("off in Codex"), "off there: not marked\n{list}");
     pick(&mut term, "done");
     term.wait_for("fake needs REIN_IMPORT_GIVEN to start, and it isn't set.");
@@ -2975,6 +3026,56 @@ fn mcp_import_brings_your_servers_from_other_apps() {
     let file: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/mcp.json")).unwrap()).unwrap();
     assert_eq!(file["mcpServers"]["fake"], json!({ "command": "sh", "args": ["server.sh"], "env": { "GIVEN": "${REIN_IMPORT_GIVEN}" } }));
     assert!(file["mcpServers"].get("other").is_none(), "left unmarked: not brought in");
+}
+
+/// A server at a URL that wants a sign-in is offered one as it's added:
+/// rein registers itself, you sign in in the browser, it starts, and its
+/// tools are the model's. The token is kept only in rein's folder, and
+/// never reaches the model.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_server_at_a_url_is_signed_in_to_in_the_browser_and_its_tools_work() {
+    let model = Model::start(vec![Turn { out: vec![Out::Call("mcp__far__hello", json!({}))] }, says("Far said hello.")]);
+    let base = model.base.trim_end_matches("/v1").to_owned();
+    // Wide, so the link to sign in is on one line.
+    let mut term = Term::start(&model, "mcp-far", 34, 420);
+    term.wait_for(IDLE);
+    term.keys(&format!("/mcp add far {base}/mcp\r"));
+    term.wait_for("Sign in to far?");
+    term.wait_for(&format!("rein opens {base} in your browser"));
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Open this link to sign in:");
+    term.wait_until("the link", |screen| screen.contains("/authorize?"));
+    let text = term.text();
+    let line = text.lines().find(|line| line.contains("/authorize?")).unwrap();
+    let link = rein_llm::reqwest::Url::parse(line[line.find("http").unwrap()..].trim()).unwrap();
+    let param = |name: &str| link.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()).unwrap_or_default();
+    assert_eq!((param("client_id"), param("code_challenge_method"), param("resource")), ("rein-far-client".to_owned(), "S256".to_owned(), format!("{base}/mcp")));
+    let back = rein_llm::reqwest::Url::parse(&param("redirect_uri")).unwrap();
+    let mut browser = TcpStream::connect(("127.0.0.1", back.port().unwrap())).unwrap();
+    write!(browser, "GET {}?code=c1&state={} HTTP/1.1\r\nHost: localhost\r\n\r\n", back.path(), param("state")).unwrap();
+    let mut page = String::new();
+    browser.read_to_string(&mut page).unwrap();
+    assert!(page.contains("rein is signed in"), "{page}");
+    term.wait_for("✓ signed in to far");
+    term.wait_for("far  1 tool: hello");
+    term.wait_for(IDLE);
+    term.keys("say hello\r");
+    term.wait_for("Let far's hello run?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Far said hello.");
+    assert_eq!(results(&model), ["hello from far away"]);
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/mcp.json")).unwrap()).unwrap();
+    assert_eq!(file["mcpServers"]["far"], json!({ "type": "http", "url": format!("{base}/mcp") }));
+    term.keys("\x04");
+    term.wait_exit();
+    assert!(!model.requests().iter().any(|request| request.to_string().contains("FAKE-far-token")), "the model never saw it");
+    for file in every_file(&term.dir) {
+        let has = std::fs::read_to_string(&file).unwrap_or_default().contains("FAKE-far-token");
+        assert_eq!(has, file == term.dir.join("home/mcp-tokens.json"), "{} {} the token", file.display(), if has { "has" } else { "doesn't have" });
+    }
 }
 
 /// A server added with a key written in is kept in your mcp.json and

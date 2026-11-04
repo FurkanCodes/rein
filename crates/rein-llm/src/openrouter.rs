@@ -11,16 +11,12 @@
 //!
 //! Spec: <https://openrouter.ai/docs/use-cases/oauth-pkce>
 
-use std::collections::HashMap;
-
 use reqwest::Url;
 use serde_json::{Value, json};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::net::TcpListener;
 
 use crate::client::check;
-use crate::oauth::{pkce_challenge, random_token, read_request_target, respond};
+use crate::oauth::{callback, pkce_challenge, random_token};
 use crate::{Error, Result};
 
 pub const AUTH_URL: &str = "https://openrouter.ai/auth";
@@ -57,7 +53,11 @@ impl PendingSignIn {
     /// Waits for the browser, then trades the code for a key at `api_base`
     /// (`https://openrouter.ai/api/v1`).
     pub async fn finish(self, http: &reqwest::Client, api_base: &str) -> Result<String> {
-        let code = wait_for_callback(self.listeners, self.state).await?;
+        let pages = (
+            "rein is connected to OpenRouter. You can close this tab and go back to the terminal.",
+            "OpenRouter wasn't connected. You can close this tab and go back to the terminal.",
+        );
+        let code = callback(self.listeners, self.state, CALLBACK_PATH, pages).await?;
         let body = json!({ "code": code, "code_verifier": self.verifier, "code_challenge_method": "S256" });
         let response = http.post(format!("{api_base}/auth/keys")).json(&body).send().await?;
         let answer: Value = check(response).await?.json().await?;
@@ -65,61 +65,11 @@ impl PendingSignIn {
     }
 }
 
-/// Serves the callback on every address until the real one arrives. Each
-/// connection gets its own task: browsers open spare ones that never send a
-/// request. All of them live in `JoinSet`s, which stop every task they hold
-/// when dropped: given up on (Esc, a timeout), nothing keeps listening.
-async fn wait_for_callback(listeners: Vec<TcpListener>, state: String) -> Result<String> {
-    let (tx, mut rx) = mpsc::channel(1);
-    let mut serving = JoinSet::new();
-    for listener in listeners {
-        let (tx, state) = (tx.clone(), state.clone());
-        serving.spawn(async move {
-            let mut connections = JoinSet::new();
-            while let Ok((socket, _)) = listener.accept().await {
-                let (tx, state) = (tx.clone(), state.clone());
-                connections.spawn(async move {
-                    if let Some(result) = handle_callback(socket, &state).await {
-                        let _ = tx.send(result).await;
-                    }
-                });
-            }
-        });
-    }
-    drop(tx);
-    rx.recv().await.unwrap_or_else(|| Err(Error::Auth("nothing could wait for the browser".into())))
-}
-
-/// Handles one browser request; `None` for ones that aren't the callback.
-async fn handle_callback(mut socket: TcpStream, state: &str) -> Option<Result<String>> {
-    let target = read_request_target(&mut socket).await?;
-    let url = Url::parse(&format!("http://localhost{target}")).ok()?;
-    if url.path() != CALLBACK_PATH {
-        respond(&mut socket, 404, "Not found.").await;
-        return None;
-    }
-    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
-    if query.get("state").map(String::as_str) != Some(state) {
-        respond(&mut socket, 400, "This sign-in link has expired. Start again from rein.").await;
-        return None;
-    }
-    let result = match (query.get("code"), query.get("error")) {
-        (Some(code), None) => Ok(code.clone()),
-        (_, error) => Err(Error::Auth(format!("sign-in wasn't completed ({})", error.map_or("no code came back", String::as_str)))),
-    };
-    let page = if result.is_ok() {
-        "rein is connected to OpenRouter. You can close this tab and go back to the terminal."
-    } else {
-        "OpenRouter wasn't connected. You can close this tab and go back to the terminal."
-    };
-    respond(&mut socket, if result.is_ok() { 200 } else { 400 }, page).await;
-    Some(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
 
     /// One HTTP request to `url`, like a browser's; the answer.
     async fn get(url: &str) -> String {

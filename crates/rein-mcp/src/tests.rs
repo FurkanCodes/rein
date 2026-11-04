@@ -21,16 +21,23 @@ async fn fake(name: &str, access: Access) -> (Server, Launch, PathBuf) {
     std::fs::write(home.join(".ssh/id_test"), "FAKE-mcp-secret").unwrap();
     let places = rein_sandbox::Places::new(&root, Some(&home), None);
     let sandbox = Arc::new(Sandbox::detect(places).await);
-    let server = Server {
-        name: "fake".into(),
-        origin: Origin::Yours,
-        command: "sh".into(),
-        args: vec!["server.sh".into()],
-        env: [("GIVEN".to_owned(), "hello there".to_owned())].into(),
-        access,
-        allow: vec!["echo".into()],
-    };
-    (server, Launch { sandbox, root, caches: home.join(".cache/rein/mcp"), keys: Arc::default() }, home)
+    let local = Local { command: "sh".into(), args: vec!["server.sh".into()], env: [("GIVEN".to_owned(), "hello there".to_owned())].into(), access };
+    let server = Server { name: "fake".into(), origin: Origin::Yours, reach: Reach::Local(local), allow: vec!["echo".into()] };
+    (server, Launch { sandbox, root, caches: home.join(".cache/rein/mcp"), keys: Arc::default(), web: None, tokens: None }, home)
+}
+
+/// The command of `server`, to change.
+fn local(server: &mut Server) -> &mut Local {
+    match &mut server.reach {
+        Reach::Local(local) => local,
+        Reach::Remote(_) => panic!("{} is reached at a URL", server.name),
+    }
+}
+
+/// `server` in other walls.
+fn walled(mut server: Server, access: Access) -> Server {
+    local(&mut server).access = access;
+    server
 }
 
 #[tokio::test]
@@ -71,11 +78,13 @@ async fn a_server_that_stops_says_why_and_is_started_again_on_its_next_call() {
 #[tokio::test]
 async fn one_that_cant_start_says_why() {
     let (mut server, launch, _) = fake("fails", Access::Outside).await;
-    server.command = "rein-no-such-command".into();
+    local(&mut server).command = "rein-no-such-command".into();
     let mut exits = server.clone();
-    (exits.name, exits.command, exits.args) = ("exits".into(), "sh".into(), vec!["-c".into(), "echo 'Error: no TOKEN' >&2; exit 1".into()]);
+    exits.name = "exits".into();
+    (local(&mut exits).command, local(&mut exits).args) = ("sh".into(), vec!["-c".into(), "echo 'Error: no TOKEN' >&2; exit 1".into()]);
     let mut missing = server.clone();
-    (missing.name, missing.env) = ("missing".into(), [("T".to_owned(), "${REIN_TEST_UNSET_VARIABLE}".to_owned())].into());
+    missing.name = "missing".into();
+    local(&mut missing).env = [("T".to_owned(), "${REIN_TEST_UNSET_VARIABLE}".to_owned())].into();
     let servers = Servers::start(vec![server, exits, missing], launch);
     let note = servers.list().await.note.unwrap();
     assert!(note.contains("fake didn't start: can't run rein-no-such-command"), "{note}");
@@ -92,7 +101,7 @@ async fn one_that_cant_start_says_why() {
 #[tokio::test]
 async fn a_variable_you_gave_rein_fills_in_what_your_environment_hasnt() {
     let (mut server, launch, _) = fake("given", Access::Outside).await;
-    server.env = [("GIVEN".to_owned(), "${REIN_TEST_GIVEN_KEY}".to_owned())].into();
+    local(&mut server).env = [("GIVEN".to_owned(), "${REIN_TEST_GIVEN_KEY}".to_owned())].into();
     let servers = Servers::start(Vec::new(), launch);
     assert_eq!(server.needs(&|name| servers.keys().get(name)).as_deref(), Some("REIN_TEST_GIVEN_KEY"));
     servers.keys().set("REIN_TEST_GIVEN_KEY", "FAKE-given-key");
@@ -142,7 +151,7 @@ async fn a_walled_servers_failed_call_says_once_that_the_sandbox_may_be_why() {
     servers.add(server.clone());
     assert!(!servers.failed_in_walls("fake"), "started again, it's forgotten");
 
-    let outside = Servers::start(vec![Server { access: Access::Outside, ..server }], launch);
+    let outside = Servers::start(vec![walled(server, Access::Outside)], launch);
     outside.list().await;
     assert_eq!(outside.call("mcp__fake__echo", &echo("!no such repo")).await, Err("!no such repo".into()), "nothing walls it in");
 }
@@ -168,11 +177,12 @@ async fn one_that_fails_in_the_sandbox_says_so_and_starts_outside() {
     }
     // It reads a file in your home folder as it starts, as one that keeps
     // its settings there does.
-    (server.command, server.args) = ("sh".into(), vec!["-c".into(), format!("cat {} > /dev/null && exec sh server.sh", home.join(".ssh/id_test").display())]);
+    (local(&mut server).command, local(&mut server).args) =
+        ("sh".into(), vec!["-c".into(), format!("cat {} > /dev/null && exec sh server.sh", home.join(".ssh/id_test").display())]);
     let servers = Servers::start(vec![server.clone()], launch);
     let status = servers.started("fake").await;
     assert!(matches!(&status, Some(Status::Failed(Failure::InWalls(_)))), "{status:?}");
-    servers.add(Server { access: Access::Outside, ..server });
+    servers.add(walled(server, Access::Outside));
     assert!(matches!(servers.started("fake").await, Some(Status::Ready(_))), "outside, it starts");
 }
 
@@ -195,7 +205,7 @@ async fn gone(pid: &str) -> bool {
 async fn a_server_added_or_removed_as_rein_runs_is_in_the_next_listing_or_stopped() {
     let (mut server, launch, _) = fake("changes", Access::Outside).await;
     let pidfile = launch.root.join("pid");
-    server.env.insert("PIDFILE".into(), pidfile.display().to_string());
+    local(&mut server).env.insert("PIDFILE".into(), pidfile.display().to_string());
     let servers = Servers::start(Vec::new(), launch);
     assert!(servers.list().await.tools.is_empty() && servers.list().await.note.is_none());
     servers.add(server.clone());
@@ -210,7 +220,7 @@ async fn a_server_added_or_removed_as_rein_runs_is_in_the_next_listing_or_stoppe
     let first = std::fs::read_to_string(&pidfile).unwrap().trim().to_owned();
 
     let mut other = server.clone();
-    other.env.insert("GIVEN".into(), "the other one".into());
+    local(&mut other).env.insert("GIVEN".into(), "the other one".into());
     servers.add(other);
     assert!(servers.call("mcp__fake__given", "{}").await.unwrap_err().contains("no tool"), "the old one's tools aren't called once it's replaced");
     servers.list().await;
@@ -230,7 +240,7 @@ async fn a_server_removed_while_it_starts_isnt_left_running() {
     let (mut server, launch, _) = fake("slow", Access::Outside).await;
     let pidfile = launch.root.join("pid");
     // It starts, and never answers.
-    (server.command, server.args) = ("sh".into(), vec!["-c".into(), format!("echo $$ > {}; exec sleep 600", pidfile.display())]);
+    (local(&mut server).command, local(&mut server).args) = ("sh".into(), vec!["-c".into(), format!("echo $$ > {}; exec sleep 600", pidfile.display())]);
     let servers = Servers::start(vec![server], launch);
     while !pidfile.exists() || std::fs::read_to_string(&pidfile).unwrap().trim().is_empty() {
         tokio::task::yield_now().await;
@@ -262,16 +272,10 @@ async fn a_server_from_npm_starts_in_the_sandbox() {
     let home = std::env::home_dir().expect("a home folder");
     let sandbox = Arc::new(Sandbox::detect(rein_sandbox::Places::new(&root, Some(&home), None)).await);
     assert!(sandbox.available(), "no sandbox here");
-    let server = Server {
-        name: "everything".into(),
-        origin: Origin::Yours,
-        command: "npx".into(),
-        args: vec!["-y".into(), "@modelcontextprotocol/server-everything".into()],
-        env: Default::default(),
-        access: Access::Network,
-        allow: Vec::new(),
-    };
-    let servers = Servers::start(vec![server], Launch { sandbox, root: root.clone(), caches: root.join("caches"), keys: Arc::default() });
+    let local = Local { command: "npx".into(), args: vec!["-y".into(), "@modelcontextprotocol/server-everything".into()], env: Default::default(), access: Access::Network };
+    let server = Server { name: "everything".into(), origin: Origin::Yours, reach: Reach::Local(local), allow: Vec::new() };
+    let launch = Launch { sandbox, root: root.clone(), caches: root.join("caches"), keys: Arc::default(), web: None, tokens: None };
+    let servers = Servers::start(vec![server], launch);
     let listing = servers.list().await;
     println!("{:?}", listing.note);
     assert!(listing.tools.iter().any(|tool| tool.name == "mcp__everything__echo"), "{:?}", listing.note);

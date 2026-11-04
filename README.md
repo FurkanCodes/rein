@@ -583,11 +583,11 @@ first. Pick one, give it what it needs that isn't a key, and rein shows
 the command it would run, pinned to a version (`npx -y
 @playwright/mcp@0.0.84`), so what you said yes to is what runs. A key it
 needs is a `${NAME}` of yours, asked for in dots as it starts, and never
-written in your `mcp.json`. npm and PyPI packages run in the sandbox;
-Docker images run with Docker, which walls in its containers itself and
-which the sandbox can't reach. Servers reached only at a URL are named,
-for later. `REIN_MCP_REGISTRY` points rein at another registry, as a
-company's own.
+written in your `mcp.json`. One reached at a URL comes first when the
+registry offers both: none of its code runs here. npm and PyPI packages
+run in the sandbox; Docker images run with Docker, which walls in its
+containers itself and which the sandbox can't reach. `REIN_MCP_REGISTRY`
+points rein at another registry, as a company's own.
 
 ```
 /mcp import
@@ -681,17 +681,47 @@ and characters a terminal doesn't draw, are taken out. A call may take 5
 minutes. A long result is cut, and kept whole in a file in the temp folder
 for the model to read in parts. A server that stops is started again on its
 next call. `/mcp` shows each server, its walls and its tools, or why it
-didn't start. Servers reached at a URL, and their sign-ins, come later.
-When one of a server's calls fails in the sandbox, the model is told once
-that the sandbox may be why, and that you can let it out from `/mcp`.
+didn't start. When one of a server's calls fails in the sandbox, the model
+is told once that the sandbox may be why, and that you can let it out from
+`/mcp`.
+
+### Servers at a URL
+
+```
+/mcp add https://mcp.linear.app/mcp
+/mcp add ctx --header "CONTEXT7_API_KEY: $CONTEXT7_API_KEY" https://mcp.context7.com/mcp
+```
+
+A server at a URL runs none of its code here: rein talks to it over MCP's
+Streamable HTTP (`"type": "http"`, `"url"` and `"headers"` in your file,
+as Claude Code writes them), and it has no walls. Named for its host if
+you don't name it. rein reaches one over https, or over plain http only on
+this computer, and follows a redirect only on the same server. MCP's old
+SSE transport it doesn't speak: a server that has it often has a newer
+address too, ending in `/mcp`.
+
+One that wants you to sign in says so as it's added or starts, and rein
+offers it there: "Sign in to linear?" Yes opens its sign-in page in your
+browser, as MCP's spec has it. The server names its sign-in server; rein
+checks it takes PKCE, registers itself there as rein (never as another
+app), and asks for a token for this server's URL alone. A sign-in server
+that won't let rein register takes a client ID you registered with it
+yourself. Tokens are kept in `~/.config/rein/mcp-tokens.json`, which only
+you can read and the sandbox hides, by the server's URL, and sent to that
+URL only. One about to run out is renewed before a request, under a lock
+every rein window shares, so a refresh token is spent once; one that can't
+be renewed asks you to sign in again from `/mcp`, which also signs you
+out. A header of yours (`Authorization: Bearer $KEY`) is sent as it is,
+and rein's sign-in isn't. A session the server ends is started again, and
+a call made in it made again: it wasn't taken.
 
 ## Layout
 
 | Crate | What it is |
 |---|---|
-| `crates/rein-llm` | Streaming LLM provider layer: one client for every provider, the Responses, Messages, Gemini and Chat Completions APIs, the providers rein knows, Sign in with ChatGPT |
+| `crates/rein-llm` | Streaming LLM provider layer: one client for every provider, the Responses, Messages, Gemini and Chat Completions APIs, the providers rein knows, Sign in with ChatGPT, and signing in to MCP servers at a URL |
 | `crates/rein-sandbox` | The walls commands run inside: macOS's Seatbelt, Linux's Landlock and seccomp, what's protected and hidden |
-| `crates/rein-mcp` | MCP servers: their files, started in the sandbox, what they say cleaned, their tools under rein's names; what the MCP Registry lists and other apps' settings have, read into servers to add |
+| `crates/rein-mcp` | MCP servers: their files, started in the sandbox or reached over Streamable HTTP, what they say cleaned, their tools under rein's names; what the MCP Registry lists and other apps' settings have, read into servers to add |
 | `crates/rein-agent` | The agent loop, the tools, the permission engine, saved conversations, and what the model is told first |
 | `crates/rein-cli` | The `rein` command |
 

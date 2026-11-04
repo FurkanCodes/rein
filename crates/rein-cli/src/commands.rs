@@ -94,8 +94,9 @@ impl Mcp {
         match (word, words.as_slice()) {
             ("", _) => Ok(Mcp::Show),
             ("add", []) => Ok(Mcp::Find(None)),
+            // A URL alone is a server reached there, named for its host.
             ("add", [url]) if url.starts_with("http://") || url.starts_with("https://") => {
-                Err(Refused::Said("rein starts servers on this computer so far; one reached at a URL comes later".into()))
+                rein_mcp::config::added(rest).map(Mcp::Add).map_err(|e| Refused::MayHoldKey(format!("can't add that: {e}")))
             }
             // A word that may be a key isn't sent to the registry to look up.
             ("add", [word]) if rein_mcp::config::looks_like_a_key(word) => {
@@ -403,23 +404,22 @@ mod tests {
     #[test]
     fn mcp_adds_removes_and_allows() {
         let Some(Ok(Slash::Mcp(Mcp::Add(named)))) = parse("/mcp add github GITHUB_TOKEN=$GITHUB_TOKEN npx -y gh") else { panic!("a server to add") };
-        assert_eq!((named.servers[0].name.as_str(), named.servers[0].args.as_slice()), ("github", ["-y".to_owned(), "gh".to_owned()].as_slice()));
+        let args = named.servers[0].local().map(|local| local.args.clone()).unwrap_or_default();
+        assert_eq!((named.servers[0].name.as_str(), args.as_slice()), ("github", ["-y".to_owned(), "gh".to_owned()].as_slice()));
         assert_eq!(parse("/mcp"), Some(Ok(Slash::Mcp(Mcp::Show))));
         assert_eq!(parse("/mcp remove github"), Some(Ok(Slash::Mcp(Mcp::Remove("github".into())))));
         assert_eq!(parse("/mcp allow github get_issue *"), Some(Ok(Slash::Mcp(Mcp::Allow("github".into(), vec!["get_issue".into(), "*".into()])))));
         assert_eq!(parse("/mcp add playwright"), Some(Ok(Slash::Mcp(Mcp::Find(Some("playwright".into()))))), "one word is looked up");
         assert_eq!(parse("/mcp add"), Some(Ok(Slash::Mcp(Mcp::Find(None)))), "nothing: asked what to look up");
         assert_eq!(parse("/mcp import"), Some(Ok(Slash::Mcp(Mcp::Import))));
+        assert!(
+            matches!(parse("/mcp add https://mcp.linear.app/mcp"), Some(Ok(Slash::Mcp(Mcp::Add(named)))) if named.servers[0].name == "linear"),
+            "a URL alone, named for its host"
+        );
         assert!(matches!(parse(r#"/mcp add {"mcpServers":{"x":{"command":"x"}}}"#), Some(Ok(Slash::Mcp(Mcp::Add(_))))), "JSON in one word is still JSON");
         let key = parse("/mcp add ghp_FAKEaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").and_then(Result::err).expect("a key isn't looked up");
         assert!(key.hides_the_line() && !key.to_string().contains("FAKE"), "{key}");
-        for (line, why) in [
-            ("/mcp add https://mcp.linear.app/mcp", "comes later"),
-            ("/mcp import x", "takes nothing"),
-            ("/mcp remove", "a server's name"),
-            ("/mcp allow github", "its tools"),
-            ("/mcp start x", "not start"),
-        ] {
+        for (line, why) in [("/mcp import x", "takes nothing"), ("/mcp remove", "a server's name"), ("/mcp allow github", "its tools"), ("/mcp start x", "not start")] {
             let refused = parse(line).and_then(Result::err).unwrap_or_else(|| panic!("{line} is turned down"));
             assert!(refused.to_string().contains(why), "{line}: {refused}");
         }

@@ -1,6 +1,8 @@
-//! MCP servers: programs on this computer that give the model more tools
-//! (an issue tracker's, a browser's, a database's), started in rein's
-//! sandbox and talked to over their standard input and output.
+//! MCP servers: programs that give the model more tools (an issue
+//! tracker's, a browser's, a database's). One on this computer is started
+//! in rein's sandbox and talked to over its standard input and output; one
+//! at a URL is reached over HTTP ([`remote`]), and runs none of its code
+//! here.
 //!
 //! A server is someone else's code, often fetched as it starts (`npx -y`),
 //! so it gets the walls a command gets: by default the project and the
@@ -11,10 +13,12 @@
 //! remove a server, so a server that starts late or changes its list can't
 //! change what the model was told.
 
+mod added;
 mod clean;
 pub mod config;
 pub mod import;
 pub mod registry;
+pub mod remote;
 mod rpc;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,7 +32,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub use clean::text as cleaned;
-pub use config::{Named, Origin, Server, Skipped, Unfilled};
+pub use config::{Local, Named, Origin, Reach, Remote, Server, Skipped, Unfilled};
 pub use rpc::Error;
 
 /// What the names of servers' tools start with: they can't clash with
@@ -78,13 +82,17 @@ pub fn parts(name: &str) -> Option<(&str, &str)> {
 
 /// How servers are started: in this sandbox, in this project, each with a
 /// folder of its own under `caches` for what `npx` or `uvx` fetch, and the
-/// variables they name filled in from your environment or `keys`.
+/// variables they name filled in from your environment or `keys`. One at a
+/// URL is reached over `web`, signed in to with `tokens`; without a `web`,
+/// it isn't.
 #[derive(Clone)]
 pub struct Launch {
     pub sandbox: Arc<Sandbox>,
     pub root: PathBuf,
     pub caches: PathBuf,
     pub keys: Arc<Keys>,
+    pub web: Option<Arc<dyn remote::Web>>,
+    pub tokens: Option<Arc<dyn remote::Tokens>>,
 }
 
 /// The values you gave rein for the variables servers name (`${NAME}`),
@@ -132,6 +140,9 @@ pub enum Failure {
     InWalls(String),
     /// It's meant for the sandbox, and there's none here.
     NoSandbox,
+    /// It's at a URL, and wants you to sign in: what its `WWW-Authenticate`
+    /// says, where to.
+    SignIn(String),
     /// Anything else, said in words.
     Other(String),
 }
@@ -142,6 +153,7 @@ impl std::fmt::Display for Failure {
             Failure::Needs(name) => write!(f, "it needs {name}, which isn't set"),
             Failure::InWalls(why) => write!(f, "{why} (it ran in the sandbox, which may be why)"),
             Failure::NoSandbox => f.write_str("there's no sandbox here to start it in"),
+            Failure::SignIn(_) => f.write_str("it needs you to sign in"),
             Failure::Other(why) => f.write_str(why),
         }
     }
@@ -157,10 +169,9 @@ impl From<Unfilled> for Failure {
 }
 
 impl Launch {
-    /// The command that starts `server`, in its walls.
-    fn command(&self, server: &Server) -> Result<tokio::process::Command, Failure> {
-        let filled = server.filled(&|name| self.keys.get(name))?;
-        let mut command = match server.access.walls() {
+    /// The command that starts `server`, `filled`, in its walls.
+    fn command(&self, server: &Server, filled: &Local) -> Result<tokio::process::Command, Failure> {
+        let mut command = match filled.access.walls() {
             // Your whole environment, keys rein kept for itself included,
             // as a command outside the sandbox gets it.
             None => {
@@ -193,20 +204,41 @@ impl Launch {
     /// Whether `server` runs in the sandbox: then what it can't reach may
     /// be why it fails.
     fn walled(&self, server: &Server) -> bool {
-        server.access.walls().is_some() && self.sandbox.available()
+        server.access().and_then(Access::walls).is_some() && self.sandbox.available()
     }
 
-    /// Starts `server`, says hello, and asks for its tools, within
-    /// [`START`].
+    /// Starts `server`, or reaches it, says hello, and asks for its tools,
+    /// within [`START`].
     async fn start(&self, server: &Server) -> Result<Connection, Failure> {
-        let mut command = self.command(server)?;
+        match server.filled(&|name| self.keys.get(name))? {
+            Reach::Local(local) => self.run(server, &local).await,
+            Reach::Remote(remote) => self.reach(&remote).await,
+        }
+    }
+
+    /// Reaches the server at `remote`'s URL, filled in.
+    async fn reach(&self, remote: &Remote) -> Result<Connection, Failure> {
+        remote::reachable(&remote.url).map_err(Failure::Other)?;
+        let web = self.web.clone().ok_or_else(|| Failure::Other("rein can't reach servers at a URL here".into()))?;
+        let session = remote::Session::new(web, self.tokens.clone(), remote.url.clone(), remote.headers.clone());
+        match tokio::time::timeout(START, Connection::open(Channel::Http(session), None)).await {
+            Ok(Ok(connection)) => Ok(connection),
+            Ok(Err(Error::Unauthorized(challenge))) => Err(Failure::SignIn(challenge)),
+            Ok(Err(e)) => Err(Failure::Other(e.to_string())),
+            Err(_) => Err(Failure::Other(format!("it didn't answer within {}s", START.as_secs()))),
+        }
+    }
+
+    /// Starts `server`'s command, `local`, filled in.
+    async fn run(&self, server: &Server, local: &Local) -> Result<Connection, Failure> {
+        let mut command = self.command(server, local)?;
         let started = async {
-            let mut child = command.spawn().map_err(|e| Error::Start(format!("can't run {}: {e}", server.command)))?;
+            let mut child = command.spawn().map_err(|e| Error::Start(format!("can't run {}: {e}", local.command)))?;
             let group = Group::new(child.id());
             let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
             let (Some(stdin), Some(stdout)) = (stdin, stdout) else { return Err(Error::Start("its input and output weren't there to talk over".into())) };
             let rpc = rpc::Rpc::start(stdout, stdin, child.stderr.take());
-            Connection::open(rpc, Some(Process { _group: group, _child: child })).await
+            Connection::open(Channel::Stdio(rpc), Some(Process { _group: group, _child: child })).await
         };
         // Once it runs, what it can't reach may be why it fails.
         let failed = |why: String| if self.walled(server) { Failure::InWalls(why) } else { Failure::Other(why) };
@@ -226,10 +258,39 @@ struct Process {
     _child: tokio::process::Child,
 }
 
+/// What rein talks to a server over.
+enum Channel {
+    Stdio(rpc::Rpc),
+    Http(remote::Session),
+}
+
+impl Channel {
+    async fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, Error> {
+        match self {
+            Channel::Stdio(rpc) => rpc.request(method, params, timeout).await,
+            Channel::Http(session) => session.request(method, params, timeout).await,
+        }
+    }
+
+    async fn notify(&self, method: &str, params: Option<Value>) {
+        match self {
+            Channel::Stdio(rpc) => rpc.notify(method, params),
+            Channel::Http(session) => session.notify(method, params).await,
+        }
+    }
+
+    fn alive(&self) -> bool {
+        match self {
+            Channel::Stdio(rpc) => rpc.alive(),
+            Channel::Http(session) => session.alive(),
+        }
+    }
+}
+
 /// A server rein is talking to, and the tools it listed.
 struct Connection {
     _process: Option<Process>,
-    rpc: rpc::Rpc,
+    channel: Channel,
     tools: Vec<Listed>,
 }
 
@@ -250,23 +311,26 @@ struct Page {
 }
 
 impl Connection {
-    /// Says hello over `rpc`, in a version both sides speak, and asks for
-    /// the tools, page by page.
-    async fn open(rpc: rpc::Rpc, process: Option<Process>) -> Result<Connection, Error> {
+    /// Says hello over `channel`, in a version both sides speak, and asks
+    /// for the tools, page by page.
+    async fn open(channel: Channel, process: Option<Process>) -> Result<Connection, Error> {
         let hello = json!({ "protocolVersion": VERSION, "capabilities": {}, "clientInfo": { "name": "rein", "version": env!("CARGO_PKG_VERSION") } });
-        let hello = rpc.request("initialize", hello, START).await?;
+        let hello = channel.request("initialize", hello, START).await?;
         let version = hello.get("protocolVersion").and_then(Value::as_str).unwrap_or_default();
         if !VERSIONS.contains(&version) {
             return Err(Error::Unreadable(format!("it speaks MCP version {}, which rein doesn't yet", clean::text(version))));
         }
-        rpc.notify("notifications/initialized", None);
+        if let Channel::Http(session) = &channel {
+            session.speaks(version);
+        }
+        channel.notify("notifications/initialized", None).await;
         let mut tools = Vec::new();
         // One with no tools to give says so by not saying it has them.
         if hello.get("capabilities").and_then(|c| c.get("tools")).is_some() {
             let mut cursor: Option<String> = None;
             for _ in 0..MOST_PAGES {
                 let params = cursor.as_ref().map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
-                let page: Page = serde_json::from_value(rpc.request("tools/list", params, START).await?).map_err(|e| Error::Unreadable(format!("its list of tools: {e}")))?;
+                let page: Page = serde_json::from_value(channel.request("tools/list", params, START).await?).map_err(|e| Error::Unreadable(format!("its list of tools: {e}")))?;
                 tools.extend(page.tools.iter().filter_map(listed));
                 match page.next {
                     Some(next) if !next.is_empty() => cursor = Some(next),
@@ -274,12 +338,19 @@ impl Connection {
                 }
             }
         }
-        Ok(Connection { _process: process, rpc, tools })
+        Ok(Connection { _process: process, channel, tools })
     }
 
-    async fn call(&self, tool: &str, arguments: Value) -> Result<String, String> {
-        let result = self.rpc.request("tools/call", json!({ "name": tool, "arguments": arguments }), CALL).await.map_err(|e| e.to_string())?;
-        clean::result(result)
+    /// Calls `tool`: what it said, or that it failed, in its words; or
+    /// what kept rein from asking.
+    async fn call(&self, tool: &str, arguments: Value) -> Result<Result<String, String>, Error> {
+        let result = self.channel.request("tools/call", json!({ "name": tool, "arguments": arguments }), CALL).await;
+        match result {
+            Ok(result) => Ok(clean::result(result)),
+            // A tool's error as the server answered it is the tool's.
+            Err(Error::Refused { code, message }) => Ok(Err(Error::Refused { code, message }.to_string())),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -327,7 +398,7 @@ impl State {
     fn status(&self) -> Status {
         match self {
             State::Starting => Status::Starting,
-            State::Ready(connection) if connection.rpc.alive() => Status::Ready(connection.tools.iter().map(|tool| tool.name.clone()).collect()),
+            State::Ready(connection) if connection.channel.alive() => Status::Ready(connection.tools.iter().map(|tool| tool.name.clone()).collect()),
             State::Ready(_) => Status::Stopped,
             State::Failed(why) => Status::Failed(why.clone()),
         }
@@ -545,7 +616,8 @@ impl Servers {
 
     /// Calls the tool the model knows as `name` with `arguments`: the text
     /// it gave, or why it failed. A server that stopped is started again
-    /// first, and the model is told.
+    /// first, and the model is told. One whose session ended is called
+    /// again in a new one: the call wasn't taken.
     pub async fn call(&self, name: &str, arguments: &str) -> Result<String, String> {
         let Some((entry, tool)) = lock(&self.offered).get(name).cloned() else { return Err(format!("there is no tool called {name}")) };
         let arguments: Value = match serde_json::from_str(arguments) {
@@ -553,33 +625,55 @@ impl Servers {
             Ok(_) => return Err("bad arguments: they should be an object".into()),
             Err(e) => return Err(format!("bad arguments: {e}")),
         };
-        let (connection, again) = {
-            let mut state = entry.state.lock().await;
-            let again = !matches!(&*state, State::Ready(connection) if connection.rpc.alive());
-            if again {
-                *state = match self.launch.start(&entry.server).await {
-                    Ok(connection) => State::Ready(Arc::new(connection)),
-                    Err(why) => State::Failed(why),
-                };
-            }
-            match &*state {
-                State::Ready(connection) => (connection.clone(), again),
-                State::Failed(why) => return Err(format!("the {} server had stopped, and didn't start again: {why}", entry.server.name)),
-                State::Starting => return Err(format!("the {} server didn't start", entry.server.name)),
-            }
-        };
-        let said = connection.call(&tool, arguments).await;
+        let (connection, mut again) = self.ready(&entry).await?;
+        let mut said = connection.call(&tool, arguments.clone()).await;
+        if matches!(said, Err(Error::SessionEnded)) {
+            let (connection, _) = self.ready(&entry).await?;
+            said = connection.call(&tool, arguments).await;
+            again = false;
+        }
         let name = &entry.server.name;
+        let said = match said {
+            Ok(said) => said,
+            Err(Error::Unauthorized(challenge)) => {
+                // Shown in /mcp, with signing in again offered.
+                *entry.state.lock().await = State::Failed(Failure::SignIn(challenge));
+                return Err(format!("the {name} server wants the user to sign in again, which /mcp offers"));
+            }
+            Err(e) => Err(e.to_string()),
+        };
         let mut note = if again { format!("\n[rein: the {name} server had stopped, so rein started it again for this call.]") } else { String::new() };
         // A server that can't reach what it needs says so in its own
         // words, which may not say why: "the screen is locked".
-        if said.is_err() && self.launch.walled(&entry.server) && lock(&self.told).insert(name.clone()) {
+        if said.is_err()
+            && self.launch.walled(&entry.server)
+            && let Some(access) = entry.server.access()
+            && lock(&self.told).insert(name.clone())
+        {
             note.push_str(&format!(
                 "\n[rein: the {name} server runs {}. If that's why this failed, the user can let it out of the sandbox from /mcp: picking {name} there offers it.]",
-                walls(entry.server.access)
+                walls(access)
             ));
         }
         said.map(|said| said + &note).map_err(|said| said + &note)
+    }
+
+    /// `entry`'s server, ready to call: started again first if it stopped,
+    /// or its session ended, and whether it was.
+    async fn ready(&self, entry: &Entry) -> Result<(Arc<Connection>, bool), String> {
+        let mut state = entry.state.lock().await;
+        let again = !matches!(&*state, State::Ready(connection) if connection.channel.alive());
+        if again {
+            *state = match self.launch.start(&entry.server).await {
+                Ok(connection) => State::Ready(Arc::new(connection)),
+                Err(why) => State::Failed(why),
+            };
+        }
+        match &*state {
+            State::Ready(connection) => Ok((connection.clone(), again)),
+            State::Failed(why) => Err(format!("the {} server had stopped, and didn't start again: {why}", entry.server.name)),
+            State::Starting => Err(format!("the {} server didn't start", entry.server.name)),
+        }
     }
 
     /// Each server, and how it's doing now, without waiting for any.

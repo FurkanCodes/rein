@@ -14,7 +14,7 @@
 //! Spec: <https://developers.openai.com/siwc/token-sharing-open-source/sign-in>
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -48,8 +48,6 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const REFRESH_MARGIN_SECS: u64 = 180;
 /// How long a token request may take.
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a window waits for another one renewing the sign-in.
-const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Everything kept after signing in. Store it so only the user can read it.
 /// Its `Debug` leaves the tokens out.
@@ -139,7 +137,7 @@ impl Session {
         if !stale(&credentials) {
             return Ok(credentials.access_token);
         }
-        let _every_window = lock_file(&self.path.with_extension("lock")).await?;
+        let _every_window = store::lock_file(&self.path.with_extension("lock"), "another rein window is still renewing your ChatGPT sign-in; try again in a moment").await?;
         // Another window may have renewed it while this one waited.
         let credentials = self.load()?;
         if !stale(&credentials) {
@@ -157,26 +155,6 @@ impl Session {
 
     fn load(&self) -> Result<Credentials> {
         store::read_json(&self.path)?.ok_or_else(|| auth_error("you're not signed in with ChatGPT any more; run `rein login`"))
-    }
-}
-
-/// Takes the lock on renewing that every rein window shares, waiting a while
-/// for a window that holds it. It's let go when the file is dropped, or when
-/// its process ends however it ends.
-async fn lock_file(path: &Path) -> Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(false).write(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options.open(path)?;
-    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
-            Err(std::fs::TryLockError::WouldBlock) => return Err(auth_error("another rein window is still renewing your ChatGPT sign-in; try again in a moment")),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-        }
     }
 }
 

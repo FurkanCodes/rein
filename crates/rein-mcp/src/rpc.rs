@@ -38,6 +38,16 @@ pub enum Error {
     Refused { code: i64, message: String },
     /// It answered with something rein can't read.
     Unreadable(String),
+    /// It couldn't be reached over the network: why.
+    Unreachable(String),
+    /// It answered over HTTP with this status, saying this, not an answer.
+    Http { status: u16, said: String },
+    /// It wants you to sign in, as its `WWW-Authenticate` says (or more:
+    /// a sign-in for more than it was given).
+    Unauthorized(String),
+    /// Its session ended: it doesn't know the one rein sent. Nothing sent
+    /// in it was taken, so it may be sent again in a new one.
+    SessionEnded,
 }
 
 impl std::fmt::Display for Error {
@@ -49,6 +59,11 @@ impl std::fmt::Display for Error {
             Error::TimedOut { what, after } => write!(f, "it didn't answer {what} within {}s", after.as_secs()),
             Error::Refused { code, message } => write!(f, "{message} (error {code})"),
             Error::Unreadable(what) => write!(f, "it said something rein can't read: {what}"),
+            Error::Unreachable(why) => write!(f, "rein couldn't reach it: {why}"),
+            Error::Http { status, said } if said.is_empty() => write!(f, "it answered {status}"),
+            Error::Http { status, said } => write!(f, "it answered {status}: {said}"),
+            Error::Unauthorized(_) => f.write_str("it needs you to sign in"),
+            Error::SessionEnded => f.write_str("its session ended"),
         }
     }
 }
@@ -214,31 +229,41 @@ async fn read(
 fn take(line: &[u8], waiting: &Waiting, lines: &mpsc::UnboundedSender<String>) {
     // What isn't JSON is a server printing where it shouldn't: let it be.
     let Ok(message) = serde_json::from_slice::<Value>(line) else { return };
-    match (message.get("method").and_then(Value::as_str), message.get("id")) {
-        // rein says it can do none of what servers may ask a client for
-        // (sampling, roots, elicitation), so only `ping` is to be expected.
-        (Some(method), Some(id)) => {
-            let answer = if method == "ping" {
-                json!({ "jsonrpc": "2.0", "id": id, "result": {} })
-            } else {
-                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("rein doesn't do {method}") } })
-            };
-            let _ = lines.send(answer.to_string());
-        }
-        (Some(_), None) => {}
-        (None, Some(id)) => {
-            let Some(tx) = id.as_u64().and_then(|id| locked(waiting).remove(&id)) else { return };
-            let answer = match message.get("error") {
-                Some(error) => Err(Error::Refused {
-                    code: error.get("code").and_then(Value::as_i64).unwrap_or_default(),
-                    message: crate::clean::text(error.get("message").and_then(Value::as_str).unwrap_or("an error, unsaid")),
-                }),
-                None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
-            };
-            let _ = tx.send(answer);
-        }
-        (None, None) => {}
+    if let Some(reply) = reply(&message) {
+        let _ = lines.send(reply.to_string());
+    } else if let Some((id, answer)) = answer(&message)
+        && let Some(tx) = locked(waiting).remove(&id)
+    {
+        let _ = tx.send(answer);
     }
+}
+
+/// rein's reply to `message`, if it's a request of the server's. rein says
+/// it can do none of what servers may ask a client for (sampling, roots,
+/// elicitation), so only `ping` is to be expected.
+pub(crate) fn reply(message: &Value) -> Option<Value> {
+    let (method, id) = (message.get("method")?.as_str()?, message.get("id")?);
+    Some(if method == "ping" {
+        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    } else {
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("rein doesn't do {method}") } })
+    })
+}
+
+/// The answer `message` is, to the request with its ID, if it's one.
+pub(crate) fn answer(message: &Value) -> Option<(u64, Result<Value, Error>)> {
+    if message.get("method").is_some() {
+        return None;
+    }
+    let id = message.get("id")?.as_u64()?;
+    let answer = match message.get("error") {
+        Some(error) => Err(Error::Refused {
+            code: error.get("code").and_then(Value::as_i64).unwrap_or_default(),
+            message: crate::clean::text(error.get("message").and_then(Value::as_str).unwrap_or("an error, unsaid")),
+        }),
+        None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+    };
+    Some((id, answer))
 }
 
 enum Read {

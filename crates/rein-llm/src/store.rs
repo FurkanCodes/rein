@@ -10,12 +10,36 @@ use serde::de::DeserializeOwned;
 
 use crate::{Error, Result};
 
+/// How long a window waits for another that holds a lock to let it go.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `$REIN_HOME` if set, otherwise `~/.config/rein`.
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("REIN_HOME") {
         return Some(dir.into());
     }
     std::env::home_dir().map(|home| home.join(".config").join("rein"))
+}
+
+/// Takes the lock at `path` that every rein window shares, waiting a while
+/// for a window that holds it; `busy` is what's said if it doesn't let go.
+/// It's let go when the file is dropped, or when its process ends however
+/// it ends.
+pub(crate) async fn lock_file(path: &Path, busy: &str) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path)?;
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Auth(busy.to_owned())),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
 }
 
 /// Reads a JSON file, or returns `None` if it doesn't exist. One that isn't

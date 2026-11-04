@@ -138,6 +138,10 @@ finding. Each says why in a line.
 - Protect what runs later, not only what runs now: hooks, git's config, rule
   files, editors' and agents' settings. A command that plants one escapes on
   your next commit.
+- An MCP server at a URL gets a token for its URL alone (`resource`), from
+  a sign-in that takes PKCE or none at all, and the token goes only there:
+  over https, or plain http to this computer, never across a redirect to
+  another server. A header you gave it wins over rein's sign-in.
 - An MCP server is a command, someone else's: it runs in the sandbox like
   one, and a project's starts only once you've said yes to all of what it
   runs (command, arguments, environment), never to its name. Cursor went by
