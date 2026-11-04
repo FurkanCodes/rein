@@ -41,22 +41,50 @@ impl Row {
         }
     }
 
-    /// How it's doing in a few words, for the list to pick from.
+    /// How it's doing, and where it runs or is reached, for the list to
+    /// pick from: all `/mcp` shows, before one is picked.
     fn about(&self) -> String {
         match self {
-            Row::Running(_, _, Also::FailedInWalls) => "● a call failed in the sandbox".into(),
-            Row::Running(_, Status::Ready(tools), _) => format!("● {} tool{}", tools.len(), if tools.len() == 1 { "" } else { "s" }),
-            Row::Running(_, Status::Failed(Failure::SignIn(_)), _) => "✗ needs you to sign in".into(),
-            Row::Running(_, Status::Starting, _) => "◌ starting".into(),
-            Row::Running(_, Status::Stopped, _) => "◌ stopped; it starts again on its next call".into(),
-            Row::Running(_, Status::Failed(Failure::Needs(name)), _) => format!("✗ needs {name}"),
-            Row::Running(_, Status::Failed(Failure::InWalls(_)), _) => "✗ didn't start in the sandbox".into(),
-            Row::Running(_, Status::Failed(Failure::NoSandbox), _) => "✗ no sandbox here to start it in".into(),
-            Row::Running(_, Status::Failed(Failure::Other(why)), _) => format!("✗ {}", why.lines().next().unwrap_or("didn't start")),
-            Row::Off(_) => "– off".into(),
-            Row::Waiting(_) => "⏸ waiting for your yes".into(),
+            Row::Running(server, status, also) => {
+                let mut about = format!("{} · {}", doing(status), place(server));
+                match also {
+                    Also::FailedInWalls => about.push_str(" · a call failed in the sandbox"),
+                    Also::SignedIn => about.push_str(" · signed in"),
+                    Also::Nothing => {}
+                }
+                if server.origin == Origin::Project {
+                    about.push_str(" · the project's");
+                }
+                about
+            }
+            Row::Off(server) => format!("– off · {}", place(server)),
+            Row::Waiting(_) => "⏸ waiting for your yes · the project's".into(),
             Row::Skipped(skipped) => format!("– can't start: {}", skipped.why),
         }
+    }
+}
+
+/// How a server is doing, in a few words, marked: its tools counted, or
+/// the start of why it didn't start.
+fn doing(status: &Status) -> String {
+    match status {
+        Status::Ready(tools) => format!("● {} tool{}", tools.len(), if tools.len() == 1 { "" } else { "s" }),
+        Status::Starting => "◌ starting".into(),
+        Status::Stopped => "◌ stopped; it starts again on its next call".into(),
+        Status::Failed(Failure::Needs(name)) => format!("✗ needs {name}"),
+        Status::Failed(Failure::SignIn(_)) => "✗ needs you to sign in".into(),
+        Status::Failed(Failure::InWalls(_)) => "✗ didn't start in the sandbox".into(),
+        Status::Failed(Failure::NoSandbox) => "✗ no sandbox here to start it in".into(),
+        Status::Failed(Failure::Other(why)) => format!("✗ {}", why.lines().next().unwrap_or("didn't start")),
+    }
+}
+
+/// Where `server` runs, or is reached.
+fn place(server: &Server) -> String {
+    match &server.reach {
+        Reach::Local(local) if local.access.walls().is_some() => format!("sandbox ({})", local.access),
+        Reach::Local(_) => "outside the sandbox".to_owned(),
+        Reach::Remote(remote) => host(&remote.url).to_owned(),
     }
 }
 
@@ -178,14 +206,16 @@ fn actions(row: Row) -> Vec<Action> {
 /// `/mcp`: how each server is doing, then, in a conversation's box, the one
 /// to change, and how.
 pub(super) async fn panel(mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
-    show(mcp, terminal);
+    let rows = rows(mcp);
+    // The list to pick from says all the table would: it isn't said twice.
+    if !terminal.input.pinned() || rows.is_empty() {
+        show(mcp, terminal);
+    }
     if !terminal.input.pinned() {
         return Ok(());
     }
-    let rows = rows(mcp);
     // After the servers, a new one: looked up, or brought from other apps.
-    let more =
-        [("+ add a server", "look one up in the MCP Registry"), ("+ bring servers from other apps", "Claude Code, Claude Desktop, Cursor, Codex, VS Code, Windsurf, Gemini CLI")];
+    let more = [("+ add", "a server, looked up in the MCP Registry"), ("+ import", "yours, from Claude Code, Claude Desktop, Cursor, Codex, VS Code, Windsurf, Gemini CLI")];
     let items = rows.iter().map(|row| (row.name().to_owned(), row.about())).chain(more.iter().map(|(name, about)| ((*name).to_owned(), (*about).to_owned()))).collect();
     let title = if rows.is_empty() { "add a server" } else { "change which server" };
     let Some(picked) = terminal.input.choose(Menu { title: title.into(), items, current: None, at: None }).await else { return Ok(()) };
@@ -302,11 +332,11 @@ async fn choose_tools(server: &Server, tools: &[String], mcp: &Mcp, agent: &mut 
     set_allow(&server.name, &allow, mcp, agent, terminal)
 }
 
-/// What `/mcp` says: a line for each server, whose it is, where it runs
-/// or is reached, and how it's doing, then those off, waiting for your
-/// yes, or not started, and why. Each line is cut to the window as it's
-/// drawn, and drawn again when the window changes: picking a server shows
-/// the rest, its tools and all.
+/// What `/mcp` says where there's no list to pick from: a line for each
+/// server, whose it is, where it runs or is reached, and how it's doing,
+/// then those off, waiting for your yes, or not started, and why. Each
+/// line is cut to the window as it's drawn, and drawn again when the
+/// window changes.
 fn show(mcp: &Mcp, terminal: &Terminal) {
     let (pad, s) = (" ".repeat(GUTTER), terminal.err);
     let rows = rows(mcp);
@@ -320,11 +350,7 @@ fn show(mcp: &Mcp, terminal: &Terminal) {
         .map(|row| {
             let (whose, how) = match row {
                 Row::Running(server, status, also) => {
-                    let place = match &server.reach {
-                        Reach::Local(local) if local.access.walls().is_some() => format!("sandbox ({})", local.access),
-                        Reach::Local(_) => "outside the sandbox".to_owned(),
-                        Reach::Remote(remote) => host(&remote.url).to_owned(),
-                    };
+                    let place = place(server);
                     let more = match also {
                         Also::FailedInWalls => s.yellow(" · a call failed in the sandbox, which may be why"),
                         Also::SignedIn => s.dim(" · signed in"),
@@ -342,7 +368,7 @@ fn show(mcp: &Mcp, terminal: &Terminal) {
     let names = shown.iter().map(|(name, ..)| name.chars().count()).max().unwrap_or(0);
     let whose = shown.iter().map(|(_, whose, _)| whose.chars().count()).max().unwrap_or(0);
     let mut lines: Vec<String> = shown.into_iter().map(|(name, said, how)| format!("{pad}{name:<names$}  {}  {how}", s.dim(&format!("{said:<whose$}")))).collect();
-    lines.push(format!("{pad}{}", s.dim("Pick one below to see its tools and change it. The model sees them as mcp__<server>__<tool>.")));
+    lines.push(format!("{pad}{}", s.dim("The model sees a server's tools as mcp__<server>__<tool>.")));
     crate::ui::screen::show(Box::new(move |width| lines.iter().map(|line| crate::ui::style::fit(line, width.saturating_sub(1))).collect()));
 }
 

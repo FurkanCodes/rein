@@ -2734,7 +2734,7 @@ fn an_mcp_server_of_yours_starts_in_the_sandbox_and_its_tools_ask_unless_allowed
     let tools = model.requests()[0]["tools"][0]["tools"].as_array().cloned().unwrap_or_default();
     let echo = tools.iter().find(|tool| tool["name"] == "mcp__fake__echo").expect("offered from the first request");
     assert_eq!(echo["strict"], false, "a server's schema isn't held to strict mode");
-    wait_for_mcp(&mut term, "fake  yours · sandbox (network)  ● 5 tools");
+    wait_for_mcp(&mut term, "● 5 tools · sandbox (network)");
 }
 
 /// A project's .mcp.json may be anyone's: its server starts only once
@@ -2753,7 +2753,7 @@ fn a_projects_mcp_server_starts_only_once_you_say_yes_to_it_as_it_is() {
     term.wait_for(IDLE);
     // Said no, it waits in /mcp for a yes, without starting rein again.
     term.keys("/mcp\r");
-    term.wait_for("waiting for your yes: pick it to start it");
+    term.wait_for("⏸ waiting for your yes · the project's");
     pick(&mut term, "fake");
     pick(&mut term, "start");
     term.wait_for("Start fake, an MCP server");
@@ -2856,7 +2856,7 @@ fn a_server_that_fails_in_the_sandbox_is_offered_to_run_outside_it() {
     term.wait_for(IDLE);
     let file: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/mcp.json")).unwrap()).unwrap();
     assert_eq!(file["mcpServers"]["fake"]["access"], "outside", "{file}");
-    wait_for_mcp(&mut term, "yours · outside the sandbox");
+    wait_for_mcp(&mut term, "● 5 tools · outside the sandbox");
 }
 
 /// `/mcp` lists the servers to pick one and change it: which of its tools
@@ -2894,7 +2894,7 @@ fn mcp_lets_you_pick_a_server_and_change_it_without_typing_its_name() {
     term.wait_for(IDLE);
     assert_eq!(file()["disabled"], true);
     term.keys("/mcp\r");
-    term.wait_for("off: pick it to turn it on");
+    term.wait_for("– off · sandbox (network)");
     pick(&mut term, "fake");
     pick(&mut term, "turn it on");
     term.wait_for("fake  5 tools: echo");
@@ -2903,12 +2903,12 @@ fn mcp_lets_you_pick_a_server_and_change_it_without_typing_its_name() {
     assert_eq!(file()["allow"], json!(["echo", "has"]), "what it let run is kept");
 }
 
-/// `/mcp` gives each server one line, cut to the window: its tools counted,
-/// not named, and why one didn't start begun, the rest of both shown when
-/// it's picked.
+/// `/mcp` lists each server once, in the list to pick from, a line each
+/// cut to the window: how it's doing, its tools counted, and where it runs.
+/// Picked, it shows its tools by name, or why it didn't start in full.
 #[cfg(target_os = "macos")]
 #[test]
-fn mcp_gives_each_server_a_line_cut_to_the_window() {
+fn mcp_lists_each_server_once_a_line_each_cut_to_the_window() {
     let mut model = Model::start(Vec::new());
     let gone = "./Some App.app/Contents/SharedSupport/Helper.app/Contents/MacOS/Helper";
     model
@@ -2917,12 +2917,16 @@ fn mcp_gives_each_server_a_line_cut_to_the_window() {
     let mut term = Term::start_with(&model, "mcp-lines", 30, 60, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
     wait_for_mcp(&mut term, "● 5 tools");
+    term.keys("/mcp\r");
+    term.wait_for(PICKING);
     let text = term.text();
-    let line = text.lines().rfind(|line| line.trim_start().starts_with("gone")).unwrap_or_else(|| panic!("{text}"));
-    assert!(line.ends_with('…') && line.contains("✗ its command"), "one line, cut: {line:?}\n{text}");
-    assert!(!text.contains("Helper.app"), "not the rest of why:\n{text}");
-    let fake = text.lines().rfind(|line| line.trim_start().starts_with("fake")).unwrap_or_default();
-    assert!(fake.trim_end().ends_with("● 5 tools"), "its tools counted, not named: {fake:?}");
+    term.keys("\x1b");
+    term.wait_for(IDLE);
+    assert!(!text.contains("yours ·") && !text.contains("mcp__<server>"), "no table above the list: it would say it all twice\n{text}");
+    let line = text.lines().rfind(|line| line.contains("gone")).unwrap_or_else(|| panic!("{text}"));
+    assert!(line.trim_end().ends_with('…') && line.contains("✗ its command"), "one line, cut: {line:?}\n{text}");
+    let fake = text.lines().rfind(|line| line.contains("fake")).unwrap_or_default();
+    assert!(fake.trim_end().ends_with("● 5 tools · sandbox (network)"), "its tools counted, not named, and where it runs: {fake:?}");
     term.keys("/mcp\r");
     pick(&mut term, "gone");
     term.wait_until("why, in full", |screen| screen.replace('\n', "").contains("Helper, isn't there"));
@@ -2952,7 +2956,7 @@ fn a_key_a_server_needs_is_asked_for_kept_and_hidden() {
 
     let mut term = term.again(&model);
     term.wait_for(IDLE);
-    wait_for_mcp(&mut term, "fake  yours");
+    wait_for_mcp(&mut term, "● 5 tools");
     assert!(!term.text().contains("needs REIN_SCREEN_FAKE_TOKEN"), "kept: not asked again\n{}", term.text());
     term.keys("\x04");
     term.wait_exit();

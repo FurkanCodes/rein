@@ -611,7 +611,7 @@ README gives after `/mcp add`, as it is:
 rein starts it at once and says how it did, and the model is offered its
 tools from your next message.
 
-`/mcp` lists the servers, then lets you pick one and change it: choose the
+`/mcp` lists the servers to pick one and change it: choose the
 tools that run without asking, change its walls, restart it, turn it off
 (it stays in your file, `"disabled": true`) or on, or remove it. A
 project's server you said no to waits there for a yes. Typed, the same is
@@ -680,9 +680,9 @@ What a server says is cleaned before you or the model see it: escape codes,
 and characters a terminal doesn't draw, are taken out. A call may take 5
 minutes. A long result is cut, and kept whole in a file in the temp folder
 for the model to read in parts. A server that stops is started again on its
-next call. `/mcp` shows a line for each server: where it runs or is
-reached, and how many tools it has, or why it didn't start, each cut to
-the window. Pick one to see its tools by name and why in full. When one of a server's calls fails in the sandbox, the model
+next call. `/mcp` lists each server once, a line each, to pick from: how
+it's doing (its tools counted, or why it didn't start) and where it runs
+or is reached. Pick one to see its tools by name, and why in full. When one of a server's calls fails in the sandbox, the model
 is told once that the sandbox may be why, and that you can let it out from
 `/mcp`.
 
