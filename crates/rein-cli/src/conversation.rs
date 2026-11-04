@@ -160,6 +160,9 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     agent.finds_tools = setup.finds_tools(&agent.model_name);
     agent.sees = setup.sees(&agent.model_name);
     crate::search::follow(&mut agent, &setup).await;
+    // A task run with -p asks nothing: a project's skills wait for a yes.
+    let skills = crate::skills::find(&root, &mut terminal, args.prompt.is_none()).await;
+    agent.set_skills(skills);
     terminal.effort = crate::effort::now(&agent);
     if let Some(why) = crate::effort::unlike_chosen(&agent) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("({why})")));
@@ -552,7 +555,15 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
             continue;
         }
         let pad = " ".repeat(GUTTER);
-        match crate::commands::parse(line) {
+        // A skill called by name goes with the message, as it was typed.
+        let parsed = match crate::skills::called(line, agent.skills()) {
+            Some(skill) => {
+                agent.call_skill(&skill);
+                None
+            }
+            None => crate::commands::parse(line),
+        };
+        match parsed {
             Some(Ok(Slash::Exit)) => break,
             Some(parsed) => {
                 // A line that may hold a key is shown again without it.
@@ -725,6 +736,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             }
         }
         Slash::Undo => crate::undo::command(agent, terminal).await?,
+        Slash::Skills => crate::skills::command(agent, terminal, &setup.root).await?,
         Slash::Search(with) => crate::search::command(with, agent, terminal, setup).await?,
         Slash::New => {
             let (loaded, context) = setup.open(None, &setup.current(agent))?;

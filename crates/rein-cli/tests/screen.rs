@@ -3132,6 +3132,42 @@ fn ctrl_v_over_ssh_says_the_clipboard_is_elsewhere() {
     assert!(model.requests().is_empty(), "nothing sent");
 }
 
+/// Your skills are offered to the model, which loads one when a task fits;
+/// `/name` calls one with your message. A project's are used only once
+/// you've said yes to them.
+#[test]
+fn skills_are_loaded_by_the_model_and_called_by_name() {
+    let load = calls("skill", json!({ "name": "graphs", "file": null, "start_line": null }));
+    let mut model = Model::start(vec![load, says("Drawn with boxes."), says("Reviewed.")]);
+    model.home.push((".agents/skills/graphs/SKILL.md".into(), "---\nname: graphs\ndescription: Draw a project's modules as a graph.\n---\nUse boxes and arrows.\n".into()));
+    let skill = "---\nname: review\ndescription: How this project is reviewed.\n---\nCheck the tests.\n";
+    let mut term = Term::start_with(&model, "skills", 30, 110, &[(".agents/skills/review/SKILL.md", skill)]);
+    term.wait_for("Use this project's skills: review?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for(IDLE);
+    term.keys("draw the modules\r");
+    term.wait_for("Drawn with boxes.");
+    let text = term.text();
+    assert!(text.contains("Skill  graphs  loaded, 1 line"), "{text}");
+    let requests = model.requests();
+    let tools = requests[0]["tools"][0]["tools"].as_array().cloned().unwrap_or_default();
+    let tool = tools.iter().find(|tool| tool["name"] == "skill").expect("offered");
+    assert_eq!(tool["parameters"]["properties"]["name"]["enum"], json!(["review", "graphs"]), "the project's first, once said yes to");
+    assert!(tool["description"].as_str().unwrap().contains("- review (the project's): How this project is reviewed."));
+    assert!(results(&model)[0].contains("Use boxes and arrows."));
+    term.wait_for(IDLE);
+    term.keys("/review the last change\r");
+    term.wait_for("Reviewed.");
+    let input = model.requests()[2]["input"].as_array().cloned().unwrap_or_default();
+    assert!(
+        input.iter().any(|item| item["type"] == "function_call_output" && item["output"].as_str().is_some_and(|o| o.contains("Check the tests."))),
+        "called with the message: {input:?}"
+    );
+    let saved = std::fs::read_to_string(term.dir.join("home/skills-trusted.json")).unwrap();
+    assert!(saved.contains("project"), "the yes kept: {saved}");
+}
+
 /// A project's .mcp.json may be anyone's: its server starts only once
 /// you've said yes to it as it is, and is asked about again once it
 /// changes.

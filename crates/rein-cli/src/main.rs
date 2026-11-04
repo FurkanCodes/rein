@@ -34,6 +34,7 @@ mod peers;
 mod rules;
 mod search;
 mod settings;
+mod skills;
 use settings::Settings;
 mod terminal;
 mod ui;

@@ -75,6 +75,9 @@ const READABLE: &[&str] = &[
     ".local/share/mise",
     // Caches.
     ".cache",
+    // Skills, whose scripts a skill has commands run: read, never changed.
+    ".agents/skills",
+    ".claude/skills",
     // Git's and Go's own settings, and the text encoding macOS programs
     // read at start.
     ".gitconfig",

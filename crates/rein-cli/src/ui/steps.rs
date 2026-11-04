@@ -81,6 +81,10 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
         Some(ToolName::Recall) => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
         Some(ToolName::ToolSearch) => ("Find tools", args["query"].as_str().unwrap_or_default().to_owned()),
         Some(ToolName::WebSearch) => ("Search", args["query"].as_str().unwrap_or_default().to_owned()),
+        Some(ToolName::Skill) => {
+            let file = args["file"].as_str().map(|file| format!(": {file}")).unwrap_or_default();
+            ("Skill", format!("{}{file}", args["name"].as_str().unwrap_or_default()))
+        }
         // To another rein: who to, then the first line of what.
         Some(tool @ (ToolName::Message | ToolName::Delegate)) => {
             let what = args[if tool == ToolName::Message { "text" } else { "task" }].as_str().unwrap_or_default();
@@ -310,6 +314,11 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
         // What it found, by server, as rein said it.
         Some(ToolName::ToolSearch) => plain(Some(true), style.dim(&first_line(output))),
         Some(ToolName::WebSearch) => searched(output, style),
+        Some(ToolName::Skill) if output.starts_with("[unchanged:") => plain(Some(true), style.dim("unchanged: already in the conversation")),
+        Some(ToolName::Skill) => {
+            let lines = output.lines().count().saturating_sub(2);
+            plain(Some(true), style.dim(&format!("loaded, {lines} line{}", if lines == 1 { "" } else { "s" })))
+        }
         Some(ToolName::Recall) => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
             if found == 0 { plain(Some(true), style.dim("nothing found")) } else { plain(Some(true), style.dim(&format!("{found} match{}", if found == 1 { "" } else { "es" }))) }

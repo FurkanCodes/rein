@@ -15,6 +15,7 @@ pub mod prompt;
 pub mod redact;
 pub mod search;
 pub mod session;
+pub mod skills;
 pub mod tools;
 pub mod undo;
 pub mod web;

@@ -163,6 +163,11 @@ async fn all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     outputs.into_iter().flatten().collect()
 }
 
+/// What the model is told of skills, when there are some.
+const SKILLS: &str = "# Skills\nThe skill tool lists skills: instructions for kinds of task, the user's own or the project's. \
+                      Before you start a task, small ones too, check whether one fits it; if one does, load it first and \
+                      follow it.";
+
 /// What a step the model asked for gets instead of running, when the user
 /// wrote before it started: what it was for may no longer hold.
 pub const SKIPPED: &str = "Not run: the user sent a message before this step started. It follows; act on it.";
@@ -323,6 +328,11 @@ pub struct Agent<M> {
     pub sees: rein_llm::Sees,
     /// Images you pasted, to go with your next message.
     pasted: Vec<rein_llm::Image>,
+    /// The skills found: the model loads them with `skill` (see
+    /// [`Agent::set_skills`]).
+    skills: crate::skills::Skills,
+    /// The skills you called with `/name`, to load with your next message.
+    called: Vec<String>,
     /// How many steps (answers from the model) a turn may take before it's
     /// stopped, and the model asked to sum up: `None` while someone is
     /// watching, who can press Esc; a number when nobody is.
@@ -433,6 +443,29 @@ impl<M: Model> Agent<M> {
             self.specs.insert(at, crate::web::spec());
         }
         self.searcher = searcher;
+    }
+
+    /// The skills the model may load with `skill`, and you with `/name`:
+    /// offered from the next request. Set before the first, it changes
+    /// nothing that's cached.
+    pub fn set_skills(&mut self, skills: crate::skills::Skills) {
+        let named = ToolName::Skill.as_str();
+        self.specs.retain(|tool| tool.name != named);
+        if let Some(spec) = crate::skills::spec(&skills) {
+            let at = self.specs.iter().position(|tool| rein_mcp::is_mcp(&tool.name) || tool.loading == Loading::Search).unwrap_or(self.specs.len());
+            self.specs.insert(at, spec);
+        }
+        self.skills = skills;
+    }
+
+    /// The skills found, and those left out.
+    pub fn skills(&self) -> &crate::skills::Skills {
+        &self.skills
+    }
+
+    /// The skill `name`, which you called, goes with your next message.
+    pub fn call_skill(&mut self, name: &str) {
+        self.called.push(name.to_owned());
     }
 
     /// Who searches the web for the model, if anyone.
@@ -600,6 +633,15 @@ impl<M: Model> Agent<M> {
                 }
                 continue;
             }
+            // And loading a skill: what it says, from its own folder.
+            if ToolName::of(&call) == Some(ToolName::Skill) {
+                ui.tool_started(&call);
+                let output = self.skill_output(&call.arguments);
+                if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
+                    return self.stop_stuck(stuck, &calls[next..], ui);
+                }
+                continue;
+            }
             // So is finding the tools held back: what it finds, the model
             // is shown from then on, as its provider loads them.
             if ToolName::of(&call) == Some(ToolName::ToolSearch) {
@@ -740,6 +782,13 @@ impl<M: Model> Agent<M> {
     /// says so instead of a second copy. A mention inside a folder with
     /// its own AGENTS.md brings that along, once.
     async fn attach(&mut self, message: &str, ui: &mut impl Ui) -> Result<()> {
+        // A skill you called comes as a load made for you.
+        for name in std::mem::take(&mut self.called) {
+            let arguments = json!({ "name": name, "file": null, "start_line": null }).to_string();
+            let call = ToolCall { call_id: format!("mention_{}", self.window.full.len()), name: ToolName::Skill.as_str().into(), arguments };
+            let output = self.skill_output(&call.arguments);
+            self.attached(call, output, ui)?;
+        }
         // What you pasted comes as a read made for you, as what you name
         // with @ does: an image is always some call's.
         for image in std::mem::take(&mut self.pasted) {
@@ -793,6 +842,23 @@ impl<M: Model> Agent<M> {
     /// `image`, which you pasted, goes with your next message.
     pub fn paste(&mut self, image: rein_llm::Image) {
         self.pasted.push(image);
+    }
+
+    /// What loading a skill as `arguments` ask gives, or that it's as it
+    /// was when it was loaded before: it's in the conversation already.
+    fn skill_output(&self, arguments: &str) -> String {
+        let output = crate::skills::load(&self.skills, arguments);
+        let before = self.history.iter().any(|item| matches!(item, Item::ToolResult { output: earlier, .. } if *earlier == output));
+        match serde_json::from_str::<Value>(arguments) {
+            Ok(asked) if before && !output.starts_with(crate::tools::ERROR) => {
+                format!(
+                    "{} the skill {} is as it was when it was loaded earlier in this conversation, so that copy is current.]",
+                    compact::UNCHANGED,
+                    asked["name"].as_str().unwrap_or_default()
+                )
+            }
+            _ => output,
+        }
     }
 
     /// Records the images the call `call_id` gave, right after its result.
@@ -922,6 +988,8 @@ impl<M: Model> Agent<M> {
         if let Some(again) = compact::found_again(&self.history[..start], &kept, format!("found_again_{}", self.window.full.len())) {
             kept.splice(0..0, again);
         }
+        let skills = compact::skills_again(&self.history[..start], &kept, &format!("skill_again_{}", self.window.full.len()));
+        kept.splice(0..0, skills);
         compact::retire(&mut kept, &retired);
         // The kept part follows the summary now, not what its thinking was
         // signed with.
@@ -960,6 +1028,8 @@ impl<M> Agent<M> {
             searcher: None,
             sees: rein_llm::Sees::Unknown,
             pasted: Vec::new(),
+            skills: Default::default(),
+            called: Vec::new(),
             step_limit: None,
             instructions: header.instructions,
             servers_say: Vec::new(),
@@ -1004,6 +1074,8 @@ impl<M> Agent<M> {
             searcher,
             sees,
             pasted,
+            skills,
+            called,
             step_limit,
             specs,
             listed,
@@ -1027,6 +1099,8 @@ impl<M> Agent<M> {
             searcher,
             sees,
             pasted,
+            skills,
+            called,
             step_limit,
             specs,
             listed,
@@ -1098,18 +1172,20 @@ impl<M> Agent<M> {
     /// say of using their tools, each in its own words. Claude Code puts
     /// them there too: codegraph's say to call it before reading files.
     fn system(&self) -> Option<String> {
-        if self.servers_say.is_empty() {
-            return self.instructions.clone();
+        let mut sections: Vec<String> = self.instructions.iter().cloned().collect();
+        // Said here too, not only in the tool: told only there, a model
+        // left a skill that fit a small task unloaded.
+        if self.specs.iter().any(|tool| tool.name == ToolName::Skill.as_str()) {
+            sections.push(SKILLS.to_owned());
         }
-        let said: Vec<String> = self.servers_say.iter().map(|(server, text)| format!("## {server}\n{}", text.trim())).collect();
-        let section = format!(
-            "# What the MCP servers say of using them\nEach server's own words about its tools (mcp__<server>__<tool>): the server's, not the user's.\n\n{}",
-            said.join("\n\n")
-        );
-        Some(match &self.instructions {
-            Some(instructions) => format!("{instructions}\n\n{section}"),
-            None => section,
-        })
+        if !self.servers_say.is_empty() {
+            let said: Vec<String> = self.servers_say.iter().map(|(server, text)| format!("## {server}\n{}", text.trim())).collect();
+            sections.push(format!(
+                "# What the MCP servers say of using them\nEach server's own words about its tools (mcp__<server>__<tool>): the server's, not the user's.\n\n{}",
+                said.join("\n\n")
+            ));
+        }
+        (!sections.is_empty()).then(|| sections.join("\n\n"))
     }
 
     /// A request carrying `input`, borrowed: nothing is copied, but the
@@ -1773,6 +1849,8 @@ mod tests {
             searcher: None,
             sees: rein_llm::Sees::Unknown,
             pasted: Vec::new(),
+            skills: Default::default(),
+            called: Vec::new(),
             step_limit: None,
             session_id: Some("session-1".into()),
             history: Vec::new(),
@@ -1945,6 +2023,40 @@ mod tests {
         let mentioned = agent.history.iter().any(|item| matches!(item, Item::Image { call_id, .. } if call_id.starts_with("mention_")));
         assert!(mentioned, "{:?}", agent.history);
         assert!(!agent.model.requests.borrow().last().unwrap().images, "a model that can't see: said in words");
+    }
+
+    /// The model loads a skill when a task fits, and gets it once: again,
+    /// it's said to be in the conversation already. One you call goes with
+    /// your message, as a load made for you.
+    #[tokio::test]
+    async fn a_skill_is_loaded_by_the_model_or_with_your_message() {
+        let load = |id: &str| {
+            vec![Item::ToolCall(ToolCall { call_id: id.into(), name: "skill".into(), arguments: json!({ "name": "graphs", "file": null, "start_line": null }).to_string() })]
+        };
+        let mut agent = agent("skills", vec![load("k1"), load("k2"), vec![Item::Assistant("Drawn.".into())], vec![Item::Assistant("Again.".into())]]);
+        assert!(agent.system().is_none_or(|system| !system.contains("# Skills")), "no skills: nothing said of them");
+        let home = agent.tools.root().join("home");
+        std::fs::create_dir_all(home.join(".agents/skills/graphs")).unwrap();
+        std::fs::write(home.join(".agents/skills/graphs/SKILL.md"), "---\nname: graphs\ndescription: Draw graphs.\n---\nUse boxes and arrows.\n").unwrap();
+        agent.set_skills(crate::skills::find(&crate::skills::folders(&home, Some(&home), false)));
+        assert!(agent.specs.iter().any(|tool| tool.name == "skill" && tool.description.contains("- graphs: Draw graphs.")));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("draw the modules".into(), &mut person).await.unwrap();
+        assert!(result_of(&agent, "k1").contains("Use boxes and arrows."), "{}", result_of(&agent, "k1"));
+        assert!(
+            agent.model.requests.borrow()[0].instructions.as_deref().is_some_and(|system| system.contains("# Skills\nThe skill tool lists skills")),
+            "told in its instructions too"
+        );
+        assert!(result_of(&agent, "k2").starts_with(compact::UNCHANGED), "not twice: {}", result_of(&agent, "k2"));
+        agent.call_skill("graphs");
+        agent.send("/graphs the tests".into(), &mut person).await.unwrap();
+        let at = agent.history.iter().position(|item| matches!(item, Item::User(text) if text == "/graphs the tests")).unwrap();
+        assert!(matches!(&agent.history[at + 1], Item::ToolCall(call) if call.name == "skill" && call.call_id.starts_with("mention_")), "{:?}", agent.history[at + 1]);
+        assert!(
+            matches!(&agent.history[at + 2], Item::ToolResult { output, .. } if output.starts_with(compact::UNCHANGED)),
+            "loaded already this conversation: {:?}",
+            agent.history[at + 2]
+        );
     }
 
     /// An image you paste goes with your message, as a read made for you.

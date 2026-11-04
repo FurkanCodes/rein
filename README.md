@@ -221,6 +221,7 @@ message, so typing ahead can't answer it by accident.
 | `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/search [auto\|off\|model]` | which model searches the web for the model: the one in use as rein decides, one you pick, or none (see [Web search](#web-search)) |
+| `/skills`, `/<skill> [args]`, `/skill:<name>` | your skills and the project's, to turn one off, keep it for you to call, or turn it on; call one with your message (see [Skills](#skills)) |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/mcp`, `/mcp add`, `/mcp import`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one by name from the MCP Registry, as you'd start it in a shell, or from the JSON its README gives; bring yours in from other apps; the same changes typed (see [MCP servers](#mcp-servers)) |
 | `/undo` | put back what rein did to the project's files since a turn you pick, its commands' changes too (see [Undo](#undo)) |
@@ -494,6 +495,37 @@ screenshot or an image copied from a browser holds) made a PNG, by a
 script macOS runs itself; on Linux, `wl-paste` or `xclip`. Over SSH the
 clipboard is on the other computer: put the image in the project and name
 it with `@`.
+
+## Skills
+
+rein reads Agent Skills (agentskills.io): a folder with a `SKILL.md`,
+instructions for a kind of task. Yours are in `~/.agents/skills`, the
+folder harnesses share, and `~/.claude/skills`, Claude Code's; a
+project's in its `.agents/skills` and `.claude/skills`, used once you've
+said yes to them as they are (a change to any of their files asks again,
+and a task run with `-p` doesn't ask). A folder reached twice through a
+link counts once; where two skills share a name, the project's comes
+before yours, and `~/.agents` before `~/.claude`; `/skills` says what was
+left out and why.
+
+The model is offered one tool, `skill`, which lists every skill with what
+it's for, and loads one when a task fits it, or when you ask it to use
+skills: the skill's text, where its folder is and what's in it, whose
+files it reads with the same tool, never outside the folder. A long one
+comes in parts; one loaded already isn't sent again. Every name stays in
+the list, and descriptions are shortened alike to fit about 2,500 tokens
+of each request: 74 skills' come to 20,000 characters. A skill loaded
+before a compaction is loaded again after it.
+
+`/name` calls one with your message (`/graphify src`), and `/skill:name`
+does where rein has a command of that name. `disable-model-invocation`
+keeps a skill from the model, `user-invocable: false` from you.
+`/skills` turns one off, keeps it for you to call, or back on.
+
+A skill is someone's text: nothing in it runs because it's loaded, and
+its `allowed-tools` lets nothing run without asking. Its scripts run as
+commands do, in the sandbox, which reads the skill folders but never
+changes them.
 
 ## Web search
 

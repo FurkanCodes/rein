@@ -382,6 +382,52 @@ pub(crate) fn found_again(earlier: &[Item], kept: &[Item], id: String) -> Option
     Some([search, Item::Found { call_id: id, names }])
 }
 
+/// The most of the skills loaded before a summary that come again after
+/// it, in characters: about 6,000 tokens.
+const SKILLS_AGAIN: usize = 25_000;
+
+/// The skills loaded before the part kept word for word, loaded again at
+/// its start: a skill is instructions for the whole task, and a summary
+/// can't carry them. The latest first, as many as [`SKILLS_AGAIN`] holds;
+/// none the kept part loads itself. Each is a load as it was, with an ID
+/// made of `id`.
+pub(crate) fn skills_again(earlier: &[Item], kept: &[Item], id: &str) -> Vec<Item> {
+    let skill = ToolName::Skill.as_str();
+    let named = |items: &[Item]| -> HashMap<String, (String, String)> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolCall(call) if call.name == skill => {
+                    Some((call.call_id.clone(), (serde_json::from_str::<Value>(&call.arguments).ok()?["name"].as_str()?.to_owned(), call.arguments.clone())))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let (before, again) = (named(earlier), named(kept));
+    let loaded_again: BTreeSet<&str> = again.values().map(|(name, _)| name.as_str()).collect();
+    let mut latest: Vec<(&str, &str, &str)> = Vec::new();
+    for item in earlier.iter().rev() {
+        let Item::ToolResult { call_id, output } = item else { continue };
+        let Some((name, arguments)) = before.get(call_id) else { continue };
+        let whole = output.starts_with("<skill ") && !loaded_again.contains(name.as_str()) && !latest.iter().any(|(n, ..)| n == name);
+        if whole {
+            latest.push((name.as_str(), arguments.as_str(), output.as_str()));
+        }
+    }
+    let (mut items, mut used) = (Vec::new(), 0);
+    for (n, (_, arguments, output)) in latest.into_iter().enumerate() {
+        used += output.len();
+        if used > SKILLS_AGAIN && n > 0 {
+            break;
+        }
+        let call_id = format!("{id}_{n}");
+        items.push(Item::ToolCall(rein_llm::ToolCall { call_id: call_id.clone(), name: skill.into(), arguments: arguments.to_owned() }));
+        items.push(Item::ToolResult { call_id, output: output.to_owned() });
+    }
+    items
+}
+
 /// The tool for searching the conversation, offered once it's been compacted.
 pub fn recall_spec() -> Tool {
     Tool {
@@ -499,6 +545,34 @@ mod tests {
         retire(&mut history, &retired);
         assert_eq!(history.iter().filter(|item| matches!(item, Item::Image { .. })).count(), 1, "its image went with it");
         assert!(matches!(&history[6], Item::Image { call_id, .. } if call_id == "r2"), "the recent one stays");
+    }
+
+    #[test]
+    fn the_skills_loaded_before_a_summary_are_loaded_again_after_it() {
+        let load = |id: &str, name: &str| call(id, "skill", json!({"name": name, "file": null, "start_line": null}));
+        let earlier = [
+            load("s1", "graphs"),
+            result("s1", "<skill name=\"graphs\">old graphs</skill>"),
+            load("s2", "review"),
+            result("s2", "<skill name=\"review\">Review this way.</skill>"),
+            load("s3", "graphs"),
+            result("s3", "<skill name=\"graphs\">Draw graphs.</skill>"),
+            load("s4", "nope"),
+            result("s4", "error: there is no skill called nope"),
+        ];
+        let kept = [Item::User("go on".into())];
+        let again = skills_again(&earlier, &kept, "again");
+        let outputs: Vec<&str> = again
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs, ["<skill name=\"graphs\">Draw graphs.</skill>", "<skill name=\"review\">Review this way.</skill>"], "the latest of each, latest first, no error");
+        assert!(matches!(&again[0], Item::ToolCall(call) if call.call_id == "again_0" && call.name == "skill"));
+        let reloads = [load("k1", "review"), result("k1", "<skill name=\"review\">Review this way.</skill>")];
+        assert_eq!(skills_again(&earlier, &reloads, "again").len(), 2, "one the kept part loads itself isn't loaded twice");
     }
 
     #[test]

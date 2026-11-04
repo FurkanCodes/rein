@@ -191,6 +191,9 @@ finding. Each says why in a line.
   loses the whole cache. A tool found mid-conversation joins after the
   conversation so far (`additional_tools`, `tool_reference`), and a format
   that can't do that shows every tool from the start.
+- What the model should do before a task goes in its instructions, not
+  only in a tool's description: told of skills only in the `skill` tool,
+  a model left one unloaded for a small task that fit it.
 - What a tool brings into the conversation is sent again with every
   request after it. A lookup that pulls in pages runs in a request of its
   own and keeps only its answer: OpenAI's web search, run in the
