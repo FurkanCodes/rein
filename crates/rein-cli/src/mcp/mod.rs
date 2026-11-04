@@ -594,12 +594,22 @@ fn caches() -> PathBuf {
     cache.join("rein").join("mcp")
 }
 
-/// How a server is doing, in a few words.
+/// How many of a server's tools are named as it starts: the rest are
+/// counted, and named when you pick it in `/mcp`.
+const NAMED: usize = 6;
+
+/// How a server is doing, in a few words: as it starts.
 fn how(status: &Status, s: Style) -> String {
     match status {
         Status::Starting => s.dim("starting…"),
         Status::Ready(tools) if tools.is_empty() => "no tools".to_owned(),
-        Status::Ready(tools) => format!("{} tool{}: {}", tools.len(), if tools.len() == 1 { "" } else { "s" }, tools.join(", ")),
+        Status::Ready(tools) => {
+            let mut names = tools.iter().take(NAMED).map(String::as_str).collect::<Vec<_>>().join(", ");
+            if tools.len() > NAMED {
+                names.push_str(&format!(" and {} more: /mcp names them", tools.len() - NAMED));
+            }
+            format!("{} tool{}: {names}", tools.len(), if tools.len() == 1 { "" } else { "s" })
+        }
         Status::Stopped => s.yellow("stopped; it starts again on its next call"),
         Status::Failed(why) => s.red(&format!("didn't start: {why}")),
     }

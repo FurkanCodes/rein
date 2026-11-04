@@ -2734,7 +2734,7 @@ fn an_mcp_server_of_yours_starts_in_the_sandbox_and_its_tools_ask_unless_allowed
     let tools = model.requests()[0]["tools"][0]["tools"].as_array().cloned().unwrap_or_default();
     let echo = tools.iter().find(|tool| tool["name"] == "mcp__fake__echo").expect("offered from the first request");
     assert_eq!(echo["strict"], false, "a server's schema isn't held to strict mode");
-    wait_for_mcp(&mut term, "5 tools: echo, peek, given, has, quit");
+    wait_for_mcp(&mut term, "fake  yours · sandbox (network)  ● 5 tools");
 }
 
 /// A project's .mcp.json may be anyone's: its server starts only once
@@ -2765,7 +2765,7 @@ fn a_projects_mcp_server_starts_only_once_you_say_yes_to_it_as_it_is() {
 
     let mut term = term.again(&model);
     term.wait_for(IDLE);
-    wait_for_mcp(&mut term, "5 tools: echo");
+    wait_for_mcp(&mut term, "● 5 tools");
     assert!(!term.text().contains("Start fake"), "said yes to as it is: not asked again\n{}", term.text());
     term.keys("/exit\r");
 
@@ -2868,12 +2868,14 @@ fn mcp_lets_you_pick_a_server_and_change_it_without_typing_its_name() {
     model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] } } }).to_string()));
     let mut term = Term::start_with(&model, "mcp-panel", 30, 130, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
-    wait_for_mcp(&mut term, "5 tools: echo");
+    wait_for_mcp(&mut term, "● 5 tools");
     let path = term.dir.join("home/mcp.json");
     let file = || serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap()["mcpServers"]["fake"].clone();
 
     term.keys("/mcp\r");
     pick(&mut term, "fake");
+    term.wait_for("5 tools: echo, peek, given, has, quit");
+    assert!(term.text().contains("fake sh server.sh"), "picked, what it runs:\n{}", term.text());
     pick(&mut term, "choose the tools");
     term.wait_for("fake: which tools run without asking");
     pick(&mut term, "echo");
@@ -2899,6 +2901,31 @@ fn mcp_lets_you_pick_a_server_and_change_it_without_typing_its_name() {
     term.wait_for(IDLE);
     assert_eq!(file().get("disabled"), None, "on again: {}", file());
     assert_eq!(file()["allow"], json!(["echo", "has"]), "what it let run is kept");
+}
+
+/// `/mcp` gives each server one line, cut to the window: its tools counted,
+/// not named, and why one didn't start begun, the rest of both shown when
+/// it's picked.
+#[cfg(target_os = "macos")]
+#[test]
+fn mcp_gives_each_server_a_line_cut_to_the_window() {
+    let mut model = Model::start(Vec::new());
+    let gone = "./Some App.app/Contents/SharedSupport/Helper.app/Contents/MacOS/Helper";
+    model
+        .home
+        .push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] }, "gone": { "command": gone, "access": "outside" } } }).to_string()));
+    let mut term = Term::start_with(&model, "mcp-lines", 30, 60, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    wait_for_mcp(&mut term, "● 5 tools");
+    let text = term.text();
+    let line = text.lines().rfind(|line| line.trim_start().starts_with("gone")).unwrap_or_else(|| panic!("{text}"));
+    assert!(line.ends_with('…') && line.contains("✗ its command"), "one line, cut: {line:?}\n{text}");
+    assert!(!text.contains("Helper.app"), "not the rest of why:\n{text}");
+    let fake = text.lines().rfind(|line| line.trim_start().starts_with("fake")).unwrap_or_default();
+    assert!(fake.trim_end().ends_with("● 5 tools"), "its tools counted, not named: {fake:?}");
+    term.keys("/mcp\r");
+    pick(&mut term, "gone");
+    term.wait_until("why, in full", |screen| screen.replace('\n', "").contains("Helper, isn't there"));
 }
 
 /// A server that needs a variable you haven't set asks for it as rein

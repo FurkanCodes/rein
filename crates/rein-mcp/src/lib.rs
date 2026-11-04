@@ -233,7 +233,7 @@ impl Launch {
     async fn run(&self, server: &Server, local: &Local) -> Result<Connection, Failure> {
         let mut command = self.command(server, local)?;
         let started = async {
-            let mut child = command.spawn().map_err(|e| Error::Start(format!("can't run {}: {e}", local.command)))?;
+            let mut child = command.spawn().map_err(|e| Error::Start(not_run(&local.command, &e)))?;
             let group = Group::new(child.id());
             let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
             let (Some(stdin), Some(stdout)) = (stdin, stdout) else { return Err(Error::Start("its input and output weren't there to talk over".into())) };
@@ -248,6 +248,15 @@ impl Launch {
             Ok(Err(e)) => Err(failed(e.to_string())),
             Err(_) => Err(failed(format!("it didn't start within {}s", START.as_secs()))),
         }
+    }
+}
+
+/// Why `command` didn't run, in words: one that isn't there is said so.
+fn not_run(command: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound if command.contains('/') => format!("its command, {command}, isn't there"),
+        std::io::ErrorKind::NotFound => format!("{command} isn't installed here: it's not on your PATH"),
+        _ => format!("can't run {command}: {e}"),
     }
 }
 

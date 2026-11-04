@@ -5,7 +5,7 @@ use rein_agent::agent::{Agent, Llm};
 use rein_agent::sandbox::Access;
 use rein_mcp::{Failure, Origin, Reach, Server, Skipped, Status};
 
-use super::{Fix, Mcp, allowed, edit, entry, give_keys, how, remove, restart, say_yes, set_access, set_allow, sign_in, turn_off};
+use super::{Fix, Mcp, allowed, edit, entry, give_keys, remove, restart, say_yes, set_access, set_allow, sign_in, turn_off};
 use crate::CliResult;
 use crate::input::Menu;
 use crate::terminal::Terminal;
@@ -52,7 +52,7 @@ impl Row {
             Row::Running(_, Status::Failed(Failure::Needs(name)), _) => format!("✗ needs {name}"),
             Row::Running(_, Status::Failed(Failure::InWalls(_)), _) => "✗ didn't start in the sandbox".into(),
             Row::Running(_, Status::Failed(Failure::NoSandbox), _) => "✗ no sandbox here to start it in".into(),
-            Row::Running(_, Status::Failed(Failure::Other(_)), _) => "✗ didn't start".into(),
+            Row::Running(_, Status::Failed(Failure::Other(why)), _) => format!("✗ {}", why.lines().next().unwrap_or("didn't start")),
             Row::Off(_) => "– off".into(),
             Row::Waiting(_) => "⏸ waiting for your yes".into(),
             Row::Skipped(skipped) => format!("– can't start: {}", skipped.why),
@@ -195,6 +195,7 @@ pub(super) async fn panel(mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut 
         None => {}
     }
     let Some(row) = rows.into_iter().nth(picked) else { return Ok(()) };
+    detail(&row, terminal);
     let name = row.name().to_owned();
     let mut actions = actions(row);
     if actions.is_empty() {
@@ -301,8 +302,11 @@ async fn choose_tools(server: &Server, tools: &[String], mcp: &Mcp, agent: &mut 
     set_allow(&server.name, &allow, mcp, agent, terminal)
 }
 
-/// What `/mcp` says: each server, whose it is, its walls, and how it's
-/// doing, then those off, waiting for your yes, or not started, and why.
+/// What `/mcp` says: a line for each server, whose it is, where it runs
+/// or is reached, and how it's doing, then those off, waiting for your
+/// yes, or not started, and why. Each line is cut to the window as it's
+/// drawn, and drawn again when the window changes: picking a server shows
+/// the rest, its tools and all.
 fn show(mcp: &Mcp, terminal: &Terminal) {
     let (pad, s) = (" ".repeat(GUTTER), terminal.err);
     let rows = rows(mcp);
@@ -311,41 +315,65 @@ fn show(mcp: &Mcp, terminal: &Terminal) {
         say!("{pad}{}", s.dim("Like: /mcp add playwright. Or as you'd start it: /mcp add context7 npx -y @upstash/context7-mcp"));
         return;
     }
-    let shown: Vec<(&Row, String, String)> = rows
+    let shown: Vec<(&str, String, String)> = rows
         .iter()
         .map(|row| {
             let (whose, how) = match row {
                 Row::Running(server, status, also) => {
-                    let walls = match &server.reach {
-                        Reach::Local(local) if local.access.walls().is_some() => format!("in the sandbox ({})", local.access),
+                    let place = match &server.reach {
+                        Reach::Local(local) if local.access.walls().is_some() => format!("sandbox ({})", local.access),
                         Reach::Local(_) => "outside the sandbox".to_owned(),
-                        Reach::Remote(remote) => format!("at {}", host(&remote.url)),
+                        Reach::Remote(remote) => host(&remote.url).to_owned(),
                     };
                     let more = match also {
                         Also::FailedInWalls => s.yellow(" · a call failed in the sandbox, which may be why"),
                         Also::SignedIn => s.dim(" · signed in"),
                         Also::Nothing => String::new(),
                     };
-                    (format!("{} · {walls}", server.origin.describe()), format!("{}{more}", how(status, s)))
+                    (format!("{} · {place}", server.origin.describe()), format!("{}{more}", brief(status, s)))
                 }
-                Row::Off(_) => ("yours".to_owned(), s.dim("off: pick it to turn it on")),
-                Row::Waiting(server) => (server.origin.describe().to_owned(), s.yellow("waiting for your yes: pick it to start it")),
-                Row::Skipped(skipped) => (skipped.origin.describe().to_owned(), s.dim(&format!("not started: {}", skipped.why))),
+                Row::Off(_) => ("yours".to_owned(), s.dim("– off: pick it to turn it on")),
+                Row::Waiting(server) => (server.origin.describe().to_owned(), s.yellow("⏸ waiting for your yes: pick it to start it")),
+                Row::Skipped(skipped) => (skipped.origin.describe().to_owned(), s.dim(&format!("– can't start: {}", skipped.why))),
             };
-            (row, whose, how)
+            (row.name(), whose, how)
         })
         .collect();
-    let names = rows.iter().map(|row| row.name().chars().count()).max().unwrap_or(0);
+    let names = shown.iter().map(|(name, ..)| name.chars().count()).max().unwrap_or(0);
     let whose = shown.iter().map(|(_, whose, _)| whose.chars().count()).max().unwrap_or(0);
-    for (row, said, how) in shown {
-        let line = format!("{pad}{:<names$}  {}  {how}", row.name(), s.dim(&format!("{said:<whose$}")));
-        // A long list of tools is cut to the screen; why one failed isn't.
-        match row {
-            Row::Running(_, Status::Ready(_), Also::Nothing | Also::SignedIn) => say!("{}", crate::ui::style::fit(&line, terminal.wrap_width().unwrap_or(100))),
-            _ => say!("{line}"),
-        }
+    let mut lines: Vec<String> = shown.into_iter().map(|(name, said, how)| format!("{pad}{name:<names$}  {}  {how}", s.dim(&format!("{said:<whose$}")))).collect();
+    lines.push(format!("{pad}{}", s.dim("Pick one below to see its tools and change it. The model sees them as mcp__<server>__<tool>.")));
+    crate::ui::screen::show(Box::new(move |width| lines.iter().map(|line| crate::ui::style::fit(line, width.saturating_sub(1))).collect()));
+}
+
+/// How a server is doing, for its line in the table: its tools counted,
+/// not named, and of why it didn't start, the first line.
+fn brief(status: &Status, s: crate::ui::style::Style) -> String {
+    match status {
+        Status::Starting => s.dim("◌ starting…"),
+        Status::Ready(tools) => format!("● {} tool{}", tools.len(), if tools.len() == 1 { "" } else { "s" }),
+        Status::Stopped => s.yellow("◌ stopped; it starts again on its next call"),
+        Status::Failed(why) => s.red(&format!("✗ {}", why.to_string().lines().next().unwrap_or_default())),
     }
-    say!("{pad}{}", s.dim("The model sees a server's tools as mcp__<server>__<tool>. /mcp add <name> <command> [args …] adds one."));
+}
+
+/// What there is to know of `row`, picked: what it runs or where it's
+/// reached, and its tools by name, or why it didn't start, in full.
+fn detail(row: &Row, terminal: &Terminal) {
+    let (pad, s) = (" ".repeat(GUTTER), terminal.err);
+    let server = match row {
+        Row::Running(server, ..) | Row::Off(server) | Row::Waiting(server) => server,
+        Row::Skipped(skipped) => {
+            say!("{pad}{} {}", s.bold(&skipped.name), s.dim(&format!("can't start: {}", skipped.why)));
+            return;
+        }
+    };
+    say!("{pad}{} {}", s.bold(&server.name), s.dim(&server.described()));
+    match row {
+        Row::Running(_, Status::Ready(tools), _) if !tools.is_empty() => say!("{pad}{} tool{}: {}", tools.len(), if tools.len() == 1 { "" } else { "s" }, tools.join(", ")),
+        Row::Running(_, Status::Failed(why), _) => say!("{pad}{}", s.red(&format!("didn't start: {why}"))),
+        _ => {}
+    }
 }
 
 /// The host of `url`, as it's written.

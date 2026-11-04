@@ -680,8 +680,9 @@ What a server says is cleaned before you or the model see it: escape codes,
 and characters a terminal doesn't draw, are taken out. A call may take 5
 minutes. A long result is cut, and kept whole in a file in the temp folder
 for the model to read in parts. A server that stops is started again on its
-next call. `/mcp` shows each server, its walls and its tools, or why it
-didn't start. When one of a server's calls fails in the sandbox, the model
+next call. `/mcp` shows a line for each server: where it runs or is
+reached, and how many tools it has, or why it didn't start, each cut to
+the window. Pick one to see its tools by name and why in full. When one of a server's calls fails in the sandbox, the model
 is told once that the sandbox may be why, and that you can let it out from
 `/mcp`.
 

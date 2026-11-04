@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{Named, Origin, Skipped};
+use crate::config::{Named, Origin, Server, Skipped};
 
 /// An app whose servers rein can bring in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +78,30 @@ impl App {
         let entries = entries.into_iter().map(|(name, entry)| (name, self.translated(entry, home))).collect();
         let mut named = crate::config::servers(entries, Origin::Yours);
         named.skipped.extend(skipped);
+        // A command that's a path inside the app's own folder is found
+        // from there, which rein can't tell: it would never start.
+        for list in [&mut named.servers, &mut named.off] {
+            let (inside, kept): (Vec<Server>, Vec<Server>) =
+                std::mem::take(list).into_iter().partition(|server| server.local().is_some_and(|local| inside_the_app(&local.command)));
+            *list = kept;
+            named.skipped.extend(inside.into_iter().map(|server| {
+                let command = server.local().map(|local| local.command.clone()).unwrap_or_default();
+                Skipped { name: server.name, origin: Origin::Yours, why: format!("its command, {command}, is a path inside {}'s own folder, which rein can't tell", self.title()) }
+            }));
+        }
         Ok(named)
     }
 
-    /// `entry` with what this app writes its own way written rein's way.
+    /// `entry` with what this app writes its own way written rein's way,
+    /// and a command in your home folder (`~/bin/x`) where it is: rein
+    /// doesn't start a server through a shell, which would say.
     fn translated(self, entry: Value, home: &Path) -> Value {
         let mut entry = strings(entry, &|text| self.words(text, home));
+        if let Some(command) = entry.get_mut("command")
+            && let Some(rest) = command.as_str().and_then(|command| command.strip_prefix("~/"))
+        {
+            *command = Value::String(home.join(rest).display().to_string());
+        }
         // Gemini CLI's server reached at a URL says so with `httpUrl`.
         if self == App::GeminiCli
             && let Some(entry) = entry.as_object_mut()
@@ -118,6 +136,12 @@ fn strings(value: Value, change: &dyn Fn(&str) -> String) -> Value {
 /// The servers by name in `file`'s `key`.
 fn by_name(file: &Value, key: &str) -> BTreeMap<String, Value> {
     file.get(key).and_then(Value::as_object).map(|servers| servers.iter().map(|(name, entry)| (name.clone(), entry.clone())).collect()).unwrap_or_default()
+}
+
+/// Whether `command` is a path from a folder of the app's own: `./x`, or
+/// `x/y`, not on your PATH, nor from the root, nor a variable of yours.
+fn inside_the_app(command: &str) -> bool {
+    command.contains('/') && !command.starts_with('/') && !command.starts_with('$')
 }
 
 /// What Cursor, VS Code and Windsurf write in a server's words: `${env:NAME}`
@@ -254,9 +278,10 @@ mod tests {
         assert_eq!(command(&named.servers[1]).command, "gh-local", "this project's own wins its name, as in Claude Code");
         assert_eq!(named.servers[2].reach, Reach::Remote(Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new() }));
 
-        let cursor =
-            r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["fs", "${workspaceFolder}", "${userHome}/notes"], "env": { "K": "${env:FS_KEY}", "L": "${unknown}" } } } }"#;
+        let cursor = r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["fs", "${workspaceFolder}", "${userHome}/notes"], "env": { "K": "${env:FS_KEY}", "L": "${unknown}" } },
+                                          "mine": { "command": "~/bin/tool" } } }"#;
         let named = App::Cursor.read(cursor, home, root).unwrap();
+        assert_eq!(command(&named.servers[1]).command, "/home/me/bin/tool", "your home, where a shell would have put it");
         let fs = command(&named.servers[0]);
         assert_eq!(fs.args, ["fs", ".", "/home/me/notes"], "the project is where rein starts it");
         assert_eq!((fs.env["K"].as_str(), fs.env["L"].as_str()), ("${FS_KEY}", "${unknown}"));
@@ -304,6 +329,10 @@ env_http_headers = { "X-Team" = "FIGMA_TEAM" }
 
 [mcp_servers.broken]
 command = 3
+
+[mcp_servers.computer-use]
+command = "./Codex Computer Use.app/Contents/MacOS/client"
+enabled = false
 "#;
         let named = App::Codex.read(toml, home, root).unwrap();
         assert_eq!(names(&named), ["context7", "figma"]);
@@ -312,6 +341,9 @@ command = 3
         let figma = BTreeMap::from([("Authorization".to_owned(), "Bearer ${FIGMA_TOKEN}".to_owned()), ("X-Team".to_owned(), "${FIGMA_TEAM}".to_owned())]);
         assert_eq!(named.servers[1].reach, Reach::Remote(Remote { url: "https://mcp.figma.com/mcp".into(), headers: figma }), "its token, a variable of yours");
         assert!(named.skipped.iter().any(|skipped| skipped.name == "broken" && skipped.why.starts_with("can't be read")), "{:?}", named.skipped);
+        let inside = named.skipped.iter().find(|skipped| skipped.name == "computer-use").expect("a path inside Codex's folder is left out, though off");
+        assert!(inside.why.contains("inside Codex's own folder"), "{}", inside.why);
+        assert!(named.off.iter().all(|server| server.name != "computer-use"));
         assert!(App::Codex.read("[mcp_servers", home, root).unwrap_err().starts_with("isn't TOML"));
     }
 

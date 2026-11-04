@@ -87,7 +87,7 @@ async fn one_that_cant_start_says_why() {
     local(&mut missing).env = [("T".to_owned(), "${REIN_TEST_UNSET_VARIABLE}".to_owned())].into();
     let servers = Servers::start(vec![server, exits, missing], launch);
     let note = servers.list().await.note.unwrap();
-    assert!(note.contains("fake didn't start: can't run rein-no-such-command"), "{note}");
+    assert!(note.contains("fake didn't start: rein-no-such-command isn't installed here: it's not on your PATH"), "{note}");
     assert!(note.contains("exits didn't start: it stopped, saying: Error: no TOKEN"), "{note}");
     assert!(note.contains("missing didn't start: it needs REIN_TEST_UNSET_VARIABLE, which isn't set"), "{note}");
     assert!(note.ends_with(". /mcp says what to do"), "{note}");
