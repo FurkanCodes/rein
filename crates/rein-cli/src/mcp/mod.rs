@@ -16,9 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rein_agent::agent::{Agent, Llm};
-use rein_agent::permissions::Mode;
 use rein_agent::sandbox::{Access, Sandbox};
-use rein_mcp::{ByMode, Failure, Keys, Named, Origin, Reach, Server, Servers, Skipped, Status, Walled};
+use rein_mcp::{Failure, Keys, Named, Origin, Reach, Server, Servers, Skipped, Status, Walled};
 use serde_json::{Value, json};
 
 use crate::commands::Mcp as Command;
@@ -85,61 +84,29 @@ impl Mcp {
     }
 }
 
-/// The walls `mode` gives a server with none of its own: none in trust,
-/// where your commands run outside the sandbox too, and `network` in the
-/// others. The sandbox is yours to choose, with the mode.
-pub(crate) fn by_mode(mode: Mode) -> Access {
-    if mode == Mode::Trust { Access::Outside } else { Access::Network }
-}
-
 /// The walls `server` runs in, or would start in now: `None` for one at a
 /// URL.
 pub(crate) fn walls_of(server: &Server, mcp: &Mcp) -> Option<Access> {
     match mcp.servers.server(&server.name) {
         Some(running) if running == *server => mcp.servers.walls(&server.name),
-        _ => server.walled().map(|walled| walled.or(mcp.servers.by_mode())),
+        _ => server.walled().map(Walled::access),
     }
 }
 
-/// Where `server` runs, in words, for asking about it: as the mode has
-/// it, the mode's walls, which may be none.
-pub(crate) fn runs(server: &Server, by_mode: Access) -> String {
+/// Where `server` runs, in words, for asking about it.
+pub(crate) fn runs(server: &Server) -> String {
     match server.walled() {
-        Some(walled) => {
-            let as_mode = if walled == Walled::ByMode { ", as your mode has it" } else { "" };
-            format!("It runs {}{as_mode}", rein_mcp::walls(walled.or(by_mode)))
-        }
+        Some(walled) => format!("It runs {}", rein_mcp::walls(walled.access())),
         None => "It's reached at its URL, and none of its code runs here".to_owned(),
     }
-}
-
-/// Starts the servers with no walls of their own in `mode`'s from
-/// now on, and says which keep running in the walls they started in.
-pub(crate) fn follow_mode(mode: Mode, mcp: &Mcp, terminal: &Terminal) {
-    let access = by_mode(mode);
-    if mcp.servers.by_mode() == access {
-        return;
-    }
-    let kept = mcp.servers.follow_mode(access);
-    if kept.is_empty() {
-        return;
-    }
-    let (were, now) = if access == Access::Outside { ("in the sandbox", "outside it") } else { ("outside the sandbox", "in this mode's walls") };
-    let what = format!(
-        "{} keep{} running {were}, as {} started: /mcp starts one again {now}",
-        kept.join(", "),
-        if kept.len() == 1 { "s" } else { "" },
-        if kept.len() == 1 { "it" } else { "they" }
-    );
-    say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&what));
 }
 
 /// Reads your servers and the project at `root`'s, asks about each of the
 /// project's you haven't said yes to as it is now, and for any variable a
 /// server needs that isn't set (when `asks`: there's someone to ask), and
-/// starts them all in the background, those with no walls of their own
-/// in `mode`'s.
-pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, mode: Mode, http: rein_llm::reqwest::Client, terminal: &mut Terminal, asks: bool) -> Mcp {
+/// starts them all in the background: those with no walls of their own
+/// outside the sandbox, whatever the mode.
+pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, http: rein_llm::reqwest::Client, terminal: &mut Terminal, asks: bool) -> Mcp {
     let named = read(&dir.join(FILE), Origin::Yours).and(read(&root.join(PROJECT_FILE), Origin::Project));
     let approved = approved(dir);
     let key = root.display().to_string();
@@ -147,7 +114,7 @@ pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, mode: M
     let (mut servers, mut waiting) = (Vec::new(), Vec::new());
     for server in named.servers {
         let said_yes = server.origin == Origin::Yours || approved.get(&key).is_some_and(|yes| yes.contains(&server.fingerprint()));
-        if said_yes || (asks && say_yes(&server, by_mode(mode), dir, &key, terminal).await) {
+        if said_yes || (asks && say_yes(&server, dir, &key, terminal).await) {
             servers.push(server);
         } else {
             waiting.push(server);
@@ -167,7 +134,7 @@ pub(crate) async fn open(dir: &Path, root: &Path, sandbox: Arc<Sandbox>, mode: M
     }
     let tokens = Arc::new(rein_llm::mcp::Tokens::new(dir.join(TOKENS_FILE), http.clone()));
     let (web, signins): (Arc<dyn rein_mcp::remote::Web>, Arc<dyn rein_mcp::remote::Tokens>) = (Arc::new(web::Http(http.clone())), Arc::new(web::SignIns(tokens.clone())));
-    let launch = rein_mcp::Launch { sandbox, root: root.to_owned(), caches: caches(), keys, web: Some(web), tokens: Some(signins), by_mode: Arc::new(ByMode::new(by_mode(mode))) };
+    let launch = rein_mcp::Launch { sandbox, root: root.to_owned(), caches: caches(), keys, web: Some(web), tokens: Some(signins) };
     let servers = Arc::new(Servers::start(servers, launch));
     Mcp { servers, off: named.off, waiting, skipped: named.skipped, dir: dir.to_owned(), root: root.to_owned(), http, tokens }
 }
@@ -436,7 +403,7 @@ fn set_access(server: &Server, access: Walled, mcp: &Mcp) -> CliResult<Server> {
     edit(&mcp.dir, |servers| {
         let entry = entry(servers, &server.name)?;
         match access {
-            Walled::ByMode => entry.remove("access"),
+            Walled::Unset => entry.remove("access"),
             Walled::Set(access) => entry.insert("access".into(), json!(access.as_str())),
         };
         Ok(())
@@ -609,8 +576,8 @@ fn read(path: &Path, origin: Origin) -> Named {
 
 /// Asks whether to start a project's `server`, saying what it runs, with
 /// what, and in which walls, and keeps a yes in the project `key`.
-async fn say_yes(server: &Server, by_mode: Access, dir: &Path, key: &str, terminal: &mut Terminal) -> bool {
-    let mut detail = runs(server, by_mode);
+async fn say_yes(server: &Server, dir: &Path, key: &str, terminal: &mut Terminal) -> bool {
+    let mut detail = runs(server);
     let takes = server.takes();
     if !takes.is_empty() {
         detail.push_str(&format!(", and gets your {}", takes.join(", ")));

@@ -636,9 +636,10 @@ impl Term {
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "test")
             .env("OPENAI_BASE_URL", &model.base)
-            // Asking, as most tests are about what asks; one that wants
-            // rein's own default sets it empty.
+            // Asking, in the sandbox, as most tests are about what asks;
+            // one that wants rein's own defaults sets them empty.
             .env("REIN_MODE", "ask")
+            .env("REIN_SANDBOX", "on")
             .envs(model.env.iter().map(|(name, value)| (name, value)))
             // Copies go to the terminal (OSC 52), never this computer's clipboard.
             .env("SSH_CONNECTION", "screen-test")
@@ -2201,17 +2202,108 @@ fn keys_and_secrets_stay_out_of_commands() {
     assert!(results[1].contains("Operation not permitted") && !results[1].lines().any(|line| line == "secret"), "{results:?}");
 }
 
+/// The sandbox is off unless you turn it on, as in Claude Code: then a
+/// command runs as you'd run it, reading what the walls would hide, and
+/// in ask, edits and read-only it asks first. Nothing about it is said
+/// at the start, and the bar says nothing of it.
 #[test]
-fn with_the_sandbox_off_commands_ask_first() {
-    let model = Model::start(vec![Turn { out: vec![bash("ls", "look", None)] }, says("Listed.")]).with_env("REIN_SANDBOX", "off");
+fn with_the_sandbox_off_commands_ask_first_and_run_as_youd_run_them() {
+    let mut model = Model::start(vec![Turn { out: vec![bash("cat ~/.ssh/id_test", "look", None)] }, says("Listed.")]).with_env("REIN_SANDBOX", "").with_env("REIN_MODE", "edits");
+    model.home.push((".ssh/id_test".into(), "FAKE-unwalled-secret\n".into()));
     let mut term = Term::start(&model, "sandbox-off", 30, 100);
-    term.wait_for("Sandbox: off in the settings, so commands ask before they run");
     term.wait_for(IDLE);
+    assert!(!term.text().contains("Sandbox:") && !term.text().contains("sandboxed"), "{}", term.text());
+    term.wait_for("commands do)");
     term.keys("list\r");
     term.wait_for("Allow this command?");
     std::thread::sleep(Duration::from_millis(700));
     term.keys("y");
     term.wait_for("Listed.");
+    assert_eq!(results(&model), ["FAKE-unwalled-secret\n[exit code 0]"]);
+}
+
+/// Auto with the sandbox off never asks, and runs every command, as
+/// Codex's full access does, but what an ask rule names, which it refuses.
+#[test]
+fn auto_without_the_sandbox_runs_every_command_but_what_asks() {
+    let turn = Turn { out: vec![bash("touch made.txt", "outside", Some("to make it")), bash("rm made.txt", "write", None)] };
+    let model = Model::start(vec![turn, says("Made it.")]).with_env("REIN_SANDBOX", "off").with_env("REIN_MODE", "auto");
+    let mut term = Term::start(&model, "sandbox-off-auto", 30, 100);
+    term.wait_for("Mode: auto (nothing asks, and every command runs, without the sandbox");
+    term.wait_for(IDLE);
+    term.keys("make it\r");
+    term.wait_for("Made it.");
+    let results = results(&model);
+    assert_eq!(results[0], "[exit code 0]");
+    assert!(results[1].starts_with("rein is in auto mode, where nothing asks, and a rule says to ask"), "{results:?}");
+    assert!(term.dir.join("project/made.txt").exists() && !term.text().contains("Allow this"), "{}", term.text());
+}
+
+/// `/sandbox` turns it on or off in any mode, there and then: on, a
+/// command that writes runs in edits without asking, and can't read what
+/// the walls hide; off, it asks. A pick isn't kept unless you say so.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_turns_the_walls_on_and_off_in_the_conversation() {
+    let read = || Turn { out: vec![bash("cat ~/.ssh/id_test; touch made.txt", "write", None)] };
+    let mut model = Model::start(vec![read(), says("In the walls."), read(), says("Outside.")]).with_env("REIN_SANDBOX", "").with_env("REIN_MODE", "edits");
+    model.home.push((".ssh/id_test".into(), "FAKE-sandbox-switch-secret\n".into()));
+    let mut term = Term::start(&model, "sandbox-switch", 30, 120);
+    term.wait_for(IDLE);
+    // Picked from the menu.
+    term.keys("/sandbox\r");
+    term.wait_for("the sandbox, in any mode");
+    term.wait_for("macOS Seatbelt");
+    term.keys("\x1b[A");
+    term.wait_for("› on");
+    term.keys("\r");
+    term.wait_for("✓ sandbox on: commands run in it");
+    term.wait_for("edits: file changes in this folder and commands in the sandbox don't ask");
+    term.wait_for("Keep the sandbox on from now on?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("n");
+    term.wait_until("the bar says so", |screen| screen.lines().last().is_some_and(|bar| bar.contains("edits sandboxed")));
+    term.keys("go\r");
+    term.wait_for("In the walls.");
+    let walled = results(&model);
+    assert!(walled[0].contains("Operation not permitted") && !walled[0].contains("FAKE-sandbox-switch-secret"), "{walled:?}");
+    assert!(term.dir.join("project/made.txt").exists() && !term.text().contains("Allow this"), "{}", term.text());
+    // Typed.
+    term.wait_for(IDLE);
+    term.keys("/sandbox off\r");
+    term.wait_for("✓ sandbox off: commands run as you'd run them");
+    term.wait_for(IDLE);
+    term.keys("go\r");
+    term.wait_for("Allow this command?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Outside.");
+    // The whole conversation goes with each request: the second is this.
+    assert!(results(&model)[1].contains("FAKE-sandbox-switch-secret"), "{:?}", results(&model));
+    assert!(!term.dir.join("home/config").exists(), "nothing kept");
+}
+
+/// Turned on and kept, new conversations start with the sandbox on.
+#[test]
+fn the_sandbox_turned_on_can_be_kept_for_new_conversations() {
+    let model = Model::start(Vec::new()).with_env("REIN_SANDBOX", "");
+    let mut term = Term::start(&model, "sandbox-kept", 30, 120);
+    term.wait_for(IDLE);
+    term.keys("/sandbox on\r");
+    term.wait_for("Keep the sandbox on from now on?");
+    term.wait_for("New conversations start with it off now");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("new conversations start with the sandbox on");
+    term.wait_for(IDLE);
+    assert_eq!(std::fs::read_to_string(term.dir.join("home/config")).unwrap(), "sandbox = on\n");
+    term.keys("\x04");
+    let mut term = term.again(&model);
+    term.wait_for(IDLE);
+    term.keys("/sandbox on\r");
+    term.wait_for("✓ sandbox on");
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("from now on?"), "kept already: {}", term.text());
 }
 
 #[test]
@@ -3002,12 +3094,12 @@ fn pick(term: &mut Term, typed: &str) {
     term.keys("\r");
 }
 
-/// Your own MCP server starts with rein, in the sandbox, and its tools are
-/// the model's from the first message: one your mcp.json allows runs, the
-/// rest ask, and the server can't read your home folder.
+/// Your own MCP server starts with rein, in the walls you gave it, and its
+/// tools are the model's from the first message: one your mcp.json allows
+/// runs, the rest ask, and the server can't read your home folder.
 #[cfg(target_os = "macos")]
 #[test]
-fn an_mcp_server_of_yours_starts_in_the_sandbox_and_its_tools_ask_unless_allowed() {
+fn an_mcp_server_of_yours_starts_in_walls_of_its_own_and_its_tools_ask_unless_allowed() {
     let secret = std::env::temp_dir().join(format!("rein-screen-{}-mcp-yours", std::process::id())).join("home/.ssh/id_test");
     let calls = Turn {
         out: vec![
@@ -3017,7 +3109,8 @@ fn an_mcp_server_of_yours_starts_in_the_sandbox_and_its_tools_ask_unless_allowed
         ],
     };
     let mut model = Model::start(vec![calls, says("Both done.")]);
-    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "allow": ["echo", "has"] } } }).to_string()));
+    let fake = json!({ "command": "sh", "args": ["server.sh"], "allow": ["echo", "has"], "access": "network" });
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": fake } }).to_string()));
     model.home.push((".ssh/id_test".into(), "FAKE-mcp-screen-secret\n".into()));
     let mut term = Term::start_with(&model, "mcp-yours", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
@@ -3037,42 +3130,29 @@ fn an_mcp_server_of_yours_starts_in_the_sandbox_and_its_tools_ask_unless_allowed
     wait_for_mcp(&mut term, "● 5 tools · sandbox (network)");
 }
 
-/// In trust a server with no walls of its own runs as your commands do
-/// there, outside the sandbox: the walls are yours to choose, with the
-/// mode. Shift-Tab to a mode with walls says it keeps running outside
-/// until it starts again; started again, it's in the mode's walls.
+/// A server with no walls of its own runs outside the sandbox, as in
+/// Codex and Claude Code, whatever the mode, and with the sandbox on for
+/// commands: walls broke what servers need. A new mode says nothing of it.
 #[cfg(target_os = "macos")]
 #[test]
-fn in_trust_a_server_without_walls_of_its_own_runs_as_your_commands_do() {
-    let secret = std::env::temp_dir().join(format!("rein-screen-{}-mcp-trust", std::process::id())).join("home/.ssh/id_test");
+fn a_server_without_walls_of_its_own_runs_outside_the_sandbox_in_every_mode() {
+    let secret = std::env::temp_dir().join(format!("rein-screen-{}-mcp-unset", std::process::id())).join("home/.ssh/id_test");
     let peek = || Turn { out: vec![Out::Call("mcp__fake__peek", json!({ "path": secret }))] };
-    let mut model = Model::start(vec![peek(), says("Read it."), peek(), says("Blocked.")]).with_env("REIN_MODE", "trust");
-    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] } } }).to_string()));
-    model.home.push((".ssh/id_test".into(), "FAKE-mcp-trust-secret\n".into()));
-    let mut term = Term::start_with(&model, "mcp-trust", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    let mut model = Model::start(vec![peek(), says("Read it."), peek(), says("Read again.")]);
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"], "allow": ["peek"] } } }).to_string()));
+    model.home.push((".ssh/id_test".into(), "FAKE-mcp-unset-secret\n".into()));
+    let mut term = Term::start_with(&model, "mcp-unset", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
     term.wait_for(IDLE);
     term.keys("peek\r");
     term.wait_for("Read it.");
-    assert_eq!(results(&model), ["read"], "outside, as trust runs commands");
+    assert_eq!(results(&model), ["read"], "outside, in ask with the sandbox on");
     wait_for_mcp(&mut term, "● 5 tools · outside the sandbox");
     term.keys("\x1b[Z");
-    let kept = "fake keeps running outside the sandbox, as it started: /mcp starts one again in this mode's walls";
-    term.wait_for(kept);
-    // From ask to edits the walls are the same: nothing more to say.
-    term.keys("\x1b[Z");
-    term.wait_for("·  edits  ·");
-    assert_eq!(term.text().matches(kept).count(), 1, "said once");
-    term.keys("/mcp\r");
-    pick(&mut term, "fake");
-    pick(&mut term, "restart");
-    term.wait_for(IDLE);
-    wait_for_mcp(&mut term, "● 5 tools · sandbox (network)");
+    term.wait_for("·  edits sandboxed  ·");
     term.keys("peek\r");
-    term.wait_for("Let fake's peek run?");
-    std::thread::sleep(Duration::from_millis(700));
-    term.keys("y");
-    term.wait_for("Blocked.");
-    assert_eq!(results(&model), ["read", "blocked"], "started again in ask: in its walls");
+    term.wait_for("Read again.");
+    assert_eq!(results(&model), ["read", "read"], "still outside in edits");
+    assert!(!term.text().contains("keeps running"), "{}", term.text());
 }
 
 /// Read-only asks before a server's tool, as ask does: turned off, a
@@ -3649,7 +3729,7 @@ fn a_server_that_fails_in_the_sandbox_is_offered_to_run_outside_it() {
     term.wait_for(IDLE);
     // It reads its settings in your home folder as it starts.
     let starts = format!("cat {} > /dev/null && exec sh server.sh", term.dir.join("home/.ssh/id_test").display());
-    term.keys(&format!("/mcp add fake sh -c '{starts}'\r"));
+    term.keys(&format!("/mcp add fake --access network sh -c '{starts}'\r"));
     term.wait_for("fake  didn't start: it stopped");
     term.wait_for("Run fake outside the sandbox?");
     std::thread::sleep(Duration::from_millis(700));
@@ -3696,7 +3776,7 @@ fn mcp_lets_you_pick_a_server_and_change_it_without_typing_its_name() {
     term.wait_for(IDLE);
     assert_eq!(file()["disabled"], true);
     term.keys("/mcp\r");
-    term.wait_for("– off · sandbox (network)");
+    term.wait_for("– off · outside the sandbox");
     pick(&mut term, "fake");
     pick(&mut term, "turn it on");
     term.wait_for("fake  5 tools: echo");
@@ -3728,7 +3808,7 @@ fn mcp_lists_each_server_once_a_line_each_cut_to_the_window() {
     let line = text.lines().rfind(|line| line.contains("gone")).unwrap_or_else(|| panic!("{text}"));
     assert!(line.trim_end().ends_with('…') && line.contains("✗ its command"), "one line, cut: {line:?}\n{text}");
     let fake = text.lines().rfind(|line| line.contains("fake")).unwrap_or_default();
-    assert!(fake.trim_end().ends_with("● 5 tools · sandbox (network)"), "its tools counted, not named, and where it runs: {fake:?}");
+    assert!(fake.trim_end().ends_with("● 5 tools · outside the sandbox"), "its tools counted, not named, and where it runs: {fake:?}");
     term.keys("/mcp\r");
     pick(&mut term, "gone");
     term.wait_until("why, in full", |screen| screen.replace('\n', "").contains("Helper, isn't there"));

@@ -24,10 +24,11 @@ What that means in practice:
   written in the README.
 - **You can always step in.** Esc stops a turn, Enter steers it at its
   next step, and `/undo` puts files back, including what commands did.
-- **Walls when you choose them.** The sandbox is yours to turn on, with
-  the mode: trust, the default, walls in nothing, and the other modes wall
-  in everything rein starts. What came with a cloned project waits for
-  your yes to exactly what it is, in every mode. The sandbox stays small:
+- **Walls when you choose them.** The sandbox is yours to turn on or
+  off, in any mode, as in Codex and Claude Code: off by default, `/sandbox`
+  turns it on for commands. MCP servers and your hooks run outside it, as
+  they do there. What came with a cloned project waits for your yes to
+  exactly what it is, in every mode. The sandbox stays small:
   its bugs get fixed, and it gets nothing new unless you ask.
 - **Your setup comes with you.** Skills, Claude Code's plugins, MCP
   servers from seven apps, and next, hooks and memory: what you set up
@@ -76,9 +77,9 @@ it for real.
 
 - **Set up.** Put the feature workflow above, and the habit of judging
   checks by their exit code, in `~/.config/rein/AGENTS.md`. rein reads
-  the repo's `CLAUDE.md` (18 KB, under the 32 KB limit) already. Stay in
-  trust mode: in the other modes `cargo test` runs in rein's sandbox, where
-  rein's own sandbox tests probably can't start one.
+  the repo's `CLAUDE.md` (18 KB, under the 32 KB limit) already. Keep the
+  sandbox off: in it, `cargo test` runs walled in, where rein's own
+  sandbox tests probably can't start one.
 - **Use it.** Small and medium rein tasks first, with Claude Code as the
   backup. Note everything that breaks or annoys, with the session file.
   That list decides what comes after this plan.
@@ -123,9 +124,8 @@ its newer hooks; pi's extensions; OpenCode's plugins.
 - **Your Claude Code hooks work as they are.** rein reads them from
   `settings.json` and from your plugins, the way it reads your skills and
   MCP servers.
-- **Hooks follow your mode**, as commands and MCP servers do: in trust,
-  outside the sandbox, as Claude Code runs them; in the other modes, in
-  its walls.
+- **Your hooks run outside the sandbox** in every mode, as Claude Code
+  runs them: they're your setup, not what the model runs.
 - **A project's hooks start only after you approve them as they are.**
   Approval is kept for exactly what each one runs; a change asks again.
   Hooks shipped in a cloned repo have been a real problem for other

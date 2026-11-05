@@ -145,11 +145,10 @@ impl Default for How {
     }
 }
 
-/// Why there's no sandbox.
+/// Why there's no sandbox. Whether you want one is yours to say apart
+/// from this: it's about what this computer has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Missing {
-    /// `sandbox = off` in the settings.
-    TurnedOff,
     /// rein has no way to sandbox commands on this system yet.
     NotHere,
     /// There is one, but it didn't start, and this is what it said. rein
@@ -230,18 +229,17 @@ impl Sandbox {
         }
     }
 
-    /// What holds commands in, in a few words: for `/status`.
+    /// What holds commands in when it's on, in a few words: for `/status`.
     pub fn describe(&self) -> String {
         match &self.how {
             #[cfg(target_os = "macos")]
-            How::Seatbelt => "on: macOS Seatbelt".to_owned(),
+            How::Seatbelt => "macOS Seatbelt".to_owned(),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            How::Landlock(version) => format!("on: Linux Landlock (version {version}) and seccomp; what runs code later is put back after each command"),
+            How::Landlock(version) => format!("Linux Landlock (version {version}) and seccomp; what runs code later is put back after each command"),
             #[cfg(feature = "test-support")]
             How::Assumed => "assumed, for a test".to_owned(),
-            How::Missing(Missing::TurnedOff) => "off in the settings: commands ask before they run".to_owned(),
-            How::Missing(Missing::NotHere) => "none on this system: commands ask before they run".to_owned(),
-            How::Missing(Missing::Failed(said)) => format!("didn't start ({said}): commands ask before they run"),
+            How::Missing(Missing::NotHere) => "none on this system".to_owned(),
+            How::Missing(Missing::Failed(said)) => format!("it didn't start ({said})"),
         }
     }
 

@@ -4,14 +4,14 @@
 use crate::args::{AskArgs, Resume};
 use crate::commands::{EffortSetting, Slash};
 use crate::format::{local_time, shorten, shown_path, thousands, traffic};
-use crate::input::{Menu, Question, Read};
+use crate::input::{Menu, Read};
 use crate::terminal::{Last, Terminal, you_said};
 use crate::ui::history::{self, History};
 use crate::ui::style::GUTTER;
 use crate::{CREDENTIALS_FILE, CliResult, config_dir, describe, login};
 use rein_agent::agent::{Agent, Llm, Outcome};
 use rein_agent::compact;
-use rein_agent::permissions::{Mode, Permissions, Whose};
+use rein_agent::permissions::{Mode, Permissions, Sandboxing, Whose};
 use rein_agent::sandbox::{self, Missing, Places, Sandbox};
 use rein_agent::session::{self, Header, Loaded, Session};
 use rein_agent::tools::Tools;
@@ -64,20 +64,20 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         Some(path) => Some(File::create(path).map_err(|e| format!("can't create {}: {e}", path.display()))?),
         None => None,
     };
-    let sandbox = std::sync::Arc::new(find_sandbox(&root, &dir, args.sandbox).await);
-    let permissions = load_permissions(&root, &dir, args.mode, sandbox.clone())?;
+    let sandbox = std::sync::Arc::new(find_sandbox(&root, &dir).await);
+    let permissions = load_permissions(&root, &dir, args.mode, args.sandbox, sandbox.clone())?;
     // What you sent from this folder before, for ↑ and Ctrl-R: only a
     // conversation has a box to bring it back in.
     let sent = if args.prompt.is_none() { History::load(history::file(&dir, &root)) } else { History::default() };
     let mut terminal = Terminal::new(root.clone(), sandbox.clone(), args.mode, args.prompt.is_none(), sent, args.bell);
-    terminal.sandboxed = sandbox.available();
+    terminal.sandboxing = permissions.sandboxing();
     // The box goes up now, so typing can start while the model list loads.
     terminal.model = connected.as_ref().map(|c| provider::shown(&c.provider, &c.model)).unwrap_or_default();
     terminal.effort = args.effort;
     terminal.input.set_bar(terminal.bar());
     // Your MCP servers and the project's start now, while the rest gets
     // ready; the project's only once you've said yes to each as it is.
-    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), args.mode, http.clone(), &mut terminal, args.prompt.is_none()).await;
+    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), http.clone(), &mut terminal, args.prompt.is_none()).await;
     let saved = match args.resume {
         Resume::New => None,
         Resume::Latest => latest,
@@ -576,9 +576,8 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 if let Some(peers) = &terminal.peers {
                     peers.follow_mode(mode);
                 }
-                crate::mcp::follow_mode(mode, &setup.mcp, terminal);
                 terminal.input.set_bar(terminal.bar());
-                terminal.input.notice(&format!("{} · shift-tab for the next", mode_description(mode, terminal.sandboxed)));
+                terminal.input.notice(&format!("{} · shift-tab for the next", crate::modes::description(mode, terminal.sandboxing)));
                 continue;
             }
             Said::Paste => {
@@ -704,7 +703,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             }
         }
         // Chosen above.
-        Slash::Mode(None) | Slash::Model(None) | Slash::Login(None) | Slash::Logout(None) | Slash::Effort(None) => {}
+        Slash::Mode(None) | Slash::Sandbox(None) | Slash::Model(None) | Slash::Login(None) | Slash::Logout(None) | Slash::Effort(None) => {}
         Slash::Mode(Some(mode)) => {
             agent.permissions.mode = mode;
             agent.step_limit = step_limit(mode, false, setup.max_steps);
@@ -712,11 +711,19 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             if let Some(peers) = &terminal.peers {
                 peers.follow_mode(mode);
             }
-            say!("{pad}{} {}", s.green("✓"), mode_description(mode, terminal.sandboxed));
-            crate::mcp::follow_mode(mode, &setup.mcp, terminal);
+            say!("{pad}{} {}", s.green("✓"), crate::modes::description(mode, terminal.sandboxing));
             // The bar says so while it asks whether to keep it.
             terminal.input.set_bar(terminal.bar());
-            keep_mode(mode, terminal).await?;
+            crate::modes::keep_mode(mode, terminal).await?;
+        }
+        Slash::Sandbox(Some(on)) => {
+            agent.permissions.set_sandbox(on);
+            terminal.sandboxing = agent.permissions.sandboxing();
+            say!("{pad}{} {}", s.green("✓"), crate::modes::sandbox_now(terminal.sandboxing, agent.permissions.sandbox()));
+            // What the mode does now, as it depends on it.
+            say!("{pad}{}", s.dim(crate::modes::description(agent.permissions.mode, terminal.sandboxing)));
+            terminal.input.set_bar(terminal.bar());
+            crate::modes::keep_sandbox(on, terminal).await?;
         }
         Slash::Permissions(rules) => crate::rules::command(rules, agent, terminal).await?,
         Slash::Model(Some(spec)) => {
@@ -762,8 +769,8 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 ("model", terminal.model.clone()),
                 ("provider", format!("{} · {}", setup.provider.title, agent.model.client.base_url())),
                 ("effort", crate::effort::words(agent)),
-                ("mode", mode_description(agent.permissions.mode, terminal.sandboxed).to_owned()),
-                ("sandbox", agent.permissions.sandbox().describe()),
+                ("mode", crate::modes::description(agent.permissions.mode, terminal.sandboxing).to_owned()),
+                ("sandbox", crate::modes::sandbox_status(terminal.sandboxing, agent.permissions.sandbox())),
                 (
                     "steps",
                     match (agent.step_limit, setup.max_steps) {
@@ -845,12 +852,23 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
             let modes = Mode::ALL;
             // "edits: file changes ...": the name is the item's already.
             let about = |m: Mode| {
-                let description = mode_description(m, terminal.sandboxed);
+                let description = crate::modes::description(m, terminal.sandboxing);
                 description.split_once(": ").map_or(description, |(_, about)| about).to_owned()
             };
             let items = modes.iter().map(|&m| (m.to_string(), about(m))).collect();
             let current = modes.iter().position(|&m| m == agent.permissions.mode);
             terminal.input.choose(menu("what runs without asking", items, current)).await.map(|i| Slash::Mode(Some(modes[i])))
+        }
+        Slash::Sandbox(None) => {
+            let sandbox = agent.permissions.sandbox();
+            let on = if sandbox.available() {
+                format!("commands run in it, within what each says it needs: {}", sandbox.describe())
+            } else {
+                format!("{}: commands would ask first, as there are no walls to hold them", sandbox.describe())
+            };
+            let items = vec![("on".to_owned(), on), ("off".to_owned(), "commands run as you'd run them, and the mode decides what asks".to_owned())];
+            let current = Some(if terminal.sandboxing == Sandboxing::Off { 1 } else { 0 });
+            terminal.input.choose(menu("the sandbox, in any mode", items, current)).await.map(|i| Slash::Sandbox(Some(i == 0)))
         }
         Slash::Effort(None) => match crate::effort::choices(agent) {
             Some(choices) => {
@@ -1077,82 +1095,36 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
     Ok(terminal.model.clone())
 }
 
-/// What `mode` lets through, `name: what`, as it is with a sandbox
-/// here (`sandboxed`) or without one.
-pub(crate) fn mode_description(mode: Mode, sandboxed: bool) -> &'static str {
-    match (mode, sandboxed) {
-        (Mode::Ask, true) => "ask: file changes ask first, and so do commands that do more than look",
-        (Mode::Ask, false) => "ask: file changes and commands ask first",
-        (Mode::Edits, true) => "edits: file changes in this folder and commands in the sandbox don't ask; going past it does",
-        (Mode::Edits, false) => "edits: file changes in this folder don't ask; commands do",
-        (Mode::Auto, true) => "auto: nothing asks; commands stay in the sandbox, and what would go past it is refused",
-        (Mode::Auto, false) => "auto: nothing asks; file changes in this folder go ahead, and only the commands rules allow run",
-        (Mode::ReadOnly, true) => "read-only: commands only look, in the sandbox, and nothing changes",
-        (Mode::ReadOnly, false) => "read-only: nothing runs or changes",
-        (Mode::Trust, _) => {
-            "trust: everything runs without asking, commands without the sandbox, but what ask rules name, like deleting, asks, and deny rules stop what they name. MCP servers keep the walls they were added with"
-        }
-    }
-}
-
-/// After `/mode`: whether new conversations start in `mode` too, asked
-/// when it isn't the one they start in already, and kept in your settings
-/// if you say so.
-async fn keep_mode(mode: Mode, terminal: &mut Terminal) -> CliResult {
-    let path = config_dir()?.join(crate::settings::FILE);
-    let settings = crate::settings::Settings::load(&path)?;
-    let kept = settings.in_file("mode").and_then(|name| name.parse::<Mode>().ok()).unwrap_or_default();
-    if kept == mode {
-        return Ok(());
-    }
-    let question = Question {
-        title: format!("Start in {mode} from now on?"),
-        detail: Some(format!("New conversations start in {kept} now. Yes keeps mode = {mode} in {}.", crate::rules::shown(&path))),
-        command: None,
-        // No first: Enter out of habit keeps nothing.
-        answers: vec![("n", "No, just this conversation".to_owned()), ("y", format!("Yes, start in {mode}"))],
-    };
-    if !terminal.yes(question).await {
-        return Ok(());
-    }
-    crate::settings::set(&path, "mode", mode.as_str())?;
-    let pad = " ".repeat(GUTTER);
-    say!("{pad}{} new conversations start in {mode}", terminal.err.green("✓"));
-    // Said, as it would otherwise look like it didn't take.
-    if std::env::var("REIN_MODE").is_ok_and(|name| !name.is_empty()) {
-        say!("{pad}{}", terminal.err.dim("(REIN_MODE in your environment still wins over the settings)"));
-    }
-    Ok(())
-}
-
-/// The sandbox for the project at `root`, with rein's own folder `rein`
-/// among what's hidden from commands; none if `on` is false.
-async fn find_sandbox(root: &Path, rein: &Path, on: bool) -> Sandbox {
+/// This computer's sandbox for the project at `root`, with rein's own
+/// folder `rein` among what's hidden from commands: found whether it's on
+/// or not, so that `/sandbox` can turn it on.
+async fn find_sandbox(root: &Path, rein: &Path) -> Sandbox {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let places = Places::new(root, home.as_deref(), Some(rein));
-    if on { Sandbox::detect(places).await } else { Sandbox::missing(places, Missing::TurnedOff) }
+    Sandbox::detect(Places::new(root, home.as_deref(), Some(rein))).await
 }
 
 /// The mode plus your rules, from rein's folder `dir`, and the project's
-/// `.rein/permissions`, if it has one, deciding with `sandbox`. Says what
-/// it's using whenever that's anything other than the plain default, when
-/// commands can't be sandboxed, and what rein does the first time.
-pub(crate) fn load_permissions(root: &Path, dir: &Path, mode: Mode, sandbox: sandbox::Shared) -> CliResult<Permissions> {
+/// `.rein/permissions`, if it has one, deciding with `sandbox` if it's
+/// `on`. Says what it's using whenever that's anything other than the
+/// plain default, when commands can't be sandboxed, and what rein does the
+/// first time.
+pub(crate) fn load_permissions(root: &Path, dir: &Path, mode: Mode, on: bool, sandbox: sandbox::Shared) -> CliResult<Permissions> {
     let path = root.join(".rein").join("permissions");
     let rules = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("can't read .rein/permissions: {e}")),
     };
-    let sandboxed = sandbox.available();
-    match (mode, sandbox.missing_why()) {
-        // Trust doesn't use it, and without it nothing changes for you.
-        (Mode::Trust, _) | (_, None) => {}
-        (_, Some(Missing::TurnedOff)) => say!("Sandbox: off in the settings, so commands ask before they run"),
-        (_, Some(Missing::NotHere)) => say!("Sandbox: none on this system yet, so commands ask before they run"),
-        (_, Some(Missing::Failed(said))) => say!("Sandbox: it didn't start ({said}), so commands ask before they run"),
-    }
     let mut permissions = Permissions::new(mode, &rules).map_err(|e| format!(".rein/permissions {e}"))?.with_sandbox(sandbox);
+    permissions.set_sandbox(on);
+    let sandboxing = permissions.sandboxing();
+    // Turned on where there's none: said, as commands ask now.
+    if sandboxing == Sandboxing::Missing {
+        match permissions.sandbox().missing_why() {
+            Some(Missing::Failed(said)) => say!("Sandbox: it didn't start ({said}), so commands ask before they run"),
+            _ => say!("Sandbox: none on this system yet, so commands ask before they run"),
+        }
+    }
     let (yours, first_time) = crate::rules::load(dir)?;
     permissions.set_yours(&yours).map_err(|e| format!("{} {e}", crate::rules::shown(&dir.join(crate::rules::FILE))))?;
     if first_time {
@@ -1163,7 +1135,7 @@ pub(crate) fn load_permissions(root: &Path, dir: &Path, mode: Mode, sandbox: san
         say!("Using {count} rule{} from .rein/permissions", if count == 1 { "" } else { "s" });
     }
     if mode != Mode::default() {
-        let description = mode_description(mode, sandboxed);
+        let description = crate::modes::description(mode, sandboxing);
         let (name, about) = description.split_once(": ").unwrap_or((description, ""));
         say!("Mode: {name} ({about})");
     }

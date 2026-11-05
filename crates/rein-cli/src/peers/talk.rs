@@ -150,8 +150,17 @@ async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &m
     }
     // Its own command line: the task isn't on it, only where to fetch it.
     let exe = std::env::current_exe().map_or_else(|_| "rein".to_owned(), |path| path.to_string_lossy().into_owned());
-    let mut argv =
-        vec![exe, "--name".to_owned(), name.clone(), "--child".to_owned(), format!("{}:{id}", std::process::id()), "--mode".to_owned(), terminal.mode.as_str().to_owned()];
+    let mut argv = vec![
+        exe,
+        "--name".to_owned(),
+        name.clone(),
+        "--child".to_owned(),
+        format!("{}:{id}", std::process::id()),
+        "--mode".to_owned(),
+        terminal.mode.as_str().to_owned(),
+        "--sandbox".to_owned(),
+        if terminal.sandboxing == rein_agent::permissions::Sandboxing::Off { "off" } else { "on" }.to_owned(),
+    ];
     if !model.is_empty() {
         argv.extend(["-m".to_owned(), model.clone()]);
     }

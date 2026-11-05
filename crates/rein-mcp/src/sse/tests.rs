@@ -126,7 +126,6 @@ fn at(url: &str, wire: Wire, web: Arc<Old>) -> (Server, Launch) {
         keys: Arc::new(crate::Keys::new([("REIN_TEST_OLD_KEY".to_owned(), "FAKE-old-key".to_owned())].into())),
         web: Some(web),
         tokens: None,
-        by_mode: Arc::default(),
     };
     (server, launch)
 }

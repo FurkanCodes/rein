@@ -28,7 +28,7 @@ async fn fake_in(name: &str, walls: Walled) -> (Server, Launch, PathBuf) {
     let sandbox = Arc::new(Sandbox::detect(places).await);
     let local = Local { command: "sh".into(), args: vec!["server.sh".into()], env: [("GIVEN".to_owned(), "hello there".to_owned())].into(), access: walls };
     let server = Server { name: "fake".into(), origin: Origin::Yours, reach: Reach::Local(local), allow: vec!["echo".into()], offered: Default::default() };
-    (server, Launch { sandbox, root, caches: home.join(".cache/rein/mcp"), keys: Arc::default(), web: None, tokens: None, by_mode: Arc::default() }, home)
+    (server, Launch { sandbox, root, caches: home.join(".cache/rein/mcp"), keys: Arc::default(), web: None, tokens: None }, home)
 }
 
 /// The command of `server`, to change.
@@ -138,31 +138,17 @@ async fn a_server_in_the_sandbox_reads_the_project_but_not_your_home_folder() {
     assert!(caches.join("fake").is_dir(), "a folder of its own, for what npx fetches");
 }
 
-/// One with no walls of its own runs as the mode has it: outside the
-/// sandbox in trust, where your commands are, and in it otherwise. One
-/// that's running keeps the walls it started in, and says so when the
-/// mode changes; started again, it's in the mode's.
+/// One with no walls of its own runs outside the sandbox, as servers do
+/// in Codex and Claude Code, whatever the mode: it reads what a walled one
+/// can't.
 #[tokio::test]
-async fn a_server_without_walls_of_its_own_runs_as_the_mode_has_it() {
-    let (server, launch, home) = fake_in("bymode", Walled::ByMode).await;
-    if !launch.sandbox.available() {
-        return;
-    }
-    launch.by_mode.set(Access::Outside);
-    let servers = Servers::start(vec![server.clone()], launch);
+async fn a_server_without_walls_of_its_own_runs_outside_the_sandbox() {
+    let (server, launch, home) = fake_in("unset", Walled::Unset).await;
+    let servers = Servers::start(vec![server], launch);
     servers.list().await;
     let peek = json!({ "path": home.join(".ssh/id_test") }).to_string();
-    assert_eq!(servers.call("mcp__fake__peek", &peek).await, Ok("read".into()), "trust: as your commands, outside");
+    assert_eq!(servers.call("mcp__fake__peek", &peek).await, Ok("read".into()));
     assert_eq!(servers.walls("fake"), Some(Access::Outside));
-    assert_eq!(servers.follow_mode(Access::Network), ["fake"], "running outside still, and said so");
-    assert_eq!(servers.walls("fake"), Some(Access::Outside), "the walls it started in");
-    assert_eq!(servers.follow_mode(Access::Network), ["fake"]);
-    servers.add(server);
-    servers.list().await;
-    assert_eq!(servers.call("mcp__fake__peek", &peek).await, Ok("blocked".into()), "started again: in the mode's walls");
-    assert_eq!(servers.walls("fake"), Some(Access::Network));
-    assert!(servers.follow_mode(Access::Network).is_empty(), "nothing to say");
-    assert_eq!(servers.follow_mode(Access::Outside), ["fake"]);
 }
 
 /// A server in the sandbox that fails may fail for what it can't reach,
@@ -311,7 +297,7 @@ async fn a_server_from_npm_starts_in_the_sandbox() {
     let local =
         Local { command: "npx".into(), args: vec!["-y".into(), "@modelcontextprotocol/server-everything".into()], env: Default::default(), access: Walled::Set(Access::Network) };
     let server = Server { name: "everything".into(), origin: Origin::Yours, reach: Reach::Local(local), allow: Vec::new(), offered: Default::default() };
-    let launch = Launch { sandbox, root: root.clone(), caches: root.join("caches"), keys: Arc::default(), web: None, tokens: None, by_mode: Arc::default() };
+    let launch = Launch { sandbox, root: root.clone(), caches: root.join("caches"), keys: Arc::default(), web: None, tokens: None };
     let servers = Servers::start(vec![server], launch);
     let listing = servers.list().await;
     println!("{:?}", listing.note);

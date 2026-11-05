@@ -220,6 +220,7 @@ message, so typing ahead can't answer it by accident.
 | Drag over text | select it and copy it to the clipboard |
 | Ctrl-L | draw the window again |
 | `/mode [trust\|ask\|edits\|auto\|read-only]` | show or change what runs without asking, and keep it for new conversations if you like |
+| `/sandbox [on\|off]` | run commands in the sandbox, or as you'd run them, in any mode, and keep it for new conversations if you like (see [The sandbox](#the-sandbox)) |
 | `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/search [auto\|off\|model]` | which model searches the web for the model: the one in use as rein decides, one you pick, or none (see [Web search](#web-search)) |
@@ -431,8 +432,9 @@ tab_command = "my-term --new-tab --title {title} -- {command}"
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`, `$REIN_SEARCH`,
 `$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS`,
 `$REIN_SANDBOX`, `$REIN_PEERS` and `$REIN_STRIP`, which win over the file.
-`/mode` writes `mode` here when you keep the one you picked, and leaves the
-rest as it was.
+`/mode` and `/sandbox` write `mode` and `sandbox` here when you keep the one
+you picked, and leave the rest as it was. The sandbox is off unless it says
+`sandbox = on` (or `--sandbox on`).
 
 ## Small things that matter
 
@@ -593,8 +595,8 @@ A skill is someone's text: nothing in it runs because it's loaded, and
 its `allowed-tools` lets nothing run without asking. A name holds letters,
 digits and `-_.:` only, and what a skill says is cleaned of what a
 terminal would act on before you or the model see it. Its scripts run as
-commands do, in the sandbox, which reads the skill folders but never
-changes them; Claude Code's are read though the rest of `~/.claude`,
+commands do: with the sandbox on, in it, which reads the skill folders but
+never changes them; Claude Code's are read though the rest of `~/.claude`,
 logins and settings, stays hidden.
 
 ## Hooks
@@ -738,9 +740,13 @@ that it only undoes what `write` and `edit` did.
 
 ### The sandbox
 
-In every mode but `trust`, commands run in a sandbox: the operating system
-holds each one, and everything it starts, to what it needs. The model says what that is when it
-asks to run one:
+The sandbox is yours to turn on or off, in any mode, as in Codex and Claude
+Code: `/sandbox`, `--sandbox on|off`, or `sandbox = on` in the settings.
+It's off unless you turn it on, as in Claude Code: commands then run as
+you'd run them, and the mode alone decides what asks (see
+[Modes](#modes)). On, the operating system holds each command, and
+everything it starts, to what it needs, in every mode, trust too. The
+model says what that is when it asks to run one:
 
 | Access | The command may |
 |---|---|
@@ -789,9 +795,11 @@ folders, though, so on Linux what's protected inside the project, and a
 tool's settings beside its records, is guarded instead: rein notes it
 before a command that may change it, and puts it back after
 (something the command leaves running in the background could still change
-it later). Where there's no sandbox (Windows, older kernels), or with
-`sandbox = off`, commands ask before they run: rein never runs one
-unconfined when it meant to confine it.
+it later). Turned on where there's no sandbox (Windows, older kernels), or
+where it didn't start, rein says so as it starts and commands ask before
+they run, and `auto` refuses them: rein never runs one unconfined when it
+meant to confine it. The bar says `sandboxed` while it's on, and `no
+sandbox` when it's on but missing.
 
 Other programs of yours can read the environment rein was started with
 (a command in the sandbox can't). So rein takes the keys and tokens out of
@@ -806,10 +814,10 @@ programs can't read it.
 
 ### Modes
 
-rein starts in `trust`: everything runs without asking, commands without
-the sandbox, except what your rules say to ask about first, which starts
-as deleting. `--mode`, `mode` in the settings, or `/mode`, which offers to
-keep what you pick for new conversations, set what runs without asking, by
+rein starts in `trust`: everything runs without asking, except what your
+rules say to ask about first, which starts as deleting. `--mode`, `mode` in
+the settings, or `/mode`, which offers to keep what you pick for new
+conversations, set what runs without asking. With the sandbox on, that's by
 what a command needs:
 
 | Mode | File changes | `look` | `write` | `network`, `outside` |
@@ -820,20 +828,30 @@ what a command needs:
 | `auto` | allowed | runs | runs | refused |
 | `read-only` | refused | runs | refused | refused |
 
-`trust` runs every command without the sandbox, except what an ask rule
-names, which asks, and what a deny rule blocks. What the model reads (a web
-page, an issue, a file in a cloned repository, an MCP server's answer) can
-lead it to run any command with your keys and the network, and the rules
-are about mistakes, not about that: for work you'd rather not watch, the
-other modes' walls hold whatever the model is told. The walls are yours
-to choose, with the mode: an MCP server with none of its own runs as your
-commands do, outside the sandbox in `trust` and in it in the others (see
-[MCP servers](#mcp-servers)).
-`auto` never asks: it's for leaving rein to work on its own, and what would
-go past the sandbox is refused, so the model makes do or tells you what it
-needs. File changes to the protected paths above ask in every mode but
-`trust`, even in `edits`. Without a sandbox, commands ask in `ask` and
-`edits`, and `auto` and `read-only` run none.
+With it off, nothing holds a command to what it says it needs, so:
+
+| Mode | File changes | Commands |
+|---|---|---|
+| `trust` (default) | allowed | run |
+| `ask` | ask | ask |
+| `edits` | allowed | ask |
+| `auto` | allowed | run |
+| `read-only` | refused | ask, if they only look; the rest are refused |
+
+`trust` runs every command without asking, in the sandbox when it's on
+(and `outside` too, without asking), except what an ask rule names, which
+asks, and what a deny rule blocks. What the model reads (a web page, an
+issue, a file in a cloned repository, an MCP server's answer) can lead it
+to run any command with your keys and the network, and the rules are about
+mistakes, not about that: for work you'd rather not watch, turn the
+sandbox on, and its walls hold whatever the model is told. `auto` never
+asks: it's for leaving rein to work on its own, and what would ask is
+refused instead. With the sandbox on, that's what would go past it, so the
+model makes do or tells you what it needs; with it off, every command runs,
+as in Codex's full access, but what an ask rule names. File changes to the
+protected paths above ask in every mode but `trust`, even in `edits`, with
+the sandbox on or off. An MCP server runs outside the sandbox in every mode,
+unless you gave it walls of its own (see [MCP servers](#mcp-servers)).
 
 ### Rules
 
@@ -902,7 +920,8 @@ the command it would run, pinned to a version (`npx -y
 needs is a `${NAME}` of yours, asked for in dots as it starts, and never
 written in your `mcp.json`. One reached at a URL comes first when the
 registry offers both: none of its code runs here. npm and PyPI packages
-run as your mode has it (below); Docker images run with Docker, which
+run outside the sandbox, as every server does unless you wall it in
+(below); Docker images run with Docker, which
 walls in its containers itself and which the sandbox can't reach. `REIN_MCP_REGISTRY`
 points rein at another registry, as a company's own.
 
@@ -941,8 +960,8 @@ there and then. One that needs a variable you haven't set (`${NAME}`) has
 it asked for, in dots, as rein starts or as you add it: it's kept in
 `~/.config/rein/mcp-keys.json`, which only you can read and the sandbox
 hides, and filled in when your shell hasn't it. Your environment's value
-wins. One that fails in the sandbox is asked about running outside it,
-which a yes writes in your file. Nothing needs typing again.
+wins. One you walled in that fails in the sandbox is asked about running
+outside it, which a yes writes in your file. Nothing needs typing again.
 
 These write `~/.config/rein/mcp.json`, which you can edit too. rein also
 reads a project's `.mcp.json`. Both have the shape Claude Code and Cursor
@@ -963,21 +982,18 @@ A line that writes a key in as it is (`TOKEN=ghp_…` rather than
 `mcp.json`, which only you can read. Leave it out and give the variable's
 name instead (`TOKEN=$GITHUB_TOKEN`): rein asks for it in dots.
 
-A server runs as your mode has it, as your commands do: in `trust`, outside
-the sandbox, and in the other modes in it, the way a command with `network`
-access runs. There it reaches the project and the internet, but not the
-rest of your home folder, other programs' sockets, or rein's keys. The walls
-are yours to choose, with the mode: no other harness walls in a server
-while it runs your commands unwalled, and walls break what servers need
-(a browser, the keychain, another app). A server that's running keeps the
-walls it started in when you change the mode, and rein says so; `/mcp`
-starts it again in the new ones. What `npx` or `uvx` fetch goes in a
-folder of the server's own, `~/.cache/rein/mcp/<server>`, which nothing
-else may write. `"access"` gives a server walls of its own, whatever the
-mode: `look`, `write`, `network`, or `outside` for one that needs all of
-your home folder, like one that reads `~/.config/gh`; `/mcp` changes it,
-back to "as your mode has it" too, and `--access` before the command sets
-it as you add one. A project's server is never let out from `/mcp`: the
+A server runs outside the sandbox, as in Codex and Claude Code, whatever
+the mode and whether the sandbox is on for commands: walls break what
+servers need (a browser, the keychain, another app), and one that came with
+a project waits for your yes to what it runs instead. `"access"` gives a
+server walls of its own, whatever the mode: `look`, `write`, or `network`,
+the way a command with that access runs, reaching the project (and with
+`network` the internet) but not the rest of your home folder, other
+programs' sockets, or rein's keys; or `outside`, which is what none means.
+What `npx` or `uvx` fetch for a walled one goes in a folder of the server's
+own, `~/.cache/rein/mcp/<server>`, which nothing else may write. `/mcp`
+changes a server's walls, and `--access` before the command sets them as
+you add one. A project's server is never let out from `/mcp`: the
 project doesn't decide that. Its environment is what `env` gives it. `${NAME}` is a
 variable of yours, filled in as it starts, and its value is hidden wherever
 it shows up.

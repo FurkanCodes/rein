@@ -457,22 +457,24 @@ impl Tools {
     }
 
     /// What the model is told about `bash`. It's the same in every mode,
-    /// so that changing modes doesn't change the start of every request
-    /// and lose the prompt cache: what a mode allows, a refusal says.
+    /// with the sandbox on or off, so that changing either doesn't change
+    /// the start of every request and lose the prompt cache: what a mode
+    /// allows, a refusal says, and what the walls held, a failure.
     fn bash_description(&self) -> &'static str {
         if self.sandbox.available() {
-            "Run a shell command in the project root and return its output and exit code. Commands run in a \
-             sandbox, so say what each needs in access, and ask for no more: look for one that only reads, write \
-             for one that changes files in the project (builds and tests usually do), network for one that also \
-             uses the internet, and outside for one that must write elsewhere (installing packages into a cache in \
-             the home folder), or use docker, ssh or a terminal. Depending on the mode, more access may need the \
-             user's approval, or be refused. Even in the sandbox, secrets in the home folder can't be read and \
-             files that run code later (.git/hooks, .git/config, .rein) can't be changed. Commands are stopped \
-             after 60 seconds unless you ask for longer, up to 600, for slow builds and test suites."
+            "Run a shell command in the project root and return its output and exit code. Say what each command \
+             needs in access, and ask for no more: look for one that only reads, write for one that changes files \
+             in the project (builds and tests usually do), network for one that also uses the internet, and outside \
+             for one that must write elsewhere (installing packages into a cache in the home folder), or use docker, \
+             ssh or a terminal. When the user has the sandbox on, commands run in it, within that access: secrets in \
+             the home folder can't be read and files that run code later (.git/hooks, .git/config, .rein) can't be \
+             changed. Depending on the mode, a command, or more access, may need the user's approval, or be refused. \
+             Commands are stopped after 60 seconds unless you ask for longer, up to 600, for slow builds and test \
+             suites."
         } else {
-            "Run a shell command in the project root and return its output and exit code. The user approves \
-             each command before it runs; say what it needs in access. Commands are stopped after 60 seconds \
-             unless you ask for longer, up to 600, for slow builds and test suites."
+            "Run a shell command in the project root and return its output and exit code. Say what it needs in \
+             access. Depending on the mode, the user may approve each command before it runs. Commands are stopped \
+             after 60 seconds unless you ask for longer, up to 600, for slow builds and test suites."
         }
     }
 

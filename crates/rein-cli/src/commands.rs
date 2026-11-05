@@ -8,6 +8,7 @@ use rein_llm::Effort;
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/help", "", "list these commands"),
     ("/mode", "[trust|ask|edits|auto|read-only]", "show or change what runs without asking"),
+    ("/sandbox", "[on|off]", "run commands in the sandbox, or as you'd run them, in any mode"),
     ("/permissions", "[add|remove rule]", "what asks first, or is refused: your rules, for every project, and this one's"),
     ("/model", "[id]", "list the models, or switch to one"),
     ("/login", "[provider]", "sign in to a provider, or see what pays for each"),
@@ -41,6 +42,8 @@ pub enum Slash {
     Help,
     /// `None` shows the mode.
     Mode(Option<Mode>),
+    /// On or off; `None` asks which.
+    Sandbox(Option<bool>),
     Permissions(Rules),
     Model(Option<String>),
     /// `None` lists the providers and what pays for each.
@@ -286,6 +289,12 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
             None => Ok(Slash::Mode(None)),
             Some(name) => name.parse().map(|m| Slash::Mode(Some(m))).map_err(Refused::Said),
         },
+        "/sandbox" => match arg.as_deref() {
+            None => Ok(Slash::Sandbox(None)),
+            Some("on") => Ok(Slash::Sandbox(Some(true))),
+            Some("off") => Ok(Slash::Sandbox(Some(false))),
+            Some(other) => Err(Refused::Said(format!("/sandbox is on or off, not {other}"))),
+        },
         "/permissions" => Rules::parse(rest).map(Slash::Permissions),
         "/model" => Ok(Slash::Model(arg)),
         "/login" => match words.as_slice() {
@@ -393,6 +402,10 @@ mod tests {
     #[test]
     fn reads_commands_and_their_arguments() {
         assert_eq!(parse("/mode edits"), Some(Ok(Slash::Mode(Some(Mode::Edits)))));
+        assert_eq!(parse("/sandbox"), Some(Ok(Slash::Sandbox(None))));
+        assert_eq!(parse("/sandbox on"), Some(Ok(Slash::Sandbox(Some(true)))));
+        assert_eq!(parse("/sandbox off"), Some(Ok(Slash::Sandbox(Some(false)))));
+        assert_eq!(parse("/sandbox maybe"), Some(Err(Refused::Said("/sandbox is on or off, not maybe".into()))));
         assert_eq!(parse("  /permissions  "), Some(Ok(Slash::Permissions(Rules::Show))));
         assert_eq!(parse("/permissions add ask git  push"), Some(Ok(Slash::Permissions(Rules::Add("ask git  push".into())))));
         assert_eq!(parse("/permissions deny curl"), Some(Ok(Slash::Permissions(Rules::Add("deny curl".into())))));

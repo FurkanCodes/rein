@@ -98,12 +98,10 @@ fn doing(status: &Status) -> String {
     }
 }
 
-/// A server's walls in a word or two, as `/mcp` names them.
+/// A server's walls in a word, as `/mcp` names them: none of its own is
+/// `outside`.
 fn walled_word(walled: Walled) -> String {
-    match walled {
-        Walled::ByMode => "as your mode has it".to_owned(),
-        Walled::Set(access) => access.to_string(),
-    }
+    walled.access().to_string()
 }
 
 /// Where `server` runs, in `walls`, or is reached.
@@ -322,17 +320,14 @@ async fn act(action: Action, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &m
             set_offered(&server.name, offered, mcp, agent, terminal)
         }
         Action::Walls(server) => {
-            // The mode's walls first: what a server has when it has none
-            // of its own.
-            let choices: Vec<Walled> = std::iter::once(Walled::ByMode).chain(Access::ALL.into_iter().map(Walled::Set)).collect();
-            let about = |walled: Walled| match walled {
-                Walled::ByMode => "outside the sandbox in trust, as your commands run there; in it, with network, in the other modes".to_owned(),
-                Walled::Set(access) => format!("{}, whatever the mode", rein_mcp::walls(access)),
-            };
+            // None of its own is outside, as it was before you chose.
+            let choices: Vec<Walled> = Access::ALL.into_iter().map(Walled::Set).collect();
+            let about = |walled: Walled| format!("{}, whatever the mode and the sandbox", rein_mcp::walls(walled.access()));
             let items = choices.iter().map(|walled| (walled_word(*walled), about(*walled))).collect();
-            let current = choices.iter().position(|walled| Some(*walled) == server.walled());
+            let now = server.walled().map(Walled::access);
+            let current = choices.iter().position(|walled| Some(walled.access()) == now);
             let menu = Menu { title: format!("{}: run it with which walls", server.name), items, current, at: None };
-            let Some(walled) = terminal.input.choose(menu).await.and_then(|i| choices.get(i).copied()).filter(|walled| Some(*walled) != server.walled()) else {
+            let Some(walled) = terminal.input.choose(menu).await.and_then(|i| choices.get(i).copied()).filter(|walled| Some(walled.access()) != now) else {
                 return Ok(());
             };
             let server = set_access(&server, walled, mcp)?;
@@ -350,7 +345,7 @@ async fn act(action: Action, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &m
         }
         Action::Remove(name, _) => remove(&name, mcp, agent, terminal),
         Action::Start(server) => {
-            if !say_yes(&server, mcp.servers.by_mode(), &mcp.dir, &mcp.project(), terminal).await {
+            if !say_yes(&server, &mcp.dir, &mcp.project(), terminal).await {
                 return Ok(());
             }
             mcp.waiting.retain(|waiting| waiting.name != server.name);

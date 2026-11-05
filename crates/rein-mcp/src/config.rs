@@ -119,24 +119,25 @@ pub struct Local {
     pub access: Walled,
 }
 
-/// The walls a server on this computer runs inside: those your mode gives
-/// every server, or its own, whatever the mode. No other harness walls in
-/// a server while it runs your commands unwalled, as trust does: the walls
-/// are yours to choose, with the mode.
+/// The walls a server on this computer runs inside: none, unless it has
+/// its own, whatever the mode and the sandbox. Codex and Claude Code run
+/// every server outside their sandboxes, and walls broke what servers need
+/// (a browser, the keychain, another app); one of someone else's waits for
+/// your yes to what it runs instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Walled {
-    /// As the mode has it: none in trust, `network` in the others.
+    /// None of its own: it runs outside the sandbox.
     #[default]
-    ByMode,
+    Unset,
     /// Its own, set in your file or with `/mcp`.
     Set(Access),
 }
 
 impl Walled {
-    /// Its walls, where the mode would give `by_mode`.
-    pub fn or(self, by_mode: Access) -> Access {
+    /// Its walls: `outside` where it has none of its own.
+    pub fn access(self) -> Access {
         match self {
-            Walled::ByMode => by_mode,
+            Walled::Unset => Access::Outside,
             Walled::Set(access) => access,
         }
     }
@@ -329,7 +330,7 @@ fn reach(entry: &Entry) -> Result<Reach, String> {
         return Ok(Reach::Remote(Remote { url, headers: entry.headers.clone(), wire }));
     }
     let command = entry.command.clone().ok_or("it has no command to start")?;
-    Ok(Reach::Local(Local { command, args: entry.args.clone(), env: entry.env.clone(), access: entry.access.map_or(Walled::ByMode, Walled::Set) }))
+    Ok(Reach::Local(Local { command, args: entry.args.clone(), env: entry.env.clone(), access: entry.access.map_or(Walled::Unset, Walled::Set) }))
 }
 
 /// A server's name goes into its tools' names (`mcp__github__get_issue`),
@@ -380,14 +381,11 @@ impl Server {
     /// variable, a URL or a header, asks again.
     pub fn fingerprint(&self) -> String {
         match &self.reach {
-            // Walls the mode gives are another yes than walls of its own:
-            // in trust, they're none.
+            // None of its own is none: the same yes as `outside`, and
+            // another than "as the mode has it", which a server with none
+            // once had, so that one is asked about again.
             Reach::Local(local) => {
-                let access = match local.access {
-                    Walled::ByMode => "as the mode has it",
-                    Walled::Set(access) => access.as_str(),
-                };
-                json!({ "name": self.name, "command": local.command, "args": local.args, "env": local.env, "access": access })
+                json!({ "name": self.name, "command": local.command, "args": local.args, "env": local.env, "access": local.access.access().as_str() })
             }
             Reach::Remote(remote) if remote.wire == Wire::Sse => json!({ "name": self.name, "url": remote.url, "headers": remote.headers, "type": "sse" }),
             Reach::Remote(remote) => json!({ "name": self.name, "url": remote.url, "headers": remote.headers }),
@@ -621,7 +619,7 @@ pub(crate) mod tests {
 
     /// A command's server, for a test.
     pub(crate) fn local(name: &str, command: &str, args: &[&str]) -> Server {
-        let local = Local { command: command.into(), args: args.iter().map(|arg| (*arg).to_owned()).collect(), env: BTreeMap::new(), access: Walled::ByMode };
+        let local = Local { command: command.into(), args: args.iter().map(|arg| (*arg).to_owned()).collect(), env: BTreeMap::new(), access: Walled::Unset };
         Server { name: name.into(), origin: Origin::Yours, reach: Reach::Local(local), allow: Vec::new(), offered: Default::default() }
     }
 
@@ -659,7 +657,7 @@ pub(crate) mod tests {
         let names: Vec<&str> = named.servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["ctx", "docs", "github", "linear", "old"]);
         let github = &named.servers[2];
-        assert_eq!((command(github).access, github.allow.as_slice()), (Walled::ByMode, ["get_issue".to_owned()].as_slice()), "as the mode has it when not said");
+        assert_eq!((command(github).access, github.allow.as_slice()), (Walled::Unset, ["get_issue".to_owned()].as_slice()), "none of its own when not said");
         assert_eq!(command(&named.servers[1]).access, Walled::Set(Access::Look));
         assert_eq!(named.servers[3].reach, Reach::Remote(Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new(), wire: Wire::Http }));
         assert_eq!(named.servers[0].walled(), None, "one at a URL has no walls: none of its code runs here");
@@ -742,14 +740,17 @@ pub(crate) mod tests {
             with(&server, |local| local.command = "npm".into()),
             with(&server, |local| local.args = vec!["-y".into(), "@evil/server-github".into()]),
             with(&server, |local| local.env = [("NODE_OPTIONS".to_owned(), "--require ./x.js".to_owned())].into()),
-            with(&server, |local| local.access = Walled::Set(Access::Outside)),
-            // In trust, the mode's walls are none.
+            with(&server, |local| local.access = Walled::Set(Access::Look)),
             with(&server, |local| local.access = Walled::Set(Access::Network)),
             Server { name: "gh".into(), ..server.clone() },
         ];
         for other in changed {
             assert_ne!(other.fingerprint(), server.fingerprint(), "{other:?}");
         }
+        // None of its own is none: the same yes as `outside`.
+        assert_eq!(server.walled(), Some(Walled::Unset));
+        assert_eq!(with(&server, |local| local.access = Walled::Set(Access::Outside)).fingerprint(), server.fingerprint());
+        assert!(server.fingerprint().contains(r#""access":"outside""#), "not what a yes to walls by mode was: {}", server.fingerprint());
         assert_eq!(server.fingerprint(), server.clone().fingerprint());
         assert_eq!(server.command_line(), "GITHUB_PERSONAL_ACCESS_TOKEN='${GITHUB_TOKEN}' MODE='${GH_MODE:-fast}' npx -y @modelcontextprotocol/server-github");
         assert_eq!(quote("it's here"), r"'it'\''s here'");

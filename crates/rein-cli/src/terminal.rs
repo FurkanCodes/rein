@@ -14,7 +14,7 @@ use crate::ui::style::{GUTTER, Style, strip};
 use crate::ui::wrap::Wrap;
 use rein_agent::agent::{Approval, Compacted, Heard, Ui};
 use rein_agent::compact;
-use rein_agent::permissions::{Mode, Rule, Whose};
+use rein_agent::permissions::{Mode, Rule, Sandboxing, Whose};
 use rein_agent::sandbox::{Access, Sandbox};
 use rein_agent::tools::{BashCall, ToolName};
 use rein_agent::undo::Watched;
@@ -72,8 +72,9 @@ pub(crate) struct Terminal {
     pub(crate) model: String,
     pub(crate) effort: Option<Effort>,
     pub(crate) mode: Mode,
-    /// Commands run in a sandbox: what one asks for past it is what's asked about.
-    pub(crate) sandboxed: bool,
+    /// Whether commands run in the sandbox: when they do, what one asks
+    /// for past it is what's asked about.
+    pub(crate) sandboxing: Sandboxing,
     pub(crate) input: Input,
     /// Ctrl-C pressed at a question; the turn waits on this to stop.
     pub(crate) interrupted: std::sync::Arc<tokio::sync::Notify>,
@@ -235,7 +236,7 @@ impl Terminal {
             model: String::new(),
             effort: None,
             mode,
-            sandboxed: false,
+            sandboxing: Sandboxing::Off,
             input,
             interrupted,
             context_limit: compact::DEFAULT_LIMIT,
@@ -458,12 +459,13 @@ impl Terminal {
     /// long the last turn took. What's used of your limits goes first when
     /// the window is too narrow for it all.
     pub(crate) fn bar(&self) -> String {
-        let full = self.bar_with(true);
-        let fits = terminal_width().is_none_or(|columns| crate::ui::style::width(&full) <= columns);
-        if fits { full } else { self.bar_with(false) }
+        // What's used of your limits goes first, then the word for the
+        // sandbox, before the context is cut off at the edge.
+        let fits = |bar: &String| terminal_width().is_none_or(|columns| crate::ui::style::width(bar) <= columns);
+        [Room::All, Room::NoMeters].into_iter().map(|room| self.bar_with(room)).find(fits).unwrap_or_else(|| self.bar_with(Room::Least))
     }
 
-    fn bar_with(&self, meters: bool) -> String {
+    fn bar_with(&self, room: Room) -> String {
         let s = self.err;
         let used = self.context_used;
         // Never 0% once anything is in there, nor a full cell short of it.
@@ -481,11 +483,17 @@ impl Terminal {
             mode @ (Mode::Edits | Mode::Auto) => s.yellow(mode.as_str()),
             mode => mode.to_string(),
         };
+        // Off is where rein starts, so only on says so.
+        let mode = match self.sandboxing {
+            Sandboxing::On if room >= Room::NoMeters => format!("{mode} {}", s.dim("sandboxed")),
+            Sandboxing::Missing if room >= Room::NoMeters => format!("{mode} {}", s.yellow("no sandbox")),
+            _ => mode,
+        };
         let cache = (self.turn.cached * 100).checked_div(self.turn.input).or(self.last_cache);
         let cache = cache.map(|cache| format!("{dot}{} {cache}%", s.dim("cache"))).unwrap_or_default();
         // The time only once the turn is over; the spinner counts until then.
         let took = self.turn.took.map(|t| format!("{dot}{}", s.dim(&format!("{:.1}s", t.as_secs_f32())))).unwrap_or_default();
-        let meters = if meters { self.meters.bar(s, std::time::SystemTime::now()).iter().map(|meter| format!("{dot}{meter}")).collect() } else { String::new() };
+        let meters = if room == Room::All { self.meters.bar(s, std::time::SystemTime::now()).iter().map(|meter| format!("{dot}{meter}")).collect() } else { String::new() };
         format!(" {model}{dot}{mode}{dot}{} {gauge} {pct}%{meters}{cache}{took}", s.dim("context"))
     }
 
@@ -539,7 +547,7 @@ impl Terminal {
     /// without one, all of it.
     fn command_question(&self, bash: Option<&BashCall>) -> &'static str {
         match bash.map(BashCall::access) {
-            _ if !self.sandboxed => "Allow this command?",
+            _ if self.sandboxing != Sandboxing::On => "Allow this command?",
             Some(Access::Write) => "Allow this command to change files?",
             Some(Access::Network) => "Allow this command to use the network?",
             Some(Access::Outside) => "Allow this command to run outside the sandbox?",
@@ -563,6 +571,17 @@ impl Terminal {
             self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: false });
         }
     }
+}
+
+/// How much of the status bar fits the window, from the least.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Room {
+    /// The model, the mode and the context.
+    Least,
+    /// The word for the sandbox too.
+    NoMeters,
+    /// What's used of your limits too.
+    All,
 }
 
 /// A width nothing is wrapped at: text goes to the full screen whole, and

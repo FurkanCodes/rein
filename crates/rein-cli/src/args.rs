@@ -56,14 +56,17 @@ Options:
   -r, --resume          Choose which saved conversation to continue
   -s, --system <text>   Standing instructions, added to rein's system prompt
       --mode <mode>     What runs without asking:
-                          trust      everything, without the sandbox, but what
-                                     ask rules name, like deleting (default)
-                          ask        reading, and commands that only look
+                          trust      everything, but what ask rules name, like
+                                     deleting (default)
+                          ask        reading, and commands that only look in
+                                     the sandbox
                           edits      file changes in this folder, and commands
                                      that stay in the sandbox
                           auto       the same, and nothing ever asks: what would
-                                     go past the sandbox is refused
+                                     go past the sandbox is refused (without it,
+                                     every command runs)
                           read-only  only reading: commands look, nothing changes
+      --sandbox <on|off>  Run commands in the sandbox, in any mode (default off)
       --max-steps <n>   How many steps a turn may take when nobody is
                         watching (auto mode, a one-shot task), or off;
                         default 200. While you watch there's no limit
@@ -84,13 +87,15 @@ part of it is allowed. Yours start by asking before deleting (rm, git clean,
 git push --force and the like). Rules decide when rein asks; they aren't a
 sandbox.
 
-In every mode but trust, commands run in a sandbox: macOS's own, or on
-Linux Landlock and seccomp. Each says what it needs: look, write (files in this folder), network (and
-the internet) or outside (no sandbox), and the sandbox holds it to that.
-Even with write access a command can't change files outside this folder,
-read the keys and logins in your home folder, or change what runs code
-later (.git/hooks, .git/config, .rein). Without a sandbox, commands ask
-first.
+With the sandbox on (--sandbox on, sandbox = on, or /sandbox), commands run
+in it in every mode: macOS's own, or on Linux Landlock and seccomp. Each
+says what it needs: look, write (files in this folder), network (and the
+internet) or outside (no sandbox), and the sandbox holds it to that. Even
+with write access a command can't change files outside this folder, read
+the keys and logins in your home folder, or change what runs code later
+(.git/hooks, .git/config, .rein). With it off, commands run as you'd run
+them, and the mode alone decides what asks: in ask and edits, every
+command. On but missing here, what it would hold asks first.
 
 A turn goes on until the model is done, or you press Esc. One that keeps
 making the same call with the same result is told, then stopped, and a turn
@@ -190,13 +195,14 @@ impl AskArgs {
             Some(name) => name.parse::<Mode>().map_err(|e| format!("{e} (in the settings)"))?,
             None => Mode::default(),
         };
-        let switch = |key: &str, env: &str| match settings.get(key, env).as_deref() {
-            None | Some("on") => Ok(true),
-            Some("off") => Ok(false),
-            Some(other) => Err(format!("{key} should be on or off, not {other}")),
+        let switch = |key: &str, env: &str, default: bool| match settings.get(key, env).as_deref() {
+            None => Ok(default),
+            Some(value) => on_off(key, value),
         };
-        let (bell, compress, sandbox) = (switch("bell", "REIN_BELL")?, switch("compress", "REIN_COMPRESS")?, switch("sandbox", "REIN_SANDBOX")?);
-        let strip = switch("strip", "REIN_STRIP")?;
+        let (bell, compress) = (switch("bell", "REIN_BELL", true)?, switch("compress", "REIN_COMPRESS", true)?);
+        // Off unless you turn it on, as in Claude Code.
+        let mut sandbox = switch("sandbox", "REIN_SANDBOX", false)?;
+        let strip = switch("strip", "REIN_STRIP", true)?;
         let tab_command = settings.get("tab_command", "REIN_TAB_COMMAND");
         let mut child = None;
         let joining = match settings.get("peers", "REIN_PEERS") {
@@ -223,6 +229,7 @@ impl AskArgs {
                     let name = value(&mut args, &arg)?;
                     mode = name.parse()?;
                 }
+                "--sandbox" => sandbox = on_off("--sandbox", &value(&mut args, &arg)?)?,
                 "-s" | "--system" => system = Some(value(&mut args, &arg)?),
                 "--max-steps" => max_steps = steps(&value(&mut args, &arg)?)?,
                 "--record" => record = Some(PathBuf::from(value(&mut args, &arg)?)),
@@ -271,6 +278,15 @@ impl AskArgs {
     }
 }
 
+/// A switch as written for `key`: `on` or `off`.
+pub(crate) fn on_off(key: &str, value: &str) -> CliResult<bool> {
+    match value.trim() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("{key} should be on or off, not {other}")),
+    }
+}
+
 /// A step limit as written: a number of steps, or `off` for none.
 fn steps(value: &str) -> CliResult<Option<usize>> {
     match value.trim() {
@@ -297,6 +313,11 @@ mod tests {
         assert_eq!((parsed.mode, parsed.prompt.as_deref()), (Mode::Edits, Some("fix the bug")));
         assert_eq!(args("--mode edits").unwrap().prompt, None, "no task: a conversation");
         assert_eq!(args("--mode yolo hi").err().as_deref(), Some("no mode called yolo; use trust, ask, edits, auto or read-only"));
+        // The sandbox is off unless it's turned on, in any mode.
+        assert!(!args("--mode edits").unwrap().sandbox);
+        assert!(args("--sandbox on --mode trust").unwrap().sandbox);
+        assert!(!args("--sandbox off").unwrap().sandbox);
+        assert_eq!(args("--sandbox maybe").err().as_deref(), Some("--sandbox should be on or off, not maybe"));
     }
 
     #[test]
@@ -315,9 +336,11 @@ mod tests {
     }
 
     #[test]
-    fn the_sandbox_is_on_unless_turned_off() {
-        assert!(args("hi").unwrap().sandbox);
-        assert!(!AskArgs::parse(vec!["hi".into()], &Settings::parse("sandbox = off").unwrap()).unwrap().sandbox);
+    fn the_sandbox_is_off_unless_turned_on() {
+        assert!(!args("hi").unwrap().sandbox);
+        assert!(AskArgs::parse(vec!["hi".into()], &Settings::parse("sandbox = on").unwrap()).unwrap().sandbox);
+        // A flag wins over the file.
+        assert!(!AskArgs::parse(vec!["--sandbox".into(), "off".into()], &Settings::parse("sandbox = on").unwrap()).unwrap().sandbox);
         let wrong = AskArgs::parse(vec!["hi".into()], &Settings::parse("sandbox = maybe").unwrap());
         assert_eq!(wrong.err().as_deref(), Some("sandbox should be on or off, not maybe"));
         assert_eq!(args("--mode auto").unwrap().mode, Mode::Auto);

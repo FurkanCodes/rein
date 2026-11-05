@@ -121,7 +121,7 @@ async fn confirm(found: &Found, server: &rein_mcp::Server, mcp: &Mcp, terminal: 
     if let Some(repository) = &found.repository {
         detail.push_str(&format!(", its code at {repository}"));
     }
-    detail.push_str(&format!(". {}", super::runs(server, mcp.servers.by_mode())));
+    detail.push_str(&format!(". {}", super::runs(server)));
     if server.local().is_some_and(|local| local.command == "docker" && local.access == rein_mcp::Walled::Set(Access::Outside)) {
         detail.push_str(": Docker, which the sandbox can't reach, runs it in a container of its own");
     }

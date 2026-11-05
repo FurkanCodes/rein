@@ -243,7 +243,7 @@ mod tests {
         assert_eq!((github.name.as_str(), command(&github).command.as_str(), github.origin), ("github", "npx", Origin::Yours));
         assert_eq!(command(&github).args, ["-y", "@modelcontextprotocol/server-github"]);
         assert_eq!(command(&github).env["GITHUB_PERSONAL_ACCESS_TOKEN"], "${GITHUB_TOKEN}", "a shell's $NAME is filled in as it starts");
-        assert_eq!(command(&github).access, Walled::ByMode, "as the mode has it");
+        assert_eq!(command(&github).access, Walled::Unset, "none of its own");
         let quoted = one(r#"docs --access look -e "ROOT=my docs" -- uvx docs-mcp --title 'it'\''s $HOME' "a \"b\"" c\ d ${X:-y}"#);
         assert_eq!(command(&quoted).access, Walled::Set(Access::Look));
         assert_eq!(command(&quoted).env["ROOT"], "my docs");

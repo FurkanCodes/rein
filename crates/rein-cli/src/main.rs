@@ -31,6 +31,7 @@ mod hooks;
 mod input;
 mod mcp;
 mod meters;
+mod modes;
 mod paste;
 mod peers;
 mod rules;

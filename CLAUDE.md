@@ -141,13 +141,16 @@ finding. Each says why in a line.
 
 ## The sandbox
 
-- The walls are yours to choose, with the mode: in trust nothing rein
-  starts is walled in (commands, MCP servers), and the other modes wall
-  them all, unless one has walls of its own. Every harness whose user
-  approves each command ships its sandbox off, none walls in servers
-  while commands run free, and walls broke what servers need. What comes
-  with a project waits for your yes in every mode, which doesn't depend
-  on walls.
+- The sandbox is a switch of its own, off unless you turn it on, in any
+  mode (`/sandbox`, `--sandbox`, `sandbox = on`), as in Codex and Claude
+  Code: tied to the mode, walls you didn't want came with `edits` or
+  `read-only`, and `sandbox = off` left auto and read-only running no
+  command at all. The mode says what asks; off, it says so alone (auto
+  runs everything, like Codex's full access). What comes with a project
+  waits for your yes either way, which doesn't depend on walls.
+- An MCP server runs outside the sandbox unless it has walls of its own
+  (`"access"`), whatever the mode: Codex and Claude Code wall in none, and
+  walls broke what servers need (a browser, the keychain, `npx`'s cache).
 - Your own hooks run outside the sandbox in every mode, as Claude Code's
   do: they're your setup, not what the model runs. Walled in, a hook
   couldn't open its own script in `~/.claude/hooks`, Python's exit code
@@ -155,9 +158,11 @@ finding. Each says why in a line.
   read-only mode. That's safe because what the model runs can't plant
   one: `~/.claude`, rein's folder and a project's `.claude` are out of its
   reach. A project's hooks are someone else's, and wait for your yes.
-- A command meant for the sandbox never runs without one: no sandbox means
-  ask, not run (`Run::Sandboxed` without one is an error). Claude Code's
-  default runs commands unsandboxed when its sandbox can't start.
+- A command meant for the sandbox never runs without one: turned on where
+  there's none means ask, not run, and auto refuses (`Sandboxing::Missing`;
+  `Run::Sandboxed` without one is an error). Claude Code's default runs
+  commands unsandboxed when its sandbox can't start. Off by your choice is
+  another case: there, nothing was meant for walls.
 - Rules allow a list and deny the rest (`(deny default)`), never the other way
   round: a sandbox that denied a list of bad operations was escaped through
   what the list forgot. System services are a short list for the same
@@ -172,9 +177,9 @@ finding. Each says why in a line.
   a sign-in that takes PKCE or none at all, and the token goes only there:
   over https, or plain http to this computer, never across a redirect to
   another server. A header you gave it wins over rein's sign-in.
-- An MCP server is a command, someone else's: it runs in the sandbox like
-  one, and a project's starts only once you've said yes to all of what it
-  runs (command, arguments, environment), never to its name. Cursor went by
+- An MCP server is a command, someone else's: a project's starts only once
+  you've said yes to all of what it runs (command, arguments, environment,
+  walls), never to its name. Cursor went by
   the name, and a later commit swapped the command behind it
   (CVE-2025-54136). What a server says of its tools is its own word: none
   runs without asking for it.

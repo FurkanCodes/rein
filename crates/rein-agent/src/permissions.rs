@@ -1,7 +1,8 @@
 //! What the model may do without asking. A mode sets the broad policy,
-//! the sandbox decides much of it (what runs inside the walls needs no
-//! asking), and rules refine it for specific commands: yours, in rein's
-//! folder, for every project, and a project's own in `.rein/permissions`:
+//! the sandbox, when you turn it on, decides much of it (what runs inside
+//! the walls needs no asking), and rules refine it for specific commands:
+//! yours, in rein's folder, for every project, and a project's own in
+//! `.rein/permissions`:
 //!
 //! ```text
 //! # one rule per line
@@ -37,24 +38,46 @@ use serde::Deserialize;
 use crate::sandbox::{self, Access, Run};
 use crate::tools::{BashCall, ERROR, ToolName};
 
+/// What runs without asking. Whether commands run in walls is the
+/// sandbox's say ([`Sandboxing`]), which is yours to turn on or off in any
+/// mode, as in Codex and Claude Code: what each mode does with commands
+/// depends on it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
-    /// Run everything without asking, without the sandbox, except what ask
-    /// rules name (deleting, from the rules you start with) and what deny
-    /// rules block. Where rein starts.
+    /// Run everything without asking, except what ask rules name
+    /// (deleting, from the rules you start with) and what deny rules
+    /// block. Where rein starts.
     #[default]
     Trust,
-    /// Ask before file changes, and before commands that do more than look.
+    /// Ask before file changes, and before commands that do more than look
+    /// in the sandbox (all of them, without it).
     Ask,
     /// File changes inside the project are fine, and so are commands that
-    /// stay in the sandbox; going past it asks.
+    /// stay in the sandbox; going past it asks, and without it every
+    /// command does.
     Edits,
-    /// Never ask: work inside the sandbox, and refuse what would go past it.
-    /// For leaving rein to work on its own.
+    /// Never ask: what would ask is refused. In the sandbox that's what
+    /// would go past it; without it, every command runs. For leaving rein
+    /// to work on its own.
     Auto,
-    /// Look, never change: commands run only with look access, in the
-    /// sandbox, and file changes are refused.
+    /// Look, never change: commands only look (in the sandbox, or after
+    /// asking you without it), and file changes are refused.
     ReadOnly,
+}
+
+/// Whether commands run in walls: as you chose (`/sandbox`, `sandbox =`
+/// in the settings), and as this computer can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sandboxing {
+    /// On: commands run in the walls their access asks for.
+    On,
+    /// Off, as you chose: commands run as you'd run them, and the mode
+    /// alone decides what asks.
+    Off,
+    /// On, but there's no sandbox here, or it didn't start: what would
+    /// have run in it asks instead, and auto refuses it. Never run
+    /// unconfined when it was meant to be confined.
+    Missing,
 }
 
 impl Mode {
@@ -325,6 +348,8 @@ pub struct Permissions {
     approved_tools: Vec<String>,
     /// What holds commands in, if anything does, and what's protected.
     sandbox: sandbox::Shared,
+    /// Whether you want commands in it: off, unless you turn it on.
+    sandbox_on: bool,
 }
 
 /// A file tool's call, for the file it changes.
@@ -343,16 +368,14 @@ fn auto_refuses(access: Access) -> String {
 
 const AUTO_ASK_RULE: &str = "rein is in auto mode, where nothing asks, and a rule says to ask before this command. \
                              Do without it, or tell the user what you need it for.";
-const AUTO_NO_SANDBOX: &str = "rein is in auto mode, where nothing asks, but there's no sandbox here to hold commands in, \
-                               so no command runs. Tell the user what you need to run.";
+const AUTO_NO_SANDBOX: &str = "rein is in auto mode, where nothing asks, and the user turned the sandbox on, but there's \
+                               none here to hold commands in, so no command runs. Tell the user what you need to run.";
 const AUTO_PROTECTED: &str = "rein is in auto mode, where nothing asks, and this file runs code later or holds rein's rules: \
                               changing it takes the user's approval. Leave it, or tell the user what to change.";
 const AUTO_MCP: &str = "rein is in auto mode, where nothing asks, and this MCP tool isn't one the user's own mcp.json allows \
                         (\"allow\": [...]). Do without it, or tell the user what you need it for.";
 const READ_ONLY_CHANGES: &str = "File changes are turned off: rein is in read-only mode.";
 const READ_ONLY_COMMANDS: &str = "rein is in read-only mode: commands run with look access only, and change nothing.";
-const READ_ONLY_NO_SANDBOX: &str = "Commands are turned off: rein is in read-only mode, and there's no sandbox here \
-                                    to keep them from changing things.";
 
 /// The rules in `text`, a file of them, each `whose`. Blank lines and `#`
 /// comments are skipped.
@@ -363,8 +386,9 @@ pub fn parse_rules(text: &str, whose: Whose) -> Result<Vec<Rule>, String> {
 
 impl Permissions {
     /// The project's rules, in the format shown at the top of this file;
-    /// yours come with [`Permissions::set_yours`]. There's no sandbox until
-    /// [`Permissions::with_sandbox`] gives one, so commands ask.
+    /// yours come with [`Permissions::set_yours`]. The sandbox is off
+    /// until [`Permissions::set_sandbox`] turns it on, and there's none to
+    /// turn on until [`Permissions::with_sandbox`] gives one.
     pub fn new(mode: Mode, rules: &str) -> Result<Self, String> {
         Ok(Permissions { mode, rules: parse_rules(rules, Whose::Project)?, ..Default::default() })
     }
@@ -390,6 +414,21 @@ impl Permissions {
 
     pub fn sandbox(&self) -> &sandbox::Sandbox {
         &self.sandbox
+    }
+
+    /// Commands in the sandbox from now on, or not: yours to choose, in
+    /// any mode.
+    pub fn set_sandbox(&mut self, on: bool) {
+        self.sandbox_on = on;
+    }
+
+    /// Whether commands run in walls now.
+    pub fn sandboxing(&self) -> Sandboxing {
+        match (self.sandbox_on, self.sandbox.available()) {
+            (false, _) => Sandboxing::Off,
+            (true, true) => Sandboxing::On,
+            (true, false) => Sandboxing::Missing,
+        }
     }
 
     /// Forgets what you said "always" to: that was for one conversation.
@@ -443,13 +482,13 @@ impl Permissions {
         }
     }
 
-    /// How `call` runs once it's allowed: a command in the sandbox, within
-    /// the walls its access asks for, unless it asked to run outside, the
-    /// mode is trust, or there's no sandbox here. rein's own tools run as
-    /// they always do.
+    /// How `call` runs once it's allowed: with the sandbox on, a command
+    /// in it, within the walls its access asks for, unless it asked to run
+    /// outside; in every mode, trust too. rein's own tools run as they
+    /// always do.
     pub fn how(&self, call: &ToolCall) -> Run {
         match BashCall::of(call) {
-            Some(c) if self.mode != Mode::Trust && self.sandbox.available() => c.access().walls().map_or(Run::Unsandboxed, Run::Sandboxed),
+            Some(c) if self.sandboxing() == Sandboxing::On => c.access().walls().map_or(Run::Unsandboxed, Run::Sandboxed),
             _ => Run::Unsandboxed,
         }
     }
@@ -492,43 +531,49 @@ impl Permissions {
             return Decision::Deny(format!("Blocked by a rule: `{rule}`."));
         }
         let asked = self.found(Kind::Ask, line).is_some();
-        let sandboxed = self.sandbox.available();
+        let sandboxing = self.sandboxing();
+        let walled = sandboxing == Sandboxing::On;
         // What you said yes to for the rest of the conversation: exactly
         // these commands, with as much access, or with any where there are
         // no walls to hold a command to what it said it needs.
-        let walled = sandboxed && self.mode != Mode::Trust;
         let said_yes = |part: &Vec<String>| self.approved.iter().any(|(words, granted)| words == part && (*granted >= access || !walled));
         let you_said_yes = parts.as_ref().is_some_and(|parts| parts.iter().all(said_yes));
+        // A project's rules come with it, and it may be anyone's: they only
+        // spare you asking about what stays in the walls. Outside them a
+        // command gets your keys, so only you say yes to that, and your own
+        // rules count wherever it runs.
+        let in_walls = walled && access != Access::Outside;
+        let allows = |part: &Vec<String>| self.rules.iter().any(|r| r.kind == Kind::Allow && (in_walls || r.whose == Whose::Yours) && r.starts(part));
+        let allowed = parts.as_ref().is_some_and(|parts| parts.iter().all(|p| allows(p) || said_yes(p)));
+        // Meant for walls that aren't here: it asks, never runs unwalled.
+        let unwalled = sandboxing == Sandboxing::Missing && access != Access::Outside && !allowed;
         if self.mode == Mode::Trust {
             // What rein couldn't take apart, it can't promise no deny rule
             // covers: it asks, rather than trust a guess. Ask rules are
             // only looked for in it, as they're about mistakes, not about
             // hiding.
             let denies = self.rules.iter().any(|r| r.kind == Kind::Deny);
-            return if (parts.is_none() && denies) || (asked && !you_said_yes) { Decision::Ask } else { Decision::Allow };
+            return if (parts.is_none() && denies) || (asked && !you_said_yes) || unwalled { Decision::Ask } else { Decision::Allow };
         }
-        // Inside the walls, nothing needs asking.
-        let free = sandboxed
-            && match access {
+        // What runs without asking: inside the walls, by the mode; without
+        // them, as you chose, only in auto, which never asks.
+        let free = match sandboxing {
+            Sandboxing::On => match access {
                 Access::Look => true,
                 Access::Write => matches!(self.mode, Mode::Edits | Mode::Auto),
                 Access::Network | Access::Outside => false,
-            };
-        // A project's rules come with it, and it may be anyone's: they only
-        // spare you asking about what stays in the walls. Outside them a
-        // command gets your keys, so only you say yes to that, and your own
-        // rules count wherever it runs.
-        let in_walls = sandboxed && access != Access::Outside;
-        let allows = |part: &Vec<String>| self.rules.iter().any(|r| r.kind == Kind::Allow && (in_walls || r.whose == Whose::Yours) && r.starts(part));
-        let allowed = parts.as_ref().is_some_and(|parts| parts.iter().all(|p| allows(p) || said_yes(p)));
+            },
+            Sandboxing::Off => self.mode == Mode::Auto,
+            Sandboxing::Missing => false,
+        };
         match self.mode {
-            Mode::ReadOnly if !sandboxed => Decision::Deny(READ_ONLY_NO_SANDBOX.into()),
+            // Whatever the walls: it says it would change something.
             Mode::ReadOnly if access > Access::Look => Decision::Deny(READ_ONLY_COMMANDS.into()),
             Mode::Auto if asked => Decision::Deny(AUTO_ASK_RULE.into()),
             // You asked to be asked, unless you've said yes to just this.
             _ if asked && !you_said_yes => Decision::Ask,
             _ if free || allowed => Decision::Allow,
-            Mode::Auto if !sandboxed => Decision::Deny(AUTO_NO_SANDBOX.into()),
+            Mode::Auto if sandboxing == Sandboxing::Missing => Decision::Deny(AUTO_NO_SANDBOX.into()),
             Mode::Auto => Decision::Deny(auto_refuses(access)),
             _ => Decision::Ask,
         }
@@ -758,11 +803,12 @@ mod tests {
         assert_eq!(p.how(&command("cargo test", "outside")), Run::Unsandboxed, "what it would be, once you say yes");
         let auto = sandboxed(Mode::Auto, "allow cargo test\n", "out-auto");
         assert!(matches!(auto.decide(&command("cargo test", "outside")), Decision::Deny(_)), "auto never asks, so it refuses");
-        // Without a sandbox nothing is walled in, so rules let nothing run.
+        // Without walls nothing is walled in, so a project's rules let
+        // nothing run: with the sandbox off, or on with none here.
         let bare = Permissions::new(Mode::Ask, "allow cargo test\n").unwrap();
         assert_eq!(bare.decide(&bash("cargo test")), Decision::Ask);
-        let bare_auto = Permissions::new(Mode::Auto, "allow cargo test\n").unwrap();
-        assert!(matches!(bare_auto.decide(&bash("cargo test")), Decision::Deny(_)));
+        assert_eq!(missing(Mode::Ask, "allow cargo test\n").decide(&bash("cargo test")), Decision::Ask);
+        assert!(matches!(missing(Mode::Auto, "allow cargo test\n").decide(&bash("cargo test")), Decision::Deny(_)));
         // What you said yes to yourself still counts.
         let mut yours = sandboxed(Mode::Ask, "", "out-yours");
         yours.remember(&command("cargo test", "outside"));
@@ -808,7 +854,7 @@ mod tests {
         assert_eq!(edits.decide(&bash("ls")), Decision::Ask);
         let read_only = Permissions::new(Mode::ReadOnly, RULES).unwrap();
         assert!(matches!(read_only.decide(&file("write")), Decision::Deny(_)));
-        assert!(matches!(read_only.decide(&bash("cargo test")), Decision::Deny(_)));
+        assert!(matches!(read_only.decide(&command("cargo test", "write")), Decision::Deny(_)));
         assert_eq!(read_only.decide(&file("read")), Decision::Allow);
         // Searching only looks, so it never asks, in any mode.
         for tool in ["grep", "glob"] {
@@ -837,7 +883,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("rein-permissions-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let sandbox = crate::sandbox::Sandbox::assume(crate::sandbox::Places::new(&root, None, None));
-        Permissions::new(mode, rules).unwrap().with_sandbox(std::sync::Arc::new(sandbox))
+        let mut permissions = Permissions::new(mode, rules).unwrap().with_sandbox(std::sync::Arc::new(sandbox));
+        permissions.set_sandbox(true);
+        permissions
     }
 
     #[test]
@@ -867,6 +915,79 @@ mod tests {
         // A command that says nothing about access only looks.
         assert_eq!(sandboxed(Mode::Ask, "", "unsaid").decide(&bash("cargo test")), Decision::Allow);
         assert_eq!(sandboxed(Mode::Ask, "", "unsaid").how(&bash("cargo test")), Run::Sandboxed(Access::Look.walls().unwrap()));
+    }
+
+    /// Permissions with the sandbox turned on, where there's none.
+    fn missing(mode: Mode, rules: &str) -> Permissions {
+        let mut permissions = Permissions::new(mode, rules).unwrap();
+        permissions.set_sandbox(true);
+        permissions
+    }
+
+    /// Each mode with `permissions` made for it, decided for a command
+    /// with look, write, network and outside access, against `table`.
+    fn decides(table: &[(Mode, [Decision; 4])], permissions: impl Fn(Mode) -> Permissions, walls: &str) {
+        for (mode, expected) in table {
+            let p = permissions(*mode);
+            for (access, expected) in ["look", "write", "network", "outside"].iter().zip(expected) {
+                let decided = match p.decide(&command("cargo test", access)) {
+                    Decision::Deny(_) => Decision::Deny(String::new()),
+                    other => other,
+                };
+                assert_eq!(&decided, expected, "{mode} with {access} access, {walls}");
+                assert_eq!(p.how(&command("cargo test", access)), Run::Unsandboxed, "{mode} with {access} access, {walls}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_the_sandbox_off_the_mode_alone_decides() {
+        use Decision::{Allow, Ask};
+        let deny = Decision::Deny(String::new());
+        // look, write, network, outside: what it says it needs counts only
+        // in read-only, which refuses what says it would change things.
+        let table = [
+            (Mode::ReadOnly, [Ask, deny.clone(), deny.clone(), deny.clone()]),
+            (Mode::Ask, [Ask, Ask, Ask, Ask]),
+            (Mode::Edits, [Ask, Ask, Ask, Ask]),
+            (Mode::Auto, [Allow, Allow, Allow, Allow]),
+            (Mode::Trust, [Allow, Allow, Allow, Allow]),
+        ];
+        decides(&table, |mode| Permissions::new(mode, "").unwrap(), "sandbox off");
+        // Off with a sandbox here is off all the same.
+        decides(
+            &table,
+            |mode| {
+                let mut p = sandboxed(mode, "", "off");
+                p.set_sandbox(false);
+                p
+            },
+            "sandbox off, one here",
+        );
+        // Auto, which never asks, still refuses what an ask rule names.
+        let auto = Permissions::new(Mode::Auto, "ask rm").unwrap();
+        assert!(matches!(auto.decide(&bash("rm -rf target")), Decision::Deny(_)));
+        assert_eq!(auto.decide(&bash("cargo test")), Decision::Allow);
+    }
+
+    #[test]
+    fn with_the_sandbox_on_but_none_here_what_it_would_hold_asks() {
+        use Decision::{Allow, Ask};
+        let deny = Decision::Deny(String::new());
+        // Never run unconfined when it was meant to be confined: what would
+        // have run in the walls asks, and auto, which never asks, refuses.
+        let table = [
+            (Mode::ReadOnly, [Ask, deny.clone(), deny.clone(), deny.clone()]),
+            (Mode::Ask, [Ask, Ask, Ask, Ask]),
+            (Mode::Edits, [Ask, Ask, Ask, Ask]),
+            (Mode::Auto, [deny.clone(), deny.clone(), deny.clone(), deny.clone()]),
+            (Mode::Trust, [Ask, Ask, Ask, Allow]),
+        ];
+        decides(&table, |mode| missing(mode, ""), "sandbox on, none here");
+        // What you allowed yourself runs, as it would without the walls.
+        let mut trust = missing(Mode::Trust, "");
+        trust.remember(&command("cargo test", "write"));
+        assert_eq!(trust.decide(&command("cargo test", "write")), Allow);
     }
 
     #[test]
@@ -907,9 +1028,14 @@ mod tests {
         assert_eq!(edits.how(&command("cargo test", "write")), walls(Access::Write));
         assert_eq!(edits.how(&command("cargo fetch", "network")), walls(Access::Network));
         assert_eq!(edits.how(&command("docker ps", "outside")), Run::Unsandboxed);
-        assert_eq!(sandboxed(Mode::Trust, "", "how-trust").how(&command("ls", "look")), Run::Unsandboxed);
-        // No sandbox here: what's allowed runs as it always did.
+        // On is on in every mode, trust too.
+        assert_eq!(sandboxed(Mode::Trust, "", "how-trust").how(&command("ls", "look")), walls(Access::Look));
+        // Off, or none here: what's allowed runs as it always did.
         assert_eq!(Permissions::new(Mode::Ask, "").unwrap().how(&command("ls", "look")), Run::Unsandboxed);
+        assert_eq!(missing(Mode::Ask, "").how(&command("ls", "look")), Run::Unsandboxed);
+        let mut off = sandboxed(Mode::Edits, "", "how-off");
+        off.set_sandbox(false);
+        assert_eq!(off.how(&command("cargo test", "write")), Run::Unsandboxed);
         assert_eq!(edits.how(&file("write")), Run::Unsandboxed);
     }
 

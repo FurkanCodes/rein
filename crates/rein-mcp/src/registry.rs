@@ -438,8 +438,8 @@ fn plan(package: &Package, version: Option<&str>) -> Result<Plan, String> {
     let id = package.identifier.trim();
     let hint = package.runtime_hint.as_deref();
     let (command, first, pinned, access) = match (package.registry_type.as_str(), hint) {
-        ("npm", None | Some("npx")) => ("npx", vec!["-y"], version.map_or_else(|| id.to_owned(), |version| format!("{id}@{version}")), Walled::ByMode),
-        ("pypi", None | Some("uvx")) => ("uvx", Vec::new(), version.map_or_else(|| id.to_owned(), |version| format!("{id}=={version}")), Walled::ByMode),
+        ("npm", None | Some("npx")) => ("npx", vec!["-y"], version.map_or_else(|| id.to_owned(), |version| format!("{id}@{version}")), Walled::Unset),
+        ("pypi", None | Some("uvx")) => ("uvx", Vec::new(), version.map_or_else(|| id.to_owned(), |version| format!("{id}=={version}")), Walled::Unset),
         ("oci", None | Some("docker")) => {
             let tagged = id.rsplit_once('/').map_or(id, |(_, last)| last).contains([':', '@']);
             let image = match version {
@@ -676,7 +676,7 @@ mod tests {
                 { "type": "positional", "valueHint": "database_url", "isRequired": true, "isSecret": true },
                 { "type": "named", "name": "--out", "isRequired": true, "format": "filepath", "description": "where it writes" }] }]));
         let plan = plan_of(&npm);
-        assert_eq!((plan.package.as_str(), plan.command(), plan.access()), ("npm @acme/thing@1.2.3", Some("npx"), Some(Walled::ByMode)));
+        assert_eq!((plan.package.as_str(), plan.command(), plan.access()), ("npm @acme/thing@1.2.3", Some("npx"), Some(Walled::Unset)));
         let asks: Vec<&str> = plan.asks.iter().map(|ask| ask.about.as_str()).collect();
         assert_eq!(asks, ["ACME_SITE (your site's address)", "where it writes"], "only what isn't a key and has no value");
         assert_eq!(plan.server("thing", &["one".into()]), None, "an answer for each ask");

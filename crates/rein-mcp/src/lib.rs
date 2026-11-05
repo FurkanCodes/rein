@@ -91,7 +91,7 @@ pub fn parts(name: &str) -> Option<(&str, &str)> {
 /// folder of its own under `caches` for what `npx` or `uvx` fetch, and the
 /// variables they name filled in from your environment or `keys`. One at a
 /// URL is reached over `web`, signed in to with `tokens`; without a `web`,
-/// it isn't. One whose walls are the mode's starts in `by_mode`'s.
+/// it isn't. One with no walls of its own runs outside the sandbox.
 #[derive(Clone)]
 pub struct Launch {
     pub sandbox: Arc<Sandbox>,
@@ -100,33 +100,6 @@ pub struct Launch {
     pub keys: Arc<Keys>,
     pub web: Option<Arc<dyn remote::Web>>,
     pub tokens: Option<Arc<dyn remote::Tokens>>,
-    pub by_mode: Arc<ByMode>,
-}
-
-/// The walls the mode gives a server that has none of its own: `outside`
-/// in trust, where commands run unwalled too, `network` in the others.
-/// It changes with the mode; a server keeps the walls it started in.
-pub struct ByMode(Mutex<Access>);
-
-impl ByMode {
-    pub fn new(access: Access) -> ByMode {
-        ByMode(Mutex::new(access))
-    }
-
-    pub fn get(&self) -> Access {
-        *lock(&self.0)
-    }
-
-    fn set(&self, access: Access) {
-        *lock(&self.0) = access;
-    }
-}
-
-/// Walled in, until told otherwise.
-impl Default for ByMode {
-    fn default() -> ByMode {
-        ByMode::new(Access::Network)
-    }
 }
 
 /// The values you gave rein for the variables servers name (`${NAME}`),
@@ -203,9 +176,9 @@ impl From<Unfilled> for Failure {
 }
 
 impl Launch {
-    /// The walls `local` starts in now: its own, or the mode's.
+    /// The walls `local` starts in: its own, or none.
     fn access(&self, local: &Local) -> Access {
-        local.access.or(self.by_mode.get())
+        local.access.access()
     }
 
     /// The command that starts `server`, `filled`, in its walls.
@@ -684,24 +657,6 @@ impl Servers {
             return connection.access;
         }
         entry.server.local().map(|local| self.launch.access(local))
-    }
-
-    /// The walls a server with none of its own starts in now.
-    pub fn by_mode(&self) -> Access {
-        self.launch.by_mode.get()
-    }
-
-    /// The walls a server with none of its own starts in from now on, as
-    /// a new mode gives them: the servers running in others, which keep
-    /// theirs until they start again.
-    pub fn follow_mode(&self, by_mode: Access) -> Vec<String> {
-        self.launch.by_mode.set(by_mode);
-        self.entries()
-            .iter()
-            .filter(|entry| entry.server.walled() == Some(Walled::ByMode))
-            .filter(|entry| matches!(entry.state.try_lock().as_deref(), Ok(State::Ready(connection)) if connection.channel.alive() && connection.access != Some(by_mode)))
-            .map(|entry| entry.server.name.clone())
-            .collect()
     }
 
     /// Whether any is still starting.
