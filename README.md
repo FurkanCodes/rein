@@ -233,8 +233,16 @@ message, so typing ahead can't answer it by accident.
 A command given no choice shows what there is to choose from: `/model`
 lists every provider's models, `/login` the providers, and `/mode`,
 `/permissions`, `/effort`, `/logout` and `/resume` theirs. ↑↓ move (PgUp/PgDn a page at a
-time), typing narrows the list, as `@` finds files, Enter picks and Esc
-changes nothing. The one in use is marked •.
+time), Enter picks and Esc changes nothing. The one in use is marked •.
+
+Typing narrows the list: every word you type must be in an item's name
+or in what's said of it, and names come first. In a name a word's letters
+count too, each starting a word or right after the one before, so `vrbp`
+finds `vercel-react-best-practices`; never scattered through a
+description, where almost any word's letters are somewhere (`react` kept
+171 of 211 skills that way, for "pRactices"; now 16). What matched is
+marked, a description is shown from where it matched when that's past
+the edge, and the box says how many match: `16 of 211`.
 
 A big paste shows in the box as one piece, `[pasted 40 lines]`, which
 Backspace takes out whole; the model gets all of it.
@@ -543,7 +551,8 @@ in the skills people have, it's money or SQL far more often than a
 placeholder, which Claude Code fills regardless.
 
 `disable-model-invocation` keeps a skill from the model, `user-invocable:
-false` from you. `/skills` lists them all: pick one to put it in the box,
+false` from you. `/skills` lists them all, those you use most first; type
+a few words to find one by its name or description, and pick it to put it in the box,
 turn it off, keep it for you to call, or turn it back on. Call one you
 turned off and rein asks to turn it on and send your message with it;
 say no, and what you typed is back in the box.

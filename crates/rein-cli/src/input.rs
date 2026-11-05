@@ -26,6 +26,7 @@ use crate::ui::editor::{Action, Editor, Entry};
 use crate::ui::fuzzy;
 use crate::ui::history::{self, History};
 use crate::ui::keys::{Key, Keys};
+use crate::ui::narrow::{self, Query, Rank};
 use crate::ui::screen::{self, Bottom, Drag, Pinned, Raw, Tone};
 use crate::ui::slash::{self, Entry as Listed, Offer};
 use crate::ui::style::{GUTTER, Style, fit, width};
@@ -95,23 +96,21 @@ struct Picking {
 }
 
 impl Picking {
-    /// The items that match what's typed, best first: the letters in
-    /// order, as `@` finds files. All of them, in order, before anything is.
+    /// What's typed to narrow it.
+    fn query(&self) -> Query {
+        Query::new(&self.filter.text())
+    }
+
+    /// The items that match what's typed, best first (see `narrow`); all
+    /// of them, in order, before anything is.
     fn matching(&self) -> Vec<usize> {
-        let query = self.filter.text();
-        let query = query.trim();
+        let query = self.query();
         if query.is_empty() {
             return (0..self.menu.items.len()).collect();
         }
-        let mut scored: Vec<(i64, usize)> = self
-            .menu
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (name, about))| Some((fuzzy::score(query, name).or_else(|| Some(fuzzy::score(query, &format!("{name} {about}"))? - 1000))?, i)))
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        scored.into_iter().map(|(_, i)| i).collect()
+        let mut ranked: Vec<(Rank, usize)> = self.menu.items.iter().enumerate().filter_map(|(i, (name, about))| Some((query.rank(name, about)?, i))).collect();
+        ranked.sort();
+        ranked.into_iter().map(|(_, i)| i).collect()
     }
 }
 
@@ -596,24 +595,38 @@ impl Boxed {
     fn picker(&self, picking: &Picking, above: Vec<String>) -> Bottom {
         let s = Style::stderr();
         let (lines, caret) = picking.filter.layout(self.pinned.text_width());
-        let lines = if picking.filter.is_empty() { vec![s.dim("type to narrow the list · ↑↓ to move")] } else { lines };
+        let lines = if picking.filter.is_empty() { vec![s.dim("type to narrow the list, by name or description · ↑↓ to move")] } else { lines };
         let matching = picking.matching();
         let mut list = Vec::new();
         if matching.is_empty() {
             list.push(s.dim(&format!("   nothing matches “{}”", picking.filter.text().trim())));
         }
         let first = (picking.picked + 1).saturating_sub(PICK_LINES);
-        let names = matching.iter().skip(first).take(PICK_LINES).map(|&i| width(&picking.menu.items[i].0)).max().unwrap_or(0).min(64);
         let cols = screen::size().1;
+        // A long name, like a plugin's skill, doesn't push every other
+        // item's description out of a narrow window: only its own.
+        let names = matching.iter().skip(first).take(PICK_LINES).map(|&i| width(&picking.menu.items[i].0)).max().unwrap_or(0).min(64).min(cols / 2);
+        let query = picking.query();
         list.extend(upward(matching.len(), picking.picked, PICK_LINES, s, |n| {
             let (name, about) = &picking.menu.items[matching[n]];
             let mark = if picking.menu.current == Some(matching[n]) { "•" } else { " " };
             let pad = " ".repeat(names.saturating_sub(width(name)));
-            let line =
-                if n == picking.picked { format!(" {} {}{mark} {pad} {}", s.blue("›"), s.bold(&s.blue(name)), about) } else { format!("   {name}{mark} {pad} {}", s.dim(about)) };
+            // What matched shows: the name's letters marked, and what's
+            // said of it from where it matched, when that's past the room.
+            let marks = query.marks(name, about);
+            let room = cols.saturating_sub(width(name).max(names) + 7);
+            let (about, about_marks) = narrow::around(about, &marks.about, room);
+            let line = if n == picking.picked {
+                let name = narrow::paint(name, &marks.name, |text| s.bold(&s.blue(text)), |text| s.bold(&s.blue(&s.underline(text))));
+                format!(" {} {name}{mark} {pad} {}", s.blue("›"), narrow::paint(&about, &about_marks, str::to_owned, |text| s.bold(text)))
+            } else {
+                let name = narrow::paint(name, &marks.name, str::to_owned, |text| s.bold(&s.blue(text)));
+                format!("   {name}{mark} {pad} {}", narrow::paint(&about, &about_marks, |text| s.dim(text), |text| s.bold(text)))
+            };
             fit(&line, cols.saturating_sub(1))
         }));
-        let notes = (picking.menu.title.clone(), "enter picks · esc cancels".to_owned());
+        let shown = if query.is_empty() { String::new() } else { format!("{} of {} · ", matching.len(), picking.menu.items.len()) };
+        let notes = (picking.menu.title.clone(), format!("{shown}enter picks · esc cancels"));
         let above = [above, list].concat();
         Bottom { above, tone: Tone::Typing, mark: s.bold(&s.blue("›")), lines, caret: Some(caret), notes, below: vec![self.bar.clone()], compact: picking.menu.title.clone() }
     }

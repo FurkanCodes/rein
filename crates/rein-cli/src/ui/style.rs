@@ -75,6 +75,10 @@ impl Style {
     pub fn blue(self, text: &str) -> String {
         self.paint("34", text)
     }
+
+    pub fn underline(self, text: &str) -> String {
+        self.paint("4", text)
+    }
 }
 
 /// <https://no-color.org>: any non-empty `NO_COLOR` turns colour off.

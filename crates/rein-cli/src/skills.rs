@@ -134,6 +134,9 @@ fn used(dir: &Path) -> BTreeMap<String, u32> {
 /// `skills` as you chose: those off kept apart, offered to no one; those
 /// only you call kept from the model; each with how often it's been used.
 fn apply(skills: &mut Skills, chosen: &Chosen, used: &BTreeMap<String, u32>) {
+    for skill in &mut skills.found {
+        skill.used = used.get(&skill.name).copied().unwrap_or(0);
+    }
     let (off, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut skills.found).into_iter().partition(|skill| chosen.off.contains(&skill.name));
     skills.off = off;
     skills.found = kept;
@@ -141,7 +144,6 @@ fn apply(skills: &mut Skills, chosen: &Chosen, used: &BTreeMap<String, u32>) {
         if chosen.yours.contains(&skill.name) {
             skill.model = false;
         }
-        skill.used = used.get(&skill.name).copied().unwrap_or(0);
     }
 }
 
@@ -352,8 +354,11 @@ pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal, roo
     let (pad, s) = (" ".repeat(GUTTER), terminal.err);
     let picked_chosen = chosen(&config_dir()?);
     let all = find(root, terminal, false).await;
-    // Those turned off are still yours to turn on.
-    let names: Vec<(String, Whose, String)> = all.found.iter().chain(&all.off).map(|skill| (skill.name.clone(), skill.whose, skill.description.clone())).collect();
+    // Those turned off are still yours to turn on; those you use most come
+    // first, and so win a tie when you type to narrow the list.
+    let mut listed: Vec<&Skill> = all.found.iter().chain(&all.off).collect();
+    listed.sort_by_key(|skill| std::cmp::Reverse(skill.used));
+    let names: Vec<(String, Whose, String)> = listed.iter().map(|skill| (skill.name.clone(), skill.whose, skill.description.clone())).collect();
     let left_out: Vec<String> = all.left_out.iter().map(|(folder, why)| rein_mcp::clean::text(&format!("{}: {why}", folder.display()))).collect();
     if names.is_empty() && left_out.is_empty() {
         say!("{pad}No skills yet: rein reads them from ~/.agents/skills and ~/.claude/skills, the plugins on in Claude Code, and the project's .agents/skills");
@@ -376,8 +381,8 @@ pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal, roo
                 Whose::Plugin => "a plugin's · ",
                 Whose::Yours => "",
             };
-            let short: String = description.chars().take(70).collect();
-            (format!("/{name}"), format!("{whose}{} · {short}", said(state(name))))
+            // Whole, to be found by any word in it; the line is cut to fit.
+            (format!("/{name}"), format!("{whose}{} · {description}", said(state(name))))
         })
         .collect();
     if !left_out.is_empty() {

@@ -681,6 +681,27 @@ impl Term {
     }
 
     /// The screen's rows as text.
+    /// What's underlined on screen, each run on a line of its own.
+    fn underlined(&self) -> Vec<String> {
+        let parser = self.screen.lock().unwrap();
+        let (rows, cols) = parser.screen().size();
+        let mut runs = Vec::new();
+        for row in 0..rows {
+            let mut run = String::new();
+            for col in 0..cols {
+                match parser.screen().cell(row, col).filter(|cell| cell.underline()) {
+                    Some(cell) => run.push_str(cell.contents()),
+                    None if !run.is_empty() => runs.push(std::mem::take(&mut run)),
+                    None => {}
+                }
+            }
+            if !run.is_empty() {
+                runs.push(run);
+            }
+        }
+        runs
+    }
+
     fn rows(&self) -> Vec<String> {
         let parser = self.screen.lock().unwrap();
         let (_, cols) = parser.screen().size();
@@ -3240,6 +3261,49 @@ fn skills_are_picked_from_the_list_named_anywhere_and_found_as_they_come() {
     pick(&mut term, "caveman");
     pick(&mut term, "use it");
     term.wait_until("the skill put in the box", |screen| screen.contains("› /caveman-commit"));
+}
+
+/// A long list is searched by the words typed, each found whole in a name
+/// or a description, names first and those you use most first in a tie:
+/// how many match is said, the letters that matched are marked, and what
+/// matched past what fits is shown.
+#[test]
+fn a_long_list_is_searched_by_the_words_typed() {
+    let mut model = Model::start(vec![]);
+    let skill = |name: &str, description: &str| (format!(".agents/skills/{name}/SKILL.md"), format!("---\nname: {name}\ndescription: {description}\n---\nBody.\n"));
+    model.home.push(skill("postgres-best-practices", "Postgres best practices for any database."));
+    model.home.push(skill("react-hooks", "Write hooks."));
+    model.home.push(skill("react-native", "Build mobile apps."));
+    let long = "Lint the styles and check the bundle size before you ship. ".repeat(3);
+    model.home.push(skill("frontend-checks", &format!("{long}Then set up Vitest for React components.")));
+    model.home.push(skill("kubernetes-operators-for-production-clusters-at-scale", "Run clusters."));
+    model.home.push(("skills-used.json".into(), r#"{"react-native": 3}"#.into()));
+    let mut term = Term::start_with(&model, "skills-search", 30, 100, &[]);
+    term.wait_for(IDLE);
+    term.keys("/skills\r");
+    term.wait_for(PICKING);
+    term.keys("react");
+    term.wait_for("3 of 5 · enter picks");
+    let rows = term.rows();
+    let at = |name: &str| rows.iter().position(|row| row.contains(name));
+    assert_eq!(at("/postgres-best-practices"), None, "not for the letters of pRactices: {rows:#?}");
+    // The list goes up from the box: the best is nearest it, and picked.
+    let (native, hooks, checks) = (at("› /react-native"), at("/react-hooks"), at("/frontend-checks"));
+    assert!(native.is_some() && checks < hooks && hooks < native, "names first, the one used first: {rows:#?}");
+    assert!(rows[checks.unwrap()].contains("…set up Vitest for React components."), "where it matched: {rows:#?}");
+    assert!(term.underlined().iter().any(|run| run == "react"), "marked: {:?}", term.underlined());
+    term.keys(" vitest");
+    term.wait_for("1 of 5 · enter picks");
+    term.keys("\r");
+    term.wait_for("/frontend-checks ─");
+    term.keys("\x1b");
+    term.wait_for(IDLE);
+    // A long name in a narrow window pushes its own description out, not
+    // every other's.
+    term.resize(30, 60);
+    term.keys("/skills\r");
+    term.wait_for(PICKING);
+    term.wait_until("each short one's description", |screen| screen.contains("/react-hooks") && screen.contains("on · Write hooks."));
 }
 
 /// A skill you turned off, called by name, is offered back: say no and

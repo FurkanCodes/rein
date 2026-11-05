@@ -308,6 +308,11 @@ finding. Each says why in a line.
   rein to export it. So the failure is a type (`Failure`), not words, and
   its fix is a key away.
 
+- Narrowing a list finds each word typed whole, every one, in a name or
+  a description; letters in order only in a name, each starting a word or
+  right after the one before. Letters anywhere, in order, across a
+  description kept 171 of 211 skills for `react` ("pRactices").
+
 ## Docs
 
 - Doc comments say what and why in plain words, and stay true: when the code
