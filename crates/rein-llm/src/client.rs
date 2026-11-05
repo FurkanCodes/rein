@@ -56,6 +56,8 @@ pub struct Client {
     auth: Auth,
     /// What this provider needs that it can't say in an error.
     quirks: Quirks,
+    /// Where it says how much of your limits is used, besides with its answers.
+    meters: crate::meter::Asked,
     /// How long an answer may go quiet before rein gives up on it.
     pub(crate) idle: Duration,
     /// How requests went over the wire, shared by the client's clones.
@@ -136,7 +138,7 @@ impl Client {
     /// which speaks `api`.
     pub fn new(http: reqwest::Client, api: Api, base_url: impl Into<String>, auth: Auth) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
-        Client { http, api, base_url, auth, quirks: Quirks::default(), idle: IDLE, wire: Arc::default(), chatgpt: None, claude_code: None }
+        Client { http, api, base_url, auth, quirks: Quirks::default(), meters: crate::meter::Asked::Nowhere, idle: IDLE, wire: Arc::default(), chatgpt: None, claude_code: None }
     }
 
     /// OpenAI on your ChatGPT plan, signed in to with `rein login` and saved
@@ -170,6 +172,27 @@ impl Client {
     pub fn with_quirks(mut self, quirks: Quirks) -> Self {
         self.quirks = quirks;
         self
+    }
+
+    /// The same client, asking `at` how much of your limits is used.
+    pub fn with_meters(mut self, at: crate::meter::Asked) -> Self {
+        self.meters = at;
+        self
+    }
+
+    /// Whether this provider can be asked how much of your limits is
+    /// used, besides being told with its answers.
+    pub fn asks_meters(&self) -> bool {
+        self.meters != crate::meter::Asked::Nowhere
+    }
+
+    /// How much of your limits is used, asked of the provider now, for
+    /// `model`: nothing where it can't be asked.
+    pub async fn meters(&self, model: &str) -> Result<Vec<crate::Meter>> {
+        match self.meters {
+            crate::meter::Asked::Nowhere => Ok(Vec::new()),
+            crate::meter::Asked::OpenRouterKey => Ok(crate::openrouter::meters(&self.get("key").await?, model, std::time::SystemTime::now())),
+        }
     }
 
     /// OpenAI itself, with `bearer` as the API key.

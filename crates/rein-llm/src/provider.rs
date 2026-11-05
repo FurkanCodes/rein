@@ -57,6 +57,8 @@ pub struct Provider {
     /// How many tokens its models take, when its model list doesn't say.
     pub context: Option<u64>,
     pub quirks: Quirks,
+    /// Where it says how much of your limits is used, besides with its answers.
+    pub meters: crate::meter::Asked,
     /// Set up or changed in your providers file.
     pub yours: bool,
 }
@@ -81,6 +83,7 @@ impl Provider {
             keys_url: None,
             context: None,
             quirks: Quirks::default(),
+            meters: crate::meter::Asked::Nowhere,
             yours: false,
         }
     }
@@ -127,6 +130,7 @@ pub fn builtin() -> Vec<Provider> {
             quirks: Quirks { effort_object: true, ..Quirks::default() },
             // Its model list is public: only this says whether a key works.
             key_check: "key".into(),
+            meters: crate::meter::Asked::OpenRouterKey,
             sign_in_url: Some(crate::openrouter::AUTH_URL.into()),
             ..chat("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY").keys_at("https://openrouter.ai/keys")
         },

@@ -280,11 +280,7 @@ struct Cited {
 }
 
 /// What `claude -p` printed, as what it found.
-pub(crate) fn from_cli(bytes: &[u8]) -> Result<Searched> {
-    let value: Value = serde_json::from_slice(bytes).map_err(|_| Error::Incomplete("Claude Code returned invalid JSON".into()))?;
-    if value["is_error"].as_bool() == Some(true) {
-        return Err(Error::Auth("Claude Code reported an error; check `claude auth status` and your subscription limits".into()));
-    }
+pub(crate) fn from_cli(value: &Value) -> Result<Searched> {
     let answer: Answer =
         serde_json::from_value(value["structured_output"].clone()).map_err(|_| Error::Incomplete("Claude Code's search came back in no shape rein reads".into()))?;
     let mut found = Searched { answer: answer.answer, ..Searched::default() };
@@ -397,9 +393,9 @@ mod tests {
     #[test]
     fn what_claude_code_found_is_read_from_its_answer() {
         let printed = json!({"is_error": false, "structured_output": {"answer": "1.99.1", "sources": [{"url": "https://blog.rust-lang.org/", "title": "Rust Blog"}]}});
-        let found = from_cli(printed.to_string().as_bytes()).unwrap();
+        let found = from_cli(&printed).unwrap();
         assert_eq!((found.answer.as_str(), found.sources[0].title.as_deref()), ("1.99.1", Some("Rust Blog")));
-        assert!(from_cli(br#"{"is_error":true}"#).is_err());
+        assert!(from_cli(&json!({"is_error": true})).is_err(), "no answer in it");
         assert!(asked("latest rust").ends_with("The question: latest rust"));
     }
 }

@@ -129,7 +129,7 @@ fn keyed(http: &rein_llm::reqwest::Client, provider: &Provider, base: &str, auth
             provider.title
         ));
     }
-    Ok(Client::new(http.clone(), provider.api, base.to_owned(), auth).with_quirks(provider.quirks))
+    Ok(Client::new(http.clone(), provider.api, base.to_owned(), auth).with_quirks(provider.quirks).with_meters(provider.meters))
 }
 
 /// A client for `provider`, with the first way to pay there is, and a line
@@ -137,7 +137,7 @@ fn keyed(http: &rein_llm::reqwest::Client, provider: &Provider, base: &str, auth
 pub async fn client_for(http: &rein_llm::reqwest::Client, provider: &Provider, keys: &Keys) -> CliResult<(Client, String)> {
     let (base, elsewhere) = base_url(provider);
     let pays = |whose: &str| if elsewhere { format!("Using {whose} with {base}") } else { format!("Using {whose} (billed to your {} API account)", provider.title) };
-    let client = |auth: Auth| Client::new(http.clone(), provider.api, base.clone(), auth).with_quirks(provider.quirks);
+    let client = |auth: Auth| Client::new(http.clone(), provider.api, base.clone(), auth).with_quirks(provider.quirks).with_meters(provider.meters);
     match payment(provider, keys) {
         Some(Payment::Plan) => Ok((chatgpt(http).await?, format!("Using ChatGPT plan (manage usage: {USAGE_URL})"))),
         Some(Payment::ClaudeCode) => {

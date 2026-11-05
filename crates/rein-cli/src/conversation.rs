@@ -549,6 +549,9 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
         if !terminal.input.pinned() {
             say!();
         }
+        // How much of your limits the last turn left, where the provider
+        // can be asked; it comes while you type.
+        terminal.meters.ask(&agent.model.client, &agent.model_name);
         let line = match message(terminal, &mut last_interrupt).await {
             Said::Message(line) => {
                 in_a_row = 0;
@@ -774,6 +777,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                     format!("{} of yours, {} from .rein/permissions · /permissions", agent.permissions.rule_count(Whose::Yours), agent.permissions.rule_count(Whose::Project)),
                 ),
                 ("context", format!("about {} of {} tokens before compacting", thousands(agent.estimated()), thousands(agent.limit()))),
+                ("limits", terminal.meters.status(std::time::SystemTime::now())),
                 ("sent", traffic(agent.model.client.traffic())),
                 ("started", header.map(|h| format!("{} · {messages} message{} so far", h.started, if messages == 1 { "" } else { "s" })).unwrap_or_default()),
                 ("folder", setup.root.display().to_string()),
@@ -1013,6 +1017,8 @@ pub(crate) async fn login_here(name: &str, given: Option<crate::commands::Key>, 
         say!("{pad}{}", s.dim(&connected.pays));
         let (client, models) = connected.models().await;
         agent.model.client = client;
+        // Another sign-in may be another account's.
+        terminal.meters.forget();
         if !models.is_empty() {
             setup.models = models;
         }
@@ -1055,6 +1061,7 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
         (setup.provider, setup.models) = (provider, models);
         // The others are others now.
         setup.others = None;
+        terminal.meters.forget();
     } else if missing(&setup.models) {
         return Err(format!("no model called {model}; /model lists them"));
     }
@@ -1205,6 +1212,11 @@ pub(crate) async fn message(terminal: &mut Terminal, last_interrupt: &mut Option
             incoming = from_peers(&mut terminal.peers), if waiting => {
                 terminal.input.stop_reading();
                 return Said::Peer(incoming);
+            }
+            // The box keeps what's typed, and reading picks up where it was.
+            meters = terminal.meters.answered() => {
+                terminal.take_meters(meters);
+                None
             }
         };
         let Some(read) = read else { continue };

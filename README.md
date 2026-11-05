@@ -179,7 +179,9 @@ rein -m claude-opus-5-5 "explain this repository"
 In a conversation rein takes the whole window, as `less` and `vim` do: the
 conversation above, and your message in a box at the bottom, with a status
 bar under it: the model and its effort, the mode, how full the context is,
-how much came from the cache, and how long the last turn took. While rein
+how much of your limits is used where the provider says (see [What's left
+of your limits](#whats-left-of-your-limits)), how much came from the cache,
+and how long the last turn took. While rein
 works, a line over the box says what it's doing and for how long. Each step
 appears on one line once it's done (`Read`, `Edit`, `Run`), with a short
 result and the output lines worth seeing; edits show as a framed diff
@@ -226,7 +228,7 @@ message, so typing ahead can't answer it by accident.
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/mcp`, `/mcp add`, `/mcp import`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one by name from the MCP Registry, as you'd start it in a shell, or from the JSON its README gives; bring yours in from other apps; the same changes typed (see [MCP servers](#mcp-servers)) |
 | `/undo` | put back what rein did to the project's files since a turn you pick, its commands' changes too (see [Undo](#undo)) |
-| `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use |
+| `/new`, `/resume`, `/status` | a fresh conversation (also `/clear`); continue a saved one; what's in use, and how much of your limits is used |
 | `/compact [focus]` | make room now; the summary keeps `focus` in mind |
 | `/copy` | copy rein's last answer as it wrote it, Markdown and all |
 | Ctrl-D or `/exit` | leave |
@@ -263,6 +265,35 @@ terminals report when asked (tmux does with `set -g focus-events on`), or,
 where the terminal doesn't say, that you haven't touched a key for 10
 seconds. What a bell does is the terminal's to decide: a sound, a flash, or a
 mark on the tab or dock icon. `bell = off` in the settings turns it off.
+
+## What's left of your limits
+
+Where the provider says how much of your limits is used, the bar shows it
+after the context, the same way whoever the provider is:
+
+- **Your Claude plan**, through Claude Code: the 5-hour and weekly windows,
+  as the CLI says them with every answer (`5h 28%  ·  7d 75%`), and a
+  model's own weekly window (`7d Opus`) once it gets close.
+- **OpenRouter**: the key's budget or cap (`$1.50 left`), or with no cap,
+  what it spent today (`$0.42 today`); on a free model, today's free
+  requests (`free 12/50`). rein asks OpenRouter with your key, between
+  turns and at most once a minute. What's left on your account takes a
+  management key to ask, so it isn't shown.
+- **Your ChatGPT plan**: OpenAI doesn't tell apps that sign in with ChatGPT
+  how much is used, so nothing shows rather than a guess. [ChatGPT settings
+  → Usage](https://chatgpt.com/settings/usage) has it.
+- Other providers show nothing yet.
+
+A figure is grey while it's fine, yellow once the provider warns or
+three quarters is used, and red at nine tenths or once it's reached, with
+when it starts over (`7d 75% →21:00`). Getting close is said once in the
+conversation (`↳ 75% of your 7d limit is used · resets 21:00`), and again
+only when it gets closer, or close again after it started over. A limit
+reached says which one, not "check your sign-in". rein never stops on a
+figure alone: a full week may still be served, from credits say; only the
+provider's refusal stops anything. A figure past its reset goes from the
+bar, another provider's go when you switch, and in a narrow window they go
+before the context gauge. `/status` lists them all.
 
 ## When the conversation gets long
 

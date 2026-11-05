@@ -42,6 +42,9 @@ pub enum Streamed<'a> {
     /// Something to tell the user about the answer, like another model
     /// having given it.
     Note(&'a str),
+    /// What the provider said, with the answer, of how much of your limits
+    /// is used.
+    Meters(&'a [rein_llm::Meter]),
 }
 
 /// Something that answers requests. The real one is a provider's API
@@ -86,6 +89,8 @@ pub trait Ui {
     fn thought(&mut self, _delta: &str) {}
     /// Something to know about the answer: another model gave it, say.
     fn note(&mut self, _note: &str) {}
+    /// What the provider said of how much of your limits is used.
+    fn meters(&mut self, _meters: &[rein_llm::Meter]) {}
     /// Asked when the permissions say to ask, with the rule that asks, if
     /// one does (in trust mode, only a rule asks). It's async so that an
     /// interrupt can cancel the turn even while it waits for an answer.
@@ -1684,6 +1689,7 @@ fn stream_to(ui: &mut impl Ui, streamed: Streamed) {
         Streamed::Text(text) => ui.text(text),
         Streamed::Thought(text) => ui.thought(text),
         Streamed::Note(note) => ui.note(note),
+        Streamed::Meters(meters) => ui.meters(meters),
     }
 }
 
@@ -1715,6 +1721,7 @@ impl Model for Llm {
                 Event::TextDelta(text) => on(Streamed::Text(&text)),
                 Event::Thought(text) => on(Streamed::Thought(&text)),
                 Event::Note(note) => on(Streamed::Note(&note)),
+                Event::Meters(meters) => on(Streamed::Meters(&meters)),
                 Event::Item(item) => items.push(item),
                 Event::Completed { usage } => return Ok((items, usage)),
             }

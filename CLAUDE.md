@@ -55,6 +55,14 @@ finding. Each says why in a line.
   function and custom tools"). rein's search is a function of its own, and
   what it finds comes as `additional_tools`, which the plan takes.
 
+- How much of your limits is used is the provider's word, never rein's
+  guess, and a provider that says nothing shows nothing: pi showed
+  "$3.92 (sub)" worked out from a price list, and its users couldn't tell
+  whether they'd been billed. A figure informs; only the provider's refusal
+  stops anything, as a week at 100% still served Opus in oh-my-pi. Name a
+  window by its length, never from a list: a list of the ones it knew made
+  a monthly plan vanish from oh-my-pi's bar.
+
 ## Errors are values until the edge
 
 - Keep errors typed until `main`, and turn them into text once there

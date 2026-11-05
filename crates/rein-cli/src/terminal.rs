@@ -83,6 +83,8 @@ pub(crate) struct Terminal {
     pub(crate) context_used: u64,
     /// How much of the last finished turn came from the prompt cache, in percent.
     pub(crate) last_cache: Option<u64>,
+    /// How much of your limits is used, as the provider last said.
+    pub(crate) meters: crate::meters::Meters,
     /// The answer being written, if one is.
     answer: Option<Answer>,
     mid_line: bool,
@@ -239,6 +241,7 @@ impl Terminal {
             context_limit: compact::DEFAULT_LIMIT,
             context_used: 0,
             last_cache: None,
+            meters: crate::meters::Meters::default(),
             answer: None,
             mid_line: false,
             spinner: None,
@@ -436,9 +439,31 @@ impl Terminal {
         say!("{bar}");
     }
 
+    /// What the provider said of how much of your limits is used: in the
+    /// bar, and in a line when one gets close.
+    pub(crate) fn take_meters(&mut self, meters: Vec<rein_llm::Meter>) {
+        for line in self.meters.read(meters, std::time::SystemTime::now()) {
+            self.quiet();
+            self.gap_before_step();
+            let lead = self.lead();
+            say!("{lead}{}", self.err.yellow(&format!("↳ {line}")));
+        }
+        if self.input.pinned() {
+            self.input.set_bar(self.bar());
+        }
+    }
+
     /// The model and its effort, the mode, how full the context is, how
-    /// much came from the cache, and how long the last turn took.
+    /// much of your limits is used, how much came from the cache, and how
+    /// long the last turn took. What's used of your limits goes first when
+    /// the window is too narrow for it all.
     pub(crate) fn bar(&self) -> String {
+        let full = self.bar_with(true);
+        let fits = terminal_width().is_none_or(|columns| crate::ui::style::width(&full) <= columns);
+        if fits { full } else { self.bar_with(false) }
+    }
+
+    fn bar_with(&self, meters: bool) -> String {
         let s = self.err;
         let used = self.context_used;
         // Never 0% once anything is in there, nor a full cell short of it.
@@ -460,7 +485,8 @@ impl Terminal {
         let cache = cache.map(|cache| format!("{dot}{} {cache}%", s.dim("cache"))).unwrap_or_default();
         // The time only once the turn is over; the spinner counts until then.
         let took = self.turn.took.map(|t| format!("{dot}{}", s.dim(&format!("{:.1}s", t.as_secs_f32())))).unwrap_or_default();
-        format!(" {model}{dot}{mode}{dot}{} {gauge} {pct}%{cache}{took}", s.dim("context"))
+        let meters = if meters { self.meters.bar(s, std::time::SystemTime::now()).iter().map(|meter| format!("{dot}{meter}")).collect() } else { String::new() };
+        format!(" {model}{dot}{mode}{dot}{} {gauge} {pct}%{meters}{cache}{took}", s.dim("context"))
     }
 
     /// What starts rein's next line: its label the first time in a turn,
@@ -656,6 +682,10 @@ impl Ui for Terminal {
         self.gap_before_step();
         let lead = self.lead();
         say!("{lead}{}", self.err.dim(&format!("↳ {note}")));
+    }
+
+    fn meters(&mut self, meters: &[rein_llm::Meter]) {
+        self.take_meters(meters.to_vec());
     }
 
     async fn approve(&mut self, call: &ToolCall, rule: Option<&Rule>) -> Approval {

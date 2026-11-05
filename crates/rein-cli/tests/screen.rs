@@ -190,6 +190,10 @@ impl Model {
                     let good = head.to_lowercase().contains("authorization: bearer good-key");
                     if good {
                         http(200, "application/json", br#"{"data":{"label":"test"}}"#)
+                    } else if head.to_lowercase().contains("authorization: bearer budget-key") {
+                        // A key in a workspace whose budget is nearly spent.
+                        let budget = r#"{"scope":"workspace","limit_usd":10.0,"spend_usd":8.5,"remaining_usd":1.5,"reset_interval":"monthly","resets_at":"2099-06-15T12:00:00Z"}"#;
+                        http(200, "application/json", format!(r#"{{"data":{{"label":"test","usage_daily":0.42,"effective_budget":{budget}}}}}"#).as_bytes())
                     } else {
                         http(401, "application/json", br#"{"error":{"message":"No auth credentials found","code":401}}"#)
                     }
@@ -1609,6 +1613,42 @@ fn a_key_is_checked_where_only_a_good_one_gets_an_answer() {
 }
 
 #[test]
+fn an_openrouter_keys_budget_shows_in_the_bar_and_says_once_that_its_nearly_spent() {
+    let mut model = Model::serve(vec![says("Hi."), says("Again.")], true, Wire::Chat, None);
+    model.home.push(("providers".into(), format!("[openrouter]\nurl = {base}\n\n[groq]\nurl = {base}\n", base = model.base)));
+    model.env.extend([("OPENROUTER_API_KEY".into(), "budget-key".into()), ("GROQ_API_KEY".into(), "test-key".into()), ("REIN_MODEL".into(), "openrouter/test-model".into())]);
+    let mut term = Term::start(&model, "openrouter-budget", 30, 120);
+    // Asked as the conversation starts, without a word to the model.
+    term.wait_for("$1.50 left of $10.00 · resets Jun 15");
+    term.wait_until("the budget in the bar", |screen| screen.contains("$1.50 left →Jun 15"));
+    assert!(model.requests.lock().unwrap().is_empty(), "nothing was sent to the model for it");
+    term.keys("hello\r");
+    term.wait_for("Hi.");
+    term.wait_for(IDLE);
+    term.keys("and again\r");
+    term.wait_for("Again.");
+    term.wait_for(IDLE);
+    assert_eq!(term.text().matches("left of $10.00").count(), 1, "said once:\n{}", term.text());
+    // Another provider's figures aren't these.
+    term.keys("/model groq/llama-test\r");
+    term.wait_until("the budget gone from the bar", |screen| !screen.contains("left →"));
+}
+
+#[test]
+fn a_narrow_window_drops_whats_used_of_your_limits_before_the_context() {
+    let mut model = Model::serve(vec![], true, Wire::Chat, None);
+    model.home.push(("providers".into(), format!("[openrouter]\nurl = {}\n", model.base)));
+    model.env.extend([("OPENROUTER_API_KEY".into(), "budget-key".into()), ("REIN_MODEL".into(), "openrouter/test-model".into())]);
+    let term = Term::start(&model, "openrouter-narrow", 30, 64);
+    term.wait_for("$1.50 left of $10.00");
+    term.wait_for(IDLE);
+    let screen = term.text();
+    let bar = screen.lines().rev().find(|line| line.contains("context")).unwrap_or_default();
+    // Left out whole, not cut off at the edge halfway through.
+    assert!(bar.contains('%') && !bar.contains('$'), "{screen}");
+}
+
+#[test]
 fn ctrl_c_at_the_key_prompt_shows_typing_again() {
     let model = Model::claude(vec![]);
     let dir = std::env::temp_dir().join(format!("rein-screen-{}-secret", std::process::id()));
@@ -2439,11 +2479,14 @@ fn claude_code_subprocess_keeps_reins_tools_and_uses_subscription_auth() {
 pwd -P >> "$0.pwd"
 printf '%s\n' "$@" > "$0.args"
 /bin/cat > "$0.input"
+now=$(/bin/date +%s)
+printf '%s\n' '{"type":"system","subtype":"init"}'
+printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","unifiedWindows":{"five_hour":{"utilization":0.28,"resetsAt":'$((now + 3600))',"status":"allowed"},"seven_day":{"utilization":0.75,"resetsAt":'$((now + 7200))',"status":"allowed_warning"}}}}'
 if [ -f "$0.called" ]; then
-    printf '%s' '{"structured_output":{"text":"Read through rein, not Claude tools.","tool_calls":[]}}'
+    printf '%s\n' '{"type":"result","structured_output":{"text":"Read through rein, not Claude tools.","tool_calls":[]}}'
 else
     : > "$0.called"
-    printf '%s' '{"structured_output":{"text":"Inspecting the fixture.","tool_calls":[{"name":"read","arguments":{"path":"example.txt","start_line":null,"line_count":null}}]}}'
+    printf '%s\n' '{"type":"result","structured_output":{"text":"Inspecting the fixture.","tool_calls":[{"name":"read","arguments":{"path":"example.txt","start_line":null,"line_count":null}}]}}'
 fi
 "#,
     )
@@ -2472,6 +2515,11 @@ fi
     assert!(places.lines().all(|place| !std::path::Path::new(place).starts_with(&project) && !std::path::Path::new(place).exists()), "{places}");
     let args = std::fs::read_to_string(bin.join("claude.args")).unwrap();
     assert!(args.contains("--setting-sources\nuser\n"), "{args}");
+    // What the CLI said of the plan: in the bar, and said once, though
+    // both steps said it.
+    let screen = term.text();
+    assert_eq!(screen.matches("75% of your 7d limit is used").count(), 1, "{screen}");
+    assert!(screen.contains("5h 28%") && screen.contains("7d 75% →"), "{screen}");
 }
 
 /// A project and a home for reins in several tabs, as one user's terminals

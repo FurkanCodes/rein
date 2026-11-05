@@ -30,6 +30,7 @@ mod harden;
 mod hooks;
 mod input;
 mod mcp;
+mod meters;
 mod paste;
 mod peers;
 mod rules;

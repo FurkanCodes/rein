@@ -1,15 +1,16 @@
 //! Claude Code as a subprocess, not an HTTP provider. Built-in tools and
 //! customizations are disabled; structured replies ask rein to run its tools.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
+use crate::meter::{Meter, Reading, Standing};
 use crate::{Error, Event, Item, Loading, Request, Result, Tool, ToolCall, Usage, found_text};
 
 #[derive(Clone)]
@@ -32,10 +33,21 @@ impl Backend {
         self.run("claude", request, idle).await
     }
 
+    /// The CLI's answer to `request`, after what it said of your plan's
+    /// limits: those come even when the answer is that a limit is reached.
     async fn run(&self, program: &str, request: &Request<'_>, idle: Duration) -> Result<VecDeque<Result<Event>>> {
         let images = shown_images(request);
         let job = Job { model: request.model, effort: request.reasoning_effort, tool: None, schema: schema(request), prompt: prompt(request).to_string(), images };
-        decode(&self.exec(program, &job, idle).await?, request)
+        let printed = self.exec(program, &job, idle).await?;
+        let mut events = VecDeque::new();
+        if !printed.meters.is_empty() {
+            events.push_back(Ok(Event::Meters(printed.meters.clone())));
+        }
+        match printed.answer().and_then(|result| decode(result, request)) {
+            Ok(answer) => events.extend(answer),
+            Err(e) => events.push_back(Err(e)),
+        }
+        Ok(events)
     }
 
     /// Searches the web for `question` with `model` and Claude Code's own
@@ -47,11 +59,11 @@ impl Backend {
 
     async fn search_with(&self, program: &str, model: &str, question: &str, idle: Duration) -> Result<crate::search::Searched> {
         let job = Job { model, effort: None, tool: Some("WebSearch"), schema: crate::search::schema(), prompt: crate::search::asked(question), images: Vec::new() };
-        crate::search::from_cli(&self.exec(program, &job, idle).await?)
+        crate::search::from_cli(self.exec(program, &job, idle).await?.answer()?)
     }
 
-    /// Runs the CLI for `job`: what it printed, once it ended well.
-    async fn exec(&self, program: &str, job: &Job<'_>, idle: Duration) -> Result<Vec<u8>> {
+    /// Runs the CLI for `job`: what it printed, read, however it ended.
+    async fn exec(&self, program: &str, job: &Job<'_>, idle: Duration) -> Result<Printed> {
         // Declared before the process group, so it goes after the CLI does.
         let workdir = Workdir::new()?;
         let mut command = Command::new(program);
@@ -91,12 +103,12 @@ impl Backend {
         if let Some(tool) = job.tool {
             command.args(["--allowedTools", tool]);
         }
-        // Images go only in streamed JSON, which the CLI then answers in too.
-        if job.images.is_empty() {
-            command.args(["--output-format", "json"]);
-        } else {
-            command.args(["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
+        // Streamed, the answer comes with what the CLI says of your plan's
+        // limits, which `json` leaves out. Images go only in streamed JSON.
+        if !job.images.is_empty() {
+            command.args(["--input-format", "stream-json"]);
         }
+        command.args(["--output-format", "stream-json", "--verbose"]);
         if let Some(effort) = job.effort {
             let effort = if effort == crate::Effort::Minimal { crate::Effort::Low } else { effort };
             command.args(["--effort", effort.as_str()]);
@@ -122,16 +134,7 @@ impl Backend {
             let (_, out, _) = tokio::try_join!(write, read_capped(stdout, idle), read_capped(stderr, idle))?;
             let status = child.wait().await?;
             group.0 = None;
-            if !status.success() {
-                // Neither stderr nor error JSON is safe: the CLI or an auth
-                // helper may echo credentials. Keep failures deliberately terse.
-                return Err(Error::Auth(format!("Claude Code exited with {status}; check `claude auth status` or run `claude setup-token`")));
-            }
-            // Streamed, the answer is its last line, as `json` gives it.
-            if !job.images.is_empty() {
-                return Ok(answered(&out));
-            }
-            Ok(out)
+            Ok(Printed::read(&out, status))
         };
         // Even a child that closes its pipes and then hangs is bounded.
         tokio::time::timeout(Duration::from_secs(600), work).await.map_err(|_| Error::Incomplete("Claude Code exceeded ten minutes".into()))?
@@ -162,10 +165,142 @@ fn streamed(prompt: &str, images: &[&crate::Image]) -> String {
     format!("{}\n", json!({ "type": "user", "message": { "role": "user", "content": content }, "parent_tool_use_id": null }))
 }
 
-/// The last `result` line of a streamed answer, which says what `json`
-/// output would: nothing when there's none.
-fn answered(out: &[u8]) -> Vec<u8> {
-    out.split(|&b| b == b'\n').rfind(|line| serde_json::from_slice::<Value>(line).is_ok_and(|v| v["type"] == "result")).map(<[u8]>::to_vec).unwrap_or_default()
+/// What a run of the CLI printed, read: its answer, and what it said of
+/// your plan's limits on the way.
+struct Printed {
+    /// The `result` line, as `json` output gives it: `None` when there's none.
+    result: Option<Value>,
+    /// The plan's limits, as it last said each.
+    meters: Vec<Meter>,
+    status: std::process::ExitStatus,
+}
+
+impl Printed {
+    fn read(out: &[u8], status: std::process::ExitStatus) -> Printed {
+        let (mut result, mut meters) = (None, Vec::new());
+        for line in out.split(|&b| b == b'\n') {
+            let Ok(value) = serde_json::from_slice::<Value>(line) else { continue };
+            match value["type"].as_str() {
+                Some("result") => result = Some(value),
+                Some("rate_limit_event") => crate::meter::merge(&mut meters, plan_meters(&value["rate_limit_info"])),
+                _ => {}
+            }
+        }
+        Printed { result, meters, status }
+    }
+
+    /// The answer, or why there's none: the plan's limit, where the CLI
+    /// said one is reached, rather than a sign-in to check. Neither stderr
+    /// nor the CLI's error is safe to show, as it or an auth helper may
+    /// echo credentials: failures stay terse.
+    fn answer(&self) -> Result<&Value> {
+        let failed = self.result.as_ref().is_none_or(|result| result["is_error"] == true);
+        if (failed || !self.status.success())
+            && let Some(reached) = self.meters.iter().find(|meter| meter.standing == Standing::Reached)
+        {
+            return Err(Error::usage_limit(format!("your Claude plan's {} limit is reached", reached.label())));
+        }
+        if !self.status.success() {
+            return Err(Error::Auth(format!("Claude Code exited with {}; check `claude auth status` or run `claude setup-token`", self.status)));
+        }
+        let result = self.result.as_ref().ok_or_else(|| Error::Incomplete("Claude Code returned invalid JSON".into()))?;
+        if result["is_error"] == true {
+            return Err(Error::Auth("Claude Code reported an error; check `claude auth status` and your subscription limits".into()));
+        }
+        Ok(result)
+    }
+}
+
+/// What the CLI says of your plan's limits, a `rate_limit_event`'s
+/// `rate_limit_info`: every window at once in `unifiedWindows`, as 2.1.318
+/// sends it, or else the one window it's about.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RateLimitInfo {
+    status: Option<Status>,
+    resets_at: Option<f64>,
+    rate_limit_type: Option<String>,
+    utilization: Option<f64>,
+    unified_windows: BTreeMap<String, Window>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct Window {
+    status: Option<Status>,
+    /// Unix seconds.
+    resets_at: Option<f64>,
+    /// The share used: 0.28 for 28%.
+    utilization: Option<f64>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum Status {
+    Allowed,
+    AllowedWarning,
+    Rejected,
+    #[serde(other)]
+    Other,
+}
+
+/// Your plan's windows in `info`, as meters; what can't be read is left out.
+fn plan_meters(info: &Value) -> Vec<Meter> {
+    let Ok(info) = RateLimitInfo::deserialize(info) else { return Vec::new() };
+    let windows = if info.unified_windows.is_empty() {
+        let window = Window { status: info.status, resets_at: info.resets_at, utilization: info.utilization };
+        info.rate_limit_type.map(|name| (name, window)).into_iter().collect()
+    } else {
+        info.unified_windows
+    };
+    windows.into_iter().filter_map(|(name, window)| plan_meter(&name, &window)).collect()
+}
+
+/// The window called `name` as a meter. Its length is in its name
+/// (`five_hour`, `seven_day_opus`), so a window rein hasn't seen yet shows
+/// as well, as long as it says how long it is.
+fn plan_meter(name: &str, window: &Window) -> Option<Meter> {
+    let mut words = name.splitn(3, '_');
+    let count: u64 = match words.next()? {
+        "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "ten" => 10,
+        "twelve" => 12,
+        "fourteen" => 14,
+        "thirty" => 30,
+        _ => return None,
+    };
+    let unit = match words.next()? {
+        "hour" => 3600,
+        "day" => 86_400,
+        "week" => 7 * 86_400,
+        "month" => 30 * 86_400,
+        _ => return None,
+    };
+    let only = words.next().unwrap_or_default();
+    // Overage is money past the plan, not a window of it.
+    if only.contains("overage") {
+        return None;
+    }
+    let used = window.utilization.filter(|used| used.is_finite())?;
+    // One over 1 is taken as said in percent.
+    let percent = if used <= 1.0 { used * 100.0 } else { used };
+    let reading = Reading::Used(percent.round().clamp(0.0, 100.0) as u8);
+    let standing = match window.status {
+        Some(Status::Rejected) => Standing::Reached,
+        Some(Status::AllowedWarning) => Standing::Warned,
+        Some(Status::Allowed) => Standing::Fine,
+        Some(Status::Other) | None => Standing::of(reading),
+    };
+    let resets = window.resets_at.and_then(|secs| Duration::try_from_secs_f64(secs).ok()).and_then(|after| SystemTime::UNIX_EPOCH.checked_add(after));
+    let mut letters = only.chars().map(|c| if c == '_' { ' ' } else { c });
+    let only = letters.next().map(|first| first.to_uppercase().chain(letters).collect::<String>());
+    Some(Meter { id: name.to_owned(), only, span: Some(Duration::from_secs(count.saturating_mul(unit))), resets, reading, standing })
 }
 
 /// The images `request` shows, in the order they come.
@@ -356,11 +491,7 @@ struct Call {
     arguments: Value,
 }
 
-fn decode(bytes: &[u8], request: &Request<'_>) -> Result<VecDeque<Result<Event>>> {
-    let value: Value = serde_json::from_slice(bytes).map_err(|_| Error::Incomplete("Claude Code returned invalid JSON".into()))?;
-    if value["is_error"].as_bool() == Some(true) {
-        return Err(Error::Auth("Claude Code reported an error; check `claude auth status` and your subscription limits".into()));
-    }
+fn decode(value: &Value, request: &Request<'_>) -> Result<VecDeque<Result<Event>>> {
     let reply: Reply = serde_json::from_value(value["structured_output"].clone()).map_err(|_| Error::Incomplete("Claude Code returned no valid structured reply".into()))?;
     let mut events = VecDeque::new();
     if !reply.text.is_empty() {
@@ -471,10 +602,11 @@ printf '%s\n' '{"type":"result","structured_output":{"text":"A dot.","tool_calls
         assert_eq!(prompt["conversation"][2]["output"], "Image a.png, 2×1.\n[image a.png, 2×1] (image 1, after the conversation)");
         assert_eq!(content[1]["text"], "Image 1: [image a.png, 2×1]");
         assert_eq!(content[2]["source"]["data"], "cG5nIQ==");
-        // With no image to show, it runs as ever.
+        // With no image to show, only what it answers is streamed.
         let blind = Request { images: false, ..request };
         let _ = Backend::new(None).run(&fake.program, &blind, Duration::from_secs(5)).await;
-        assert!(std::fs::read_to_string(format!("{}.args", fake.program)).unwrap().contains("--output-format\njson\n"));
+        let args = std::fs::read_to_string(format!("{}.args", fake.program)).unwrap();
+        assert!(args.contains("--output-format\nstream-json\n--verbose\n") && !args.contains("--input-format"), "{args}");
     }
 
     #[test]
@@ -504,7 +636,7 @@ printf '%s\n' '{"type":"result","structured_output":{"text":"A dot.","tool_calls
 [ -z "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$ANTHROPIC_BASE_URL$OPENAI_API_KEY$CLAUDE_CODE_USE_BEDROCK" ] || exit 11
 printf '%s\n' "$@" > "$0.args"
 /bin/cat > "$0.input"
-printf '%s' '{"structured_output":{"text":"Hello from CLI","tool_calls":[]},"usage":{"input_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,"output_tokens":5}}'
+printf '%s\n' '{"type":"result","structured_output":{"text":"Hello from CLI","tool_calls":[]},"usage":{"input_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,"output_tokens":5}}'
 "#,
         );
         let backend = Backend::new(Some("test-secret".into()));
@@ -527,7 +659,7 @@ printf '%s' '{"structured_output":{"text":"Hello from CLI","tool_calls":[]},"usa
             r#"
 printf '%s\n' "$@" > "$0.args"
 /bin/cat > "$0.input"
-printf '%s' '{"structured_output":{"answer":"Rust 1.99.1","sources":[{"url":"https://blog.rust-lang.org/","title":"Rust Blog"}]}}'
+printf '%s\n' '{"type":"result","structured_output":{"answer":"Rust 1.99.1","sources":[{"url":"https://blog.rust-lang.org/","title":"Rust Blog"}]}}'
 "#,
         );
         let found = Backend::new(None).search_with(&fake.program, "haiku", "latest rust", Duration::from_secs(5)).await.unwrap();
@@ -556,7 +688,7 @@ pwd -P > "$0.pwd"
 printf '%s\n' "$@" > "$0.args"
 [ -z "${CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR+set}" ] || exit 12
 /bin/cat > /dev/null
-printf '%s' '{"structured_output":{"text":"ok","tool_calls":[]}}'
+printf '%s\n' '{"type":"result","structured_output":{"text":"ok","tool_calls":[]}}'
 "#,
         );
         Backend::new(None).run(&fake.program, &request(), Duration::from_secs(5)).await.unwrap();
@@ -616,7 +748,7 @@ printf '%s' '{"structured_output":{"text":"ok","tool_calls":[]}}'
         }];
         let input = [Item::User("read this".into()), Item::ToolResult { call_id: "old".into(), output: "contents".into() }];
         let request = Request { tools: &tools, input: &input, ..request() };
-        let events = decode(br#"{"structured_output":{"text":"Checking","tool_calls":[{"name":"read","arguments":{"path":"a.rs"}}]}}"#, &request).unwrap();
+        let events = decode(&json!({"structured_output":{"text":"Checking","tool_calls":[{"name":"read","arguments":{"path":"a.rs"}}]}}), &request).unwrap();
         assert!(
             events
                 .iter()
@@ -624,16 +756,88 @@ printf '%s' '{"structured_output":{"text":"ok","tool_calls":[]}}'
         );
         assert_eq!(schema(&request)["properties"]["tool_calls"]["items"]["anyOf"][0]["properties"]["name"]["enum"][0], "read");
         assert_eq!(prompt(&request)["conversation"][1]["output"], "contents");
-        assert!(decode(br#"{"structured_output":{"text":"","tool_calls":[{"name":"bash","arguments":{}}]}}"#, &request).is_err());
+        assert!(decode(&json!({"structured_output":{"text":"","tool_calls":[{"name":"bash","arguments":{}}]}}), &request).is_err());
     }
 
     #[tokio::test]
     async fn subprocess_failures_and_malformed_replies_do_not_echo_secrets() {
-        for body in ["echo secret >&2; exit 1", "echo '{\"is_error\":true,\"result\":\"secret\"}'", "echo '{\"structured_output\":\"secret\"}'", "echo secret"] {
+        for body in [
+            "echo secret >&2; exit 1",
+            "echo '{\"type\":\"result\",\"is_error\":true,\"result\":\"secret\"}'",
+            "echo '{\"type\":\"result\",\"structured_output\":\"secret\"}'",
+            "echo secret",
+        ] {
             let fake = Fake::new(body);
-            let err = Backend::new(None).run(&fake.program, &request(), Duration::from_secs(5)).await.unwrap_err();
+            let err = failure(Backend::new(None).run(&fake.program, &request(), Duration::from_secs(5)).await);
             assert!(!err.to_string().contains("secret"), "{err}");
         }
+    }
+
+    /// The error a run ended in: before anything came, or as its answer.
+    fn failure(run: Result<VecDeque<Result<Event>>>) -> Error {
+        match run {
+            Err(e) => e,
+            Ok(events) => events.into_iter().find_map(Result::err).expect("the run failed"),
+        }
+    }
+
+    /// What Claude Code 2.1.318 printed of a Max plan at 28% of its five
+    /// hours and 75% of its week.
+    const WARNED: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1793901600,"rateLimitType":"seven_day","utilization":0.75,"overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"surpassedThreshold":0.75,"unifiedWindows":{"five_hour":{"utilization":0.28,"resetsAt":1793888400,"status":"allowed"},"seven_day":{"utilization":0.75,"resetsAt":1793901600,"status":"allowed_warning","surpassedThreshold":0.75}},"overageEnabled":false},"uuid":"u","session_id":"s"}"#;
+
+    fn at(secs: u64) -> Option<SystemTime> {
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    #[tokio::test]
+    async fn a_plans_limits_come_before_its_answer() {
+        let fake = Fake::new(&format!(
+            "/bin/cat > /dev/null\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}' '{WARNED}' '{{\"type\":\"result\",\"structured_output\":{{\"text\":\"hi\",\"tool_calls\":[]}}}}'"
+        ));
+        let events = Backend::new(None).run(&fake.program, &request(), Duration::from_secs(5)).await.unwrap();
+        let Some(Ok(Event::Meters(meters))) = events.front() else { panic!("{events:?}") };
+        let read: Vec<_> = meters.iter().map(|m| (m.label(), m.reading, m.standing, m.resets)).collect();
+        assert_eq!(read, [("5h".into(), Reading::Used(28), Standing::Fine, at(1_793_888_400)), ("7d".into(), Reading::Used(75), Standing::Warned, at(1_793_901_600))]);
+        assert!(matches!(&events[1], Ok(Event::TextDelta(text)) if text == "hi"), "then the answer, as ever");
+    }
+
+    #[test]
+    fn a_window_is_read_by_the_length_in_its_name_and_what_isnt_a_window_is_left_out() {
+        let one = |info: Value| plan_meters(&info).into_iter().map(|m| (m.label(), m.reading, m.standing)).collect::<Vec<_>>();
+        // Without `unifiedWindows`, the one window it's about, as the SDK's types have it.
+        let single = json!({"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.9, "resetsAt": 1_793_888_400});
+        assert_eq!(one(single), [("5h".into(), Reading::Used(90), Standing::Warned)]);
+        let opus = json!({"rateLimitType": "seven_day_opus", "utilization": 0.5, "status": "allowed"});
+        assert_eq!(one(opus), [("7d Opus".into(), Reading::Used(50), Standing::Fine)]);
+        let monthly = json!({"unifiedWindows": {"thirty_day": {"utilization": 0.1}}});
+        assert_eq!(one(monthly), [("mo".into(), Reading::Used(10), Standing::Fine)], "a window not seen before shows too");
+        assert!(one(json!({"rateLimitType": "overage", "utilization": 0.5})).is_empty(), "overage is money past the plan");
+        assert!(one(json!({"rateLimitType": "seven_day_overage_included", "utilization": 0.5})).is_empty());
+        assert!(one(json!({"rateLimitType": "five_hour", "utilization": "lots"})).is_empty(), "what can't be read isn't guessed");
+        assert!(one(json!({"rateLimitType": "five_hour"})).is_empty(), "no reading, no meter");
+        assert!(one(json!("nonsense")).is_empty());
+        let percent = json!({"rateLimitType": "five_hour", "utilization": 42.0, "status": "rejected"});
+        assert_eq!(one(percent), [("5h".into(), Reading::Used(42), Standing::Reached)], "one over 1 is a percent, and the CLI's word on it stands");
+    }
+
+    #[tokio::test]
+    async fn a_reached_limit_is_said_as_the_plans_not_as_a_sign_in_to_check() {
+        let reached = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","utilization":1.0,"resetsAt":1793901600}}"#;
+        let refused = r#"{"type":"result","is_error":true,"api_error_status":429,"result":"Weekly limit hit"}"#;
+        for exit in ["0", "1"] {
+            let fake = Fake::new(&format!("/bin/cat > /dev/null\nprintf '%s\\n' '{reached}' '{refused}'\nexit {exit}"));
+            let events = Backend::new(None).run(&fake.program, &request(), Duration::from_secs(5)).await.unwrap();
+            assert!(matches!(events.front(), Some(Ok(Event::Meters(meters))) if meters[0].standing == Standing::Reached), "{events:?}");
+            let err = failure(Ok(events));
+            assert_eq!(err.kind(), Some(crate::ErrorKind::UsageLimit), "{err}");
+            assert!(err.to_string().contains("Claude plan's 7d limit is reached"), "{err}");
+            assert!(!err.retryable(), "waiting a few seconds won't help");
+        }
+        // Served past a reached window, from overage say, it's an answer.
+        let served = r#"{"type":"result","structured_output":{"text":"still here","tool_calls":[]}}"#;
+        let fake = Fake::new(&format!("/bin/cat > /dev/null\nprintf '%s\\n' '{reached}' '{served}'"));
+        let events = Backend::new(None).run(&fake.program, &request(), Duration::from_secs(5)).await.unwrap();
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
     }
 
     #[tokio::test]

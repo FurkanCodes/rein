@@ -33,6 +33,8 @@ pub(crate) struct LocalTime {
     year: i32,
     month: u32,
     day: u32,
+    /// Days since Sunday.
+    weekday: u32,
     pub(crate) hour: u32,
     pub(crate) minute: u32,
     pub(crate) second: u32,
@@ -41,6 +43,22 @@ pub(crate) struct LocalTime {
 impl LocalTime {
     pub(crate) fn date(&self) -> String {
         format!("{}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    /// Its day's short name: `Fri`.
+    pub(crate) fn weekday(&self) -> &'static str {
+        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].get(self.weekday as usize).copied().unwrap_or("")
+    }
+
+    /// Its month's short name and its day: `Nov 12`.
+    pub(crate) fn month_day(&self) -> String {
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        format!("{} {}", months.get(self.month.saturating_sub(1) as usize).copied().unwrap_or(""), self.day)
+    }
+
+    /// Its time of day: `21:00`.
+    pub(crate) fn clock(&self) -> String {
+        format!("{:02}:{:02}", self.hour, self.minute)
     }
 }
 
@@ -54,7 +72,15 @@ pub(crate) fn local_time(time: SystemTime) -> LocalTime {
     if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
         unsafe { libc::gmtime_r(&seconds, &mut tm) };
     }
-    LocalTime { year: tm.tm_year + 1900, month: (tm.tm_mon + 1) as u32, day: tm.tm_mday as u32, hour: tm.tm_hour as u32, minute: tm.tm_min as u32, second: tm.tm_sec as u32 }
+    LocalTime {
+        year: tm.tm_year + 1900,
+        month: (tm.tm_mon + 1) as u32,
+        day: tm.tm_mday as u32,
+        weekday: tm.tm_wday as u32,
+        hour: tm.tm_hour as u32,
+        minute: tm.tm_min as u32,
+        second: tm.tm_sec as u32,
+    }
 }
 
 /// What the requests cost on the wire: `412 KB as 128 KB (gzip, 3.2× fewer bytes)`.

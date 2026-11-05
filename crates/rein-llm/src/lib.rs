@@ -15,6 +15,7 @@ pub mod decode;
 pub mod gemini;
 pub mod http;
 pub mod mcp;
+pub mod meter;
 mod oauth;
 pub mod openai;
 pub mod openrouter;
@@ -24,6 +25,7 @@ pub mod sse;
 pub mod store;
 
 pub use client::{Auth, Client, Compression, ResponseStream, Traffic};
+pub use meter::{Meter, Reading, Standing};
 pub use reqwest;
 pub use serde_json;
 
@@ -45,6 +47,9 @@ pub enum Event {
     /// A finished piece of the answer. Append it to the conversation: the
     /// next request has to send it back.
     Item(Item),
+    /// What the provider said, with the answer, of how much of your limits
+    /// is used: a plan's windows, say.
+    Meters(Vec<Meter>),
     /// The response finished normally. Always the last event.
     Completed { usage: Usage },
 }
@@ -676,6 +681,11 @@ impl Error {
     /// The model declined to answer, saying `why`.
     pub fn refusal(why: impl Into<String>) -> Error {
         Error::Api { status: None, kind: ErrorKind::Refusal, code: None, message: why.into(), request_id: None, param: None }
+    }
+
+    /// The plan or account has no usage left: `why`, which limit.
+    pub fn usage_limit(why: impl Into<String>) -> Error {
+        Error::Api { status: None, kind: ErrorKind::UsageLimit, code: None, message: why.into(), request_id: None, param: None }
     }
 
     /// The conversation doesn't fit: `why`, in the provider's words.

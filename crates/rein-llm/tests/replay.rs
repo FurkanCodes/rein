@@ -36,7 +36,7 @@ fn text_and_usage(events: Vec<rein_llm::Result<Event>>) -> (String, Option<Usage
     for event in events {
         match event.expect("no errors") {
             Event::TextDelta(delta) => text.push_str(&delta),
-            Event::Item(_) | Event::Thought(_) | Event::Note(_) => {}
+            Event::Item(_) | Event::Thought(_) | Event::Note(_) | Event::Meters(_) => {}
             Event::Completed { usage: u } => usage = Some(u),
         }
     }
