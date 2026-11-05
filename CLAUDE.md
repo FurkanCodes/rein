@@ -3,8 +3,9 @@
 rein is a terminal coding agent in Rust (edition 2024, tokio `current_thread`).
 `crates/rein-llm` speaks to providers (Responses, Messages, Gemini and Chat
 Completions APIs), `crates/rein-agent` is the agent loop and its tools,
-`crates/rein-cli` is the `rein` binary and its full-screen terminal. The README
-says what rein does; this file says how its code is kept.
+`crates/rein-cli` is the `rein` binary and its full-screen terminal.
+[docs/guide.md](docs/guide.md) says everything rein does, and README.md is
+the short front page; this file says how its code is kept.
 
 Every rule below is here because breaking it caused a real bug or a review
 finding. Each says why in a line.
@@ -398,5 +399,9 @@ finding. Each says why in a line.
 
 ## Docs
 
+- What rein does, in full, is `docs/guide.md`: a change you can see changes
+  it in the same commit. README.md is the front page and stays short: a
+  feature gets a line there, its details go in the guide. The README had
+  grown to 1,300 lines, too long to show what rein is at a glance.
 - Doc comments say what and why in plain words, and stay true: when the code
   changes, the comment changes with it.

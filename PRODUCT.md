@@ -1,6 +1,7 @@
 # rein: what we're building, and how
 
-The README says what rein does today, CLAUDE.md how its code is kept.
+The [guide](docs/guide.md) says what rein does today, CLAUDE.md how its
+code is kept.
 This file says what rein is for, how we decide what to build, and what
 comes next.
 
@@ -21,7 +22,7 @@ What that means in practice:
 - **Nothing happens behind your back.** Each step shows as it runs. What
   rein adds to the conversation (a skill loaded, the skills that changed,
   a memory saved) is said where you can see it. What the model is told is
-  written in the README.
+  written in the guide.
 - **You can always step in.** Esc stops a turn, Enter steers it at its
   next step, and `/undo` puts files back, including what commands did.
 - **Walls when you choose them.** The sandbox is yours to turn on or
@@ -36,7 +37,7 @@ What that means in practice:
 - **Use what you pay for, the official way.** Your ChatGPT plan through
   OpenAI's sign-in for open-source apps, your Claude plan through
   Anthropic's own CLI, API keys. rein never signs in as another app.
-- **Small and fast.** One 4.7 MB binary, about 10 ms a sandboxed command,
+- **Small and fast.** One 5 MB binary, about 10 ms a sandboxed command,
   and a prompt cache that holds at 96–98% across a conversation.
 
 ## How we build it
