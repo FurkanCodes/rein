@@ -295,6 +295,16 @@ hears what broke right away, not three steps later when a build fails.
 **Done when:** a broken edit is caught at the step that broke it, at a
 cost we've measured and are happy with.
 
+**Built.** As researched (2026-11-05): Kilo and Crush ask a language
+server after each edit and wait up to 5 s, Roo waits a fixed 1 s, Aider
+lints once per reply, and Claude Code pushes a server's errors without
+waiting, so they often come a step late, with old ones back as new.
+Codex, Gemini CLI and pi don't check, and OpenCode v2 has a TODO there.
+rein runs the project's own check once per step that changed files
+(`cargo check` on rein: 0.3-0.7 s after an edit), asked about once per
+project, and tells only what the turn broke, by what each error is, not
+where.
+
 ---
 
 ## Open questions

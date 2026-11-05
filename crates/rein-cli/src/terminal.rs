@@ -703,6 +703,39 @@ impl Ui for Terminal {
         say!("{lead}{}", self.err.dim(&format!("↳ {note}")));
     }
 
+    fn checking(&mut self, check: &rein_agent::check::Check) {
+        self.doing(&format!("Checking with {}", check.name()));
+    }
+
+    /// `↳ cargo check · no new errors · 0.4s` under the step, or what broke:
+    /// `✗ cargo check · 2 new errors · 0.6s` and the first few. Ctrl-O shows
+    /// them all.
+    fn checked(&mut self, checked: &rein_agent::check::Checked, printed: &str) {
+        use rein_agent::check::Verdict;
+        self.end_line();
+        let s = self.err;
+        let pad = " ".repeat(steps::INDENT);
+        let took = format!("{:.1}s", checked.took.as_secs_f32());
+        let line = match checked.verdict {
+            Verdict::Clean => s.dim(&format!("↳ {} · no new errors · {took}", checked.name)),
+            Verdict::New(count) => s.red(&format!("✗ {} · {count} new error{} · {took}", checked.name, if count == 1 { "" } else { "s" })),
+            Verdict::Fixed => format!("{} {}", s.green("✓"), s.dim(&format!("{} · the errors these changes brought in are fixed · {took}", checked.name))),
+            Verdict::Busy => s.dim(&format!("↳ {} · not run: another command had the build", checked.name)),
+        };
+        say!("{pad}{line}");
+        let width = self.wrap_width().unwrap_or(80).saturating_sub(steps::INDENT + 2).max(20);
+        for shown in checked.shown.iter().take(3) {
+            let first = rein_agent::background::plain(shown.lines().next().unwrap_or_default());
+            say!("{pad}  {}", s.dim(&crate::ui::style::fit(&first, width)));
+        }
+        if checked.shown.len() > 3 {
+            say!("{pad}  {}", s.dim(&format!("… {} more · ctrl-o shows them", checked.shown.len() - 3)));
+        }
+        if self.input.pinned() && !printed.is_empty() {
+            self.input.keep_output(format!("Check  {} · {}", checked.name, strip(&line).trim_start_matches(['↳', '✗', '✓', ' '])), printed);
+        }
+    }
+
     /// `↳ b1 npm run dev ended: exit 1`, where the model is told.
     fn background_ended(&mut self, ended: &rein_agent::background::Ended) {
         self.end_line();

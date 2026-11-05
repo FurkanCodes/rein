@@ -20,6 +20,7 @@ macro_rules! out {
 }
 
 mod args;
+mod check;
 mod claude;
 mod commands;
 mod connect;

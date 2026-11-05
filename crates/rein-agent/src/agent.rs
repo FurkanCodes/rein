@@ -141,6 +141,12 @@ pub trait Ui {
     fn steered(&mut self, _heard: &Heard) {}
     /// A background command ended, and the model is told, here.
     fn background_ended(&mut self, _ended: &crate::background::Ended) {}
+    /// The project's check runs: before the turn's first change, or after
+    /// a step's changes.
+    fn checking(&mut self, _check: &crate::check::Check) {}
+    /// What the check after a step's changes said, and `printed`, the
+    /// errors it found, all of them, to read whole.
+    fn checked(&mut self, _checked: &crate::check::Checked, _printed: &str) {}
     /// Does what the model asked of another rein (`peers`, `message`,
     /// `delegate`), and says how it went. Only offered where there are
     /// other reins to reach; see [`Agent::with_peer_tools`].
@@ -435,6 +441,11 @@ pub struct Agent<M> {
     hooks_said: Vec<String>,
     /// A hook stopped the turn after a tool ran: it ends once the step does.
     hook_stopped: Option<By>,
+    /// The project's check after edits, and what this turn's checks know.
+    checking: crate::check::Checking,
+    /// The step under way changed the project's files: it's checked once
+    /// it's done.
+    changed_in_step: bool,
 }
 
 impl<M: Model> Agent<M> {
@@ -529,6 +540,86 @@ impl<M: Model> Agent<M> {
         self.work(ui).await
     }
 
+    /// How the project's check runs: in the sandbox's write walls when it's
+    /// on, as a command that builds would.
+    fn check_how(&self) -> crate::sandbox::Run {
+        use crate::sandbox::Run;
+        match self.permissions.sandboxing() {
+            crate::permissions::Sandboxing::On => crate::sandbox::Access::Write.walls().map_or(Run::Unsandboxed, Run::Sandboxed),
+            _ => Run::Unsandboxed,
+        }
+    }
+
+    /// Looks at the errors there are before the turn's first change, once
+    /// a turn.
+    async fn check_baseline(&mut self, ui: &mut impl Ui) {
+        if !self.checking.turn.wants_baseline() {
+            return;
+        }
+        let Some(check) = self.checking.active().cloned() else { return };
+        ui.checking(&check);
+        match self.tools.check(&check, self.check_how()).await {
+            crate::check::Ran::Done { problems, .. } => self.checking.turn.set_baseline(Some(problems)),
+            // Not this turn, then: what's new can't be told without it.
+            crate::check::Ran::Busy => self.checking.turn.set_baseline(None),
+            ran => {
+                self.checking.turn.set_baseline(None);
+                self.check_paused(&check, &ran, ui);
+            }
+        }
+    }
+
+    /// Checks the project after a step that changed its files, and tells
+    /// the model what the turn's changes broke, or that it's fixed.
+    async fn check_after(&mut self, ui: &mut impl Ui) -> Result<()> {
+        if !std::mem::take(&mut self.changed_in_step) {
+            return Ok(());
+        }
+        let Some(check) = self.checking.active().cloned() else { return Ok(()) };
+        if !self.checking.turn.has_baseline() {
+            return Ok(());
+        }
+        ui.checking(&check);
+        let ran = self.tools.check(&check, self.check_how()).await;
+        match ran {
+            crate::check::Ran::Done { problems, took, printed } => {
+                if let Some((checked, note)) = self.checking.turn.after(&check, &problems, took) {
+                    ui.checked(&checked, &self.tools.hidden(printed));
+                    if let Some(note) = note {
+                        self.record(Item::User(self.tools.hidden(note)))?;
+                    }
+                }
+            }
+            crate::check::Ran::Busy => {
+                let checked = crate::check::Checked { name: check.name(), took: crate::check::BUDGET, verdict: crate::check::Verdict::Busy, shown: Vec::new() };
+                ui.checked(&checked, "");
+            }
+            ran => self.check_paused(&check, &ran, ui),
+        }
+        Ok(())
+    }
+
+    /// The check was too slow, or wouldn't start: it's paused for the
+    /// conversation, and you're told why, and how to run it again.
+    fn check_paused(&mut self, check: &crate::check::Check, ran: &crate::check::Ran, ui: &mut impl Ui) {
+        self.checking.pause();
+        let why = match ran {
+            crate::check::Ran::Slow => format!("`{}` took longer than {}s", check.name(), crate::check::BUDGET.as_secs()),
+            crate::check::Ran::Couldnt(why) => why.clone(),
+            _ => return,
+        };
+        ui.note(&format!("{why}, so rein stopped checking the project after edits in this conversation: /check on runs it again"));
+    }
+
+    /// Tells the model, once a turn, as it says it's done, of the errors
+    /// its changes brought in that are still there: whether it did.
+    fn note_still_broken(&mut self) -> Result<bool> {
+        let Some(check) = self.checking.active().cloned() else { return Ok(false) };
+        let Some(note) = self.checking.turn.at_end(&check) else { return Ok(false) };
+        self.record(Item::User(self.tools.hidden(note)))?;
+        Ok(true)
+    }
+
     /// Tells the model of the background commands that ended since it was
     /// last told: whether there were any.
     async fn note_ended(&mut self, ui: &mut impl Ui) -> Result<bool> {
@@ -575,6 +666,7 @@ impl<M: Model> Agent<M> {
     /// the first message.
     async fn begin(&mut self, said: &str) -> Result<()> {
         self.repair();
+        self.checking.turn = crate::check::Turn::default();
         self.tools.turn(said).await;
         if let Some(context) = self.context.take() {
             if let Some(session) = &mut self.session {
@@ -766,7 +858,9 @@ impl<M: Model> Agent<M> {
                 // Done, unless the user wrote meanwhile: then that's next.
                 // Or a command ended in the background.
                 let ended = self.note_ended(ui).await?;
-                if self.steer(ui.steering(), ui).await? || ended {
+                // Or it broke the build and didn't say: it's told once.
+                let broken = self.note_still_broken()?;
+                if self.steer(ui.steering(), ui).await? || ended || broken {
                     continue;
                 }
                 // Or a hook of yours says the work isn't done.
@@ -802,8 +896,10 @@ impl<M: Model> Agent<M> {
             if let Some(by) = self.hook_stopped.take() {
                 return Ok(Outcome::HookStopped(by));
             }
-            // What ended in the background, and what the user wrote, during
-            // the last step goes with its result.
+            // What the step's changes broke, what ended in the background,
+            // and what the user wrote, during the last step goes with its
+            // result.
+            self.check_after(ui).await?;
             self.note_ended(ui).await?;
             self.steer(ui.steering(), ui).await?;
         }
@@ -814,6 +910,12 @@ impl<M: Model> Agent<M> {
     /// the model so. Your hooks run before each, and after.
     async fn run_step(&mut self, calls: &[ToolCall], last: bool, repeats: &mut Repeats, ui: &mut impl Ui) -> Result<Ran> {
         let closing = if last { calls.last().map(|call| call.call_id.clone()) } else { None };
+        self.changed_in_step = false;
+        // The errors there are before the turn changes anything: what a
+        // check after it finds beyond them is what the turn broke.
+        if calls.iter().any(may_change_files) {
+            self.check_baseline(ui).await;
+        }
         let mut next = 0;
         while next < calls.len() {
             // The user wrote: what's left was planned before that, so it
@@ -994,8 +1096,10 @@ impl<M: Model> Agent<M> {
                     ui.tool_started(&call);
                     let output = self.tools.run(&call, self.permissions.how(&call)).await;
                     if let Some(watched) = self.tools.take_watched() {
+                        self.changed_in_step |= matches!(&watched, Watched::Changed(changed) if !changed.is_empty());
                         ui.watched(&call, &watched);
                     }
+                    self.changed_in_step |= ToolName::of(&call).is_some_and(ToolName::changes_files) && !output.starts_with(crate::tools::ERROR);
                     self.after(&call, output, began, &pre.context, ui).await
                 }
                 Err(reason) => reason,
@@ -1483,6 +1587,8 @@ impl<M> Agent<M> {
             hooks: std::sync::Arc::default(),
             hooks_said: Vec::new(),
             hook_stopped: None,
+            checking: crate::check::Checking::default(),
+            changed_in_step: false,
         }
     }
 
@@ -1536,6 +1642,8 @@ impl<M> Agent<M> {
             hooks,
             hooks_said,
             hook_stopped,
+            checking,
+            changed_in_step,
         } = self;
         Agent {
             model,
@@ -1563,7 +1671,20 @@ impl<M> Agent<M> {
             hooks,
             hooks_said,
             hook_stopped,
+            checking,
+            changed_in_step,
         }
+    }
+
+    /// The check that runs after a step changes the project's files, or
+    /// none: see [`crate::check`].
+    pub fn set_check(&mut self, check: Option<crate::check::Check>) {
+        self.checking.set(check);
+    }
+
+    /// The project's check, and whether it's paused.
+    pub fn checking(&self) -> &crate::check::Checking {
+        &self.checking
     }
 
     /// The hooks that run from now on: yours, Claude Code's and its
@@ -1822,6 +1943,16 @@ fn undone(done: &Plan) -> String {
     }
     told.push_str(" What commands did outside the project, or to anything but its files, wasn't undone.]");
     told
+}
+
+/// Whether `call` may change the project's files: a write or an edit, or
+/// a command that asks for more than to look.
+fn may_change_files(call: &ToolCall) -> bool {
+    match ToolName::of(call) {
+        Some(tool) if tool.changes_files() => true,
+        Some(ToolName::Bash) => BashCall::of(call).is_some_and(|bash| bash.access() != crate::sandbox::Access::Look),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -2315,6 +2446,8 @@ mod tests {
             hooks: std::sync::Arc::default(),
             hooks_said: Vec::new(),
             hook_stopped: None,
+            checking: crate::check::Checking::default(),
+            changed_in_step: false,
         }
     }
 
@@ -2613,6 +2746,94 @@ mod tests {
         let input = &requests[2].input;
         let yours = input.iter().position(|item| matches!(item, Item::User(text) if text == "I stopped it")).unwrap();
         assert!(matches!(&input[yours - 1], Item::User(text) if text.contains("b1 (sleep 49.31) was stopped by the user.")), "{:?}", input[yours - 1]);
+    }
+
+    fn edits(id: &str, path: &str, old: &str, new: &str) -> Item {
+        Item::ToolCall(ToolCall { call_id: id.into(), name: "edit".into(), arguments: json!({ "path": path, "old_text": old, "new_text": new, "replace_all": false }).to_string() })
+    }
+
+    /// A check that reads as tsc writes: an error for each line of a.ts
+    /// that says BROKEN, and a line in check.log each time it runs.
+    fn tsc_like(root: &std::path::Path) -> crate::check::Check {
+        let script =
+            "echo ran >> check.log; grep -n BROKEN a.ts | while IFS=: read n rest; do echo \"a.ts($n,1): error TS2304: Cannot find name '$rest'.\"; done; ! grep -q BROKEN a.ts";
+        std::fs::write(root.join("check.sh"), script).unwrap();
+        crate::check::Check { command: "sh check.sh".into(), reads: crate::check::Reads::Tsc, found_from: None }
+    }
+
+    fn check_notes(input: &[Item]) -> Vec<String> {
+        input
+            .iter()
+            .filter_map(|item| match item {
+                Item::User(text) if crate::check::is_note(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_breaks_the_build_is_told_at_its_step_and_its_fix_too() {
+        let turns = vec![vec![edits("e1", "a.ts", "ok", "BROKEN here")], vec![edits("e2", "a.ts", "BROKEN here", "fine")], vec![Item::Assistant("Fixed.".into())]];
+        let mut agent = agent("check-breaks", turns);
+        let root = root_of("check-breaks");
+        std::fs::write(root.join("a.ts"), "OLDBROKEN stays\nok\n").unwrap();
+        agent.set_check(Some(tsc_like(&root)));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("change it".into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        assert!(check_notes(&requests[0].input).is_empty());
+        // The old error was there before: only the edit's is told.
+        assert_eq!(
+            check_notes(&requests[1].input),
+            ["[rein checked the project with `sh` after these changes: 1 new error.\na.ts:2:1 error[TS2304]: Cannot find name 'BROKEN here'.]"]
+        );
+        let fixed = check_notes(&requests[2].input);
+        assert_eq!(fixed.len(), 2);
+        assert!(fixed[1].ends_with("the errors your changes brought in are gone.]"), "{fixed:?}");
+        // Before the first change, and after each of the two.
+        assert_eq!(std::fs::read_to_string(root.join("check.log")).unwrap().lines().count(), 3);
+        assert!(!compact::record(&agent.window.full).contains("rein checked"), "not as something you said");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ends_with_what_it_broke_is_told_once() {
+        let turns = vec![vec![edits("e1", "a.ts", "ok", "BROKEN")], vec![Item::Assistant("Done.".into())], vec![Item::Assistant("It stays broken on purpose.".into())]];
+        let mut agent = agent("check-end", turns);
+        let root = root_of("check-end");
+        std::fs::write(root.join("a.ts"), "ok\n").unwrap();
+        agent.set_check(Some(tsc_like(&root)));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("break it".into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        assert_eq!(requests.len(), 3, "told once as it said it was done, then it was");
+        let end = check_notes(&requests[2].input);
+        assert!(end.last().unwrap().contains("1 new error your changes this turn brought in is still there. Fix it, or say why it's left:\na.ts:1:1"), "{end:?}");
+    }
+
+    #[tokio::test]
+    async fn a_key_in_what_the_check_says_is_hidden_from_the_model() {
+        let turns = vec![vec![edits("e1", "a.ts", "ok", "BROKEN FAKE-check-key-123")], vec![Item::Assistant("Seen.".into())], vec![Item::Assistant("Left.".into())]];
+        let mut agent = agent("check-key", turns);
+        let root = root_of("check-key");
+        std::fs::write(root.join("a.ts"), "ok\n").unwrap();
+        agent.set_check(Some(tsc_like(&root)));
+        agent.tools.hide_too(["FAKE-check-key-123".to_owned()]);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("change it".into(), &mut person).await.unwrap();
+        let told = check_notes(&agent.model.requests.borrow()[1].input);
+        assert!(told[0].contains("Cannot find name 'BROKEN") && !told[0].contains("FAKE-check-key-123"), "{told:?}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_only_looks_isnt_checked() {
+        let turns = vec![vec![bash("look", "ls"), read_call("r", "a.ts", json!(null), json!(null))], vec![Item::Assistant("Seen.".into())]];
+        let mut agent = agent("check-looks", turns);
+        let root = root_of("check-looks");
+        std::fs::write(root.join("a.ts"), "BROKEN\n").unwrap();
+        agent.set_check(Some(tsc_like(&root)));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("look".into(), &mut person).await.unwrap();
+        assert!(!root.join("check.log").exists(), "it never ran");
     }
 
     #[tokio::test]

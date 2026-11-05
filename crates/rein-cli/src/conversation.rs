@@ -183,6 +183,9 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     // to ask: not in a task run on its own, nor in a sub-agent's tab, which
     // has its task to do.
     crate::hooks::start(&mut agent, &mut terminal, &dir, source, args.prompt.is_none() && args.child.is_none()).await;
+    // The project's check after edits: one rein found asks first, as the
+    // project's hooks do.
+    crate::check::start(&mut agent, &mut terminal, &dir, &args.check, args.prompt.is_none() && args.child.is_none()).await;
     // A continued conversation is as full as it was.
     terminal.context_used = agent.estimated();
     terminal.input.set_bar(terminal.bar());
@@ -854,6 +857,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         Slash::Hooks => crate::hooks::command(agent, terminal, &config_dir()?).await?,
         Slash::Memory => crate::memory::command(agent, terminal).await?,
         Slash::Tasks => crate::tasks::command(agent, terminal).await?,
+        Slash::Check(given) => crate::check::command(given.as_deref(), agent, terminal, &config_dir()?)?,
         Slash::Search(with) => crate::search::command(with, agent, terminal, setup).await?,
         Slash::New => {
             let (loaded, context) = setup.open(None, &setup.current(agent))?;

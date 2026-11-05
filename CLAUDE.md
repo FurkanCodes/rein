@@ -199,6 +199,10 @@ finding. Each says why in a line.
   the name, and a later commit swapped the command behind it
   (CVE-2025-54136). What a server says of its tools is its own word: none
   runs without asking for it.
+- A check rein runs by itself after edits is the project's code (`cargo
+  check` runs build scripts and proc macros): one rein found waits for
+  your yes once per project, kept by its exact command, as a project's
+  hooks are; a task run on its own runs only what you said yes to.
 - What a command may write whatever its walls (a tool's records: rtk's
   stats) is a file, never a link or a folder, and never the settings
   beside it: rtk outside the walls writes where those say, and through a
@@ -264,6 +268,10 @@ finding. Each says why in a line.
   terminal acts on, a way out of its `<memory>`), keys come out before
   it's written, and every save is a step you see. Another app's notes
   (Claude Code's) are read, never written: its own pass would fight ours.
+- What a check tells the model is what the turn broke: errors from before
+  its first change are its baseline, compared by file, code and message,
+  never by line. Claude Code and Roo counted an old error that moved as
+  new, and re-sent old ones after every edit.
 - A note rein adds to the conversation isn't something you said: mark it
   with a `const` (`skills::is_note`). Compaction's record lists every
   message as yours, and kept a note of skills changed as your words.

@@ -4,6 +4,7 @@
 
 pub mod agent;
 pub mod background;
+pub mod check;
 pub mod claude;
 pub mod compact;
 pub mod context;

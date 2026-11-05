@@ -435,6 +435,16 @@ impl Tools {
         self
     }
 
+    /// Runs the project's `check`, as `how` says: see [`crate::check`].
+    pub(crate) async fn check(&self, check: &crate::check::Check, how: Run) -> crate::check::Ran {
+        crate::check::run(check, &self.root, &self.sandbox, how).await
+    }
+
+    /// `text` with the keys rein knows hidden.
+    pub(crate) fn hidden(&self, text: String) -> String {
+        self.secrets.hide(text)
+    }
+
     /// The commands `bash` started, those in the background among them.
     pub fn jobs(&self) -> &std::sync::Arc<Jobs> {
         &self.jobs

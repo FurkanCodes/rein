@@ -4347,3 +4347,80 @@ fn closing_the_tab_stops_what_runs_in_the_background() {
     term.wait_exit();
     assert!(!alive("sleep 48.29"), "the command outlived rein");
 }
+
+/// A stand-in for cargo on `PATH`, in `dir`: `cargo check` says, as
+/// rustc's JSON does, there's an error on each line of src/lib.rs that
+/// says BROKEN, and writes a line in `dir`/checks each time it runs.
+fn fake_cargo(dir: &std::path::Path) -> String {
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+echo ran >> "{}/checks"
+grep -n BROKEN src/lib.rs | while IFS=: read n rest; do
+  printf '%s\n' '{{"reason":"compiler-message","message":{{"message":"cannot find value `BROKEN` in this scope","level":"error","code":{{"code":"E0425"}},"spans":[{{"file_name":"src/lib.rs","line_start":'"$n"',"column_start":5,"is_primary":true}}]}}}}'
+done
+! grep -q BROKEN src/lib.rs
+"#,
+        dir.display()
+    );
+    std::fs::write(bin.join("cargo"), script).unwrap();
+    let mut permissions = std::fs::metadata(bin.join("cargo")).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(bin.join("cargo"), permissions).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+fn edits(path: &str, old: &str, new: &str) -> Turn {
+    calls("edit", json!({ "path": path, "old_text": old, "new_text": new, "replace_all": false }))
+}
+
+#[test]
+fn an_edit_that_breaks_the_build_is_caught_at_its_step() {
+    let tools = std::env::temp_dir().join(format!("rein-screen-tools-{}-check", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tools);
+    let path = fake_cargo(&tools);
+    let lib = "pub fn size() -> usize {\n    64\n}\n";
+    let model =
+        Model::start(vec![edits("src/lib.rs", "    64", "    BROKEN"), edits("src/lib.rs", "    BROKEN", "    65"), says("Changed it, and it builds."), says("Hello again.")])
+            .with_env("REIN_MODE", "trust")
+            .with_env("PATH", &path);
+    let mut term = Term::start_with(&model, "check-edits", 30, 110, &[("Cargo.toml", "[package]\nname = \"probe\"\n"), ("src/lib.rs", lib)]);
+    // Found from the project's files, and asked about once: No first.
+    term.wait_for("Check the project with cargo check after edits?");
+    // A question takes no key in its first moment, so none typed ahead answers it.
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Check after edits: cargo check (found from Cargo.toml) · /check");
+    term.wait_for(IDLE);
+    term.keys("change the size\r");
+    term.wait_for("Changed it, and it builds.");
+    let screen = term.text();
+    for part in
+        ["✗ cargo check · 1 new error", "src/lib.rs:2:5 error[E0425]: cannot find value `BROKEN` in this scope", "✓ cargo check · the errors these changes brought in are fixed"]
+    {
+        assert!(screen.contains(part), "{part:?} isn't shown:\n{screen}");
+    }
+    let told = model.requests()[1].to_string();
+    assert!(told.contains("[rein checked the project with `cargo check` after these changes: 1 new error.\\nsrc/lib.rs:2:5 error[E0425]"), "{told}");
+    // Before the first change, and after each.
+    assert_eq!(std::fs::read_to_string(tools.join("checks")).unwrap().lines().count(), 3);
+    term.keys("/exit\r");
+    // Your yes is kept, by its command: not asked again.
+    let mut term = term.again(&model);
+    term.wait_for("Check after edits: cargo check (found from Cargo.toml) · /check");
+    assert!(!term.text().contains("after edits?"), "{}", term.text());
+    term.wait_for(IDLE);
+    term.keys("/check off\r");
+    term.wait_for("rein doesn't check this project after edits; /check on does again");
+    let kept = std::fs::read_to_string(term.dir.join("home/checks.json")).unwrap();
+    assert!(kept.contains("\"on\": false") && kept.contains("cargo check --workspace --all-targets --message-format=json"), "{kept}");
+    // Off stays off, and isn't asked about again.
+    term.keys("/exit\r");
+    let term = term.again(&model);
+    term.wait_for(IDLE);
+    let screen = term.text();
+    assert!(!screen.contains("Check after edits") && !screen.contains("after edits?"), "{screen}");
+    drop(term);
+    let _ = std::fs::remove_dir_all(&tools);
+}

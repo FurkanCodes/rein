@@ -19,6 +19,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/hooks", "", "your hooks, rein's and Claude Code's: what each runs on and how it last did; pick one to turn it off or on"),
     ("/memory", "", "the notes kept across conversations, rein's and Claude Code's: read one, or forget one of rein's"),
     ("/tasks", "", "the commands running in the background: pick one to stop it (Ctrl-O shows what each printed)"),
+    ("/check", "[on|off|command]", "the project's check after edits: what runs, turn it off or on, or run yours"),
     ("/status", "", "the model, mode, context and conversation"),
     ("/mcp", "[add|import|remove|allow …]", "the MCP servers: add one by name from the MCP Registry, bring yours from other apps, or change one"),
     ("/compact", "[focus]", "make room in the conversation now"),
@@ -67,6 +68,8 @@ pub enum Slash {
     Memory,
     /// The commands in the background, to stop one.
     Tasks,
+    /// The project's check after edits: what it is, on, off, or yours.
+    Check(Option<String>),
     Status,
     Mcp(Mcp),
     Compact(Option<String>),
@@ -323,6 +326,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
         "/hooks" => Ok(Slash::Hooks),
         "/memory" => Ok(Slash::Memory),
         "/tasks" => Ok(Slash::Tasks),
+        "/check" => Ok(Slash::Check(arg)),
         "/search" => match arg.as_deref() {
             None => Ok(Slash::Search(None)),
             Some(with) => with.parse().map(|with| Slash::Search(Some(with))).map_err(Refused::Said),

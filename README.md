@@ -223,6 +223,7 @@ message, so typing ahead can't answer it by accident.
 | `/mode [trust\|ask\|edits\|auto\|read-only]` | show or change what runs without asking, and keep it for new conversations if you like |
 | `/memory` | the notes kept across conversations, rein's and Claude Code's: read one, or forget one of rein's (see [Memory](#memory)) |
 | `/tasks` | the commands running in the background: pick one to stop it (see [Background commands](#background-commands)) |
+| `/check [on\|off\|command]` | the project's check after edits: what runs, off or on for the project, or yours (see [Checks after edits](#checks-after-edits)) |
 | `/sandbox [on\|off]` | run commands in the sandbox, or as you'd run them, in any mode, and keep it for new conversations if you like (see [The sandbox](#the-sandbox)) |
 | `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
@@ -435,7 +436,7 @@ tab_command = "my-term --new-tab --title {title} -- {command}"
 
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`, `$REIN_SEARCH`,
 `$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS`,
-`$REIN_SANDBOX`, `$REIN_MEMORY`, `$REIN_PEERS` and `$REIN_STRIP`, which win over the file.
+`$REIN_SANDBOX`, `$REIN_MEMORY`, `$REIN_CHECK`, `$REIN_PEERS` and `$REIN_STRIP`, which win over the file.
 `/mode` and `/sandbox` write `mode` and `sandbox` here when you keep the one
 you picked, and leave the rest as it was. The sandbox is off unless it says
 `sandbox = on` (or `--sandbox on`).
@@ -667,6 +668,46 @@ in the turn it's seen in. They stop with the conversation (leaving, `/new`,
 `/resume`, the end of `rein "task"`), and with the tab: each is asked to
 stop, then its whole process group is killed 2 seconds later. A compaction
 lists what still runs, so the model doesn't start a second server.
+
+## Checks after edits
+
+After a step changes the project's files, with an edit or a command
+(`sed`, a formatter), rein runs the project's own check and tells the model
+what its changes broke, at that step, not three steps later when a build
+fails. The check comes from the project's files: `cargo check` for
+`Cargo.toml`, the project's own `tsc --noEmit` for `tsconfig.json`, `go vet`
+for `go.mod`, pyright or mypy where the project sets them up. You're asked
+once per project, as it runs the project's own code (build scripts), in the
+sandbox when it's on. Your answer is kept in rein's folder by the exact
+command, so a different one asks again. `/check` shows what runs, `/check off`
+and `/check on` change it for the project, and `/check <command>` runs
+yours. `check = off` in the settings turns it off everywhere, and
+`check = <command>` runs yours everywhere.
+
+Only what the turn broke is told. The errors there were before its first
+change are left out, compared by file, code and message, never by line, so
+an old error an edit moved isn't new. Errors only, never warnings, the
+first 10 of them, each with its path from the project root:
+
+```text
+[rein checked the project with `cargo check` after these changes: 1 new error.
+src/lib.rs:2:5 error[E0425]: cannot find value `BROKEN` in this scope]
+```
+
+A check that broke nothing adds nothing to the conversation, and once the
+errors are fixed it says so once. If the model says it's done while errors
+it brought in are still there, it's told once. Under the step you see
+`↳ cargo check · no new errors · 0.4s`, or `✗ cargo check · 1 new error`
+with the first few, and Ctrl-O shows them all. On rein itself, `cargo check`
+answers in 0.3 to 0.7 s after an edit. A check that takes longer than 15 s is
+stopped, and checking pauses for the conversation, said once; one that waits
+for a build another command holds is skipped for that step.
+
+The project's own command, not a language server: it says what the build
+says, and needs nothing installed. In other harnesses, language servers'
+errors came a step late, went stale after a `sed`, came back as new, or
+the servers hung or were left running. OpenCode's own docs now advise
+running the type check instead.
 
 ## Hooks
 

@@ -117,10 +117,15 @@ Set peers = hold to let each message in yourself (trust mode always does),
 refuse to take none, or off to stay out.
 
 Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
-compact_at, max_steps, peers, and bell, compress, sandbox, memory and strip (on or
+compact_at, max_steps, peers, check, and bell, compress, sandbox, memory and strip (on or
 off), like `mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE,
 $REIN_COMPACT_AT, $REIN_MAX_STEPS, $REIN_BELL, $REIN_COMPRESS, $REIN_SANDBOX,
-$REIN_MEMORY, $REIN_PEERS and $REIN_STRIP, which win over the file.
+$REIN_MEMORY, $REIN_CHECK, $REIN_PEERS and $REIN_STRIP, which win over the file.
+
+After a step changes files, rein runs the project's check (cargo check, tsc,
+go vet, pyright or mypy, found from its files, asked about once) and tells the
+model what its changes broke, at that step. /check shows it; check = off stops
+it everywhere, and check = <your command> runs yours instead.
 
 The model keeps notes across conversations, per project: corrections and why,
 who you are, what the project's files don't say. Each save is a step you see,
@@ -169,6 +174,8 @@ pub(crate) struct AskArgs {
     pub(crate) sandbox: bool,
     /// Keep notes across conversations, and start each with their index.
     pub(crate) memory: bool,
+    /// What checks the project after edits: see [`crate::check`].
+    pub(crate) check: crate::check::Setting,
     /// How many steps a turn nobody is watching may take; `None`: no limit.
     pub(crate) max_steps: Option<usize>,
     /// `None` starts a conversation instead of doing one task.
@@ -210,6 +217,7 @@ impl AskArgs {
         // Off unless you turn it on, as in Claude Code.
         let mut sandbox = switch("sandbox", "REIN_SANDBOX", false)?;
         let memory = switch("memory", "REIN_MEMORY", true)?;
+        let check = crate::check::Setting::of(settings.get("check", "REIN_CHECK").as_deref());
         let strip = switch("strip", "REIN_STRIP", true)?;
         let tab_command = settings.get("tab_command", "REIN_TAB_COMMAND");
         let mut child = None;
@@ -274,6 +282,7 @@ impl AskArgs {
             compress,
             sandbox,
             memory,
+            check,
             max_steps,
             prompt,
             name,

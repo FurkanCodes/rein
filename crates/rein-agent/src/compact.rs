@@ -95,16 +95,17 @@ pub fn is_summary(item: &Item) -> bool {
     matches!(item, Item::User(text) if text.starts_with(SUMMARY))
 }
 
+/// `text` is a note rein added, not something the user said.
+fn rein_note(text: &str) -> bool {
+    crate::skills::is_note(text) || crate::hooks::is_note(text) || crate::background::is_note(text) || crate::check::is_note(text)
+}
+
 /// A message the user actually typed: not rein's first message, not a summary.
 fn typed(item: &Item) -> Option<&str> {
     match item {
-        // rein's notes of the skills and of background commands, and what
-        // your hooks said, aren't anything you said.
-        Item::User(text)
-            if !crate::context::is_context(item) && !is_summary(item) && !crate::skills::is_note(text) && !crate::hooks::is_note(text) && !crate::background::is_note(text) =>
-        {
-            Some(text)
-        }
+        // rein's notes of the skills, background commands and checks, and
+        // what your hooks said, aren't anything you said.
+        Item::User(text) if !crate::context::is_context(item) && !is_summary(item) && !rein_note(text) => Some(text),
         _ => None,
     }
 }
