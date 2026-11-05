@@ -77,7 +77,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.input.set_bar(terminal.bar());
     // Your MCP servers and the project's start now, while the rest gets
     // ready; the project's only once you've said yes to each as it is.
-    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), http.clone(), &mut terminal, args.prompt.is_none()).await;
+    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), args.mode, http.clone(), &mut terminal, args.prompt.is_none()).await;
     let saved = match args.resume {
         Resume::New => None,
         Resume::Latest => latest,
@@ -554,6 +554,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 if let Some(peers) = &terminal.peers {
                     peers.follow_mode(mode);
                 }
+                crate::mcp::follow_mode(mode, &setup.mcp, terminal);
                 terminal.input.set_bar(terminal.bar());
                 terminal.input.notice(&format!("{} · shift-tab for the next", mode_description(mode, terminal.sandboxed)));
                 continue;
@@ -689,6 +690,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 peers.follow_mode(mode);
             }
             say!("{pad}{} {}", s.green("✓"), mode_description(mode, terminal.sandboxed));
+            crate::mcp::follow_mode(mode, &setup.mcp, terminal);
             // The bar says so while it asks whether to keep it.
             terminal.input.set_bar(terminal.bar());
             keep_mode(mode, terminal).await?;

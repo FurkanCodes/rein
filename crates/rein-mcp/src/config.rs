@@ -17,9 +17,11 @@
 //! ```
 //!
 //! `access` and `allow` are rein's own. `access` is the walls the server
-//! runs inside, as a command's are: `network` when not said, and `outside`
-//! for one that needs your whole home folder. A server reached at a URL
-//! runs none of its code here, and has none. `allow` names tools that run
+//! runs inside, as a command's are, whatever the mode: `outside` for one
+//! that needs your whole home folder. Not said, the server runs as your
+//! mode has it: outside the sandbox in trust, as your commands do, and in
+//! it with `network` in the others. A server reached at a URL runs none of
+//! its code here, and has none. `allow` names tools that run
 //! without asking, or `*` for all of one server's; it counts only in your
 //! own file, never in a project's. `"disabled": true`, as Cline writes it,
 //! keeps a server in the file without starting it. `"tools": "search"`
@@ -114,7 +116,30 @@ pub struct Local {
     /// only as the server starts.
     pub env: BTreeMap<String, String>,
     /// The walls it runs inside.
-    pub access: Access,
+    pub access: Walled,
+}
+
+/// The walls a server on this computer runs inside: those your mode gives
+/// every server, or its own, whatever the mode. No other harness walls in
+/// a server while it runs your commands unwalled, as trust does: the walls
+/// are yours to choose, with the mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Walled {
+    /// As the mode has it: none in trust, `network` in the others.
+    #[default]
+    ByMode,
+    /// Its own, set in your file or with `/mcp`.
+    Set(Access),
+}
+
+impl Walled {
+    /// Its walls, where the mode would give `by_mode`.
+    pub fn or(self, by_mode: Access) -> Access {
+        match self {
+            Walled::ByMode => by_mode,
+            Walled::Set(access) => access,
+        }
+    }
 }
 
 /// A server reached at a URL: none of its code runs here.
@@ -304,7 +329,7 @@ fn reach(entry: &Entry) -> Result<Reach, String> {
         return Ok(Reach::Remote(Remote { url, headers: entry.headers.clone(), wire }));
     }
     let command = entry.command.clone().ok_or("it has no command to start")?;
-    Ok(Reach::Local(Local { command, args: entry.args.clone(), env: entry.env.clone(), access: entry.access.unwrap_or(Access::Network) }))
+    Ok(Reach::Local(Local { command, args: entry.args.clone(), env: entry.env.clone(), access: entry.access.map_or(Walled::ByMode, Walled::Set) }))
 }
 
 /// A server's name goes into its tools' names (`mcp__github__get_issue`),
@@ -344,9 +369,9 @@ impl Server {
         }
     }
 
-    /// The walls it runs inside: none for one reached at a URL, whose code
-    /// doesn't run here.
-    pub fn access(&self) -> Option<Access> {
+    /// The walls it runs inside, as its file has them: none for one
+    /// reached at a URL, whose code doesn't run here.
+    pub fn walled(&self) -> Option<Walled> {
         self.local().map(|local| local.access)
     }
 
@@ -355,7 +380,15 @@ impl Server {
     /// variable, a URL or a header, asks again.
     pub fn fingerprint(&self) -> String {
         match &self.reach {
-            Reach::Local(local) => json!({ "name": self.name, "command": local.command, "args": local.args, "env": local.env, "access": local.access.as_str() }),
+            // Walls the mode gives are another yes than walls of its own:
+            // in trust, they're none.
+            Reach::Local(local) => {
+                let access = match local.access {
+                    Walled::ByMode => "as the mode has it",
+                    Walled::Set(access) => access.as_str(),
+                };
+                json!({ "name": self.name, "command": local.command, "args": local.args, "env": local.env, "access": access })
+            }
             Reach::Remote(remote) if remote.wire == Wire::Sse => json!({ "name": self.name, "url": remote.url, "headers": remote.headers, "type": "sse" }),
             Reach::Remote(remote) => json!({ "name": self.name, "url": remote.url, "headers": remote.headers }),
         }
@@ -374,8 +407,8 @@ impl Server {
                 if !local.env.is_empty() {
                     entry.insert("env".into(), json!(local.env));
                 }
-                if local.access != Access::Network {
-                    entry.insert("access".into(), json!(local.access.as_str()));
+                if let Walled::Set(access) = local.access {
+                    entry.insert("access".into(), json!(access.as_str()));
                 }
             }
             Reach::Remote(remote) => {
@@ -588,7 +621,7 @@ pub(crate) mod tests {
 
     /// A command's server, for a test.
     pub(crate) fn local(name: &str, command: &str, args: &[&str]) -> Server {
-        let local = Local { command: command.into(), args: args.iter().map(|arg| (*arg).to_owned()).collect(), env: BTreeMap::new(), access: Access::Network };
+        let local = Local { command: command.into(), args: args.iter().map(|arg| (*arg).to_owned()).collect(), env: BTreeMap::new(), access: Walled::ByMode };
         Server { name: name.into(), origin: Origin::Yours, reach: Reach::Local(local), allow: Vec::new(), offered: Default::default() }
     }
 
@@ -626,10 +659,10 @@ pub(crate) mod tests {
         let names: Vec<&str> = named.servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["ctx", "docs", "github", "linear", "old"]);
         let github = &named.servers[2];
-        assert_eq!((command(github).access, github.allow.as_slice()), (Access::Network, ["get_issue".to_owned()].as_slice()), "network when not said");
-        assert_eq!(command(&named.servers[1]).access, Access::Look);
+        assert_eq!((command(github).access, github.allow.as_slice()), (Walled::ByMode, ["get_issue".to_owned()].as_slice()), "as the mode has it when not said");
+        assert_eq!(command(&named.servers[1]).access, Walled::Set(Access::Look));
         assert_eq!(named.servers[3].reach, Reach::Remote(Remote { url: "https://mcp.linear.app/mcp".into(), headers: BTreeMap::new(), wire: Wire::Http }));
-        assert_eq!(named.servers[0].access(), None, "one at a URL has no walls: none of its code runs here");
+        assert_eq!(named.servers[0].walled(), None, "one at a URL has no walls: none of its code runs here");
         let skipped: Vec<(&str, &str)> = named.skipped.iter().map(|s| (s.name.as_str(), s.why.as_str())).collect();
         assert_eq!(skipped.len(), 5, "{skipped:?}");
         assert_eq!(
@@ -709,7 +742,9 @@ pub(crate) mod tests {
             with(&server, |local| local.command = "npm".into()),
             with(&server, |local| local.args = vec!["-y".into(), "@evil/server-github".into()]),
             with(&server, |local| local.env = [("NODE_OPTIONS".to_owned(), "--require ./x.js".to_owned())].into()),
-            with(&server, |local| local.access = Access::Outside),
+            with(&server, |local| local.access = Walled::Set(Access::Outside)),
+            // In trust, the mode's walls are none.
+            with(&server, |local| local.access = Walled::Set(Access::Network)),
             Server { name: "gh".into(), ..server.clone() },
         ];
         for other in changed {
@@ -740,7 +775,8 @@ pub(crate) mod tests {
         for server in [
             sse,
             local("github", "npx", &["-y", "gh"]),
-            with(&local("x", "sh", &[]), |local| local.access = Access::Outside),
+            with(&local("x", "sh", &[]), |local| local.access = Walled::Set(Access::Outside)),
+            with(&local("n", "sh", &[]), |local| local.access = Walled::Set(Access::Network)),
             Server { allow: vec!["*".into()], ..local("y", "sh", &[]) },
             Server { offered: Offered::OnSearch, ..local("z", "sh", &[]) },
             Server { offered: Offered::UpFront, ..local("w", "sh", &[]) },

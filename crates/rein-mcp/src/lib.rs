@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 pub use clean::text as cleaned;
 pub use clean::{Picture, Said};
-pub use config::{Local, Named, Offered, Origin, Reach, Remote, Server, Skipped, Unfilled, Wire};
+pub use config::{Local, Named, Offered, Origin, Reach, Remote, Server, Skipped, Unfilled, Walled, Wire};
 pub use rpc::Error;
 
 /// What the names of servers' tools start with: they can't clash with
@@ -91,7 +91,7 @@ pub fn parts(name: &str) -> Option<(&str, &str)> {
 /// folder of its own under `caches` for what `npx` or `uvx` fetch, and the
 /// variables they name filled in from your environment or `keys`. One at a
 /// URL is reached over `web`, signed in to with `tokens`; without a `web`,
-/// it isn't.
+/// it isn't. One whose walls are the mode's starts in `by_mode`'s.
 #[derive(Clone)]
 pub struct Launch {
     pub sandbox: Arc<Sandbox>,
@@ -100,6 +100,33 @@ pub struct Launch {
     pub keys: Arc<Keys>,
     pub web: Option<Arc<dyn remote::Web>>,
     pub tokens: Option<Arc<dyn remote::Tokens>>,
+    pub by_mode: Arc<ByMode>,
+}
+
+/// The walls the mode gives a server that has none of its own: `outside`
+/// in trust, where commands run unwalled too, `network` in the others.
+/// It changes with the mode; a server keeps the walls it started in.
+pub struct ByMode(Mutex<Access>);
+
+impl ByMode {
+    pub fn new(access: Access) -> ByMode {
+        ByMode(Mutex::new(access))
+    }
+
+    pub fn get(&self) -> Access {
+        *lock(&self.0)
+    }
+
+    fn set(&self, access: Access) {
+        *lock(&self.0) = access;
+    }
+}
+
+/// Walled in, until told otherwise.
+impl Default for ByMode {
+    fn default() -> ByMode {
+        ByMode::new(Access::Network)
+    }
 }
 
 /// The values you gave rein for the variables servers name (`${NAME}`),
@@ -176,9 +203,14 @@ impl From<Unfilled> for Failure {
 }
 
 impl Launch {
+    /// The walls `local` starts in now: its own, or the mode's.
+    fn access(&self, local: &Local) -> Access {
+        local.access.or(self.by_mode.get())
+    }
+
     /// The command that starts `server`, `filled`, in its walls.
     fn command(&self, server: &Server, filled: &Local) -> Result<tokio::process::Command, Failure> {
-        let mut command = match filled.access.walls() {
+        let mut command = match self.access(filled).walls() {
             // Your whole environment, keys rein kept for itself included,
             // as a command outside the sandbox gets it.
             None => {
@@ -208,10 +240,10 @@ impl Launch {
         Ok(command)
     }
 
-    /// Whether `server` runs in the sandbox: then what it can't reach may
-    /// be why it fails.
+    /// Whether `server` starts in the sandbox now: then what it can't
+    /// reach may be why it fails.
     fn walled(&self, server: &Server) -> bool {
-        server.access().and_then(Access::walls).is_some() && self.sandbox.available()
+        server.local().map(|local| self.access(local)).and_then(Access::walls).is_some() && self.sandbox.available()
     }
 
     /// Starts `server`, or reaches it, says hello, and asks for its tools,
@@ -267,7 +299,9 @@ impl Launch {
             let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
             let (Some(stdin), Some(stdout)) = (stdin, stdout) else { return Err(Error::Start("its input and output weren't there to talk over".into())) };
             let rpc = rpc::Rpc::start(stdout, stdin, child.stderr.take());
-            Connection::open(Channel::Stdio(rpc), Some(Process { _group: group, _child: child })).await
+            let mut connection = Connection::open(Channel::Stdio(rpc), Some(Process { _group: group, _child: child })).await?;
+            connection.access = Some(self.access(local));
+            Ok(connection)
         };
         // Once it runs, what it can't reach may be why it fails.
         let failed = |why: String| if self.walled(server) { Failure::InWalls(why) } else { Failure::Other(why) };
@@ -336,6 +370,8 @@ struct Connection {
     tools: Vec<Listed>,
     /// What the server says of using it, as it starts, cleaned and cut.
     instructions: Option<String>,
+    /// The walls it started in: `None` for one at a URL.
+    access: Option<Access>,
 }
 
 /// A tool as its server lists it, cleaned.
@@ -383,7 +419,7 @@ impl Connection {
                 }
             }
         }
-        Ok(Connection { _process: process, channel, tools, instructions })
+        Ok(Connection { _process: process, channel, tools, instructions, access: None })
     }
 
     /// Calls `tool`: what it said, or that it failed, in its words; or
@@ -639,6 +675,35 @@ impl Servers {
         lock(&self.told).contains(name)
     }
 
+    /// The walls the server called `name` runs in: those it started in,
+    /// once it has, or those it would start in now. `None` for one at a
+    /// URL, or none of that name.
+    pub fn walls(&self, name: &str) -> Option<Access> {
+        let entry = self.entries().into_iter().find(|entry| entry.server.name == name)?;
+        if let Ok(State::Ready(connection)) = entry.state.try_lock().as_deref() {
+            return connection.access;
+        }
+        entry.server.local().map(|local| self.launch.access(local))
+    }
+
+    /// The walls a server with none of its own starts in now.
+    pub fn by_mode(&self) -> Access {
+        self.launch.by_mode.get()
+    }
+
+    /// The walls a server with none of its own starts in from now on, as
+    /// a new mode gives them: the servers running in others, which keep
+    /// theirs until they start again.
+    pub fn follow_mode(&self, by_mode: Access) -> Vec<String> {
+        self.launch.by_mode.set(by_mode);
+        self.entries()
+            .iter()
+            .filter(|entry| entry.server.walled() == Some(Walled::ByMode))
+            .filter(|entry| matches!(entry.state.try_lock().as_deref(), Ok(State::Ready(connection)) if connection.channel.alive() && connection.access != Some(by_mode)))
+            .map(|entry| entry.server.name.clone())
+            .collect()
+    }
+
     /// Whether any is still starting.
     pub fn starting(&self) -> bool {
         self.entries().iter().any(|entry| !matches!(entry.state.try_lock().as_deref(), Ok(State::Ready(_) | State::Failed(_))))
@@ -743,8 +808,7 @@ impl Servers {
         // A server that can't reach what it needs says so in its own
         // words, which may not say why: "the screen is locked".
         if said.is_err()
-            && self.launch.walled(&entry.server)
-            && let Some(access) = entry.server.access()
+            && let Some(access) = connection.access.filter(|access| access.walls().is_some() && self.launch.sandbox.available())
             && lock(&self.told).insert(name.clone())
         {
             note.push_str(&format!(

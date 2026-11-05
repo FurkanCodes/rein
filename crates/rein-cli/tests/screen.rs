@@ -2989,6 +2989,44 @@ fn an_mcp_server_of_yours_starts_in_the_sandbox_and_its_tools_ask_unless_allowed
     wait_for_mcp(&mut term, "● 5 tools · sandbox (network)");
 }
 
+/// In trust a server with no walls of its own runs as your commands do
+/// there, outside the sandbox: the walls are yours to choose, with the
+/// mode. Shift-Tab to a mode with walls says it keeps running outside
+/// until it starts again; started again, it's in the mode's walls.
+#[cfg(target_os = "macos")]
+#[test]
+fn in_trust_a_server_without_walls_of_its_own_runs_as_your_commands_do() {
+    let secret = std::env::temp_dir().join(format!("rein-screen-{}-mcp-trust", std::process::id())).join("home/.ssh/id_test");
+    let peek = || Turn { out: vec![Out::Call("mcp__fake__peek", json!({ "path": secret }))] };
+    let mut model = Model::start(vec![peek(), says("Read it."), peek(), says("Blocked.")]).with_env("REIN_MODE", "trust");
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] } } }).to_string()));
+    model.home.push((".ssh/id_test".into(), "FAKE-mcp-trust-secret\n".into()));
+    let mut term = Term::start_with(&model, "mcp-trust", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("peek\r");
+    term.wait_for("Read it.");
+    assert_eq!(results(&model), ["read"], "outside, as trust runs commands");
+    wait_for_mcp(&mut term, "● 5 tools · outside the sandbox");
+    term.keys("\x1b[Z");
+    let kept = "fake keeps running outside the sandbox, as it started: /mcp starts one again in this mode's walls";
+    term.wait_for(kept);
+    // From ask to edits the walls are the same: nothing more to say.
+    term.keys("\x1b[Z");
+    term.wait_for("·  edits  ·");
+    assert_eq!(term.text().matches(kept).count(), 1, "said once");
+    term.keys("/mcp\r");
+    pick(&mut term, "fake");
+    pick(&mut term, "restart");
+    term.wait_for(IDLE);
+    wait_for_mcp(&mut term, "● 5 tools · sandbox (network)");
+    term.keys("peek\r");
+    term.wait_for("Let fake's peek run?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Blocked.");
+    assert_eq!(results(&model), ["read", "blocked"], "started again in ask: in its walls");
+}
+
 /// A server whose tools are held back is named in the tool search, not
 /// shown: the model finds the tool it needs, which is added to its tools
 /// where it found it, and calls it. `/mcp` says they're found when needed.

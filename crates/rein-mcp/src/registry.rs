@@ -14,7 +14,7 @@ use rein_sandbox::Access;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::{Local, Origin, Reach, Remote, Server, Wire};
+use crate::config::{Local, Origin, Reach, Remote, Server, Walled, Wire};
 
 /// Where the registry is.
 pub const URL: &str = "https://registry.modelcontextprotocol.io";
@@ -90,7 +90,7 @@ enum How {
         env: Vec<(String, Piece)>,
         /// Its walls: the sandbox's, but for Docker, which the sandbox
         /// can't reach and which walls in its containers itself.
-        access: Access,
+        access: Walled,
     },
     /// Each joined from its pieces: `https://{slug}.inite.ai/mcp` is three.
     Remote { url: Vec<Piece>, headers: Vec<(String, Vec<Piece>)>, wire: Wire },
@@ -125,7 +125,7 @@ impl Plan {
 
     /// Its walls: `None` for one reached at a URL, whose code doesn't run
     /// here.
-    pub fn access(&self) -> Option<Access> {
+    pub fn access(&self) -> Option<Walled> {
         match &self.how {
             How::Local { access, .. } => Some(*access),
             How::Remote { .. } => None,
@@ -438,15 +438,17 @@ fn plan(package: &Package, version: Option<&str>) -> Result<Plan, String> {
     let id = package.identifier.trim();
     let hint = package.runtime_hint.as_deref();
     let (command, first, pinned, access) = match (package.registry_type.as_str(), hint) {
-        ("npm", None | Some("npx")) => ("npx", vec!["-y"], version.map_or_else(|| id.to_owned(), |version| format!("{id}@{version}")), Access::Network),
-        ("pypi", None | Some("uvx")) => ("uvx", Vec::new(), version.map_or_else(|| id.to_owned(), |version| format!("{id}=={version}")), Access::Network),
+        ("npm", None | Some("npx")) => ("npx", vec!["-y"], version.map_or_else(|| id.to_owned(), |version| format!("{id}@{version}")), Walled::ByMode),
+        ("pypi", None | Some("uvx")) => ("uvx", Vec::new(), version.map_or_else(|| id.to_owned(), |version| format!("{id}=={version}")), Walled::ByMode),
         ("oci", None | Some("docker")) => {
             let tagged = id.rsplit_once('/').map_or(id, |(_, last)| last).contains([':', '@']);
             let image = match version {
                 Some(version) if !tagged => format!("{id}:{version}"),
                 _ => id.to_owned(),
             };
-            ("docker", vec!["run", "-i", "--rm"], image, Access::Outside)
+            // The sandbox can't reach Docker, which walls in its
+            // containers itself: outside, whatever the mode.
+            ("docker", vec!["run", "-i", "--rm"], image, Walled::Set(Access::Outside))
         }
         (kind, Some(hint)) if ["npm", "pypi", "oci"].contains(&kind) => return Err(format!("it starts with {}, which rein doesn't know how to run", crate::clean::text(hint))),
         (kind, _) => return Err(format!("it's a {} package, which rein doesn't start yet", crate::clean::text(kind))),
@@ -674,7 +676,7 @@ mod tests {
                 { "type": "positional", "valueHint": "database_url", "isRequired": true, "isSecret": true },
                 { "type": "named", "name": "--out", "isRequired": true, "format": "filepath", "description": "where it writes" }] }]));
         let plan = plan_of(&npm);
-        assert_eq!((plan.package.as_str(), plan.command(), plan.access()), ("npm @acme/thing@1.2.3", Some("npx"), Some(Access::Network)));
+        assert_eq!((plan.package.as_str(), plan.command(), plan.access()), ("npm @acme/thing@1.2.3", Some("npx"), Some(Walled::ByMode)));
         let asks: Vec<&str> = plan.asks.iter().map(|ask| ask.about.as_str()).collect();
         assert_eq!(asks, ["ACME_SITE (your site's address)", "where it writes"], "only what isn't a key and has no value");
         assert_eq!(plan.server("thing", &["one".into()]), None, "an answer for each ask");
@@ -697,7 +699,7 @@ mod tests {
             json!([{ "registryType": "oci", "identifier": "ghcr.io/acme/thing:3.1", "environmentVariables": [{ "name": "ACME_TOKEN", "isSecret": true, "isRequired": true }] }]),
         );
         let docker = plan_of(&docker);
-        assert_eq!(docker.access(), Some(Access::Outside), "the sandbox can't reach Docker; Docker walls in its container itself");
+        assert_eq!(docker.access(), Some(Walled::Set(Access::Outside)), "the sandbox can't reach Docker; Docker walls in its container itself");
         assert_eq!(command(&docker.server("t", &[]).unwrap()).args, ["run", "-i", "--rm", "-e", "ACME_TOKEN", "ghcr.io/acme/thing:3.1"]);
         let both = detail(json!([{ "registryType": "oci", "identifier": "acme/thing" }, { "registryType": "npm", "identifier": "thing" }]));
         assert_eq!(plan_of(&both).command(), Some("npx"), "npm's before Docker's");

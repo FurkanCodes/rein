@@ -1599,7 +1599,7 @@ mod tests {
             command: "sh".into(),
             args: vec!["server.sh".into()],
             env: [("GIVEN".to_owned(), "FAKE-mcp-key-123".to_owned())].into(),
-            access: crate::sandbox::Access::Outside,
+            access: rein_mcp::Walled::Set(crate::sandbox::Access::Outside),
         };
         let server = rein_mcp::Server {
             name: "fake".into(),
@@ -1608,7 +1608,15 @@ mod tests {
             allow: vec!["echo".into()],
             offered: Default::default(),
         };
-        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default(), web: None, tokens: None };
+        let launch = rein_mcp::Launch {
+            sandbox: Default::default(),
+            root: root.clone(),
+            caches: root.join("caches"),
+            keys: Default::default(),
+            web: None,
+            tokens: None,
+            by_mode: Default::default(),
+        };
         let servers = std::sync::Arc::new(rein_mcp::Servers::start(vec![server], launch));
         agent.tools = Tools::new(&root).with_mcp(servers).with_secrets(crate::redact::Secrets::new(["FAKE-mcp-key-123".to_owned()]));
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
@@ -1643,7 +1651,8 @@ mod tests {
         let mut agent = agent("mcp-held-back", turns);
         let root = agent.tools.root().to_owned();
         std::fs::write(root.join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
-        let local = rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: crate::sandbox::Access::Outside };
+        let local =
+            rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: rein_mcp::Walled::Set(crate::sandbox::Access::Outside) };
         let server = rein_mcp::Server {
             name: "fake".into(),
             origin: rein_mcp::Origin::Yours,
@@ -1651,7 +1660,15 @@ mod tests {
             allow: vec!["echo".into()],
             offered: rein_mcp::Offered::OnSearch,
         };
-        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default(), web: None, tokens: None };
+        let launch = rein_mcp::Launch {
+            sandbox: Default::default(),
+            root: root.clone(),
+            caches: root.join("caches"),
+            keys: Default::default(),
+            web: None,
+            tokens: None,
+            by_mode: Default::default(),
+        };
         agent.tools = Tools::new(&root).with_mcp(std::sync::Arc::new(rein_mcp::Servers::start(vec![server], launch)));
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("use the server".into(), &mut person).await.unwrap();
@@ -1683,12 +1700,21 @@ mod tests {
         let mut agent = agent("mcp-changed", vec![says("One."), says("Two."), says("Three."), says("Four.")]);
         let root = agent.tools.root().to_owned();
         std::fs::write(root.join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
-        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default(), web: None, tokens: None };
+        let launch = rein_mcp::Launch {
+            sandbox: Default::default(),
+            root: root.clone(),
+            caches: root.join("caches"),
+            keys: Default::default(),
+            web: None,
+            tokens: None,
+            by_mode: Default::default(),
+        };
         let servers = std::sync::Arc::new(rein_mcp::Servers::start(Vec::new(), launch));
         agent.tools = Tools::new(&root).with_mcp(servers.clone());
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("one".into(), &mut person).await.unwrap();
-        let local = rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: crate::sandbox::Access::Outside };
+        let local =
+            rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: rein_mcp::Walled::Set(crate::sandbox::Access::Outside) };
         let server =
             rein_mcp::Server { name: "fake".into(), origin: rein_mcp::Origin::Yours, reach: rein_mcp::Reach::Local(local), allow: Vec::new(), offered: Default::default() };
         servers.add(server);
@@ -2049,7 +2075,8 @@ mod tests {
         let root = agent.tools.root().to_owned();
         std::fs::write(root.join("a.png"), crate::image::tests::png(40, 30, png::Compression::Fast)).unwrap();
         std::fs::write(root.join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
-        let local = rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: crate::sandbox::Access::Outside };
+        let local =
+            rein_mcp::Local { command: "sh".into(), args: vec!["server.sh".into()], env: Default::default(), access: rein_mcp::Walled::Set(crate::sandbox::Access::Outside) };
         let server = rein_mcp::Server {
             name: "fake".into(),
             origin: rein_mcp::Origin::Yours,
@@ -2057,7 +2084,15 @@ mod tests {
             allow: vec!["echo".into()],
             offered: rein_mcp::Offered::UpFront,
         };
-        let launch = rein_mcp::Launch { sandbox: Default::default(), root: root.clone(), caches: root.join("caches"), keys: Default::default(), web: None, tokens: None };
+        let launch = rein_mcp::Launch {
+            sandbox: Default::default(),
+            root: root.clone(),
+            caches: root.join("caches"),
+            keys: Default::default(),
+            web: None,
+            tokens: None,
+            by_mode: Default::default(),
+        };
         let kept = root.join(".images");
         agent.tools = Tools::new(&root).with_mcp(std::sync::Arc::new(rein_mcp::Servers::start(vec![server], launch))).with_images(kept.clone());
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };

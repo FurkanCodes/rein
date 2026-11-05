@@ -722,8 +722,10 @@ names, which asks, and what a deny rule blocks. What the model reads (a web
 page, an issue, a file in a cloned repository, an MCP server's answer) can
 lead it to run any command with your keys and the network, and the rules
 are about mistakes, not about that: for work you'd rather not watch, the
-other modes' walls hold whatever the model is told. An MCP server keeps
-the walls it was added with, in every mode: `/mcp` lets one out.
+other modes' walls hold whatever the model is told. The walls are yours
+to choose, with the mode: an MCP server with none of its own runs as your
+commands do, outside the sandbox in `trust` and in it in the others (see
+[MCP servers](#mcp-servers)).
 `auto` never asks: it's for leaving rein to work on its own, and what would
 go past the sandbox is refused, so the model makes do or tells you what it
 needs. File changes to the protected paths above ask in every mode but
@@ -797,8 +799,8 @@ the command it would run, pinned to a version (`npx -y
 needs is a `${NAME}` of yours, asked for in dots as it starts, and never
 written in your `mcp.json`. One reached at a URL comes first when the
 registry offers both: none of its code runs here. npm and PyPI packages
-run in the sandbox; Docker images run with Docker, which walls in its
-containers itself and which the sandbox can't reach. `REIN_MCP_REGISTRY`
+run as your mode has it (below); Docker images run with Docker, which
+walls in its containers itself and which the sandbox can't reach. `REIN_MCP_REGISTRY`
 points rein at another registry, as a company's own.
 
 ```
@@ -858,14 +860,20 @@ A line that writes a key in as it is (`TOKEN=ghp_…` rather than
 `mcp.json`, which only you can read. Leave it out and give the variable's
 name instead (`TOKEN=$GITHUB_TOKEN`): rein asks for it in dots.
 
-A server is someone else's code, often fetched as it starts, so it runs in
-the sandbox the way a command with `network` access does. It reaches the
-project and the internet, but not the rest of your home folder, other
-programs' sockets, or rein's keys. What `npx` or `uvx` fetch goes in a
-folder of the server's own, `~/.cache/rein/mcp/<server>`, which nothing else
-may write. `"access"` gives it other walls: `look`, `write`, or `outside`
-for one that needs all of your home folder, like one that reads
-`~/.config/gh`; `/mcp` changes it, and `--access` before the command sets
+A server runs as your mode has it, as your commands do: in `trust`, outside
+the sandbox, and in the other modes in it, the way a command with `network`
+access runs. There it reaches the project and the internet, but not the
+rest of your home folder, other programs' sockets, or rein's keys. The walls
+are yours to choose, with the mode: no other harness walls in a server
+while it runs your commands unwalled, and walls break what servers need
+(a browser, the keychain, another app). A server that's running keeps the
+walls it started in when you change the mode, and rein says so; `/mcp`
+starts it again in the new ones. What `npx` or `uvx` fetch goes in a
+folder of the server's own, `~/.cache/rein/mcp/<server>`, which nothing
+else may write. `"access"` gives a server walls of its own, whatever the
+mode: `look`, `write`, `network`, or `outside` for one that needs all of
+your home folder, like one that reads `~/.config/gh`; `/mcp` changes it,
+back to "as your mode has it" too, and `--access` before the command sets
 it as you add one. A project's server is never let out from `/mcp`: the
 project doesn't decide that. Its environment is what `env` gives it. `${NAME}` is a
 variable of yours, filled in as it starts, and its value is hidden wherever

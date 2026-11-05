@@ -118,6 +118,7 @@ fn at(url: &str, headers: &[(&str, &str)], web: Arc<Fake>, tokens: Option<Arc<dy
         keys: Arc::new(crate::Keys::new([("REIN_TEST_FAR_KEY".to_owned(), "FAKE-far-key".to_owned())].into())),
         web: Some(web),
         tokens,
+        by_mode: Arc::default(),
     };
     (server, launch)
 }

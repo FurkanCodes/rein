@@ -3,9 +3,9 @@
 
 use rein_agent::agent::{Agent, Llm};
 use rein_agent::sandbox::Access;
-use rein_mcp::{Failure, Offered, Origin, Reach, Server, Skipped, Status};
+use rein_mcp::{Failure, Offered, Origin, Reach, Server, Skipped, Status, Walled};
 
-use super::{Fix, Mcp, allowed, edit, entry, give_keys, remove, restart, say_yes, set_access, set_allow, set_offered, sign_in, turn_off};
+use super::{Fix, Mcp, allowed, edit, entry, give_keys, remove, restart, say_yes, set_access, set_allow, set_offered, sign_in, turn_off, walls_of};
 use crate::CliResult;
 use crate::input::Menu;
 use crate::terminal::Terminal;
@@ -13,11 +13,11 @@ use crate::ui::style::GUTTER;
 
 /// A server as `/mcp` shows it.
 enum Row {
-    /// Started, how it's doing, what else is known of it, and when the
-    /// model is shown its tools.
-    Running(Server, Status, Also, Shown),
-    /// Yours, turned off.
-    Off(Server),
+    /// Started, how it's doing, what else is known of it, when the model
+    /// is shown its tools, and the walls it runs in.
+    Running(Server, Status, Also, Shown, Option<Access>),
+    /// Yours, turned off, and the walls it would start in.
+    Off(Server, Option<Access>),
     /// The project's, waiting for your yes.
     Waiting(Server),
     /// One rein can't start, and why.
@@ -55,7 +55,7 @@ impl Shown {
 impl Row {
     fn name(&self) -> &str {
         match self {
-            Row::Running(server, ..) | Row::Off(server) | Row::Waiting(server) => &server.name,
+            Row::Running(server, ..) | Row::Off(server, _) | Row::Waiting(server) => &server.name,
             Row::Skipped(skipped) => &skipped.name,
         }
     }
@@ -64,8 +64,8 @@ impl Row {
     /// pick from: all `/mcp` shows, before one is picked.
     fn about(&self) -> String {
         match self {
-            Row::Running(server, status, also, shown) => {
-                let mut about = format!("{}{} · {}", doing(status), shown.said(), place(server));
+            Row::Running(server, status, also, shown, walls) => {
+                let mut about = format!("{}{} · {}", doing(status), shown.said(), place(server, *walls));
                 match also {
                     Also::FailedInWalls => about.push_str(" · a call failed in the sandbox"),
                     Also::SignedIn => about.push_str(" · signed in"),
@@ -76,7 +76,7 @@ impl Row {
                 }
                 about
             }
-            Row::Off(server) => format!("– off · {}", place(server)),
+            Row::Off(server, walls) => format!("– off · {}", place(server, *walls)),
             Row::Waiting(_) => "⏸ waiting for your yes · the project's".into(),
             Row::Skipped(skipped) => format!("– can't start: {}", skipped.why),
         }
@@ -98,12 +98,20 @@ fn doing(status: &Status) -> String {
     }
 }
 
-/// Where `server` runs, or is reached.
-fn place(server: &Server) -> String {
-    match &server.reach {
-        Reach::Local(local) if local.access.walls().is_some() => format!("sandbox ({})", local.access),
-        Reach::Local(_) => "outside the sandbox".to_owned(),
-        Reach::Remote(remote) => host(&remote.url).to_owned(),
+/// A server's walls in a word or two, as `/mcp` names them.
+fn walled_word(walled: Walled) -> String {
+    match walled {
+        Walled::ByMode => "as your mode has it".to_owned(),
+        Walled::Set(access) => access.to_string(),
+    }
+}
+
+/// Where `server` runs, in `walls`, or is reached.
+fn place(server: &Server, walls: Option<Access>) -> String {
+    match (&server.reach, walls) {
+        (Reach::Local(_), Some(access)) if access.walls().is_some() => format!("sandbox ({access})"),
+        (Reach::Local(_), _) => "outside the sandbox".to_owned(),
+        (Reach::Remote(remote), _) => host(&remote.url).to_owned(),
     }
 }
 
@@ -118,9 +126,10 @@ fn rows(mcp: &Mcp) -> Vec<Row> {
             Also::Nothing
         };
         let shown = if mcp.servers.held_back(&server.name) { Shown::WhenFound } else { Shown::FromTheStart };
-        Row::Running(server, status, also, shown)
+        let walls = walls_of(&server, mcp);
+        Row::Running(server, status, also, shown, walls)
     });
-    let off = mcp.off.iter().cloned().map(Row::Off);
+    let off = mcp.off.iter().map(|server| Row::Off(server.clone(), walls_of(server, mcp)));
     let waiting = mcp.waiting.iter().cloned().map(Row::Waiting);
     running.chain(off).chain(waiting).chain(mcp.skipped.iter().cloned().map(Row::Skipped)).collect()
 }
@@ -174,7 +183,7 @@ impl Action {
                 };
                 ("choose when the model is shown its tools".into(), format!("now: {now}"))
             }
-            Action::Walls(server) => ("change its walls".into(), server.access().map_or_else(String::new, |access| format!("now: {access}"))),
+            Action::Walls(server) => ("change its walls".into(), server.walled().map_or_else(String::new, |walled| format!("now: {}", walled_word(walled)))),
             Action::Restart(_) => ("restart it".into(), String::new()),
             Action::Off(_) => ("turn it off".into(), "it stays in your mcp.json, to turn on later".into()),
             Action::On(_) => ("turn it on".into(), String::new()),
@@ -190,7 +199,7 @@ impl Action {
 /// start.
 fn actions(row: Row) -> Vec<Action> {
     match row {
-        Row::Running(server, status, also, shown) => {
+        Row::Running(server, status, also, shown, _) => {
             let mut actions = Vec::new();
             let fix = match &status {
                 Status::Failed(failure) => Fix::of(&server, failure),
@@ -212,7 +221,7 @@ fn actions(row: Row) -> Vec<Action> {
                     actions.push(Action::Offer(server.clone(), shown));
                 }
                 // One at a URL runs none of its code here: it has no walls.
-                if server.access().is_some() {
+                if server.walled().is_some() {
                     actions.push(Action::Walls(server.clone()));
                 }
             }
@@ -226,7 +235,7 @@ fn actions(row: Row) -> Vec<Action> {
             actions.push(Action::Remove(server.name, server.origin));
             actions
         }
-        Row::Off(server) => vec![Action::On(server.clone()), Action::Remove(server.name, Origin::Yours)],
+        Row::Off(server, _) => vec![Action::On(server.clone()), Action::Remove(server.name, Origin::Yours)],
         Row::Waiting(server) => vec![Action::Start(server)],
         Row::Skipped(skipped) if skipped.origin == Origin::Yours => vec![Action::Remove(skipped.name, Origin::Yours)],
         Row::Skipped(_) => Vec::new(),
@@ -281,7 +290,7 @@ async fn act(action: Action, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &m
             restart(server, mcp, agent, terminal).await
         }
         Action::Outside(server) => {
-            let server = set_access(&server, Access::Outside, mcp)?;
+            let server = set_access(&server, Walled::Set(Access::Outside), mcp)?;
             restart(server, mcp, agent, terminal).await
         }
         Action::SignIn(server, challenge) => {
@@ -313,11 +322,20 @@ async fn act(action: Action, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &m
             set_offered(&server.name, offered, mcp, agent, terminal)
         }
         Action::Walls(server) => {
-            let items = Access::ALL.iter().map(|access| (access.to_string(), rein_mcp::walls(*access).to_owned())).collect();
-            let current = Access::ALL.iter().position(|access| Some(*access) == server.access());
+            // The mode's walls first: what a server has when it has none
+            // of its own.
+            let choices: Vec<Walled> = std::iter::once(Walled::ByMode).chain(Access::ALL.into_iter().map(Walled::Set)).collect();
+            let about = |walled: Walled| match walled {
+                Walled::ByMode => "outside the sandbox in trust, as your commands run there; in it, with network, in the other modes".to_owned(),
+                Walled::Set(access) => format!("{}, whatever the mode", rein_mcp::walls(access)),
+            };
+            let items = choices.iter().map(|walled| (walled_word(*walled), about(*walled))).collect();
+            let current = choices.iter().position(|walled| Some(*walled) == server.walled());
             let menu = Menu { title: format!("{}: run it with which walls", server.name), items, current, at: None };
-            let Some(access) = terminal.input.choose(menu).await.and_then(|i| Access::ALL.get(i).copied()).filter(|access| Some(*access) != server.access()) else { return Ok(()) };
-            let server = set_access(&server, access, mcp)?;
+            let Some(walled) = terminal.input.choose(menu).await.and_then(|i| choices.get(i).copied()).filter(|walled| Some(*walled) != server.walled()) else {
+                return Ok(());
+            };
+            let server = set_access(&server, walled, mcp)?;
             restart(server, mcp, agent, terminal).await
         }
         Action::Restart(server) => restart(server, mcp, agent, terminal).await,
@@ -332,7 +350,7 @@ async fn act(action: Action, mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &m
         }
         Action::Remove(name, _) => remove(&name, mcp, agent, terminal),
         Action::Start(server) => {
-            if !say_yes(&server, &mcp.dir, &mcp.project(), terminal).await {
+            if !say_yes(&server, mcp.servers.by_mode(), &mcp.dir, &mcp.project(), terminal).await {
                 return Ok(());
             }
             mcp.waiting.retain(|waiting| waiting.name != server.name);
@@ -396,8 +414,8 @@ fn show(mcp: &Mcp, terminal: &Terminal) {
         .iter()
         .map(|row| {
             let (whose, how) = match row {
-                Row::Running(server, status, also, shown) => {
-                    let place = place(server);
+                Row::Running(server, status, also, shown, walls) => {
+                    let place = place(server, *walls);
                     let more = match also {
                         Also::FailedInWalls => s.yellow(" · a call failed in the sandbox, which may be why"),
                         Also::SignedIn => s.dim(" · signed in"),
@@ -405,7 +423,7 @@ fn show(mcp: &Mcp, terminal: &Terminal) {
                     };
                     (format!("{} · {place}", server.origin.describe()), format!("{}{}{more}", brief(status, s), s.dim(shown.said())))
                 }
-                Row::Off(_) => ("yours".to_owned(), s.dim("– off: pick it to turn it on")),
+                Row::Off(..) => ("yours".to_owned(), s.dim("– off: pick it to turn it on")),
                 Row::Waiting(server) => (server.origin.describe().to_owned(), s.yellow("⏸ waiting for your yes: pick it to start it")),
                 Row::Skipped(skipped) => (skipped.origin.describe().to_owned(), s.dim(&format!("– can't start: {}", skipped.why))),
             };
@@ -435,7 +453,7 @@ fn brief(status: &Status, s: crate::ui::style::Style) -> String {
 fn detail(row: &Row, terminal: &Terminal) {
     let (pad, s) = (" ".repeat(GUTTER), terminal.err);
     let server = match row {
-        Row::Running(server, ..) | Row::Off(server) | Row::Waiting(server) => server,
+        Row::Running(server, ..) | Row::Off(server, _) | Row::Waiting(server) => server,
         Row::Skipped(skipped) => {
             say!("{pad}{} {}", s.bold(&skipped.name), s.dim(&format!("can't start: {}", skipped.why)));
             return;
@@ -462,7 +480,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn server(origin: Origin, access: Access) -> Server {
-        let local = rein_mcp::Local { command: "sh".into(), args: Vec::new(), env: BTreeMap::new(), access };
+        let local = rein_mcp::Local { command: "sh".into(), args: Vec::new(), env: BTreeMap::new(), access: Walled::Set(access) };
         Server { name: "fake".into(), origin, reach: Reach::Local(local), allow: Vec::new(), offered: Default::default() }
     }
 
@@ -481,51 +499,54 @@ mod tests {
         let ready = || Status::Ready(vec!["echo".into()]);
         let yours = server(Origin::Yours, Access::Network);
         assert_eq!(
-            offered(Row::Running(yours.clone(), ready(), Also::Nothing, Shown::FromTheStart)),
+            offered(Row::Running(yours.clone(), ready(), Also::Nothing, Shown::FromTheStart, Some(Access::Network))),
             ["choose the tools that run without asking", "choose when the model is shown its tools", "change its walls", "restart it", "turn it off", "remove it"]
         );
-        let failed = offered(Row::Running(yours.clone(), Status::Failed(Failure::InWalls("it stopped".into())), Also::Nothing, Shown::FromTheStart));
+        let failed = offered(Row::Running(yours.clone(), Status::Failed(Failure::InWalls("it stopped".into())), Also::Nothing, Shown::FromTheStart, Some(Access::Network)));
         assert_eq!(failed[0], "run it outside the sandbox", "{failed:?}");
         assert_eq!(
-            offered(Row::Running(yours.clone(), ready(), Also::FailedInWalls, Shown::FromTheStart))[0],
+            offered(Row::Running(yours.clone(), ready(), Also::FailedInWalls, Shown::FromTheStart, Some(Access::Network)))[0],
             "run it outside the sandbox",
             "a call that failed in the sandbox counts too"
         );
-        assert_eq!(offered(Row::Running(yours.clone(), Status::Failed(Failure::Needs("TOKEN".into())), Also::Nothing, Shown::FromTheStart))[0], "give it TOKEN");
+        assert_eq!(
+            offered(Row::Running(yours.clone(), Status::Failed(Failure::Needs("TOKEN".into())), Also::Nothing, Shown::FromTheStart, Some(Access::Network)))[0],
+            "give it TOKEN"
+        );
         let outside = server(Origin::Yours, Access::Outside);
         assert!(
-            !offered(Row::Running(outside, Status::Failed(Failure::InWalls("x".into())), Also::FailedInWalls, Shown::FromTheStart))
+            !offered(Row::Running(outside, Status::Failed(Failure::InWalls("x".into())), Also::FailedInWalls, Shown::FromTheStart, Some(Access::Network)))
                 .contains(&"run it outside the sandbox".to_owned()),
             "it's out already"
         );
         let theirs = server(Origin::Project, Access::Network);
         assert_eq!(
-            offered(Row::Running(theirs.clone(), Status::Failed(Failure::InWalls("x".into())), Also::FailedInWalls, Shown::FromTheStart)),
+            offered(Row::Running(theirs.clone(), Status::Failed(Failure::InWalls("x".into())), Also::FailedInWalls, Shown::FromTheStart, Some(Access::Network))),
             ["restart it", "take back your yes"],
             "the project doesn't decide its walls, nor what runs without asking"
         );
         assert_eq!(
-            offered(Row::Running(theirs.clone(), Status::Failed(Failure::Needs("TOKEN".into())), Also::Nothing, Shown::FromTheStart))[0],
+            offered(Row::Running(theirs.clone(), Status::Failed(Failure::Needs("TOKEN".into())), Also::Nothing, Shown::FromTheStart, Some(Access::Network)))[0],
             "give it TOKEN",
             "a key of yours it gets, as you said yes to"
         );
-        assert_eq!(offered(Row::Off(yours)), ["turn it on", "remove it"]);
+        assert_eq!(offered(Row::Off(yours, Some(Access::Network))), ["turn it on", "remove it"]);
         assert_eq!(offered(Row::Waiting(theirs)), ["start it"]);
         assert!(offered(Row::Skipped(Skipped { name: "x".into(), origin: Origin::Project, why: String::new() })).is_empty());
         let far = remote(Origin::Yours);
-        let signing = offered(Row::Running(far.clone(), Status::Failed(Failure::SignIn("Bearer".into())), Also::Nothing, Shown::FromTheStart));
+        let signing = offered(Row::Running(far.clone(), Status::Failed(Failure::SignIn("Bearer".into())), Also::Nothing, Shown::FromTheStart, Some(Access::Network)));
         assert_eq!(signing, ["sign in", "restart it", "turn it off", "remove it"], "no walls for one whose code doesn't run here");
         assert_eq!(
-            offered(Row::Running(far, ready(), Also::SignedIn, Shown::FromTheStart)),
+            offered(Row::Running(far, ready(), Also::SignedIn, Shown::FromTheStart, Some(Access::Network))),
             ["choose the tools that run without asking", "choose when the model is shown its tools", "sign out", "restart it", "turn it off", "remove it"]
         );
         assert_eq!(
-            offered(Row::Running(remote(Origin::Project), Status::Failed(Failure::SignIn("Bearer".into())), Also::Nothing, Shown::FromTheStart))[0],
+            offered(Row::Running(remote(Origin::Project), Status::Failed(Failure::SignIn("Bearer".into())), Also::Nothing, Shown::FromTheStart, Some(Access::Network)))[0],
             "sign in",
             "you said yes to it"
         );
         assert_eq!(host("https://me:pw@mcp.example.com:8443/mcp?x=1"), "mcp.example.com:8443");
-        let held = Row::Running(server(Origin::Yours, Access::Network), ready(), Also::Nothing, Shown::WhenFound);
+        let held = Row::Running(server(Origin::Yours, Access::Network), ready(), Also::Nothing, Shown::WhenFound, Some(Access::Network));
         assert!(held.about().starts_with("● 1 tool · found when needed · "), "{}", held.about());
     }
 }

@@ -226,7 +226,7 @@ fn variable(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, word: &mut Str
 mod tests {
     use super::*;
     use crate::config::tests::command;
-    use crate::config::{Reach, Remote, Server};
+    use crate::config::{Reach, Remote, Server, Walled};
     use rein_sandbox::Access;
 
     /// One server, as `/mcp add` took it.
@@ -243,13 +243,13 @@ mod tests {
         assert_eq!((github.name.as_str(), command(&github).command.as_str(), github.origin), ("github", "npx", Origin::Yours));
         assert_eq!(command(&github).args, ["-y", "@modelcontextprotocol/server-github"]);
         assert_eq!(command(&github).env["GITHUB_PERSONAL_ACCESS_TOKEN"], "${GITHUB_TOKEN}", "a shell's $NAME is filled in as it starts");
-        assert_eq!(command(&github).access, Access::Network);
+        assert_eq!(command(&github).access, Walled::ByMode, "as the mode has it");
         let quoted = one(r#"docs --access look -e "ROOT=my docs" -- uvx docs-mcp --title 'it'\''s $HOME' "a \"b\"" c\ d ${X:-y}"#);
-        assert_eq!(command(&quoted).access, Access::Look);
+        assert_eq!(command(&quoted).access, Walled::Set(Access::Look));
         assert_eq!(command(&quoted).env["ROOT"], "my docs");
         assert_eq!(command(&quoted).args, ["docs-mcp", "--title", "it's $HOME", r#"a "b""#, "c d", "${X:-y}"], "single quotes leave a $ as it is");
         assert_eq!(command(&one("x --access=outside A=1 B= sh -c 'exec x'")).env.len(), 2);
-        assert_eq!(command(&one("x --access=outside sh")).access, Access::Outside);
+        assert_eq!(command(&one("x --access=outside sh")).access, Walled::Set(Access::Outside));
         for (text, why) in [
             ("github", "takes a name, then the command"),
             ("--access outside", "takes a name"),
@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(command(&one(r#""github": { "command": "npx", "args": ["-y", "gh"] },"#)).args, ["-y", "gh"], "the part to paste in, a comma after it");
         assert_eq!(command(&one(r#"{ "github": { "command": "npx" } }"#)).command, "npx");
         assert_eq!(one(r#"{ "servers": { "gh": { "type": "stdio", "command": "npx" } } }"#).name, "gh", "VS Code's shape");
-        assert_eq!(command(&one("gh {\n  \"command\": \"npx\",\n  \"access\": \"look\"\n}")).access, Access::Look);
+        assert_eq!(command(&one("gh {\n  \"command\": \"npx\",\n  \"access\": \"look\"\n}")).access, Walled::Set(Access::Look));
         assert!(added(r#"{ "command": "npx" }"#).unwrap_err().contains("say what to call it"));
         assert!(added("{ not json").unwrap_err().contains("isn't JSON"));
     }

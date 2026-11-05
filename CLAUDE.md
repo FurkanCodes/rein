@@ -133,6 +133,13 @@ finding. Each says why in a line.
 
 ## The sandbox
 
+- The walls are yours to choose, with the mode: in trust nothing rein
+  starts is walled in (commands, MCP servers), and the other modes wall
+  them all, unless one has walls of its own. Every harness whose user
+  approves each command ships its sandbox off, none walls in servers
+  while commands run free, and walls broke what servers need. What comes
+  with a project waits for your yes in every mode, which doesn't depend
+  on walls.
 - A command meant for the sandbox never runs without one: no sandbox means
   ask, not run (`Run::Sandboxed` without one is an error). Claude Code's
   default runs commands unsandboxed when its sandbox can't start.

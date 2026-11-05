@@ -121,11 +121,8 @@ async fn confirm(found: &Found, server: &rein_mcp::Server, mcp: &Mcp, terminal: 
     if let Some(repository) = &found.repository {
         detail.push_str(&format!(", its code at {repository}"));
     }
-    match server.access() {
-        Some(access) => detail.push_str(&format!(". It runs {}", rein_mcp::walls(access))),
-        None => detail.push_str(". It's reached at its URL: none of its code runs here"),
-    }
-    if server.local().is_some_and(|local| local.command == "docker" && local.access == Access::Outside) {
+    detail.push_str(&format!(". {}", super::runs(server, mcp.servers.by_mode())));
+    if server.local().is_some_and(|local| local.command == "docker" && local.access == rein_mcp::Walled::Set(Access::Outside)) {
         detail.push_str(": Docker, which the sandbox can't reach, runs it in a container of its own");
     }
     detail.push('.');
