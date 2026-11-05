@@ -22,7 +22,7 @@ Usage:
   rein login claude-code         Use Claude Code CLI login or paste a setup-token token
   rein logout claude-code        Forget rein's Claude Code setup (not the CLI's login)
   rein logout <provider>         Forget it (rein logout chatgpt signs out)
-  rein providers                 List the providers rein can reach, and what pays
+  rein providers                 List the providers, and which you're signed in to
   rein models [<provider>]       List the models you can use
   rein peers                     Watch the reins running in your other terminals,
                                  and answer what they ask (y/n)
@@ -138,7 +138,7 @@ doesn't take compressed requests gets them uncompressed instead.
 
 A model's name says who serves it (claude-* is Anthropic's, gpt-* OpenAI's,
 gemini-* Google's), or name the provider first: openrouter/qwen/qwen3-coder,
-ollama/qwen3:8b. `rein providers` lists the providers and what pays for each;
+ollama/qwen3:8b. `rein providers` lists the providers and which you're signed in to;
 add your own in ~/.config/rein/providers. Keys come from each provider's
 variable, like $ANTHROPIC_API_KEY, or from `rein login <provider>`. Signed in
 with ChatGPT, OpenAI's models use your plan.";

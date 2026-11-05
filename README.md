@@ -1,80 +1,99 @@
-<div align="center">
+<p align="center">
+  <img src="docs/screenshot/logo.png" alt="rein" width="288">
+</p>
 
-<pre>
-█▀▀▄ █▀▀▀ █ █▄  █
-█▀█  █▀▀  █ █ ▀▄█
-▀  ▀ ▀▀▀▀ ▀ ▀   ▀
-</pre>
+<p align="center">
+  <a href="#licence"><img alt="Licence: MIT or Apache 2.0" src="https://img.shields.io/badge/licence-MIT%20or%20Apache%202.0-blue"></a>
+  <a href="#install"><img alt="Rust 1.95 or newer" src="https://img.shields.io/badge/rust-1.95%2B-orange?logo=rust"></a>
+  <a href="#status"><img alt="Tested on macOS" src="https://img.shields.io/badge/tested%20on-macOS-lightgrey?logo=apple"></a>
+</p>
 
-**A tiny, fast coding agent for your terminal. You hold the reins.**
+rein is a coding agent for the terminal, written in Rust. It reads and
+edits your code and runs commands, and you see every step as it happens.
+You hold the reins.
 
-One 5 MB Rust binary · any model · every step in view
+![rein in a terminal: the / list of commands and skills, the python-tests skill asked to fix failing tests, the edit approved with its diff in view, the tests passing, the Context7 MCP server asked how to strip accents in Python, and /undo](docs/screenshot/demo.webp)
 
-</div>
+## Why rein
 
----
+Most coding agents are moving toward work you hand off and check on later,
+in cloud tasks and background agents. I wanted one I could stay inside:
+Enter steers the model in the middle of a turn, Esc stops it, and
+sub-agents work in tabs you can read and type into.
 
-## Quick start
+If you come from Claude Code, your skills and hooks work as they are, and
+`/mcp import` brings your MCP servers over.
+
+rein is one 5 MB binary, and it only runs in your terminal. There's no IDE
+extension, desktop app or cloud version.
+
+## Install
+
+There are no packages yet. With Rust 1.95 or newer, from a clone of this
+repo:
 
 ```sh
-cargo install --path crates/rein-cli --locked   # from a clone of this repo
-rein login                     # your ChatGPT plan; or: rein login anthropic | openrouter | …
-rein                           # a conversation in this folder
-rein "fix the failing test"    # one task, then exit
-rein -c                        # pick up where you left off
+cargo install --path crates/rein-cli --locked
 ```
 
-Everything else is in **[the guide](docs/guide.md)**.
+Then run `rein` in your project's folder. The first time, it asks you to
+sign in.
 
-## Features
+rein works with a ChatGPT plan, a Claude plan (through Anthropic's own
+`claude` CLI), or an API key for OpenAI, Anthropic, Gemini, OpenRouter,
+Groq, DeepSeek, xAI, Mistral and a few more. Ollama and LM Studio need no
+key at all. You can switch models mid-conversation, even to another
+provider. rein only signs in the official ways and never borrows another
+app's login. [The guide](docs/guide.md#models-and-signing-in) shows how to
+set up each one.
 
-| | |
-|---|---|
-| 🧠 **Models** | 4 APIs and 15 providers: OpenAI, Anthropic, Gemini, OpenRouter, Groq, DeepSeek, xAI, Mistral and more, plus Ollama and LM Studio. Switch models mid-conversation, even across providers. |
-| 🖥️ **Terminal UI** | Full screen, Markdown answers, diffs before you approve. Enter steers a turn, Esc stops it. `@file` points at code, Ctrl-V pastes an image, Ctrl-O shows any step's full output. |
-| 🛡️ **Safety** | Five modes from `trust` to `read-only`. Rules find `rm` behind `sudo` or `sh -c`. An OS sandbox (Seatbelt, Landlock). `/undo` puts back what commands did too. |
-| 🔁 **Long work** | Loops are caught, long turns aren't cut. Compaction retires stale output first, and `recall` searches what was compacted. |
-| ⚙️ **Background commands** | Dev servers and watchers keep running; the model is told when one ends, so it never polls. |
-| ✅ **Checks after edits** | `cargo check`, `tsc`, `go vet`, pyright or mypy after each change, telling the model only the errors it brought in. |
-| 🪟 **Sub-agents and tabs** | Each sub-agent gets a terminal tab of its own: watch it, type into it, close it. Its report shows in full where you started it. Reins in other tabs talk with `/send` and `/delegate`. |
-| 🔌 **MCP** | Add servers by name from the MCP Registry, import them from 7 apps, or reach them at a URL with sign-in. Big tool sets are found when needed. |
-| 🧩 **Skills · hooks · memory** | Agent Skills, Claude Code's hooks as they are, and notes kept across conversations in Claude Code's format. |
-| 🔎 **Web search** | Runs in a request of its own, so only the answer joins the conversation. |
-| 📊 **Limits** | Your plan's usage in the status bar, only as the provider reports it. |
+## What's in it
 
-## Why rein, compared to others
+- [Sub-agents](docs/guide.md#sub-agents): each one runs in a terminal tab
+  of its own, in tmux, kitty, WezTerm, iTerm2, Ghostty or Terminal.app.
+  You can watch it, type into it, and keep going with it after it's done.
+- [MCP](docs/guide.md#mcp-servers): add a server by name from the
+  registry, import the ones you set up in Claude Code, Cursor, Codex and
+  others, or connect to one by URL. A server with dozens of tools doesn't
+  send them all with every request: the model looks them up when it
+  needs one.
+- [Skills](docs/guide.md#skills): the ones you already have in
+  `~/.claude/skills` and `~/.agents/skills` just work, plugins' too.
+- [Hooks](docs/guide.md#hooks): Claude Code's hooks, as you wrote them.
+- [Memory](docs/guide.md#memory): notes kept across conversations, in
+  Claude Code's format, and you see every save.
+- [Checks after edits](docs/guide.md#checks-after-edits): rein runs the
+  project's own check (`cargo check`, `tsc`, `go vet`, pyright, mypy) and
+  tells the model only about the errors it just introduced.
+- [Background commands](docs/guide.md#background-commands): dev servers
+  and watchers keep running, and the model hears when one exits instead
+  of polling.
+- [Web search](docs/guide.md#web-search): runs in a separate request and
+  brings back only its answer, so the pages it read don't fill up your
+  conversation.
+- [Permissions and sandbox](docs/guide.md#what-rein-may-do): rules that
+  catch `rm` even behind `sudo` or `sh -c`, modes from `trust` to
+  `read-only`, and an optional sandbox (Seatbelt on macOS, Landlock on
+  Linux).
+- [Undo](docs/guide.md#undo): `/undo` puts back files the model changed,
+  including what its commands did.
+- [Usage limits](docs/guide.md#whats-left-of-your-limits): your plan's
+  usage in the status bar, only when the provider reports it.
 
-| When… | Elsewhere | In rein |
-|---|---|---|
-| a sub-agent finishes | Claude Code shows `Done (N tool uses · tokens · time)`; the report itself only under Ctrl-O | The whole report in your window, as the model reads it |
-| you want more from a finished sub-agent | Codex and OpenCode make it read-only | It stays: go on in its tab, and its parent hears |
-| a sub-agent's tab or pane is closed | Claude Code's lead keeps showing the teammate as running | The parent hears what it did so far, the moment it closes |
-| the web is searched | Search inside the conversation (OpenAI's own tool) added ~12,000 tokens, sent again with every request | Only the answer: ~780 tokens |
-| errors are checked after an edit | Claude Code and Roo counted an old error that moved as new | Compared by file, code and message, never by line |
-| two hooks rewrite one call | Claude Code runs them at once; the last to finish wins | In turn, each given the call as the last left it |
-| a cloned project brings hooks | Claude Code trusts the folder; Codex trusts a hook's command, not its script | It asks once for each hook and every script it names, and again if either changes |
-| conversations hold images | Codex kept them inline: session folders reached 165 GB | Each image stored once, named in the session |
-| memory is kept | Codex's background passes drained users' limits | Saved as the model works, each save a step you see |
-| usage is shown | pi showed a cost worked out from a price list | Only the provider's own figures, or nothing |
+## Status
 
-**Measured:** ~10 ms per sandboxed command · prompt cache at 96–98% · MCP tool search took a first request from 27,831 to 3,140 tokens.
-
-**The official way only:** your ChatGPT plan through OpenAI's Sign in with ChatGPT, a Claude plan through Anthropic's own CLI, or API keys. rein never signs in as another app.
-
-## Where it falls short
-
-- **Young.** Its longest real conversation so far was 9 messages; daily use on itself starts now.
-- **Few providers tried for real.** The ChatGPT plan and Claude Code's CLI have been. Gemini, OpenRouter, Anthropic's API and the rest have only run against test servers.
-- **A Claude plan only through `claude -p`.** Each step is a fresh CLI run, and its text arrives when the step ends, not word by word.
-- **Terminal only.** No IDE extension, desktop or web app.
-- **Build it yourself.** No packages yet: you need Rust.
-- **No language server.** It finds code with grep and glob, and learns about errors from the project's own check.
-- **No usage figures on a ChatGPT plan.** OpenAI doesn't tell apps.
-- **Sandbox on macOS and Linux only.** None on Windows. On Linux, some protected files inside the project are guarded and put back rather than walled off.
-- **Tabs need a terminal that opens them:** tmux, kitty, WezTerm, iTerm2, Ghostty or Terminal.app. Elsewhere you paste a command. Ghostty, kitty and WezTerm ask before you close a finished sub-agent's tab; Ctrl-D in it doesn't.
+Early. I've just started using it to work on rein itself, on macOS, which
+is the only system it has been used on so far. It has run for real on a
+ChatGPT plan and through Claude Code's CLI; the other providers are built
+to their docs and tested against fake servers so far.
 
 ## More
 
-- [The guide](docs/guide.md): every feature, in detail
-- [PRODUCT.md](PRODUCT.md): what rein is for, and what's next
-- [CLAUDE.md](CLAUDE.md): how the code is kept
+[The guide](docs/guide.md) has everything else: every command and key,
+settings, providers, the sandbox. [PRODUCT.md](PRODUCT.md) is where rein is
+going. If you want to change the code, read [CLAUDE.md](CLAUDE.md) first.
+
+## Licence
+
+MIT or Apache 2.0, whichever you prefer: [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE).

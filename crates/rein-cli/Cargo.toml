@@ -2,6 +2,8 @@
 name = "rein-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 description = "rein: a tiny, fast agent harness. You hold the reins."
 
 [dependencies]

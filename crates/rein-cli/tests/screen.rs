@@ -1978,7 +1978,7 @@ fn signing_in_from_the_conversation_makes_a_provider_ready_to_switch_to() {
     let gpt = Model::start(vec![says("From GPT.")]).with_env("ANTHROPIC_BASE_URL", &claude.base);
     let mut term = Term::start(&gpt, "login-here", 40, 100);
     term.wait_for(IDLE);
-    // /login alone: a menu of who to sign in to, and what pays for each now.
+    // /login alone: a menu of who to sign in to, and which you're signed in to now.
     term.keys("/login\r");
     term.wait_for("sign in to a provider");
     let screen = term.text();

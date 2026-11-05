@@ -11,7 +11,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/sandbox", "[on|off]", "run commands in the sandbox, or as you'd run them, in any mode"),
     ("/permissions", "[add|remove rule]", "what asks first, or is refused: your rules, for every project, and this one's"),
     ("/model", "[id]", "list the models, or switch to one"),
-    ("/login", "[provider]", "sign in to a provider, or see what pays for each"),
+    ("/login", "[provider]", "sign in to a provider, or see which you're signed in to"),
     ("/logout", "[provider]", "forget a provider's key (chatgpt: sign out)"),
     ("/effort", "[level|default]", "change how hard the model thinks"),
     ("/search", "[auto|off|model]", "choose which model searches the web for the model"),
@@ -49,7 +49,7 @@ pub enum Slash {
     Sandbox(Option<bool>),
     Permissions(Rules),
     Model(Option<String>),
-    /// `None` lists the providers and what pays for each.
+    /// `None` lists the providers and which you're signed in to.
     Login(Option<String>),
     /// `/login openrouter <key>`: that key, for that provider. The line
     /// it came in is never shown again or kept.

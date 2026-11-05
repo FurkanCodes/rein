@@ -149,7 +149,7 @@ async fn login(http: &rein_llm::reqwest::Client, tell: &dyn Fn(&str)) -> CliResu
     if !credentials.plan_enabled() {
         tell(&format!(
             "Signed in as {who}, but rein wasn't allowed to use your ChatGPT plan. \
-             Run `rein login` again and allow it, or set OPENAI_API_KEY to pay with an API key."
+             Run `rein login` again and allow it, or set OPENAI_API_KEY to use an API key instead."
         ));
         return Ok(());
     }

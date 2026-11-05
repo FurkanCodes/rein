@@ -121,7 +121,9 @@ pub(crate) async fn command(with: Option<SearchWith>, agent: &mut Agent<Llm>, te
     match (&found, &with) {
         (Some(searcher), _) => say!("{pad}{} {} searches the web for the model, from your next message", s.green("✓"), searcher.model()),
         (None, SearchWith::Off) => say!("{pad}{} the model can't search the web now: /search turns it on", s.green("✓")),
-        (None, _) => say!("{pad}{}", s.dim("Nothing you can pay for can search the web: OpenAI's, Anthropic's and Claude Code's models can, once /login has one")),
+        (None, _) => {
+            say!("{pad}{}", s.dim("None of the providers you're signed in to can search the web: OpenAI's, Anthropic's and Claude Code's models can, once /login has one"))
+        }
     }
     agent.set_searcher(found);
     setup.set_search(with);
