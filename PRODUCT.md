@@ -127,7 +127,8 @@ its newer hooks; pi's extensions; OpenCode's plugins.
 - **Your hooks run outside the sandbox** in every mode, as Claude Code
   runs them: they're your setup, not what the model runs.
 - **A project's hooks start only after you approve them as they are.**
-  Approval is kept for exactly what each one runs; a change asks again.
+  Approval is kept for exactly what each one runs, and the scripts it
+  names; a change to either asks again. (Built.)
   Hooks shipped in a cloned repo have been a real problem for other
   harnesses.
 - **You can see what a hook did.** Each step shows when a hook changed it,

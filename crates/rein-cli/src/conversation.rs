@@ -170,7 +170,10 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     }
     agent.step_limit = step_limit(args.mode, args.prompt.is_some(), args.max_steps);
     // Your hooks, and those on a session starting.
-    crate::hooks::start(&mut agent, &mut terminal, &dir, source).await;
+    // A project's that wait for a yes are asked about where there's someone
+    // to ask: not in a task run on its own, nor in a sub-agent's tab, which
+    // has its task to do.
+    crate::hooks::start(&mut agent, &mut terminal, &dir, source, args.prompt.is_none() && args.child.is_none()).await;
     // A continued conversation is as full as it was.
     terminal.context_used = agent.estimated();
     terminal.input.set_bar(terminal.bar());

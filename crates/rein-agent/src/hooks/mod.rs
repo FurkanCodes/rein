@@ -353,9 +353,10 @@ pub struct Hooks {
 
 impl Hooks {
     /// The hooks of rein's own file in `rein`, Claude Code's settings and
-    /// plugins in `home`, and the project at `root`'s, as you `chosen`.
-    pub fn load(rein: &Path, home: Option<&Path>, root: &Path, chosen: &Chosen) -> Hooks {
-        let found = config::find(rein, home, root, chosen);
+    /// plugins in `home`, and the project at `root`'s, as you `chosen`: the
+    /// project's those you `approved` as they are.
+    pub fn load(rein: &Path, home: Option<&Path>, root: &Path, chosen: &Chosen, approved: &[String]) -> Hooks {
+        let found = config::find(rein, home, root, chosen, approved);
         Hooks { hooks: found.hooks, left_out: found.left_out, ..Hooks::default() }
     }
 

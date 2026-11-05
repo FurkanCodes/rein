@@ -179,7 +179,10 @@ finding. Each says why in a line.
   another server. A header you gave it wins over rein's sign-in.
 - An MCP server is a command, someone else's: a project's starts only once
   you've said yes to all of what it runs (command, arguments, environment,
-  walls), never to its name. Cursor went by
+  walls), never to its name. So does a project's hook, by all of what it
+  is and the contents of each script in the project it names: Codex
+  trusts a hook by its command, and runs whatever its script says after
+  a later commit. Cursor went by
   the name, and a later commit swapped the command behind it
   (CVE-2025-54136). What a server says of its tools is its own word: none
   runs without asking for it.

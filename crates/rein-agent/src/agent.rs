@@ -2910,7 +2910,7 @@ mod tests {
         let dir = root_of(name).join(".hooks");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("hooks.json"), json!({ "hooks": hooks }).to_string()).unwrap();
-        agent.set_hooks(std::sync::Arc::new(Hooks::load(&dir, None, &root_of(name), &hooks::Chosen::default())));
+        agent.set_hooks(std::sync::Arc::new(Hooks::load(&dir, None, &root_of(name), &hooks::Chosen::default(), &[])));
         agent.permissions.mode = crate::permissions::Mode::Trust;
     }
 

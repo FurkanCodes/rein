@@ -649,11 +649,23 @@ Where it does better:
   and the project's `.claude` are out of its commands' reach in every
   walled mode.
 
+- **A project's hooks run once you've said yes to each as it is, its
+  scripts too.** Those in its `.claude/settings.json` and
+  `settings.local.json` came with the project, which may be anyone's. As
+  a conversation starts, rein lists each that's new or changed (when it
+  runs, its command, and the scripts in the project it names, like
+  `.claude/hooks/check.py`) and asks once, No first. A yes is kept in
+  rein's folder, never the project's, and a commit that changes a hook's
+  command or a script it names asks again. Claude Code asks once about
+  the folder, so a later commit's hook runs unasked; Codex asks about
+  each hook, but not its script. A task run on its own, or a sub-agent,
+  asks nothing and runs only what you said yes to; `/hooks` turns a
+  project's hook on, asking, or off, taking the yes back. Once you've
+  said yes, a project's hook runs as yours do.
+
 They run with no terminal, in a process group of their own, stopped with
 everything they started when they take too long (10 minutes, as Claude
-Code's; 30 s on your message) or the turn stops. A project's hooks, in its
-`.claude/settings.json`, are listed but don't run yet: one came with the
-project, which may be anyone's. iTerm2's status program for Claude Code is
+Code's; 30 s on your message) or the turn stops. iTerm2's status program for Claude Code is
 off unless you turn it on, as rein sets the tab's status itself.
 `disableAllHooks` in Claude Code's settings turns its hooks off here too.
 rein starts by saying in a line which hooks run, and `/hooks` lists each,

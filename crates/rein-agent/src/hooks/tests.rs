@@ -18,7 +18,7 @@ fn hooks(name: &str, hooks: Value) -> (Hooks, PathBuf) {
     std::fs::create_dir_all(dir.join("rein")).unwrap();
     std::fs::create_dir_all(dir.join("project")).unwrap();
     std::fs::write(dir.join("rein/hooks.json"), json!({ "hooks": hooks }).to_string()).unwrap();
-    (Hooks::load(&dir.join("rein"), None, &dir.join("project"), &Chosen::default()), dir.join("project"))
+    (Hooks::load(&dir.join("rein"), None, &dir.join("project"), &Chosen::default(), &[]), dir.join("project"))
 }
 
 fn here(root: &Path, mode: Mode) -> Here<'_> {

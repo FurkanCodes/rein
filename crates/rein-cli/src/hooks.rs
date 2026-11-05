@@ -1,36 +1,86 @@
 //! Your hooks, in the conversation: found as rein starts, said in a line,
 //! and `/hooks`, to see each, what it runs on and how it last did, and to
 //! turn one off or on. What you choose is kept in rein's folder.
+//!
+//! A project's hooks came with it, and may be anyone's: they run once
+//! you've said yes to each as it is, with the scripts it names, asked as
+//! rein starts in a conversation, or in `/hooks`. Your yes is kept in
+//! rein's folder, never the project's, and a change asks again.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use rein_agent::agent::{Agent, Llm};
-use rein_agent::hooks::{Chosen, EventName, Hook, Hooks, Source, State};
+use rein_agent::hooks::{Chosen, EventName, From, Hook, Hooks, Source, State};
 
 use crate::CliResult;
-use crate::input::Menu;
+use crate::input::{Menu, Question};
 use crate::terminal::Terminal;
 use crate::ui::style::GUTTER;
 
 /// What you chose of hooks, in rein's folder.
 const CHOSEN_FILE: &str = "hooks-chosen.json";
 
+/// The projects' hooks you said yes to, by project, in rein's folder:
+/// each hook's fingerprint, as it was.
+const APPROVED_FILE: &str = "hooks-approved.json";
+
 /// Your hooks, rein's and Claude Code's, its plugins', and the project at
 /// `root`'s, as you chose them in rein's folder `dir`.
 pub(crate) fn load(dir: &Path, root: &Path) -> Arc<Hooks> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    Arc::new(Hooks::load(dir, home.as_deref(), root, &chosen(dir)))
+    let approved = approved(dir).remove(&key(root)).unwrap_or_default();
+    Arc::new(Hooks::load(dir, home.as_deref(), root, &chosen(dir), &approved))
 }
 
 fn chosen(dir: &Path) -> Chosen {
     std::fs::read(dir.join(CHOSEN_FILE)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
 }
 
+/// The project at `root`, as the projects' yeses are kept by.
+fn key(root: &Path) -> String {
+    root.display().to_string()
+}
+
+fn approved(dir: &Path) -> BTreeMap<String, Vec<String>> {
+    rein_llm::store::read_json(&dir.join(APPROVED_FILE)).ok().flatten().unwrap_or_default()
+}
+
+/// Keeps your yes to `hooks` of the project at `root`, as they are now,
+/// or takes it back (`yes` false), in rein's folder `dir`.
+fn keep(dir: &Path, root: &Path, hooks: &[Hook], yes: bool) -> CliResult {
+    let mut approved = approved(dir);
+    let theirs = approved.entry(key(root)).or_default();
+    for hook in hooks {
+        let fingerprint = hook.fingerprint(root);
+        theirs.retain(|known| *known != fingerprint);
+        if yes {
+            theirs.push(fingerprint);
+        }
+    }
+    if theirs.is_empty() {
+        approved.remove(&key(root));
+    }
+    let path = dir.join(APPROVED_FILE);
+    rein_llm::store::write_json_private(&path, &approved).map_err(|e| format!("can't keep that in {}: {}", path.display(), crate::describe(e)))
+}
+
 /// Gives `agent` its hooks and runs those on the session's start, from
-/// `source`, saying in a line which run.
-pub(crate) async fn start(agent: &mut Agent<Llm>, terminal: &mut Terminal, dir: &Path, source: Source) {
-    let hooks = load(dir, agent.tools.root());
+/// `source`, saying in a line which run. When there's someone to `ask`, a
+/// project's hooks that wait for a yes are asked about first, all in one
+/// question; a task run on its own, or a sub-agent, runs only those you
+/// said yes to already.
+pub(crate) async fn start(agent: &mut Agent<Llm>, terminal: &mut Terminal, dir: &Path, source: Source, ask: bool) {
+    let root = agent.tools.root().to_owned();
+    let mut hooks = load(dir, &root);
+    let waiting: Vec<Hook> = hooks.all().iter().filter(|hook| hook.state == State::Waiting).cloned().collect();
+    if ask && !waiting.is_empty() && say_yes(&waiting, &root, terminal).await {
+        match keep(dir, &root, &waiting, true) {
+            Ok(()) => hooks = load(dir, &root),
+            Err(e) => say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&format!("✗ {e}"))),
+        }
+    }
     if let Some(said) = said(&hooks) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&said));
     }
@@ -98,8 +148,51 @@ fn why_off(state: &State) -> String {
         State::On => String::new(),
         State::Off => "you turned it off".into(),
         State::ReinDoesIt(why) => (*why).to_owned(),
+        State::Waiting => "it came with the project, and waits for your yes".into(),
         State::NotRun(why) => why.clone(),
     }
+}
+
+/// Asks whether to run the project's `hooks`, each shown above the
+/// question: when it runs, what it runs, and the scripts it names.
+async fn say_yes(hooks: &[Hook], root: &Path, terminal: &mut Terminal) -> bool {
+    let pad = " ".repeat(GUTTER);
+    let s = terminal.err;
+    // Where in the project, as its own files are named.
+    let file = |hook: &Hook| match &hook.from {
+        From::Project(path) => path.strip_prefix(root).unwrap_or(path).display().to_string(),
+        other => other.describe(),
+    };
+    let files: Vec<String> = hooks.iter().map(file).fold(Vec::new(), |mut files, file| {
+        if !files.contains(&file) {
+            files.push(file);
+        }
+        files
+    });
+    say!("{pad}{}", s.dim(&format!("The project sets hooks, in {}:", files.join(" and "))));
+    for hook in hooks {
+        say!("{pad}  {} {}: {}{}", hook.name(), when(hook), command_line(hook), scripts(hook, root));
+    }
+    let count = hooks.len();
+    let (they, one) = if count == 1 { ("It came", "it, or to a script it names, asks again") } else { ("They came", "one, or to a script it names, asks again") };
+    let run = if count == 1 { "it'd run as you'd run it" } else { "they'd run as you'd run them" };
+    let question = Question {
+        title: format!("Run {} this project sets?", if count == 1 { "the hook".to_owned() } else { format!("the {count} hooks") }),
+        detail: Some(format!(
+            "{they} with the project, and may be anyone's: {run}, outside the sandbox, with your keys. A change to {one}; \
+             /hooks turns one off or on."
+        )),
+        command: None,
+        // No first: what's in a cloned repository runs only once you choose.
+        answers: vec![("n", "No, not this time".to_owned()), ("y", if count == 1 { "Yes, run it" } else { "Yes, run them" }.to_owned())],
+    };
+    terminal.yes(question).await
+}
+
+/// The scripts `hook` names, said after its command: ` · runs a.py`.
+fn scripts(hook: &Hook, root: &Path) -> String {
+    let scripts: Vec<String> = hook.scripts(root).iter().map(|script| script.display().to_string()).collect();
+    if scripts.is_empty() { String::new() } else { format!(" · runs {}", scripts.join(", ")) }
 }
 
 /// `/hooks`: every hook, where it's set, what it runs on, and how it last
@@ -109,7 +202,9 @@ pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal, dir
     let (pad, s) = (" ".repeat(GUTTER), terminal.err);
     let hooks = agent.hooks();
     if hooks.all().is_empty() && hooks.left_out().is_empty() {
-        say!("{pad}No hooks: rein runs those in ~/.config/rein/hooks.json, Claude Code's ~/.claude/settings.json and its plugins'");
+        say!(
+            "{pad}No hooks: rein runs those in ~/.config/rein/hooks.json, Claude Code's ~/.claude/settings.json and its plugins', and the project's .claude/settings.json once you say yes"
+        );
         return Ok(());
     }
     // Those that run first.
@@ -137,6 +232,19 @@ pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal, dir
         return Ok(());
     }
     let hook = agent.hooks().all()[order[picked]].clone();
+    let root = agent.tools.root().to_owned();
+    // A project's: on is your yes to it as it is, and off takes it back.
+    if matches!(hook.from, From::Project(_)) && matches!(hook.state, State::On | State::Waiting) {
+        let yes = hook.state == State::Waiting;
+        if yes && !say_yes(std::slice::from_ref(&hook), &root, terminal).await {
+            return Ok(());
+        }
+        keep(dir, &root, std::slice::from_ref(&hook), yes)?;
+        agent.set_hooks(load(dir, &root));
+        let now = if yes { "on now, as it is".to_owned() } else { "off now: it waits for your yes again".to_owned() };
+        say!("{pad}{} {} is {now}", s.green("✓"), hook.name());
+        return Ok(());
+    }
     let id = hook.id();
     let mut chosen = chosen(dir);
     let on = match &hook.state {
@@ -156,6 +264,8 @@ pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal, dir
             say!("{pad}{}", s.dim(&format!("{} doesn't run: {why}", hook.name())));
             return Ok(());
         }
+        // A project's, above.
+        State::Waiting => return Ok(()),
     };
     rein_llm::store::write_json_private(&dir.join(CHOSEN_FILE), &chosen).map_err(|e| format!("can't write {}: {e}", dir.join(CHOSEN_FILE).display()))?;
     agent.set_hooks(load(dir, agent.tools.root()));
