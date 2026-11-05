@@ -53,6 +53,12 @@ pub trait Model {
     /// Sends one request, passing what streams in to `on` as it arrives,
     /// and returns the finished items and the token counts.
     fn respond(&self, request: &Request<'_>, on: &mut dyn FnMut(Streamed)) -> impl Future<Output = Result<(Vec<Item>, Usage)>>;
+
+    /// Whether `request`, as this model is sent it, holds back the tools
+    /// found with the search: they cost nothing until they're found.
+    fn holds_back(&self, request: &Request<'_>) -> bool {
+        request.holds_back()
+    }
 }
 
 /// The answer to "may this run?".
@@ -1276,6 +1282,39 @@ impl<M: Model> Agent<M> {
         Ok(report)
     }
 
+    /// About how many tokens the next request will carry: the provider's
+    /// count for the last one, plus an estimate for what was added since.
+    /// Without a count, all of it is estimated, with the tools the request
+    /// carries: not those held back until they're found. Counted, a new
+    /// conversation with Linear's, Chrome's and Playwright's servers was
+    /// compacted before its first request, at 49k of a 30k limit.
+    pub fn estimated(&self) -> u64 {
+        let added = |items: &[Item]| items.iter().map(|item| compact::estimate(compact::size(item))).sum::<u64>();
+        match self.window.measured {
+            Some((tokens, sent)) if sent <= self.history.len() => tokens + added(&self.history[sent..]),
+            _ => {
+                let held = self.model.holds_back(&self.request(&[], None));
+                let found: std::collections::HashSet<&str> = self
+                    .history
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Found { names, .. } => Some(names.iter().map(String::as_str)),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                let sent = |tool: &&Tool| match tool.loading {
+                    Loading::UpFront => true,
+                    Loading::Found => !held || found.contains(tool.name.as_str()),
+                    Loading::Search => held,
+                };
+                let tools: usize = self.specs().iter().filter(sent).map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len()).sum();
+                let instructions = self.system().map_or(0, |system| system.len());
+                compact::estimate(tools + instructions) + added(&self.history)
+            }
+        }
+    }
+
     async fn compact_now(&mut self, focus: Option<&str>, summarize: bool, ui: &mut impl Ui) -> Result<Compacted> {
         ui.compacting();
         let before = self.estimated();
@@ -1594,21 +1633,6 @@ impl<M> Agent<M> {
         Ok(())
     }
 
-    /// About how many tokens the next request will carry: the provider's
-    /// count for the last one, plus an estimate for what was added since.
-    /// Without a count, all of it is estimated.
-    pub fn estimated(&self) -> u64 {
-        let added = |items: &[Item]| items.iter().map(|item| compact::estimate(compact::size(item))).sum::<u64>();
-        match self.window.measured {
-            Some((tokens, sent)) if sent <= self.history.len() => tokens + added(&self.history[sent..]),
-            _ => {
-                let tools: usize = self.specs().iter().map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len()).sum();
-                let instructions = self.system().map_or(0, |system| system.len());
-                compact::estimate(tools + instructions) + added(&self.history)
-            }
-        }
-    }
-
     /// Adds an item to the history, saving it first. What [`Agent::repair`]
     /// fills in isn't saved: loading and repairing again gives the same.
     fn record(&mut self, item: Item) -> Result<()> {
@@ -1697,6 +1721,10 @@ fn stream_to(ui: &mut impl Ui, streamed: Streamed) {
 const RETRY_WAITS: [u64; 3] = [1, 2, 4];
 
 impl Model for Llm {
+    fn holds_back(&self, request: &Request<'_>) -> bool {
+        self.client.holds_back(request)
+    }
+
     async fn respond(&self, request: &Request<'_>, on: &mut dyn FnMut(Streamed)) -> Result<(Vec<Item>, Usage)> {
         // Only the request itself is retried: once the answer has started,
         // trying again would show it twice.
@@ -2558,6 +2586,26 @@ mod tests {
         let before = agent.history.clone();
         agent.repair();
         assert_eq!(agent.history, before);
+    }
+
+    /// Before the provider has counted, the estimate counts the tools a
+    /// request carries: one held back only once the model has found it.
+    #[test]
+    fn a_held_back_tool_counts_only_once_it_is_found() {
+        let mut agent = agent("estimate", vec![]);
+        let bare = agent.estimated();
+        let tool = |name: &str, loading| Tool { loading, strict: false, name: name.into(), description: "x".repeat(40_000), parameters: json!({}) };
+        agent.specs.push(tool("mcp__big__one", Loading::Found));
+        agent.specs.push(tool(rein_llm::TOOL_SEARCH, Loading::Search));
+        let held = agent.estimated();
+        assert!(held < bare + 11_000, "held back, only the search goes: {bare} → {held}");
+        agent.history.push(Item::Found { call_id: "s1".into(), names: vec!["mcp__big__one".into()] });
+        assert!(agent.estimated() >= held + 10_000, "found, it goes from then on");
+        // A model that can't find tools is shown them all, but the search.
+        agent.history.pop();
+        agent.finds_tools = rein_llm::FindsTools::No;
+        let all = agent.estimated();
+        assert!(all >= bare + 10_000 && all < bare + 11_000, "{bare} → {all}");
     }
 
     #[tokio::test]

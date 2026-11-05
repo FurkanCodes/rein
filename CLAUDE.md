@@ -221,6 +221,11 @@ finding. Each says why in a line.
   work once the sandbox stopped asking; a loop is the same call giving the
   same result again and again, and that's what's caught. Only a turn nobody
   watches has a step limit, and its last step asks for a report.
+- A guess at what a request carries counts what it does carry: tools held
+  back count once found, and only where the format holds them back.
+  Counting all 127 of three servers' tools, a new conversation was
+  compacted before its first request, and every compaction said it made
+  the conversation bigger.
 - A guard against rein looping on its own work goes by progress, not a
   count: compacting "once per message" overflowed long turns. Compact again
   after a step since the last time, and not after one that made no room.

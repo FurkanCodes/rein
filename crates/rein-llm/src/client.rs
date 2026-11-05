@@ -163,6 +163,14 @@ impl Client {
         client
     }
 
+    /// Whether `request` holds back the tools found with the search, as
+    /// this client sends it: Responses and Messages can (Claude Code's CLI
+    /// speaks Messages here); Chat Completions and Gemini show every tool
+    /// from the start.
+    pub fn holds_back(&self, request: &Request<'_>) -> bool {
+        request.holds_back() && matches!(self.api, Api::Responses | Api::Anthropic)
+    }
+
     /// Gives up on an answer that sends nothing for `idle`.
     pub fn with_idle_timeout(mut self, idle: Duration) -> Self {
         self.idle = idle;
@@ -567,6 +575,30 @@ impl HttpStream {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// What's held back costs nothing until it's found only where the
+    /// format holds it back: Chat Completions and Gemini show every tool.
+    #[test]
+    fn only_responses_and_messages_hold_tools_back() {
+        let tools = crate::testing::held_back_tools();
+        let request = Request {
+            model: "m",
+            instructions: None,
+            input: &[],
+            tools: &tools,
+            reasoning_effort: None,
+            reasoning_summary: false,
+            session_id: None,
+            max_output_tokens: None,
+            hold_back: true,
+            images: false,
+        };
+        let client = |api| Client::new(reqwest::Client::new(), api, "http://127.0.0.1:1", Auth::None);
+        let holds: Vec<bool> = [Api::Responses, Api::Anthropic, Api::Chat, Api::Gemini].into_iter().map(|api| client(api).holds_back(&request)).collect();
+        assert_eq!(holds, [true, true, false, false]);
+        assert!(Client::claude_code(reqwest::Client::new(), None).holds_back(&request), "Claude Code's CLI is told in words, once found");
+        assert!(!client(Api::Responses).holds_back(&Request { hold_back: false, ..request }), "a model that can't find tools");
+    }
 
     #[tokio::test]
     async fn a_level_a_model_turns_down_goes_as_none_from_then_on_for_that_model_only() {

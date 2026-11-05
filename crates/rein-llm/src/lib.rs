@@ -345,7 +345,7 @@ impl Request<'_> {
     /// Tools are held back from the model in this request, in a format
     /// that can hold them back: there are some to hold back, and the model
     /// can find them.
-    pub(crate) fn holds_back(&self) -> bool {
+    pub fn holds_back(&self) -> bool {
         self.hold_back && self.tools.iter().any(|tool| tool.loading == Loading::Found) && self.tools.iter().any(|tool| tool.loading == Loading::Search)
     }
 
