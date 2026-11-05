@@ -8,7 +8,7 @@
 //! from 5.13 on. Where rein has none, commands ask before they run: rein
 //! never runs one unconfined when it meant to confine it.
 
-mod group;
+pub mod group;
 mod guard;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod landlock;

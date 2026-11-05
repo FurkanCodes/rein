@@ -215,12 +215,14 @@ message, so typing ahead can't answer it by accident.
 | Esc or Ctrl-C while rein works | stop that turn; the conversation goes on |
 | Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
 | Alt-← / Alt-→ | a word left or right |
-| Ctrl-O | see every step's full output: ↑↓ scroll, ←→ other steps, `/` search, Esc back |
+| Ctrl-O | see every step's full output, and each background command's: ↑↓ scroll, ←→ other steps, `/` search, Esc back |
+| Ctrl-B while a command runs, with nothing typed | it goes on in the background, and the turn goes on (see [Background commands](#background-commands)). With something typed, it's a letter left |
 | Mouse wheel, PgUp / PgDn, Shift-↑ / ↓ | scroll the conversation |
 | Drag over text | select it and copy it to the clipboard |
 | Ctrl-L | draw the window again |
 | `/mode [trust\|ask\|edits\|auto\|read-only]` | show or change what runs without asking, and keep it for new conversations if you like |
 | `/memory` | the notes kept across conversations, rein's and Claude Code's: read one, or forget one of rein's (see [Memory](#memory)) |
+| `/tasks` | the commands running in the background: pick one to stop it (see [Background commands](#background-commands)) |
 | `/sandbox [on\|off]` | run commands in the sandbox, or as you'd run them, in any mode, and keep it for new conversations if you like (see [The sandbox](#the-sandbox)) |
 | `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
@@ -442,8 +444,10 @@ you picked, and leave the rest as it was. The sandbox is off unless it says
 
 - A request that fails before anything streams (network trouble, a busy
   server, a rate limit) is retried, 1, 2 and 4 seconds apart.
-- Commands are stopped after 60 seconds; the model can ask for up to 10
-  minutes for a slow build or test suite.
+- A command still running after 60 seconds (the model can ask for up to
+  10 minutes) goes on in the background rather than being stopped; see
+  [Background commands](#background-commands). What a command prints comes
+  back as its start and, more of it, its end, where it says how it went.
 - A turn goes on until the model is done, however many steps that takes,
   as in Claude Code, Codex and pi: you're watching, and Esc stops it. A
   model going round in circles is caught instead of counted: when the same
@@ -634,6 +638,35 @@ limits. Keys rein knows are taken out of a note before it's written, and
 what a terminal would act on, or a note's way out of its place in the
 first message, is taken out as notes are read. `memory = off` in the
 settings turns it off.
+
+## Background commands
+
+The model runs a dev server, a watcher or a long test suite in the
+background (`bash` with `background`), and goes on working: rein answers at
+once with its name, `b1`, and keeps what it prints in memory, its first
+64 KB and its latest 1 MB. With its `background` tool the model reads
+what's new since it last read, waits for a line (`until: "ready"`, up to
+10 minutes), or stops it. It never has to poll: when one ends, the model
+is told once, with its exit code and its last lines, in the turn if one
+is going, or in a turn of its own if you're not typing. A command you stop
+yourself, it hears of with your next message.
+
+A command still running at its timeout (60 seconds, or up to 10 minutes
+when the model asks) goes on in the background instead of being stopped,
+and so does one you press Ctrl-B on, with nothing typed in the box. One
+that ends but leaves something running (`npm run dev &`) is kept too:
+before, the server holding its output kept the turn waiting until the
+timeout, and then was killed with it.
+
+Each one running has a line under the box (`▸ b1 npm run dev · 2m 03s ·
+ready on :3000`), Ctrl-O shows what each printed, and `/tasks` lists them
+to stop one. At most 8 run at once: a ninth is refused with the list, so
+the model stops one itself, as nothing is dropped behind its back. They
+run in the walls they were started in, and `/undo` keeps what they change
+in the turn it's seen in. They stop with the conversation (leaving, `/new`,
+`/resume`, the end of `rein "task"`), and with the tab: each is asked to
+stop, then its whole process group is killed 2 seconds later. A compaction
+lists what still runs, so the model doesn't start a second server.
 
 ## Hooks
 
@@ -842,8 +875,8 @@ on Ubuntu 24.04 and in containers too. Landlock can only wall off whole
 folders, though, so on Linux what's protected inside the project, and a
 tool's settings beside its records, is guarded instead: rein notes it
 before a command that may change it, and puts it back after
-(something the command leaves running in the background could still change
-it later). Turned on where there's no sandbox (Windows, older kernels), or
+(a command in the background could still change it while it runs: it's put
+back when that command ends). Turned on where there's no sandbox (Windows, older kernels), or
 where it didn't start, rein says so as it starts and commands ask before
 they run, and `auto` refuses them: rein never runs one unconfined when it
 meant to confine it. The bar says `sandboxed` while it's on, and `no

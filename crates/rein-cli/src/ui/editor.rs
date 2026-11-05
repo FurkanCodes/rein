@@ -219,7 +219,7 @@ impl Editor {
             Key::Delete | Key::CtrlD if self.cursor < self.text.len() => {
                 self.text.remove(self.cursor);
             }
-            Key::Left => self.cursor = self.cursor.saturating_sub(1),
+            Key::Left | Key::CtrlB => self.cursor = self.cursor.saturating_sub(1),
             Key::Right => self.cursor = (self.cursor + 1).min(self.text.len()),
             Key::WordLeft => {
                 while self.cursor > 0 && !self.text[self.cursor - 1].is_alphanumeric() {

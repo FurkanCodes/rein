@@ -253,18 +253,8 @@ impl Node {
         let file = folder.join(format!("{pid}.json"));
         // Closing the tab hangs up on rein, which would end it before any
         // Drop runs: its files go first, so no one finds a rein that's gone.
-        for (kind, number) in [(tokio::signal::unix::SignalKind::hangup(), libc::SIGHUP), (tokio::signal::unix::SignalKind::terminate(), libc::SIGTERM)] {
-            if let Ok(mut signal) = tokio::signal::unix::signal(kind) {
-                let (file, socket) = (file.clone(), info.socket.clone());
-                tasks.spawn(async move {
-                    if signal.recv().await.is_some() {
-                        let _ = std::fs::remove_file(&file);
-                        let _ = std::fs::remove_file(&socket);
-                        std::process::exit(128 + number);
-                    }
-                });
-            }
-        }
+        crate::ending::remove_on_signal(file.clone());
+        crate::ending::remove_on_signal(info.socket.clone());
         if show.title {
             crate::ui::screen::save_title();
         }

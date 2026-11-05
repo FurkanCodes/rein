@@ -1461,7 +1461,7 @@ fn claude_thinking_always_goes_back_after_what_it_was_signed_with() {
     ])
     // Under the third request, over the second: see below. Sizes are
     // tuned by hand, so nothing else goes in the first message.
-    .with_env("REIN_COMPACT_AT", "9000")
+    .with_env("REIN_COMPACT_AT", "9500")
     .with_env("REIN_MEMORY", "off");
     let mut term = Term::start_with(&model, "claude-compact", 30, 100, &[("big.txt", &big)]);
     term.wait_for(IDLE);
@@ -4250,4 +4250,100 @@ fn a_server_added_with_its_key_keeps_it_out_of_the_screen_history_and_conversati
         let has = std::fs::read_to_string(&file).unwrap_or_default().contains("FAKE-mcp-pw");
         assert_eq!(has, file == term.dir.join("home/mcp.json"), "{} {} the key", file.display(), if has { "has" } else { "doesn't have" });
     }
+}
+
+/// Whether a process whose whole command is `command` is alive, not just
+/// waiting to be reaped: whole, so the shell that started it doesn't count.
+fn alive(command: &str) -> bool {
+    let ps = Command::new("ps").args(["-axo", "stat=,command="]).output().unwrap();
+    String::from_utf8_lossy(&ps.stdout).lines().any(|line| {
+        let (stat, rest) = line.trim_start().split_once(' ').unwrap_or_default();
+        !stat.starts_with('Z') && rest.trim() == command
+    })
+}
+
+/// A command the model starts in the background.
+fn starts(command: &str) -> Turn {
+    calls("bash", json!({ "command": command, "timeout_seconds": null, "access": "write", "reason": null, "background": true }))
+}
+
+#[test]
+fn a_dev_server_is_started_tested_against_and_stopped_in_one_turn() {
+    let server = "trap 'exit 0' TERM; echo starting; sleep 0.3; echo 'ready on 3000'; while true; do sleep 0.1; done";
+    let model = Model::start(vec![
+        starts(server),
+        calls("background", json!({ "id": "b1", "action": "read", "until": "ready", "seconds": 5 })),
+        runs("sleep 1.5; echo tested"),
+        calls("background", json!({ "id": "b1", "action": "stop", "until": null, "seconds": null })),
+        says("Started, tested and stopped."),
+    ])
+    .with_env("REIN_MODE", "trust");
+    let mut term = Term::start(&model, "dev-server", 30, 110);
+    term.wait_for(IDLE);
+    term.keys("start the server and test it\r");
+    // While the tests run against it, it has its line under the box.
+    term.wait_for("▸ b1 trap 'exit 0' TERM");
+    term.wait_for("Started, tested and stopped.");
+    let screen = term.text();
+    for part in ["started as b1", "Wait   b1 for ready  ready on 3000", "tested", "Stop   b1  was stopped"] {
+        assert!(screen.contains(part), "{part:?} isn't shown:\n{screen}");
+    }
+    term.wait_until("its line to go", |screen| !screen.contains("▸ b1"));
+    let waited = model.requests()[2].to_string();
+    assert!(waited.contains("A line matched: ready on 3000"), "{waited}");
+}
+
+#[test]
+fn a_background_command_that_ends_while_you_wait_is_told_to_the_model() {
+    let model =
+        Model::start(vec![starts("sleep 0.5; echo finished; exit 2"), says("It runs in the background."), says("It failed with exit code 2.")]).with_env("REIN_MODE", "trust");
+    let mut term = Term::start(&model, "bg-ends", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("run it\r");
+    term.wait_for("It runs in the background.");
+    term.wait_for("↳ b1 sleep 0.5; echo finished; exit 2 ended: exit 2");
+    term.wait_for("It failed with exit code 2.");
+    let told = model.requests()[2].to_string();
+    assert!(
+        told.contains(
+            "[rein: the background command b1 (sleep 0.5; echo finished; exit 2) ended: [exit code 2]. What it printed since you last read:\\nfinished\\n[It ran in the sandbox"
+        ),
+        "{told}"
+    );
+}
+
+#[test]
+fn ctrl_b_moves_a_command_to_the_background_and_leaving_stops_it() {
+    let model = Model::start(vec![runs("echo going; sleep 48.17"), says("It goes on.")]).with_env("REIN_MODE", "trust");
+    let mut term = Term::start(&model, "ctrl-b", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("run it\r");
+    term.wait_for("echo going; sleep 48.17");
+    term.wait_until("the command to run", |_| alive("sleep 48.17"));
+    term.keys("\x02");
+    term.wait_for("goes on in the background as b1");
+    term.wait_for("It goes on.");
+    term.wait_for("▸ b1 echo going; sleep 48.17");
+    // Its output is a Ctrl-O away.
+    term.keys("\x0f");
+    term.wait_for("b1  echo going; sleep 48.17 · running");
+    term.keys("\x1b");
+    term.wait_for(IDLE);
+    term.keys("/exit\r");
+    term.wait_exit();
+    assert!(!alive("sleep 48.17"), "the command was left running");
+}
+
+#[test]
+fn closing_the_tab_stops_what_runs_in_the_background() {
+    let model = Model::start(vec![starts("sleep 48.29"), says("It runs.")]).with_env("REIN_MODE", "trust");
+    let mut term = Term::start(&model, "hangup", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("run it\r");
+    term.wait_for("It runs.");
+    term.wait_until("the command to run", |_| alive("sleep 48.29"));
+    // SAFETY: kill only sends a signal, to the rein this test started.
+    assert_eq!(unsafe { libc::kill(term.child.id() as libc::pid_t, libc::SIGHUP) }, 0);
+    term.wait_exit();
+    assert!(!alive("sleep 48.29"), "the command outlived rein");
 }

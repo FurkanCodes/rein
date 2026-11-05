@@ -36,7 +36,7 @@ pub(crate) fn input(call: &ToolCall, root: &Path) -> Value {
     let input = match ToolName::of(call) {
         Some(ToolName::Bash) => {
             let timeout = args.get("timeout_seconds").and_then(Value::as_u64).map_or(Value::Null, |seconds| json!(seconds.saturating_mul(1000)));
-            json!({ "command": get("command"), "description": get("reason"), "timeout": timeout })
+            json!({ "command": get("command"), "description": get("reason"), "timeout": timeout, "run_in_background": get("background") })
         }
         Some(ToolName::Read) => json!({ "file_path": path("path"), "offset": get("start_line"), "limit": get("line_count") }),
         Some(ToolName::Write) => json!({ "file_path": path("path"), "content": get("content") }),
@@ -88,6 +88,7 @@ pub(crate) fn rewritten(call: &ToolCall, updated: &Value, root: &Path) -> Result
         Some(ToolName::Bash) => {
             take("command", "command");
             take("description", "reason");
+            take("run_in_background", "background");
             if let Some(ms) = updated.get("timeout").and_then(Value::as_u64) {
                 args.insert("timeout_seconds".into(), json!(ms.div_ceil(1000).max(1)));
             }

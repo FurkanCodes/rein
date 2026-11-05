@@ -109,13 +109,26 @@ finding. Each says why in a line.
 - Every network read has a timeout: a stream idle for 5 minutes is given up on,
   a callback connection that sends nothing for 10 seconds is closed.
 - Hold a std `Mutex` guard for as short as possible, and never across `.await`.
+  A `for` over a value taken from a guard (`for x in take(&mut *lock())`)
+  holds the lock for the whole loop: `stop_all` deadlocked dropping groups
+  that lock the same list. Take the value into a variable first.
+- A wait that wakes on a change never signals one itself: reads go through
+  a method that tells no one (`Jobs::with`), changes through one that does
+  (`change`). A read that called `notify_waiters` woke its own waiter, which
+  read again, and spun.
 
 ## Processes
 
 - A command runs in its own process group, held by a guard whose `Drop` kills
   the whole group. Killing `sh` alone left `cargo test` and dev servers running
-  after a timeout or Esc. A command that finishes normally disarms the guard, so
-  what it put in the background on purpose keeps running.
+  after a timeout or Esc. A command that finishes but leaves something in its
+  group (a server behind `&`) is kept as a background command, in view, and
+  stops with the conversation: before, the server held the output pipe open
+  and the turn waited for the timeout, then killed it.
+- A signal that ends rein (closing the tab: SIGHUP) runs no `Drop`, so every
+  armed group is kept in one list (`group::stop_all`) that the one signal
+  handler stops before exiting: otherwise a background dev server outlived
+  the tab for good.
 - Read a child's output with a cap; never `wait_with_output` on something that
   can print gigabytes.
 
@@ -327,6 +340,9 @@ finding. Each says why in a line.
   opened real OpenRouter sign-in pages.
 - Wait for the state you need (`wait_for`, `wait_until`), never `sleep` and then
   look: a menu's title can be drawn before its list.
+- Tests of state the whole process shares (the armed process groups) take
+  one lock: `stop_all` in one test killed the group another test was
+  checking, and it failed one run in three.
 - Check processes by their exact command, not `pgrep -f`, which also matches the
   shell that started the test.
 - An opt-in test is `#[ignore = "why"]`, so it shows as ignored, not passed.

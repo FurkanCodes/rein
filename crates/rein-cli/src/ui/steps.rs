@@ -76,7 +76,8 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
                 Some(Access::Outside) => " (outside the sandbox)",
                 _ => "",
             };
-            ("Run", format!("{first}{more}{past}"))
+            let behind = if BashCall::of(call).is_some_and(|bash| bash.background()) { " (in the background)" } else { "" };
+            ("Run", format!("{first}{more}{past}{behind}"))
         }
         Some(ToolName::Recall) => ("Recall", args["query"].as_str().unwrap_or_default().to_owned()),
         Some(ToolName::ToolSearch) => ("Find tools", args["query"].as_str().unwrap_or_default().to_owned()),
@@ -104,6 +105,14 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
         }
         Some(ToolName::Spawn) => {
             ("Sub-agent", format!("{}: {}", args["role"].as_str().unwrap_or_default(), args["task"].as_str().unwrap_or_default().lines().next().unwrap_or_default()))
+        }
+        Some(ToolName::Background) => {
+            let id = args["id"].as_str().unwrap_or_default();
+            match (args["action"].as_str(), args["until"].as_str().filter(|until| !until.is_empty())) {
+                (Some("stop"), _) => ("Stop", id.to_owned()),
+                (_, Some(until)) => ("Wait", format!("{id} for {until}")),
+                _ => ("Check", id.to_owned()),
+            }
         }
         Some(ToolName::Plan) => {
             let steps = args["steps"].as_array().map_or(0, Vec::len);
@@ -251,6 +260,19 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
                 None if stopped => style.red("stopped by a signal"),
                 None => style.dim("no exit code"),
             };
+            // Gone on in the background: that's how it went, so far.
+            let behind = tools::in_background(output);
+            if let Some(at) = lines.iter().position(|line| line.starts_with(tools::MOVED)) {
+                lines.truncate(at);
+            }
+            let (failed, status) = match behind {
+                Some(id) if output.starts_with(tools::STARTED) => {
+                    lines.clear();
+                    (false, style.dim(&format!("started as {id}")))
+                }
+                Some(id) => (false, style.yellow(&format!("goes on in the background as {id}"))),
+                None => (failed, status),
+            };
             let body: Vec<&str> = lines.into_iter().filter(|line| !line.trim().is_empty()).collect();
             // A failure shows where it says what went wrong; success, how it ended.
             let mut shown: Vec<&str> = if failed {
@@ -337,6 +359,15 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
                 _ => "read",
             };
             plain(Some(true), style.dim(said))
+        }
+        // `A line matched: ready on 3000`, `b1 (npm run dev) is still running.`
+        Some(ToolName::Background) => {
+            let first = output.lines().next().unwrap_or_default();
+            let said = match first.split_once(": ") {
+                Some(("A line matched", line)) => line,
+                _ => first.split_once(") ").map_or(first, |(_, rest)| rest).trim_end_matches('.'),
+            };
+            plain(Some(true), style.dim(&fit(said, 100)))
         }
         Some(ToolName::Recall) => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();

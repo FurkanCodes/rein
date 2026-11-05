@@ -54,6 +54,9 @@ pub enum Key {
     /// Ctrl-V: an image from the clipboard (text comes as a paste).
     CtrlV,
     CtrlO,
+    /// Ctrl-B: a cursor left, or with nothing typed, the running command
+    /// goes on in the background.
+    CtrlB,
     /// Ctrl-R: find a message sent before.
     CtrlR,
     /// The window came to the front (`true`) or went behind another, as
@@ -138,7 +141,7 @@ fn decode(bytes: &[u8]) -> Decoded {
     match bytes[0] {
         0x1b => escape(bytes),
         0x01 => key(Key::Home, 1),
-        0x02 => key(Key::Left, 1),
+        0x02 => key(Key::CtrlB, 1),
         0x03 => key(Key::CtrlC, 1),
         0x04 => key(Key::CtrlD, 1),
         0x05 => key(Key::End, 1),
@@ -273,7 +276,7 @@ fn spelled(params: &[u8]) -> Option<Key> {
             let c = char::from_u32(code)?;
             match (ctrl, alt, c.to_ascii_lowercase()) {
                 (true, false, 'a') => Key::Home,
-                (true, false, 'b') => Key::Left,
+                (true, false, 'b') => Key::CtrlB,
                 (true, false, 'c') => Key::CtrlC,
                 (true, false, 'd') => Key::CtrlD,
                 (true, false, 'e') => Key::End,

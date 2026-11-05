@@ -284,10 +284,16 @@ impl Undo {
     }
 
     /// What was done since a look before that never had its look after.
-    fn settle(&mut self, hides: Hides) {
+    pub(crate) fn settle(&mut self, hides: Hides) {
         if self.pending {
             self.after_all(hides);
         }
+    }
+
+    /// A command in the background may still change files: the next look
+    /// keeps what it changed since this one in the turn, as rein's doing.
+    pub(crate) fn still_changing(&mut self) {
+        self.pending = self.whole;
     }
 
     /// Before a command that may change files: the whole project as it is

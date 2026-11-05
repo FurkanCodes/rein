@@ -139,6 +139,8 @@ pub trait Ui {
     }
     /// Something heard has gone into the conversation, here.
     fn steered(&mut self, _heard: &Heard) {}
+    /// A background command ended, and the model is told, here.
+    fn background_ended(&mut self, _ended: &crate::background::Ended) {}
     /// Does what the model asked of another rein (`peers`, `message`,
     /// `delegate`), and says how it went. Only offered where there are
     /// other reins to reach; see [`Agent::with_peer_tools`].
@@ -448,6 +450,8 @@ impl<M: Model> Agent<M> {
         self.begin(&prompt).await?;
         self.offer_servers_tools(ui).await;
         self.note_skills()?;
+        // What ended unannounced (one you stopped), before what you say of it.
+        self.note_ended(ui).await?;
         self.record(Item::User(prompt.clone()))?;
         self.attach(&prompt, ui).await?;
         self.hooks_add(&heard.context, ui)?;
@@ -504,7 +508,36 @@ impl<M: Model> Agent<M> {
 
     /// Runs your hooks on the session's end, as `ended`.
     pub async fn session_ended(&self, ended: hooks::Ended, ui: &mut impl Ui) {
+        // What it started in the background goes with it.
+        let stopped = self.tools.jobs().stop_all().await;
+        if !stopped.is_empty() {
+            let names: Vec<String> = stopped.iter().map(|listed| format!("{} ({})", listed.id, listed.command)).collect();
+            let s = if names.len() == 1 { "" } else { "s" };
+            ui.note(&format!("stopped the background command{s} still running: {}", names.join(", ")));
+        }
         self.hook(hooks::Event::SessionEnd(ended), ui).await;
+    }
+
+    /// Works on what's ended in the background while nobody was talking,
+    /// as [`Agent::send`] does on the user's message.
+    pub async fn hear_ended(&mut self, ui: &mut impl Ui) -> Result<Outcome> {
+        self.begin("[a background command ended]").await?;
+        self.offer_servers_tools(ui).await;
+        if !self.note_ended(ui).await? {
+            return Ok(Outcome::Done);
+        }
+        self.work(ui).await
+    }
+
+    /// Tells the model of the background commands that ended since it was
+    /// last told: whether there were any.
+    async fn note_ended(&mut self, ui: &mut impl Ui) -> Result<bool> {
+        let ended = self.tools.ended().await;
+        for one in &ended {
+            ui.background_ended(one);
+            self.record(Item::User(one.note.clone()))?;
+        }
+        Ok(!ended.is_empty())
     }
 
     /// Runs your hooks on a turn that ended on `error`.
@@ -532,6 +565,7 @@ impl<M: Model> Agent<M> {
     pub async fn hear(&mut self, from: &str, text: &str, ui: &mut impl Ui) -> Result<Outcome> {
         self.begin(&format!("{from}: {text}")).await?;
         self.offer_servers_tools(ui).await;
+        self.note_ended(ui).await?;
         self.record(Item::User(crate::peers::heard(from, text)))?;
         self.work(ui).await
     }
@@ -730,7 +764,9 @@ impl<M: Model> Agent<M> {
                     return Ok(Outcome::StepLimit(limit));
                 }
                 // Done, unless the user wrote meanwhile: then that's next.
-                if self.steer(ui.steering(), ui).await? {
+                // Or a command ended in the background.
+                let ended = self.note_ended(ui).await?;
+                if self.steer(ui.steering(), ui).await? || ended {
                     continue;
                 }
                 // Or a hook of yours says the work isn't done.
@@ -766,7 +802,9 @@ impl<M: Model> Agent<M> {
             if let Some(by) = self.hook_stopped.take() {
                 return Ok(Outcome::HookStopped(by));
             }
-            // What the user wrote during the last step goes with its result.
+            // What ended in the background, and what the user wrote, during
+            // the last step goes with its result.
+            self.note_ended(ui).await?;
             self.steer(ui.steering(), ui).await?;
         }
     }
@@ -1369,7 +1407,15 @@ impl<M: Model> Agent<M> {
         if summary.iter().all(|text| text.trim().is_empty()) {
             return Err(Error::Incomplete("the model wrote no summary".into()));
         }
-        let message = compact::summary_message(&summary.join("\n"), &compact::record(&self.window.full));
+        let mut record = compact::record(&self.window.full);
+        // What still runs, so it isn't started again: a second dev server
+        // after compaction, in Claude Code.
+        let running: Vec<String> =
+            self.tools.jobs().list().into_iter().filter(|listed| listed.ended.is_none()).map(|listed| format!("- {}: `{}`", listed.id, listed.command)).collect();
+        if !running.is_empty() {
+            record.push_str(&format!("Still running in the background, so don't start them again (read or stop them with background):\n{}\n", running.join("\n")));
+        }
+        let message = compact::summary_message(&summary.join("\n"), &record);
 
         let pinned = usize::from(self.history.first().is_some_and(context::is_context));
         // Keep less word for word when the limit is small (as in tests).
@@ -2531,6 +2577,62 @@ mod tests {
         agent.set_skills(find(), crate::skills::LEAST_ROOM);
         agent.send("fourth".into(), &mut person).await.unwrap();
         assert!(agent.history.iter().any(|item| matches!(item, Item::User(text) if text == crate::skills::AS_LISTED)), "as listed again");
+    }
+
+    fn in_background(id: &str, command: &str) -> Item {
+        Item::ToolCall(ToolCall { call_id: id.into(), name: "bash".into(), arguments: json!({ "command": command, "background": true }).to_string() })
+    }
+
+    #[tokio::test]
+    async fn a_background_command_that_ends_mid_turn_is_told_with_the_next_step_once() {
+        let turns = vec![vec![in_background("bg", "echo built; exit 4")], vec![bash("wait", "sleep 0.6")], vec![Item::Assistant("Seen.".into())]];
+        let mut agent = agent("bg-mid-turn", turns);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("build in the background".into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        let notes = |input: &[Item]| input.iter().filter(|item| matches!(item, Item::User(text) if crate::background::is_note(text))).count();
+        assert_eq!(notes(&requests[1].input), 0, "it hadn't ended yet");
+        let last = &requests[2].input;
+        assert_eq!(notes(last), 1);
+        // After the step it ended during, at the end of the conversation.
+        let Some(Item::User(note)) = last.last() else { panic!("{last:?}") };
+        assert!(note.contains("b1 (echo built; exit 4) ended: [exit code 4]") && note.contains("\nbuilt"), "{note}");
+        assert!(matches!(&last[last.len() - 2], Item::ToolResult { call_id, .. } if call_id == "wait"));
+        assert!(!compact::record(&agent.window.full).contains("ended: [exit code 4]"), "not as something you said");
+    }
+
+    #[tokio::test]
+    async fn a_command_you_stopped_is_told_just_before_your_next_message() {
+        let turns = vec![vec![in_background("bg", "sleep 49.31")], vec![Item::Assistant("Running.".into())], vec![Item::Assistant("Noted.".into())]];
+        let mut agent = agent("bg-yours", turns);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("start it".into(), &mut person).await.unwrap();
+        agent.tools.jobs().stop_yours("b1").await.unwrap();
+        agent.send("I stopped it".into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        let input = &requests[2].input;
+        let yours = input.iter().position(|item| matches!(item, Item::User(text) if text == "I stopped it")).unwrap();
+        assert!(matches!(&input[yours - 1], Item::User(text) if text.contains("b1 (sleep 49.31) was stopped by the user.")), "{:?}", input[yours - 1]);
+    }
+
+    #[tokio::test]
+    async fn the_compaction_record_says_what_still_runs_and_the_end_stops_it() {
+        let turns = vec![vec![in_background("bg", "sleep 49.21")], vec![Item::Assistant("Running.".into())], vec![Item::Assistant("Summary.".into())]];
+        let mut agent = agent("bg-compact", turns);
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("start it".into(), &mut person).await.unwrap();
+        agent.set_limit(5);
+        agent.compact(None, true, &mut person).await.unwrap();
+        let summary = agent.history.iter().find_map(|item| if compact::is_summary(item) { Some(format!("{item:?}")) } else { None }).unwrap();
+        assert!(summary.contains("Still running in the background, so don't start them again") && summary.contains("- b1: `sleep 49.21`"), "{summary}");
+        agent.session_ended(hooks::Ended::Exit, &mut person).await;
+        assert!(agent.tools.jobs().list().is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let ps = std::process::Command::new("ps").args(["-axo", "stat=,command="]).output().unwrap();
+        let left = String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .any(|line| line.trim_start().split_once(' ').is_some_and(|(stat, rest)| !stat.starts_with('Z') && rest.trim() == "sleep 49.21"));
+        assert!(!left, "the sleep was left running");
     }
 
     /// An image you paste goes with your message, as a read made for you.

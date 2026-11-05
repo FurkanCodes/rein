@@ -25,6 +25,7 @@ mod commands;
 mod connect;
 mod conversation;
 mod effort;
+mod ending;
 mod format;
 mod harden;
 mod hooks;
@@ -39,6 +40,7 @@ mod rules;
 mod search;
 mod settings;
 mod skills;
+mod tasks;
 use settings::Settings;
 mod terminal;
 mod ui;
@@ -84,6 +86,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(args: Vec<String>) -> CliResult {
+    ending::watch();
     let http = rein_llm::http::client(concat!("rein/", env!("CARGO_PKG_VERSION"))).map_err(|e| e.to_string())?;
     if let Ok(dir) = config_dir() {
         claude::forget_borrowed_sign_in(&dir, &|line| say!("{line}"));

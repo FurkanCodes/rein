@@ -261,6 +261,13 @@ them, and Codex's long-running terminal sessions.
 **Done when:** the model starts a dev server, tests against it, and
 stops it, all in one turn, with you seeing each part.
 
+**Built.** As researched (2026-11-05): Claude Code pushes the end to the
+model, Codex makes it poll (a request per poll), Cursor waits for a line.
+rein pushes the end once, waits for a line, and keeps a command that hits
+its timeout, gets Ctrl-B, or leaves a server behind `&`, instead of
+killing it. Each has a line under the box, `/tasks` stops one, a ninth is
+refused rather than one evicted, and closing the tab stops them too.
+
 ### 6. Errors after each edit
 
 **What:** after the model edits a file, rein checks it, and the model

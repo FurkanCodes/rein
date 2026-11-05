@@ -154,6 +154,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.input.set_bar(terminal.bar());
     let max_output = setup.max_output(&model_name);
     let mut agent = Agent::new(Llm { client, record }, tools, permissions, model_name, limit, loaded, context);
+    terminal.input.follow_jobs(agent.tools.jobs());
     // Only a conversation joins the others: a task done on its own has no
     // one to answer what they send.
     let child = args.child.as_ref().map(|(pid, id)| (*pid, id.as_str()));
@@ -414,6 +415,7 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Te
                 agent.send(prompt.clone(), terminal).await
             }
             Start::Peer { from, text } => agent.hear(from, text, terminal).await,
+            Start::Ended => agent.hear_ended(terminal).await,
         }
     };
     let outcome = tokio::select! {
@@ -482,6 +484,8 @@ pub(crate) enum Start {
     You(String),
     /// What another rein sent.
     Peer { from: String, text: String },
+    /// A command in the background ended while nobody was talking.
+    Ended,
 }
 
 /// How many steps a turn may take: no limit while you're watching, who can
@@ -578,7 +582,8 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
         // How much of your limits the last turn left, where the provider
         // can be asked; it comes while you type.
         terminal.meters.ask(&agent.model.client, &agent.model_name);
-        let line = match message(terminal, &mut last_interrupt).await {
+        let jobs = agent.tools.jobs().clone();
+        let line = match message(terminal, &jobs, &mut last_interrupt).await {
             Said::Message(line) => {
                 in_a_row = 0;
                 // Typed into a sub-agent: it's yours now, and stays open.
@@ -591,6 +596,16 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 }
                 if leaves(terminal) {
                     break;
+                }
+                continue;
+            }
+            // The model hears of it, and goes on from there.
+            Said::Ended => {
+                terminal.start_turn(None);
+                let outcome = turn(agent, Start::Ended, terminal).await;
+                crate::peers::talk::close_finished(terminal).await;
+                if let Err(e) = outcome {
+                    say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&format!("✗ {e}")));
                 }
                 continue;
             }
@@ -838,6 +853,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         Slash::Skills => crate::skills::command(agent, terminal, &setup.root, setup.skill_room(&agent.model_name)).await?,
         Slash::Hooks => crate::hooks::command(agent, terminal, &config_dir()?).await?,
         Slash::Memory => crate::memory::command(agent, terminal).await?,
+        Slash::Tasks => crate::tasks::command(agent, terminal).await?,
         Slash::Search(with) => crate::search::command(with, agent, terminal, setup).await?,
         Slash::New => {
             let (loaded, context) = setup.open(None, &setup.current(agent))?;
@@ -1174,6 +1190,8 @@ pub(crate) enum Said {
     Message(String),
     /// Another rein sent something while you hadn't started typing.
     Peer(crate::peers::node::Incoming),
+    /// A command in the background ended, while you hadn't started typing.
+    Ended,
     /// Shift-Tab: on to the next mode.
     NextMode,
     /// Ctrl-V: an image from the clipboard.
@@ -1196,7 +1214,7 @@ async fn from_peers(peers: &mut Option<crate::peers::Node>) -> crate::peers::nod
 /// Reads your next message. A line ending in `\` continues on the next.
 /// Ctrl-C clears what you typed; a second one within two seconds, or
 /// Ctrl-D, ends the conversation.
-pub(crate) async fn message(terminal: &mut Terminal, last_interrupt: &mut Option<std::time::Instant>) -> Said {
+pub(crate) async fn message(terminal: &mut Terminal, jobs: &rein_agent::background::Jobs, last_interrupt: &mut Option<std::time::Instant>) -> Said {
     let mut text = String::new();
     loop {
         let prompt = if text.is_empty() { "you    " } else { "…      " };
@@ -1211,6 +1229,10 @@ pub(crate) async fn message(terminal: &mut Terminal, last_interrupt: &mut Option
             incoming = from_peers(&mut terminal.peers), if waiting => {
                 terminal.input.stop_reading();
                 return Said::Peer(incoming);
+            }
+            () = jobs.ended(), if waiting => {
+                terminal.input.stop_reading();
+                return Said::Ended;
             }
             // The box keeps what's typed, and reading picks up where it was.
             meters = terminal.meters.answered() => {

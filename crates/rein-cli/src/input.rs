@@ -32,6 +32,7 @@ use crate::ui::slash::{self, Entry as Listed, Offer};
 use crate::ui::style::{GUTTER, Style, fit, width};
 use crate::ui::viewer::Viewer;
 use crate::ui::wrap::Wrap;
+use rein_agent::background::Jobs;
 use rein_agent::sandbox::Sandbox;
 
 /// What reading a line produced.
@@ -230,6 +231,12 @@ struct Boxed {
     bar: String,
     replies: tokio::sync::mpsc::UnboundedSender<Read>,
     interrupted: Arc<tokio::sync::Notify>,
+    /// The conversation's commands: a line under the box for each running
+    /// in the background. Weak, so they stop with the conversation.
+    jobs: Option<std::sync::Weak<Jobs>>,
+    /// What of them was drawn, and when: the box is drawn again when they
+    /// change, and each second for their times.
+    jobs_drawn: (u64, Instant),
 }
 
 fn locked(boxed: &Mutex<Boxed>) -> MutexGuard<'_, Boxed> {
@@ -468,12 +475,37 @@ impl Boxed {
         })
     }
 
-    /// Under the box: a note, or the bar.
+    /// Under the box: a note, or the bar, then a line for each command
+    /// running in the background.
     fn under(&self) -> Vec<String> {
-        match &self.notice {
+        let mut lines = match &self.notice {
             Some((note, _)) => vec![format!(" {}", Style::stderr().yellow(note))],
             None => vec![self.bar.clone()],
+        };
+        lines.extend(self.job_lines());
+        lines
+    }
+
+    /// `▸ b1 npm run dev · 2m 03s · ready on :3000`, for each command running
+    /// in the background, the first few.
+    fn job_lines(&self) -> Vec<String> {
+        let Some(jobs) = self.jobs.as_ref().and_then(std::sync::Weak::upgrade) else { return Vec::new() };
+        let s = Style::stderr();
+        let running: Vec<rein_agent::background::Listed> = jobs.list().into_iter().filter(|job| job.ended.is_none()).collect();
+        let room = screen::size().1.saturating_sub(1);
+        let mut lines: Vec<String> = running
+            .iter()
+            .take(JOB_LINES)
+            .map(|job| {
+                let command = rein_agent::background::plain(job.command.lines().next().unwrap_or_default());
+                let last = job.last.as_ref().map(|last| format!(" · {last}")).unwrap_or_default();
+                fit(&format!(" {} {} {command}{}", s.blue("▸"), s.bold(&job.id), s.dim(&format!(" · {}{last}", seconds(job.took)))), room)
+            })
+            .collect();
+        if running.len() > JOB_LINES {
+            lines.push(s.dim(&format!("   +{} more · /tasks", running.len() - JOB_LINES)));
         }
+        lines
     }
 
     fn found(&self, search: &Search) -> Vec<String> {
@@ -679,8 +711,22 @@ impl Boxed {
             }
             return;
         }
-        if key == Key::CtrlO && !self.outputs.is_empty() {
-            let mut viewer = Viewer::new(self.outputs.clone());
+        // With nothing typed, the running command goes on in the
+        // background; otherwise it's the cursor, a letter left.
+        if key == Key::CtrlB
+            && self.editor.text().is_empty()
+            && let Some(jobs) = self.jobs.as_ref().and_then(std::sync::Weak::upgrade)
+        {
+            jobs.detach();
+            return;
+        }
+        // Every step's output, then each background command's as it is now.
+        let backgrounds: Vec<crate::ui::viewer::Entry> = match (&key, self.jobs.as_ref().and_then(std::sync::Weak::upgrade)) {
+            (Key::CtrlO, Some(jobs)) => jobs.outputs().into_iter().map(|(title, output)| crate::ui::viewer::Entry::new(title, &output)).collect(),
+            _ => Vec::new(),
+        };
+        if key == Key::CtrlO && !(self.outputs.is_empty() && backgrounds.is_empty()) {
+            let mut viewer = Viewer::new(self.outputs.iter().cloned().chain(backgrounds).collect());
             let (rows, cols) = screen::size();
             let shown = viewer.render(rows, cols, Style::stderr());
             self.pinned.open_viewer(&shown);
@@ -973,11 +1019,27 @@ impl Boxed {
         if expired {
             self.notice = None;
         }
-        if expired || self.busy.is_some() {
+        // Commands in the background: drawn again when they change, and
+        // each second while one runs, for its time.
+        let jobs = self.jobs.as_ref().and_then(std::sync::Weak::upgrade);
+        let (drawn, at) = self.jobs_drawn;
+        let due = jobs.is_some_and(|jobs| {
+            let version = jobs.version();
+            let due = (version != drawn && at.elapsed() >= Duration::from_millis(300)) || (jobs.running() > 0 && at.elapsed() >= Duration::from_secs(1));
+            if due {
+                self.jobs_drawn = (version, Instant::now());
+            }
+            due
+        });
+        if expired || self.busy.is_some() || due {
             self.draw();
         }
     }
 }
+
+/// The most commands running in the background that get a line under the
+/// box; `/tasks` lists them all.
+const JOB_LINES: usize = 4;
 
 /// The most lines of a command a question shows; a longer one is shown
 /// above the box too.
@@ -1184,6 +1246,8 @@ impl Input {
                 bar: String::new(),
                 replies: tx,
                 interrupted,
+                jobs: None,
+                jobs_drawn: (0, Instant::now()),
             }));
             // A window that changes size gets the box drawn again right
             // away, not only at the next key.
@@ -1455,6 +1519,13 @@ impl Input {
         if let Some(boxed) = &self.boxed {
             locked(boxed).outputs.push(crate::ui::viewer::Entry::new(title, output));
         }
+    }
+
+    /// Shows a line under the box for each of `jobs` running in the
+    /// background, and gives Ctrl-B the one waited for.
+    pub fn follow_jobs(&self, jobs: &Arc<Jobs>) {
+        let jobs = Arc::downgrade(jobs);
+        self.with(|boxed| boxed.jobs = Some(jobs));
     }
 
     /// Shows `bar` under the box.

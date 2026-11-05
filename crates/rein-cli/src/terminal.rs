@@ -703,6 +703,16 @@ impl Ui for Terminal {
         say!("{lead}{}", self.err.dim(&format!("↳ {note}")));
     }
 
+    /// `↳ b1 npm run dev ended: exit 1`, where the model is told.
+    fn background_ended(&mut self, ended: &rein_agent::background::Ended) {
+        self.end_line();
+        self.gap_before_step();
+        let lead = self.lead();
+        let command = rein_agent::background::plain(ended.command.lines().next().unwrap_or_default());
+        let line = format!("↳ {} {command} ended: {}", ended.id, ended.exit.said());
+        say!("{lead}{}", if ended.exit.failed() { self.err.red(&line) } else { self.err.dim(&line) });
+    }
+
     fn meters(&mut self, meters: &[rein_llm::Meter]) {
         self.take_meters(meters.to_vec());
     }

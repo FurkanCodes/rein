@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use rein_llm::{Loading, Tool, ToolCall};
 
+use crate::background::{self, Foreground, Jobs, Started};
 use crate::redact::{self, Secrets};
 use crate::sandbox::{self, Access, Run};
 use crate::undo::{Listed, Plan, Undo, Watched};
@@ -18,7 +19,7 @@ use serde_json::{Value, json};
 
 /// The most a tool sends back. Everything the model sees is resent with
 /// every later request, so long outputs get cut.
-const MAX_OUTPUT: usize = 30_000;
+pub(crate) const MAX_OUTPUT: usize = 30_000;
 
 pub struct Tools {
     /// The project directory: `read` can't see outside it, `bash` starts in it.
@@ -43,6 +44,9 @@ pub struct Tools {
     /// The images each call gave, by its ID, until the agent takes them
     /// into the conversation after its result.
     pictures: std::sync::Mutex<std::collections::HashMap<String, Vec<rein_llm::Image>>>,
+    /// The commands `bash` started, the ones in the background too: they
+    /// stop when these tools go.
+    jobs: std::sync::Arc<Jobs>,
 }
 
 /// A file the model named, found inside the project: the project, resolved,
@@ -143,6 +147,9 @@ pub struct BashCall {
     /// Why it needs network or outside access, for the user.
     #[serde(default)]
     reason: Option<String>,
+    /// Run it in the background: rein answers at once.
+    #[serde(default)]
+    background: Option<bool>,
 }
 
 impl BashCall {
@@ -158,6 +165,11 @@ impl BashCall {
 
     pub fn access(&self) -> Access {
         self.access.unwrap_or_default()
+    }
+
+    /// Whether it's to run in the background.
+    pub fn background(&self) -> bool {
+        self.background == Some(true)
     }
 
     /// The reason given, if it says anything.
@@ -196,7 +208,7 @@ pub enum Ended<'a> {
     Signal,
 }
 
-const SIGNAL_LINE: &str = "[stopped by a signal]";
+pub(crate) const SIGNAL_LINE: &str = "[stopped by a signal]";
 
 /// How the command whose result is `output` ended, and which of its lines
 /// says so: everything before that line is what the command printed. Notes
@@ -244,10 +256,13 @@ pub enum ToolName {
     Spawn,
     /// Notes that outlast the conversation: see [`crate::memory`].
     Memory,
+    /// Reading what a background command prints, or stopping it: see
+    /// [`crate::background`].
+    Background,
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 16] = [
+    pub const ALL: [ToolName; 17] = [
         Self::Read,
         Self::Grep,
         Self::Glob,
@@ -264,6 +279,7 @@ impl ToolName {
         Self::Delegate,
         Self::Spawn,
         Self::Memory,
+        Self::Background,
     ];
 
     /// The name the model knows it by.
@@ -285,6 +301,7 @@ impl ToolName {
             Self::Delegate => "delegate",
             Self::Spawn => "spawn",
             Self::Memory => "memory",
+            Self::Background => "background",
         }
     }
 
@@ -341,6 +358,7 @@ impl Tools {
             images: std::env::temp_dir().join(format!("rein-images-{}", std::process::id())),
             pictures: Default::default(),
             memory: None,
+            jobs: Jobs::new(),
         }
     }
 
@@ -407,12 +425,29 @@ impl Tools {
     /// added it.
     pub fn hide_too(&mut self, values: impl IntoIterator<Item = String>) {
         self.secrets = self.secrets.and(values);
+        self.jobs.hide(self.secrets.clone());
     }
 
     /// Hides `secrets` in what the tools say: see [`redact`].
     pub fn with_secrets(mut self, secrets: Secrets) -> Self {
         self.secrets = secrets;
+        self.jobs.hide(self.secrets.clone());
         self
+    }
+
+    /// The commands `bash` started, those in the background among them.
+    pub fn jobs(&self) -> &std::sync::Arc<Jobs> {
+        &self.jobs
+    }
+
+    /// The background commands that ended since the model was told, now
+    /// told: what `/undo` didn't see them change is kept in the turn first.
+    pub async fn ended(&self) -> Vec<background::Ended> {
+        let ended = self.jobs.untold();
+        if !ended.is_empty() {
+            self.on_undo(|undo, hides| undo.settle(hides)).await;
+        }
+        ended
     }
 
     pub fn with_sandbox(mut self, sandbox: sandbox::Shared) -> Self {
@@ -488,12 +523,15 @@ impl Tools {
              ssh or a terminal. When the user has the sandbox on, commands run in it, within that access: secrets in \
              the home folder can't be read and files that run code later (.git/hooks, .git/config, .rein) can't be \
              changed. Depending on the mode, a command, or more access, may need the user's approval, or be refused. \
-             Commands are stopped after 60 seconds unless you ask for longer, up to 600, for slow builds and test \
-             suites."
+             A command still running after 60 seconds, or the timeout you ask for (up to 600, for slow builds and \
+             test suites), goes on in the background. Start servers, watchers and anything else that keeps running \
+             with background: rein answers at once with its name, and tells you when it ends."
         } else {
             "Run a shell command in the project root and return its output and exit code. Say what it needs in \
-             access. Depending on the mode, the user may approve each command before it runs. Commands are stopped \
-             after 60 seconds unless you ask for longer, up to 600, for slow builds and test suites."
+             access. Depending on the mode, the user may approve each command before it runs. A command still \
+             running after 60 seconds, or the timeout you ask for (up to 600, for slow builds and test suites), goes \
+             on in the background. Start servers, watchers and anything else that keeps running with background: \
+             rein answers at once with its name, and tells you when it ends."
         }
     }
 
@@ -607,7 +645,25 @@ impl Tools {
                         "enum": Access::ALL.map(Access::as_str),
                         "description": "What the command needs. look: only reads. write: also changes files in the project. network: also uses the internet. outside: runs without the sandbox."
                     },
-                    "reason": { "type": ["string", "null"], "description": "For network or outside: why, in a few words the user will read. Null otherwise." }
+                    "reason": { "type": ["string", "null"], "description": "For network or outside: why, in a few words the user will read. Null otherwise." },
+                    "background": { "type": ["boolean", "null"], "description": "True to run it in the background, for a server, a watcher or a long run: rein answers at once with its name (b1). Null for no." }
+                })),
+            },
+            Tool {
+                loading: Loading::UpFront,
+                strict: true,
+                name: ToolName::Background.as_str().into(),
+                description: "Check on a command running in the background, or stop it. You're told when one ends \
+                              without asking, so never poll in a loop or sleep. read: what it printed since you last \
+                              read, and whether it still runs; with until, it first waits for a line matching that \
+                              regular expression (a server's \"ready\" line, say), or for the command to end. stop: \
+                              stops it and everything it started. Commands stop when the conversation ends."
+                    .into(),
+                parameters: object(json!({
+                    "id": { "type": "string", "description": "Its name, like b1." },
+                    "action": { "type": "string", "enum": ["read", "stop"], "description": "read or stop." },
+                    "until": { "type": ["string", "null"], "description": "For read: a regular expression (Rust syntax) to wait for in a line it prints, like `ready|listening`. Null to read at once." },
+                    "seconds": { "type": ["integer", "null"], "description": "For read with until: how long to wait, at most 600. Null for 30." }
                 })),
             },
         ];
@@ -627,6 +683,7 @@ impl Tools {
             Some(ToolName::Grep) => self.grep(&call.arguments).await,
             Some(ToolName::Glob) => self.glob(&call.arguments).await,
             Some(ToolName::Bash) => self.bash(&call.arguments, how).await,
+            Some(ToolName::Background) => self.jobs.call(&call.arguments).await,
             Some(ToolName::Write) => self.write(&call.arguments).await,
             Some(ToolName::Edit) => self.edit(&call.arguments).await,
             // The checklist is for showing; the model keeps it in its own words.
@@ -838,11 +895,19 @@ impl Tools {
                 *locked(&self.watched) = Some(Watched::Changed(changed));
             }
         }
+        // What one in the background changes is rein's doing too: the next
+        // look keeps it in the turn it's seen in.
+        if self.jobs.writing() {
+            self.on_undo(|undo, _| undo.still_changing()).await;
+        }
         ran
     }
 
     async fn command(&self, args: &BashCall, how: Run) -> Result<String, String> {
         let timeout = args.timeout_seconds.map_or(self.timeout, |s| Duration::from_secs(s).clamp(Duration::from_secs(1), MAX_TIMEOUT));
+        if args.background() && self.jobs.running() >= background::MOST {
+            return Err(self.too_many());
+        }
         // Where the sandbox can't keep a command from what runs code later,
         // that's noted now and put back once it's done, or dropped (Esc).
         // Before the command, so it's dropped after its group is stopped.
@@ -864,41 +929,102 @@ impl Tools {
         // A group of its own, so stopping it stops what it started too.
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command.spawn().map_err(|e| format!("can't start sh: {e}"))?;
+        let child = command.spawn().map_err(|e| format!("can't start sh: {e}"))?;
         let group = sandbox::Group::new(child.id());
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let run = async { tokio::join!(read_capped(stdout), read_capped(stderr), child.wait()) };
-        // Given up on, or the turn stopped: `group` is dropped, and with it
-        // everything the command started.
-        let Ok(((out, out_total), (err, err_total), status)) = tokio::time::timeout(timeout, run).await else {
-            return Err(format!("the command took longer than {timeout:?} and was stopped"));
-        };
-        let status = status.map_err(|e| format!("the command failed to run: {e}"))?;
-        // Done: what it put in the background on purpose, like a server,
-        // is its own business.
-        group.disarm();
-        let mut text = String::from_utf8_lossy(&out).into_owned();
-        text.push_str(&String::from_utf8_lossy(&err));
-        let dropped = (out_total - out.len()) + (err_total - err.len());
-        if dropped > 0 {
-            text.push_str(&format!("\n[{dropped} more bytes of output weren't kept]\n"));
+        let id = self.jobs.follow(Started { child, group, guard, command: args.command.clone(), how });
+        // Given up on, or the turn stopped: dropped, and with it everything
+        // the command started.
+        let waiting = Foreground::new(&self.jobs, id);
+        if args.background() {
+            waiting.keep();
+            self.jobs.to_background(id, 0);
+            return Ok(format!(
+                "{STARTED}{id}. You'll be told when it ends, so don't poll or sleep: read what it prints, or wait for a line like a \
+                 server's \"ready\", with background."
+            ));
         }
-        // A sandboxed command that failed says what its walls were: they may
-        // be why, and the model can ask for more.
-        let mut note = match how {
-            Run::Sandboxed(walls) if !status.success() => format!("\n{}", walls.note()),
-            _ => String::new(),
+        let budget = MAX_OUTPUT - 2000;
+        let moved = tokio::select! {
+            settled = self.jobs.settled(id) => (settled == background::Settled::Left).then_some(Moved::Left),
+            () = tokio::time::sleep(timeout) => Some(Moved::Timeout),
+            () = self.jobs.detached() => Some(Moved::You),
         };
-        let restored = guard.map(sandbox::Guard::finish).unwrap_or_default();
-        if !restored.is_empty() {
-            note.push_str(&format!("\n[The sandbox here can't keep a command from files that run code later, so rein put them back as they were: {}.]", restored.join(", ")));
+        let Some(moved) = moved else {
+            waiting.keep();
+            let Some((text, exit, restored)) = self.jobs.finish(id, budget) else { return Err("the command was lost".to_owned()) };
+            return Ok(result_of(text, exit, how, &restored));
+        };
+        if moved == Moved::Timeout && self.jobs.running() >= background::MOST {
+            drop(waiting);
+            return Err(format!("the command took longer than {timeout:?} and was stopped: {}", self.too_many()));
         }
-        let status = match status.code() {
-            Some(code) => format!("[exit code {code}]"),
-            None => SIGNAL_LINE.to_owned(),
+        waiting.keep();
+        let (text, exit) = self.jobs.to_background(id, budget);
+        let status = exit.map(|exit| exit.line() + "\n").unwrap_or_default();
+        let why = match moved {
+            Moved::Left => "it ended, but what it started still runs (a server behind &, say), so rein keeps it. It stops when the \
+                            conversation ends, or when you stop it with background; you'll be told if it ends before."
+                .to_owned(),
+            Moved::Timeout => format!(
+                "it's still running after {timeout:?}, so it goes on there rather than being stopped. You'll be told when it ends; \
+                 read what it prints, or wait for a line, with background, or stop it."
+            ),
+            Moved::You => "the user moved it there. You'll be told when it ends; read what it prints, or wait for a line, with \
+                           background, or stop it."
+                .to_owned(),
         };
-        Ok(format!("{text}{status}{note}"))
+        let note = format!("{MOVED}{id}: {why}]");
+        Ok(format!("{text}{}{status}{note}", if text.is_empty() || text.ends_with('\n') { "" } else { "\n" }))
     }
+
+    /// Why no more commands may go to the background, with what's there.
+    fn too_many(&self) -> String {
+        let running: Vec<String> = self.jobs.list().into_iter().filter(|listed| listed.ended.is_none()).map(|listed| format!("{} ({})", listed.id, listed.command)).collect();
+        format!("{} commands already run in the background, the most there may be: stop one first. They are: {}", background::MOST, running.join(", "))
+    }
+}
+
+/// How `bash` answers a command started in the background, before its name.
+pub const STARTED: &str = "Started in the background as ";
+
+/// How the note starts that says a command went on in the background part
+/// way through, before its name.
+pub const MOVED: &str = "[In the background as ";
+
+/// The name of the background command that `output`, a `bash` result,
+/// says it started or moved there; `None` for one that ran in the
+/// foreground.
+pub fn in_background(output: &str) -> Option<&str> {
+    let rest = output.strip_prefix(STARTED).or_else(|| output.lines().find_map(|line| line.strip_prefix(MOVED)))?;
+    let end = rest.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Why a command waited for in the foreground went on in the background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Moved {
+    /// It ended, but what it started runs on.
+    Left,
+    /// It ran past its timeout.
+    Timeout,
+    /// You pressed Ctrl-B.
+    You,
+}
+
+/// A finished command's result: what it printed, how it ended, and notes
+/// of its walls, where they may be why it failed, and of what the sandbox
+/// put back.
+fn result_of(text: String, exit: background::Exit, how: Run, restored: &[String]) -> String {
+    let mut text = text;
+    let mut note = match how {
+        Run::Sandboxed(walls) if exit.failed() => format!("\n{}", walls.note()),
+        _ => String::new(),
+    };
+    if !restored.is_empty() {
+        note.push_str(&format!("\n[The sandbox here can't keep a command from files that run code later, so rein put them back as they were: {}.]", restored.join(", ")));
+    }
+    text.push_str(&exit.line());
+    text + &note
 }
 
 /// `mutex`'s guard: one a panic left behind still holds what it held.
@@ -957,7 +1083,7 @@ fn replace(file: &str, old: &str, new: &str, replace_all: bool) -> Result<Edited
     Ok(Edited { text: format!("{bom}{text}"), count })
 }
 
-fn parse<T: DeserializeOwned>(arguments: &str) -> Result<T, String> {
+pub(crate) fn parse<T: DeserializeOwned>(arguments: &str) -> Result<T, String> {
     serde_json::from_str(arguments).map_err(|e| format!("bad arguments: {e}"))
 }
 
@@ -1090,11 +1216,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_stopped_by_its_timeout_takes_everything_it_started_with_it() {
+    async fn a_command_past_its_timeout_with_no_room_left_takes_everything_it_started_with_it() {
         let tools = Tools::new(project("timeout-group", &[]));
+        for _ in 0..background::MOST {
+            let started = run(&tools, &call("bash", json!({ "command": "sleep 41.19", "background": true }))).await;
+            assert!(started.starts_with("Started in the background as b"), "{started}");
+        }
+        let refused = run(&tools, &call("bash", json!({ "command": "sleep 41.19", "background": true }))).await;
+        assert!(refused.starts_with("error: 8 commands already run in the background") && refused.contains("b8 (sleep 41.19)"), "{refused}");
         let output = run(&tools, &bash_call("sleep 41.17 & sleep 41.17", Some(1))).await;
-        assert!(output.contains("took longer"), "{output}");
+        assert!(output.contains("took longer") && output.contains("stop one first"), "{output}");
         assert!(!running("sleep 41.17"), "the sleeps were left running");
+        drop(tools);
+        assert!(!running("sleep 41.19"), "the background ones were left running");
+    }
+
+    #[tokio::test]
+    async fn a_command_past_its_timeout_goes_on_in_the_background() {
+        let tools = Tools::new(project("timeout-moves", &[])).with_timeout(Duration::from_millis(300));
+        let output = run(&tools, &call("bash", json!({ "command": "echo first; sleep 0.8; echo second" }))).await;
+        assert!(output.starts_with("first\n[In the background as b1: it's still running after 300ms, so"), "{output}");
+        assert_eq!(in_background(&output), Some("b1"));
+        assert_eq!(ended(&output), None, "no exit line: it hasn't ended");
+        let read = run(&tools, &call("background", json!({ "id": "b1", "action": "read", "until": "sec.nd", "seconds": 5 }))).await;
+        assert!(read.starts_with("A line matched: second\n"), "{read}");
+        assert!(!read.contains("\nfirst\n"), "what the model was given is not given again: {read}");
+        // Ended while the model waited and read: it's not told again.
+        let read = run(&tools, &call("background", json!({ "id": "b1", "action": "read", "until": "never", "seconds": 5 }))).await;
+        assert!(read.starts_with("It ended before a line matched never.\nb1 (echo first; sleep 0.8; echo second) ended: [exit code 0]\nNothing new"), "{read}");
+        assert!(tools.ended().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_background_command_is_read_waited_for_and_stopped() {
+        let tools = Tools::new(project("server", &[]));
+        let server = "trap 'echo bye; exit 0' TERM; echo starting; sleep 0.3; echo ready on 3000; while true; do sleep 0.1; done";
+        let started = run(&tools, &call("bash", json!({ "command": server, "background": true }))).await;
+        assert!(started.starts_with("Started in the background as b1."), "{started}");
+        assert_eq!(in_background(&started), Some("b1"));
+        assert_eq!(in_background("Started in the foreground\n[exit code 0]"), None);
+        let ready = run(&tools, &call("background", json!({ "id": "b1", "action": "read", "until": "ready|listening", "seconds": 5 }))).await;
+        assert!(ready.starts_with("A line matched: ready on 3000\nb1 ("), "{ready}");
+        assert!(ready.contains("is still running.\nstarting\nready on 3000\n"), "{ready}");
+        let nothing = run(&tools, &call("background", json!({ "id": "b1", "action": "read", "until": null, "seconds": null }))).await;
+        assert!(nothing.ends_with("is still running.\nNothing new since you last read."), "{nothing}");
+        let waited = std::time::Instant::now();
+        let none = run(&tools, &call("background", json!({ "id": "b1", "action": "read", "until": "never", "seconds": 1 }))).await;
+        assert!(none.starts_with("No line matched never in 1s."), "{none}");
+        assert!(waited.elapsed() >= Duration::from_millis(900), "it waited");
+        let stopped = run(&tools, &call("background", json!({ "id": "b1", "action": "stop", "until": null, "seconds": null }))).await;
+        assert!(stopped.contains("was stopped.") && stopped.ends_with("bye\n"), "asked first, so it said goodbye: {stopped}");
+        assert!(tools.ended().await.is_empty(), "the model stopped it, so it knows");
+        let unknown = run(&tools, &call("background", json!({ "id": "b9", "action": "read", "until": null, "seconds": null }))).await;
+        assert_eq!(unknown, "error: there's no background command called b9; there are b1");
+        let bad = run(&tools, &call("background", json!({ "id": "b1", "action": "read", "until": "(", "seconds": null }))).await;
+        assert!(bad.starts_with("error: until isn't a regular expression"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn a_background_command_that_ends_is_told_of_once_with_its_last_lines() {
+        let tools = Tools::new(project("told", &[]));
+        run(&tools, &call("bash", json!({ "command": "echo one; echo two; exit 3", "background": true }))).await;
+        let jobs = tools.jobs().clone();
+        tokio::time::timeout(Duration::from_secs(5), jobs.ended()).await.expect("it ended");
+        let ended = tools.ended().await;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].exit, background::Exit::Code(3));
+        assert_eq!(ended[0].note, "[rein: the background command b1 (echo one; echo two; exit 3) ended: [exit code 3]. What it printed since you last read:\none\ntwo]");
+        assert!(background::is_note(&ended[0].note));
+        assert!(tools.ended().await.is_empty(), "told once");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let listed = tools.jobs().list();
+        assert_eq!((listed[0].ended, listed[0].last.as_deref()), (Some(background::Exit::Code(3)), Some("two")));
+        assert!(listed[0].took < Duration::from_millis(500), "how long it ran, not how long ago it started: {:?}", listed[0].took);
+    }
+
+    #[tokio::test]
+    async fn what_a_finished_command_leaves_running_is_kept_and_stops_with_the_tools() {
+        let tools = Tools::new(project("left", &[]));
+        let output = run(&tools, &bash_call("sleep 43.31 >/dev/null 2>&1 & echo started", None)).await;
+        assert!(output.starts_with("started\n[exit code 0]\n[In the background as b1: it ended, but what it started still runs"), "{output}");
+        assert!(running("sleep 43.31"), "a server started with & keeps running");
+        assert_eq!(tools.jobs().running(), 1);
+        drop(tools);
+        assert!(!running("sleep 43.31"), "it stops with the conversation");
+    }
+
+    #[tokio::test]
+    async fn a_server_holding_the_output_open_doesnt_hold_up_the_turn() {
+        let tools = Tools::new(project("held", &[]));
+        let began = std::time::Instant::now();
+        let output = run(&tools, &bash_call("sleep 44.41 & echo started", Some(30))).await;
+        assert!(began.elapsed() < Duration::from_secs(5), "it waited {:?}", began.elapsed());
+        assert!(output.starts_with("started\n[exit code 0]\n"), "{output}");
+        assert_eq!(in_background(&output), Some("b1"));
+        drop(tools);
+        assert!(!running("sleep 44.41"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_b_moves_the_command_to_the_background() {
+        let tools = Tools::new(project("ctrl-b", &[]));
+        let jobs = tools.jobs().clone();
+        let press = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            jobs.detach();
+            std::future::pending::<String>().await
+        };
+        let command = bash_call("echo going; sleep 45.51", None);
+        let output = tokio::select! {
+            output = run(&tools, &command) => output,
+            never = press => never,
+        };
+        assert!(output.starts_with("going\n[In the background as b1: the user moved it there."), "{output}");
+        assert_eq!(tools.jobs().running(), 1);
+        // You stop it: the model hears of it, with your next message.
+        tools.jobs().stop_yours("b1").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(300), jobs.ended()).await.is_err(), "it doesn't wake the model");
+        let ended = tools.ended().await;
+        assert!(ended[0].note.contains("b1 (echo going; sleep 45.51) was stopped by the user."), "{:?}", ended);
+        assert!(!running("sleep 45.51"));
     }
 
     #[tokio::test]
@@ -1107,20 +1348,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_that_finishes_leaves_what_it_put_in_the_background() {
-        let tools = Tools::new(project("background", &[]));
-        let output = run(&tools, &bash_call("sleep 43.31 >/dev/null 2>&1 & echo started", None)).await;
-        assert!(output.contains("started"), "{output}");
-        assert!(running("sleep 43.31"), "a server started with & keeps running");
-        let _ = std::process::Command::new("pkill").args(["-x", "-f", "sleep 43.31"]).status();
-    }
-
-    #[tokio::test]
     async fn a_flood_of_output_isnt_all_kept() {
         let tools = Tools::new(project("flood", &[]));
         let output = run(&tools, &bash_call("head -c 20000000 /dev/zero | tr '\\0' x", None)).await;
         assert!(output.len() < 100_000, "{} bytes kept", output.len());
-        assert!(output.contains("more bytes"), "{}", &output[output.len().saturating_sub(200)..]);
+        assert!(output.contains("bytes in between not shown"), "{}", &output[output.len().saturating_sub(200)..]);
+        assert!(output.ends_with("x[exit code 0]"), "its end, with how it went, is kept: {}", &output[output.len().saturating_sub(200)..]);
     }
 
     /// A fresh directory for one test, with `files` written into it.
@@ -1364,10 +1597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_stops_slow_commands() {
-        let tools = Tools::new(project("slow", &[])).with_timeout(Duration::from_millis(200));
-        let answer = run(&tools, &call("bash", json!({"command": "sleep 5"}))).await;
-        assert_eq!(answer, "error: the command took longer than 200ms and was stopped");
+    async fn bash_waits_as_long_as_its_asked_to() {
         // Asking for longer works, within the limit.
         let tools = Tools::new(project("slow-ok", &[])).with_timeout(Duration::from_millis(200));
         let answer = run(&tools, &call("bash", json!({"command": "sleep 1.2; echo done", "timeout_seconds": 3}))).await;
