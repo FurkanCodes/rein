@@ -2997,7 +2997,7 @@ fn a_sub_agent_starts_in_a_new_tab_works_where_you_see_it_and_reports_back() {
     let spawn = calls("spawn", json!({ "role": "tests", "task": "run the test suite", "model": null, "edits": false }));
     let parent_model = Model::start(vec![spawn, says("Started tests."), says("tests is done: all of them pass.")])
         .with_env("REIN_TAB_COMMAND", &format!("echo {{command}} >> {}", opened.display()));
-    let mut web = Term::spawn_in(&parent_model, base.clone(), &project, &home, 30, 100, &["--name", "web"]);
+    let mut web = Term::spawn_in(&parent_model, base.clone(), &project, &home, 50, 100, &["--name", "web"]);
     web.wait_for(IDLE);
     web.keys("get the tests run\r");
     web.wait_for("Start a sub-agent in a new tab?");
@@ -3020,9 +3020,11 @@ fn a_sub_agent_starts_in_a_new_tab_works_where_you_see_it_and_reports_back() {
     assert_eq!(&args[..2], ["--name", "tests"], "{args:?}");
     assert!(args.contains(&"--child".to_owned()), "{args:?}");
 
-    let child_model = Model::start(vec![says("All of them pass.")]);
+    // A report longer than a message is shown: it's shown whole all the same.
+    let report: Vec<String> = (1..=15).map(|n| format!("Suite {n} passes.")).collect();
+    let child_model = Model::start(vec![says(&format!("All of them pass.\n\n{}", report.join("\n")))]);
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut tests = Term::spawn_in(&child_model, base.clone(), &project, &home, 30, 100, &words);
+    let mut tests = Term::spawn_in(&child_model, base.clone(), &project, &home, 50, 100, &words);
     tests.wait_for("A sub-agent of web");
     tests.wait_for("All of them pass.");
     let asked = child_model.requests()[0].to_string();
@@ -3031,7 +3033,18 @@ fn a_sub_agent_starts_in_a_new_tab_works_where_you_see_it_and_reports_back() {
     assert!(tools.contains("\"delegate\"") && !tools.contains("\"spawn\""), "a sub-agent can't start sub-agents: {tools}");
     web.wait_for("tests is done: all of them pass.");
     assert!(parent_model.requests()[2].to_string().contains("All of them pass."), "the result came back");
-    // Its result read, the sub-agent goes, and its tab with it.
+    // You see it too, all of it, under how it went.
+    let shown = web.text();
+    assert!(shown.contains("✓ tests is done") && shown.contains("changed no files"), "{shown}");
+    assert!(shown.contains("Suite 1 passes.") && shown.contains("Suite 15 passes.") && !shown.contains("more lines"), "{shown}");
+    // Its result read, the sub-agent stays, to go on with.
+    tests.wait_for("type to go on, or Ctrl-D to close this tab");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(tests.child.try_wait().unwrap().is_none(), "it stays once its result is read:\n{}", tests.text());
+    // Its parent gone, a sub-agent you didn't type into goes too.
+    web.keys("/exit\r");
+    web.wait_exit();
+    tests.wait_for("so does this sub-agent");
     tests.wait_exit();
 }
 
@@ -3053,7 +3066,7 @@ fn a_sub_agent_you_say_no_to_never_opens() {
 }
 
 #[test]
-fn a_sub_agent_you_typed_into_stays_when_its_parent_is_done_with_it() {
+fn a_sub_agent_you_typed_into_stays_when_its_parent_goes() {
     let (base, project, home) = tabs("adopt");
     std::fs::create_dir_all(project.join(".rein")).unwrap();
     std::fs::write(project.join(ALLOWED.0), ALLOWED.1).unwrap();
@@ -3077,9 +3090,126 @@ fn a_sub_agent_you_typed_into_stays_when_its_parent_is_done_with_it() {
     lint.keys("run the tests too\r");
     lint.wait_for("Linted, and the tests too.");
     web.wait_for("lint is done.");
-    lint.wait_for("it's yours now");
+    web.keys("/exit\r");
+    web.wait_exit();
+    lint.wait_for("this one is yours now");
     std::thread::sleep(Duration::from_millis(500));
     assert!(lint.child.try_wait().unwrap().is_none(), "it stays: you typed into it");
+}
+
+/// A parent `web` in `base` that starts sub-agent `role` on `task` once
+/// you say yes, then says what `parent` scripts after; the sub-agent's
+/// rein, started as its tab would start it, works as `child` scripts.
+fn parent_and_sub_agent(base: &std::path::Path, project: &std::path::Path, home: &std::path::Path, role: &str, parent: Vec<Turn>, child: Vec<Turn>) -> (Model, Term, Model, Term) {
+    let opened = base.join("opened");
+    let spawn = calls("spawn", json!({ "role": role, "task": "run the test suite", "model": null, "edits": false }));
+    let parent_model = Model::start(std::iter::once(spawn).chain(parent).collect()).with_env("REIN_TAB_COMMAND", &format!("echo {{command}} >> {}", opened.display()));
+    let mut web = Term::spawn_in(&parent_model, base.to_owned(), project, home, 40, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.keys("get the tests run\r");
+    web.wait_for("Start a sub-agent in a new tab?");
+    std::thread::sleep(Duration::from_millis(700));
+    web.keys("y");
+    web.wait_for("started in a new tab");
+    let script = std::fs::read_to_string(std::fs::read_to_string(&opened).unwrap().trim().strip_prefix("/bin/sh ").unwrap()).unwrap();
+    let args = child_args(&script);
+    let child_model = Model::start(child);
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let sub_agent = Term::spawn_in(&child_model, base.to_owned(), project, home, 30, 100, &words);
+    (parent_model, web, child_model, sub_agent)
+}
+
+#[test]
+fn what_you_do_in_a_finished_sub_agents_tab_goes_back_to_its_parent() {
+    let (base, project, home) = tabs("follow");
+    let parent = vec![says("Started tests."), says("tests says they pass."), says("Noted: the flaky one is fixed.")];
+    let (parent_model, mut web, _child_model, mut tests) = parent_and_sub_agent(&base, &project, &home, "tests", parent, vec![says("They pass."), says("Fixed the flaky one.")]);
+    tests.wait_for("type to go on");
+    web.wait_for("tests says they pass.");
+    tests.keys("fix the flaky one too\r");
+    tests.wait_for("Fixed the flaky one.");
+    tests.wait_for("web hears of this with its next turn");
+    web.wait_for("you went on with tests in its tab");
+    web.wait_for("Fixed the flaky one.");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(parent_model.requests().len(), 3, "it starts no turn there: you're at work in the other tab");
+    web.keys("anything new?\r");
+    web.wait_for("Noted: the flaky one is fixed.");
+    let asked = parent_model.requests()[3].to_string();
+    assert!(asked.contains("the user went on with tests in its tab") && asked.contains("Fixed the flaky one."), "{asked}");
+    // Its tab closed once it's done: there's nothing more to say.
+    // SAFETY: a signal to the rein this test started.
+    unsafe { libc::kill(tests.child.id() as i32, libc::SIGHUP) };
+    tests.wait_exit();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!web.text().contains("its tab was closed"), "{}", web.text());
+    assert_eq!(parent_model.requests().len(), 4, "nothing starts there");
+}
+
+#[test]
+fn closing_a_sub_agents_tab_before_its_done_tells_its_parent_what_it_did() {
+    let (base, project, home) = tabs("close");
+    std::fs::create_dir_all(project.join(".rein")).unwrap();
+    std::fs::write(project.join(ALLOWED.0), ALLOWED.1).unwrap();
+    let slow = Turn {
+        out: vec![Out::Text("Made it; now the slow part.".into()), Out::Call("bash", json!({ "command": "sleep 30", "timeout_seconds": null, "access": "write", "reason": null }))],
+    };
+    let parent = vec![says("Started tests."), says("I'll finish what tests began.")];
+    let touch =
+        Turn { out: vec![Out::Text("Making it.".into()), Out::Call("bash", json!({ "command": "touch made.txt", "timeout_seconds": null, "access": "write", "reason": null }))] };
+    let (parent_model, web, _child_model, mut tests) = parent_and_sub_agent(&base, &project, &home, "tests", parent, vec![touch, slow]);
+    tests.wait_for("Running sleep 30");
+    web.wait_for("Started tests.");
+    // Closing its tab hangs up on it; a terminal may follow with SIGTERM,
+    // which mustn't end it before it has said what it did.
+    // SAFETY: signals to the rein this test started.
+    unsafe {
+        libc::kill(tests.child.id() as i32, libc::SIGHUP);
+        libc::kill(tests.child.id() as i32, libc::SIGTERM);
+    }
+    tests.wait_exit();
+    web.wait_for("✗ tests stopped before it was done: its tab was closed");
+    web.wait_for("I'll finish what tests began.");
+    let asked = parent_model.requests()[2].to_string();
+    for said in ["the user closed its tab", "- Run touch made.txt", "Files it changed: made.txt.", "Its last words:\\nMade it; now the slow part.", "rather than doing it again"] {
+        assert!(asked.contains(said), "{said:?} isn't in:\n{asked}");
+    }
+    assert!(!asked.contains("sleep 30 ·"), "the step it was on hadn't finished: {asked}");
+    assert!(asked.contains("It was in the middle of this one, which may have partly run: Run sleep 30"), "{asked}");
+    web.wait_for("▸ Run sleep 30 · cut off, may have partly run");
+}
+
+#[test]
+fn a_report_that_comes_while_its_parent_works_shows_whole_too() {
+    let (base, project, home) = tabs("midturn");
+    std::fs::create_dir_all(project.join(".rein")).unwrap();
+    std::fs::write(project.join(ALLOWED.0), ALLOWED.1).unwrap();
+    let report: Vec<String> = (1..=15).map(|n| format!("Suite {n} passes.")).collect();
+    let parent = vec![runs("sleep 3"), says("Saw what tests said.")];
+    let (parent_model, web, _child_model, tests) = parent_and_sub_agent(&base, &project, &home, "tests", parent, vec![says(&format!("All pass.\n\n{}", report.join("\n")))]);
+    tests.wait_for("type to go on");
+    web.wait_for("Saw what tests said.");
+    let shown = web.text();
+    assert!(shown.contains("✓ tests is done") && shown.contains("Suite 1 passes.") && shown.contains("Suite 15 passes."), "{shown}");
+    assert!(parent_model.requests()[2].to_string().contains("Suite 15 passes."), "the model read it in the same turn");
+}
+
+#[test]
+fn a_sub_agent_killed_outright_is_found_gone_by_its_parent() {
+    let (base, project, home) = tabs("killed");
+    std::fs::create_dir_all(project.join(".rein")).unwrap();
+    std::fs::write(project.join(ALLOWED.0), ALLOWED.1).unwrap();
+    let parent = vec![says("Started tests."), says("tests is gone; I'll look at what it left.")];
+    let (parent_model, web, _child_model, mut tests) = parent_and_sub_agent(&base, &project, &home, "tests", parent, vec![runs("sleep 30")]);
+    tests.wait_for("Running sleep 30");
+    web.wait_for("Started tests.");
+    // SAFETY: a signal to the rein this test started.
+    unsafe { libc::kill(tests.child.id() as i32, libc::SIGKILL) };
+    tests.wait_exit();
+    web.wait_for("✗ tests went without a word before it was done");
+    web.wait_for("tests is gone; I'll look at what it left.");
+    let asked = parent_model.requests()[2].to_string();
+    assert!(asked.contains("without a word: it crashed or was killed"), "{asked}");
 }
 
 #[test]
@@ -3096,11 +3226,11 @@ fn spawn_starts_a_sub_agent_you_name_without_asking() {
     let args = child_args(&script);
     let child_model = Model::start(vec![says("They pass.")]);
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut tests = Term::spawn_in(&child_model, base.clone(), &project, &home, 30, 100, &words);
+    let tests = Term::spawn_in(&child_model, base.clone(), &project, &home, 30, 100, &words);
     tests.wait_for("They pass.");
     assert!(child_model.requests()[0].to_string().contains("run the test suite"));
     lead.wait_for("tests says they pass.");
-    tests.wait_exit();
+    tests.wait_for("type to go on");
 }
 
 /// Asks `/mcp` until it shows `text`, as a server takes a moment to start,

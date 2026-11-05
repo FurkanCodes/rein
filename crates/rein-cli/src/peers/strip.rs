@@ -86,7 +86,7 @@ const fn color(state: State) -> (u8, u8, u8) {
 }
 
 /// `12s`, `4m`, `2h`.
-fn short(secs: u64) -> String {
+pub(crate) fn short(secs: u64) -> String {
     match secs {
         0..60 => format!("{secs}s"),
         60..3600 => format!("{}m", secs / 60),

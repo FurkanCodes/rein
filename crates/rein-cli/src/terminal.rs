@@ -130,16 +130,19 @@ pub(crate) struct Terminal {
     /// Tasks other reins handed over in this turn: where each one's
     /// result goes, and its ID.
     pub(crate) tasks: Vec<(String, String)>,
-    /// The files this turn changed, for a task's result.
-    pub(crate) changed: Vec<String>,
-    /// What came in while no turn ran that isn't a message: notes of files
-    /// other reins changed, for the next turn.
+    /// What came in while no turn ran that starts none: notes of files
+    /// other reins changed, and what you did in a sub-agent's tab, for the
+    /// next turn's start.
     pub(crate) notes: Vec<Heard>,
-    /// The rein that started this one is done with it: it goes once it's
+    /// The rein that started this one has gone: this one goes once it's
     /// idle, unless it's been adopted.
     pub(crate) closing: bool,
-    /// You've typed into this sub-agent: it's yours now, and stays.
+    /// You've typed into this sub-agent: it's yours now, and stays when
+    /// the rein that started it goes.
     pub(crate) adopted: bool,
+    /// The task whose report went back to the rein that started this one,
+    /// where it went and its ID: what you do here after is told there too.
+    pub(crate) followed: Option<(String, String)>,
     /// You said always to opening tabs for sub-agents.
     pub(crate) spawn_always: bool,
     /// It's been said how Terminal can open tabs, not windows.
@@ -263,10 +266,10 @@ impl Terminal {
             turn: TurnStats::default(),
             peers: None,
             tasks: Vec::new(),
-            changed: Vec::new(),
             notes: Vec::new(),
             closing: false,
             adopted: false,
+            followed: None,
             spawn_always: false,
             said_tabs: false,
             spec: String::new(),
@@ -275,19 +278,24 @@ impl Terminal {
     }
 
     /// What another rein sent, as the agent hears it. A task's result is
-    /// owed to its sender at the end of the turn it goes into.
-    /// `None` for what isn't for the model: the rein that started this one
-    /// being done with it, which the conversation acts on after the turn.
+    /// owed to its sender at the end of the turn it goes into, and sent
+    /// even if rein is ended first. `None` for what isn't for the model:
+    /// the rein that started this one having gone, which the conversation
+    /// acts on after the turn.
     pub(crate) fn heard_of(&mut self, incoming: Incoming) -> Option<Heard> {
         let text = incoming.text();
         Some(match incoming {
             Incoming::Changed { from, path } => Heard::Changed { by: from, path },
             Incoming::Task { from, reply_to, id, .. } => {
+                crate::peers::farewell::owe(&reply_to, &id);
                 self.tasks.push((reply_to, id));
                 Heard::Peer { from, text }
             }
-            Incoming::Message { from, .. } | Incoming::Result { from, .. } => Heard::Peer { from, text },
-            Incoming::Close { .. } => {
+            Incoming::Message { from, .. } => Heard::Peer { from, text },
+            // Shown whole as it came, by whoever took it in.
+            Incoming::Result { from, .. } => Heard::Reported { from, text },
+            Incoming::Followed { from, .. } => Heard::Told { from, text },
+            Incoming::ParentGone { .. } => {
                 self.closing = true;
                 return None;
             }
@@ -327,9 +335,7 @@ impl Terminal {
     /// Notes that this turn changed `path`, for a task's result and the
     /// other reins.
     fn changed_path(&mut self, path: String) {
-        if !self.changed.contains(&path) {
-            self.changed.push(path.clone());
-        }
+        crate::peers::farewell::changed(&path);
         if let Some(peers) = &mut self.peers {
             peers.changed(&path);
         }
@@ -393,7 +399,7 @@ impl Terminal {
     /// A new turn: your message under its label, then a blank line.
     pub(crate) fn start_turn(&mut self, echo: Option<&str>) {
         self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
-        self.changed.clear();
+        crate::peers::farewell::turn_started();
         self.state(State::Working);
         self.last = Last::You;
         self.labeled = false;
@@ -638,9 +644,15 @@ impl Ui for Terminal {
                 out!("{lead}");
             }
             self.answer = Some(Answer { markdown: width.map(|_| Markdown::new(self.out.on())), wrap: width.map(|width| Wrap::new(width, GUTTER, GUTTER)) });
+            if !self.compacting {
+                crate::peers::farewell::writing();
+            }
             if self.input.pinned() && !self.compacting {
                 self.doing("Writing");
             }
+        }
+        if !self.compacting {
+            crate::peers::farewell::wrote(delta);
         }
         let answer = self.answer.as_mut().expect("set above");
         let mut text = match &mut answer.markdown {
@@ -876,6 +888,8 @@ impl Ui for Terminal {
             let lead = self.lead();
             self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: false, done: false });
         }
+        let (name, target) = steps::describe(call);
+        crate::peers::farewell::running(&format!("{name} {target}"));
         if let Some(peers) = &self.peers {
             peers.doing(&steps::doing(call));
         }
@@ -908,6 +922,8 @@ impl Ui for Terminal {
         self.step = None;
         let lead = self.lead();
         let s = self.err;
+        let (name, target) = steps::describe(call);
+        crate::peers::farewell::stepped(&format!("{name} {target} · blocked: {reason}"));
         let (call_, lead_, status) = (call.clone(), lead.clone(), s.red(&format!("blocked: {reason}")));
         self.show(move |width| vec![steps::line(&call_, &lead_, &s.red("●"), &status, s, width)]);
         self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: true });
@@ -923,6 +939,8 @@ impl Ui for Terminal {
         let s = self.err;
         let asked = step.as_ref().is_some_and(|step| step.header_shown);
         let mut outcome = steps::outcome(call, output, s);
+        let (name, target) = steps::describe(call);
+        crate::peers::farewell::stepped(&format!("{name} {target} · {}", strip(&outcome.status)));
         if ToolName::of(call).is_some_and(ToolName::changes_files) && outcome.ok == Some(true) {
             self.changed_file(call);
         }
@@ -1056,20 +1074,32 @@ impl Ui for Terminal {
         });
     }
 
-    /// Your messages, then what came in from other reins.
+    /// Your messages, then what came in from other reins. A sub-agent's
+    /// report shows whole, here, as it goes in.
     fn steering(&mut self) -> Vec<Heard> {
         let mut heard: Vec<Heard> = self.input.steering().into_iter().map(Heard::You).collect();
         // Typed into a sub-agent while it works: it's yours now too.
         self.adopted |= !heard.is_empty();
-        heard.append(&mut self.notes);
         let mut incoming = Vec::new();
         if let Some(peers) = &mut self.peers {
             while let Ok(one) = peers.inbox.try_recv() {
                 incoming.push(one);
             }
         }
-        heard.extend(incoming.into_iter().filter_map(|one| self.heard_of(one)));
+        for one in incoming {
+            if self.fancy
+                && let Some(shown) = crate::peers::talk::reported(&one, self.err, self.wrap_width().unwrap_or(80))
+            {
+                self.end_line();
+                say!("\n{shown}");
+            }
+            heard.extend(self.heard_of(one));
+        }
         heard
+    }
+
+    fn waiting(&mut self) -> Vec<Heard> {
+        std::mem::take(&mut self.notes)
     }
 
     /// What was heard, where it went into the turn: between the steps it

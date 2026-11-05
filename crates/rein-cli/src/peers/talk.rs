@@ -5,23 +5,43 @@ use std::path::Path;
 
 use rein_agent::agent::{Agent, Heard, Llm, Outcome};
 use rein_agent::permissions::Mode;
-use rein_llm::Item;
 
 use super::node::{Incoming, Joining, Policy, Show, preview};
-use super::{Body, Node, Reply, State};
+use super::{Body, Ended, Node, Reply, Report, State};
 use crate::CliResult;
 use crate::commands::Slash;
 use crate::conversation::{Start, turn};
 use crate::input::Menu;
 use crate::terminal::{Terminal, peer_said};
-use crate::ui::style::GUTTER;
+use crate::ui::markdown::Markdown;
+use crate::ui::style::{GUTTER, Style};
+use crate::ui::wrap::Wrap;
 
 /// How many turns in a row other reins may start before you say anything:
 /// past that, what they send waits in `/inbox`.
 const TURNS_IN_A_ROW: usize = 12;
 
-/// The most of a turn's last answer that goes back as a task's result.
-const RESULT_CHARS: usize = 4000;
+/// The most of a turn's last answer that goes back as a task's result,
+/// about 4,000 tokens: Claude Code's teammates send 4,000 characters, and
+/// asking for the rest runs the teammate again; oh-my-pi sends 11,500.
+/// Past this, its start, and how much more there was.
+const RESULT_CHARS: usize = 16_000;
+
+/// `text` as a result carries it: whole up to [`RESULT_CHARS`], or its
+/// start and how much more there was, which `ask`, still there, has.
+pub(crate) fn capped(text: &str, ask: Option<&str>) -> String {
+    let text = text.trim();
+    let count = text.chars().count();
+    if count <= RESULT_CHARS {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(RESULT_CHARS).collect();
+    let more = count - RESULT_CHARS;
+    match ask {
+        Some(name) => format!("{head}\n\n[…{more} more characters: ask {name} for the rest]"),
+        None => format!("{head}\n\n[…{more} more characters]"),
+    }
+}
 
 /// Joins the other reins, as the settings say, and says who this one is.
 /// `child` is the rein that started this one and the task it's for, for a
@@ -44,6 +64,7 @@ pub(crate) async fn join(
     match Node::start(&super::folder(rein), name, workspace, root, &terminal.model, policy, show).await {
         Ok(node) => {
             node.follow_mode(mode);
+            super::farewell::joined(super::folder(rein), &node.info().workspace);
             let others = node.peers().await.len();
             let about = match others {
                 0 => "no other rein is running yet: start one in another tab".to_owned(),
@@ -79,6 +100,19 @@ pub(crate) async fn take_in(incoming: Incoming, in_a_row: &mut usize, agent: &mu
         terminal.notes.extend(note);
         return Ok(());
     }
+    // You went on in a sub-agent's tab: you see it here now, and this
+    // conversation hears of it with its next turn. It starts none: you're
+    // at work in the other tab.
+    if matches!(incoming, Incoming::Followed { .. }) {
+        if terminal.fancy
+            && let Some(shown) = reported(&incoming, terminal.err, terminal.wrap_width().unwrap_or(80))
+        {
+            say!("\n{shown}");
+        }
+        let note = terminal.heard_of(incoming);
+        terminal.notes.extend(note);
+        return Ok(());
+    }
     if *in_a_row >= TURNS_IN_A_ROW {
         if let Some(peers) = &terminal.peers {
             peers.hold(incoming);
@@ -92,14 +126,15 @@ pub(crate) async fn take_in(incoming: Incoming, in_a_row: &mut usize, agent: &mu
 
 /// A turn on what another rein sent, then its result back, if it was a task.
 async fn work_on(incoming: Incoming, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
-    let Some(Heard::Peer { from, text }) = terminal.heard_of(incoming) else { return Ok(()) };
+    let columns = terminal.wrap_width().unwrap_or(80);
+    let shown = reported(&incoming, terminal.err, columns);
+    let (Some(Heard::Peer { from, text }) | Some(Heard::Reported { from, text })) = terminal.heard_of(incoming) else { return Ok(()) };
     terminal.start_turn(None);
     if terminal.fancy {
-        say!("\n{}", peer_said(&from, &text, terminal.err, terminal.wrap_width().unwrap_or(80)));
+        say!("\n{}", shown.unwrap_or_else(|| peer_said(&from, &text, terminal.err, columns)));
     }
     let outcome = turn(agent, Start::Peer { from, text }, terminal).await;
-    report(agent, terminal, outcome.as_ref().ok()).await;
-    close_finished(terminal).await;
+    report(terminal, outcome.as_ref().ok()).await;
     outcome.map(|_| ())
 }
 
@@ -113,6 +148,13 @@ pub(crate) async fn spawn(call: &rein_llm::ToolCall, terminal: &mut Terminal) ->
         Err(e) => format!("{error}bad arguments: {e}"),
     }
 }
+
+/// What the model is told of a sub-agent's result as it starts it: it
+/// comes by itself. Told only that it comes back as a message, the model
+/// messaged the sub-agent to ask for it, and the sub-agent answered with
+/// a message too.
+const AWAITED: &str =
+    "Its result comes back to you by itself when it's done, and starts a turn: don't message it to ask, and end your turn if there's nothing else to do meanwhile.";
 
 /// What a sub-agent's tab is given of this rein's environment: where rein
 /// keeps its files, and where programs and their settings are found. A
@@ -188,15 +230,13 @@ async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &m
             if opener == super::spawn::Opener::Terminal && !std::mem::replace(&mut terminal.said_tabs, true) && !super::spawn::windows_open_as_tabs().await {
                 say!("{pad}{}", s.dim("Terminal opens a window for it. For a tab: System Settings → Desktop & Dock → Prefer tabs when opening documents → Always"));
             }
-            format!("Started sub-agent {name} ({model}) in {} (task {id}). Its result comes back to you as a message when it's done.", opener.place())
+            format!("Started sub-agent {name} ({model}) in {} (task {id}). {AWAITED}", opener.place())
         }
         Ok(super::spawn::Opened::Paste(command)) => {
             let copied = matches!(crate::input::copy(&command), crate::input::Copied::Clipboard);
             say!("{pad}{} open a new tab and paste{}:", s.yellow("◆"), if copied { " (it's copied)" } else { "" });
             say!("{pad}  {command}");
-            format!(
-                "This terminal can't open tabs, so the user was given a command to start sub-agent {name} in a new tab (task {id}). Its result comes back to you as a message when it's done."
-            )
+            format!("This terminal can't open tabs, so the user was given a command to start sub-agent {name} in a new tab (task {id}). {AWAITED}")
         }
         Err(e) => {
             if let Some(node) = &terminal.peers {
@@ -239,40 +279,29 @@ async fn ask_to_spawn(name: &str, model: &str, task: &str, edits: bool, terminal
     }
 }
 
-/// Tells each sub-agent whose result this rein has now read that it's
-/// done with it: its tab goes, unless you've taken it over.
-pub(crate) async fn close_finished(terminal: &Terminal) {
-    let Some(node) = &terminal.peers else { return };
-    for child in node.finished_children() {
-        if let Some(address) = &child.address {
-            let _ = node.send(address, Body::Close).await;
-        }
-    }
-}
-
-/// Sends each task this turn took on its result: done or not, the turn's
-/// last answer, and the files it changed.
-pub(crate) async fn report(agent: &Agent<Llm>, terminal: &mut Terminal, outcome: Option<&Outcome>) {
+/// Sends each task this turn took on its result: how it ended, its last
+/// answer, the steps it ran, and the files it changed. A sub-agent stays
+/// after, with what it knows: you can go on with it in its tab, and its
+/// parent can hand it more.
+pub(crate) async fn report(terminal: &mut Terminal, outcome: Option<&Outcome>) {
     if terminal.tasks.is_empty() {
         return;
     }
-    let summary: String = agent
-        .full()
-        .iter()
-        .rev()
-        .find_map(|item| match item {
-            Item::Assistant(text) if !text.trim().is_empty() => Some(text.trim().chars().take(RESULT_CHARS).collect()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let done = outcome == Some(&Outcome::Done);
-    let files = terminal.changed.clone();
-    let tasks = std::mem::take(&mut terminal.tasks);
     let Some(peers) = &terminal.peers else { return };
+    let ended = if outcome == Some(&Outcome::Done) { Ended::Done } else { Ended::Stopped };
+    let report = super::farewell::finished(ended, &peers.info().name);
+    super::farewell::settled();
+    let tasks = std::mem::take(&mut terminal.tasks);
+    let sub_agent = peers.parent().is_some();
     let s = terminal.err;
+    let mut followed = None;
     for (reply_to, id) in tasks {
-        let body = Body::Result { id, done, summary: summary.clone(), files: files.clone() };
+        let body = Body::Result { id: id.clone(), report: report.clone() };
         let said = match peers.send(&reply_to, body).await {
+            Ok((peer, Reply::Delivered | Reply::Held)) if sub_agent => {
+                followed = Some((reply_to, id));
+                s.dim(&format!("↳ the report went back to {} · type to go on, or Ctrl-D to close this tab", peer.name))
+            }
             Ok((peer, Reply::Delivered | Reply::Held)) => s.dim(&format!("↳ the result went back to {}", peer.name)),
             Ok((peer, Reply::Refused { why })) => s.red(&format!("✗ {} turned the result away: {why}", peer.name)),
             Ok((peer, Reply::Status(_) | Reply::Task { .. })) => s.red(&format!("✗ {} answered with something else", peer.name)),
@@ -281,6 +310,100 @@ pub(crate) async fn report(agent: &Agent<Llm>, terminal: &mut Terminal, outcome:
         say!("{}{said}", " ".repeat(GUTTER));
     }
     peers.set_state(State::Done, None);
+    if followed.is_some() {
+        terminal.followed = followed;
+    }
+}
+
+/// After a turn you typed into a sub-agent whose task went back: what it
+/// did goes to the rein that started it too, which hears of it with its
+/// next turn. Codex and OpenCode make a finished one read-only; Kilo and
+/// Roo let you go on, and the parent never hears.
+pub(crate) async fn follow_up(terminal: &mut Terminal) {
+    let Some((to, id)) = terminal.followed.clone() else { return };
+    // Its parent has gone: nobody to tell.
+    let Some(peers) = terminal.peers.as_ref().filter(|peers| peers.parent().is_some()) else { return };
+    let report = super::farewell::finished(Ended::Done, &peers.info().name);
+    let s = terminal.err;
+    let said = match peers.send(&to, Body::Followed { id, summary: report.summary, files: report.files }).await {
+        Ok((peer, Reply::Delivered | Reply::Held)) => s.dim(&format!("↳ {} hears of this with its next turn", peer.name)),
+        Ok((peer, Reply::Refused { why })) => s.red(&format!("✗ {} turned it away: {why}", peer.name)),
+        Ok((peer, Reply::Status(_) | Reply::Task { .. })) => s.red(&format!("✗ {} answered with something else", peer.name)),
+        Err(e) => s.red(&format!("✗ it didn't go to the rein that started this one: {e}")),
+    };
+    say!("{}{said}", " ".repeat(GUTTER));
+}
+
+/// A sub-agent's report as this rein shows it: a line saying how it went,
+/// then all it said, drawn as answers are, and for one that stopped early,
+/// the steps it ran. You see what the model reads: Claude Code shows
+/// `Done (12 tool uses · 30k tokens)`, and the report only to the model.
+/// `None` for what isn't a report.
+pub(crate) fn reported(incoming: &Incoming, s: Style, columns: usize) -> Option<String> {
+    let pad = " ".repeat(GUTTER);
+    let (head, summary, steps) = match incoming {
+        Incoming::Result { from, report, .. } => {
+            let steps = if report.ended == Ended::Done { Vec::new() } else { step_lines(report) };
+            (headline(from, report, s), &report.summary, steps)
+        }
+        Incoming::Followed { from, summary, files, .. } => {
+            (format!("{} {}{}", s.yellow("✉"), s.bold(&format!("you went on with {from} in its tab")), s.dim(&format!(" · {}", changed_files(files.len())))), summary, Vec::new())
+        }
+        _ => return None,
+    };
+    let mut out = format!("{pad}{head}");
+    let width = columns.saturating_sub(GUTTER + 2).max(20);
+    for step in steps {
+        out += &format!("\n{pad}  {}", s.dim(&crate::ui::style::fit(&step, width)));
+    }
+    if !summary.trim().is_empty() {
+        let mut markdown = Markdown::new(s.on());
+        let text = markdown.push(summary.trim()) + &markdown.finish();
+        let mut wrap = Wrap::new(columns, GUTTER, GUTTER);
+        let text = wrap.push(&text) + &wrap.finish();
+        out += &format!("\n{pad}{}", text.trim_end());
+    }
+    Some(out)
+}
+
+/// `✓ tests is done · 14 steps · 2m · changed 3 files`.
+fn headline(from: &str, report: &Report, s: Style) -> String {
+    let steps = report.step_count();
+    let mut about = Vec::new();
+    if steps > 0 {
+        about.push(format!("{steps} step{}", if steps == 1 { "" } else { "s" }));
+    }
+    if report.seconds > 0 {
+        about.push(super::strip::short(report.seconds));
+    }
+    if report.ended != Ended::Gone {
+        about.push(changed_files(report.files.len()));
+    }
+    let about = if about.is_empty() { String::new() } else { s.dim(&format!(" · {}", about.join(" · "))) };
+    let (mark, what) = match report.ended {
+        Ended::Done => (s.green("✓"), format!("{from} is done")),
+        Ended::Stopped => (s.red("✗"), format!("{from} stopped before it was done")),
+        Ended::Closed => (s.red("✗"), format!("{from} stopped before it was done: its tab was closed")),
+        Ended::Killed => (s.red("✗"), format!("{from} stopped before it was done: it was ended")),
+        Ended::Gone => (s.red("✗"), format!("{from} went without a word before it was done")),
+    };
+    format!("{mark} {}{about}", s.bold(&what))
+}
+
+fn changed_files(count: usize) -> String {
+    match count {
+        0 => "changed no files".to_owned(),
+        1 => "changed 1 file".to_owned(),
+        n => format!("changed {n} files"),
+    }
+}
+
+/// The steps a report says it ran, a line each, after how many earlier,
+/// then the one it was in the middle of.
+fn step_lines(report: &Report) -> Vec<String> {
+    let earlier = (report.earlier > 0).then(|| format!("…{} earlier", report.earlier));
+    let on = report.on.as_ref().map(|on| format!("▸ {on} · cut off, may have partly run"));
+    earlier.into_iter().chain(report.steps.iter().map(|step| format!("· {step}"))).chain(on).collect()
 }
 
 /// `/spawn`: a sub-agent you start yourself, so nothing asks. What isn't
@@ -455,4 +578,47 @@ async fn inbox(agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
     let Some(i) = terminal.input.choose(Menu { title: "let which in".into(), items, current: None, at: None }).await else { return Ok(()) };
     let Some(incoming) = node(terminal)?.take_held(i) else { return Ok(()) };
     work_on(incoming, agent, terminal).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_report_goes_whole_up_to_its_cap_then_says_how_much_more() {
+        assert_eq!(capped("  All pass.\n", Some("tests")), "All pass.");
+        let long = "é".repeat(RESULT_CHARS + 5);
+        let sent = capped(&long, Some("tests"));
+        assert!(sent.starts_with(&"é".repeat(RESULT_CHARS)) && sent.ends_with("[…5 more characters: ask tests for the rest]"), "{}", &sent[sent.len() - 60..]);
+        assert!(capped(&long, None).ends_with("[…5 more characters]"), "one that's gone can't be asked");
+    }
+
+    #[test]
+    fn a_report_shows_how_it_went_then_all_it_said() {
+        let report = Report {
+            ended: Ended::Closed,
+            summary: "Half done.\n\n**Next**: the docs.".into(),
+            steps: vec!["Run cargo test · exit 0".into()],
+            earlier: 2,
+            on: Some("Run cargo build".into()),
+            seconds: 130,
+            files: vec!["a.rs".into()],
+        };
+        let shown = reported(&Incoming::Result { from: "tests".into(), id: "t1".into(), report, folder: None }, Style::plain(), 80).unwrap();
+        let lines: Vec<&str> = shown.lines().map(str::trim).collect();
+        assert_eq!(
+            lines,
+            [
+                "✗ tests stopped before it was done: its tab was closed · 3 steps · 2m · changed 1 file",
+                "…2 earlier",
+                "· Run cargo test · exit 0",
+                "▸ Run cargo build · cut off, may have partly run",
+                "Half done.",
+                "",
+                "Next: the docs."
+            ],
+            "{shown}"
+        );
+        assert_eq!(reported(&Incoming::Message { from: "api".into(), text: "hi".into() }, Style::plain(), 80), None, "a message isn't a report");
+    }
 }

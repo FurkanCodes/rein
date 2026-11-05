@@ -21,7 +21,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use super::{Body, Info, Question, Reply, Request, State, Status};
+use super::{Body, Ended, Info, Question, Reply, Report, Request, State, Status};
 
 /// What another rein sent, for the conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,20 +37,30 @@ pub(crate) enum Incoming {
         id: String,
         text: String,
     },
+    /// How a task this rein handed over went. `folder` is where the rein
+    /// that did it works, when it isn't this one's folder (a sub-agent's
+    /// worktree): what it changed is there.
     Result {
         from: String,
         id: String,
-        done: bool,
+        report: Report,
+        folder: Option<PathBuf>,
+    },
+    /// What you did in the tab of a sub-agent this rein started, after
+    /// its task: it waits for this conversation's next turn.
+    Followed {
+        from: String,
+        id: String,
         summary: String,
         files: Vec<String>,
+        folder: Option<PathBuf>,
     },
     Changed {
         from: String,
         path: String,
     },
-    /// The rein that started this one is done with it: its result was
-    /// read, or it has gone.
-    Close {
+    /// The rein that started this one has gone.
+    ParentGone {
         from: String,
     },
 }
@@ -58,7 +68,12 @@ pub(crate) enum Incoming {
 impl Incoming {
     pub(crate) fn from(&self) -> &str {
         match self {
-            Self::Message { from, .. } | Self::Task { from, .. } | Self::Result { from, .. } | Self::Changed { from, .. } | Self::Close { from } => from,
+            Self::Message { from, .. }
+            | Self::Task { from, .. }
+            | Self::Result { from, .. }
+            | Self::Followed { from, .. }
+            | Self::Changed { from, .. }
+            | Self::ParentGone { from } => from,
         }
     }
 
@@ -68,15 +83,58 @@ impl Incoming {
         match self {
             Self::Message { text, .. } => text.clone(),
             Self::Task { text, .. } => format!("A task for you, handed over by {}. When you're done, your last message goes back to it as the result.\n\n{text}", self.from()),
-            Self::Result { id, done, summary, files, .. } => {
-                let how = if *done { "is done" } else { "stopped before it was done" };
-                let files = if files.is_empty() { "It changed no files.".to_owned() } else { format!("Files it changed: {}.", files.join(", ")) };
-                format!("The task you handed over (task {id}) {how}. {files}\n\n{summary}")
+            Self::Result { from, id, report, folder } => result_text(from, id, report) + &elsewhere(from, folder.as_deref()),
+            Self::Followed { from, id, summary, files, folder } => {
+                format!("After task {id}, the user went on with {from} in its tab. {}{}\n\nIts last answer:\n{summary}", changed(files), elsewhere(from, folder.as_deref()))
             }
             Self::Changed { path, .. } => format!("changed {path}"),
-            Self::Close { .. } => "done with this sub-agent".to_owned(),
+            Self::ParentGone { .. } => "the rein that started this one has gone".to_owned(),
         }
     }
+}
+
+/// Where `from` works, when it isn't here: what it changed is there.
+fn elsewhere(from: &str, folder: Option<&Path>) -> String {
+    folder.map_or_else(String::new, |folder| format!("\n\n{from} works in a folder of its own, {}: what it changed is there, not in yours.", folder.display()))
+}
+
+/// `Files it changed: a.rs, b.rs.`, or that it changed none.
+fn changed(files: &[String]) -> String {
+    if files.is_empty() { "It changed no files.".to_owned() } else { format!("Files it changed: {}.", files.join(", ")) }
+}
+
+/// What the model is told of how a task it handed `from` went. One that
+/// stopped early says what it did, so the work is gone on with rather
+/// than done again.
+fn result_text(from: &str, id: &str, report: &Report) -> String {
+    let Report { ended, summary, steps, earlier, on, files, .. } = report;
+    let files = changed(files);
+    let ran = || {
+        let earlier = (*earlier > 0).then(|| format!("- …{earlier} earlier step{}", if *earlier == 1 { "" } else { "s" }));
+        let lines: Vec<String> = earlier.into_iter().chain(steps.iter().map(|step| format!("- {step}"))).collect();
+        let finished = if lines.is_empty() { "It finished no steps.".to_owned() } else { format!("The steps it finished:\n{}", lines.join("\n")) };
+        // An interrupted step may have partly run: neither done nor not.
+        match on {
+            Some(on) => format!("{finished}\nIt was in the middle of this one, which may have partly run: {on}"),
+            None => finished,
+        }
+    };
+    let why = match ended {
+        Ended::Done => return format!("The task you handed {from} (task {id}) is done. {files}\n\n{summary}"),
+        Ended::Gone => {
+            return format!("{from} went before task {id} was done, without a word: it crashed or was killed. What it changed is still in its folder; look before doing it again.");
+        }
+        Ended::Stopped => "",
+        Ended::Closed => ": the user closed its tab",
+        Ended::Killed => ": it was ended",
+    };
+    let next = if *ended == Ended::Stopped {
+        format!("{from} is still there with what it knows: hand it the rest rather than starting over.")
+    } else {
+        "Go on from what it did rather than doing it again.".to_owned()
+    };
+    let said = if summary.trim().is_empty() { String::new() } else { format!("\n\nIts last words:\n{summary}") };
+    format!("The task you handed {from} (task {id}) stopped before it was done{why}. {files}\n{}{said}\n\n{next}", ran())
 }
 
 /// What this rein lets in from others.
@@ -159,7 +217,13 @@ pub(crate) struct Child {
     task: Option<String>,
     /// Its address, once it has claimed its task.
     pub(crate) address: Option<String>,
-    /// Its result has come.
+    /// Its process, once it has claimed its task: watched, so one that
+    /// goes without a word is found gone.
+    pid: Option<u32>,
+    /// Where it works, once it has claimed its task.
+    root: Option<PathBuf>,
+    /// Its result has come. It stays, idle, with what it knows, but no
+    /// longer counts toward [`MOST_CHILDREN`].
     pub(crate) finished: bool,
 }
 
@@ -419,9 +483,10 @@ impl Node {
         let what = match &body {
             Body::Message { text } => format!("you → {}: {}", peer.name, preview(text)),
             Body::Task { text, .. } => format!("you → {}: task: {}", peer.name, preview(text)),
-            Body::Result { done, .. } => format!("you → {}: result ({})", peer.name, if *done { "done" } else { "not done" }),
+            Body::Result { report, .. } => format!("you → {}: result ({})", peer.name, if report.ended == Ended::Done { "done" } else { "not done" }),
+            Body::Followed { .. } => format!("you → {}: what you did after its task", peer.name),
             Body::Answer { yes, .. } => format!("you answered {}: {}", peer.name, if *yes { "yes" } else { "no" }),
-            Body::Status | Body::Changed { .. } | Body::Claim { .. } | Body::Close => String::new(),
+            Body::Status | Body::Changed { .. } | Body::Claim { .. } => String::new(),
         };
         // Noted before it goes: a quick rein's result may come back first.
         let task = if let Body::Task { id, .. } = &body { Some(id.clone()) } else { None };
@@ -451,20 +516,13 @@ impl Node {
         if running >= MOST_CHILDREN {
             return Err(format!("{running} sub-agents are running, the most at once: wait for one to finish"));
         }
-        shared.children.insert(id.to_owned(), Child { role: role.to_owned(), task: Some(task.to_owned()), address: None, finished: false });
+        shared.children.insert(id.to_owned(), Child { role: role.to_owned(), task: Some(task.to_owned()), address: None, pid: None, root: None, finished: false });
         Ok(running + 1)
     }
 
     /// A sub-agent that never claimed its task: its tab didn't open.
     pub(crate) fn forget_child(&self, id: &str) {
         locked(&self.shared).children.remove(id);
-    }
-
-    /// The sub-agents whose results have come, taken out: their tabs may go.
-    pub(crate) fn finished_children(&self) -> Vec<Child> {
-        let mut shared = locked(&self.shared);
-        let done: Vec<String> = shared.children.iter().filter(|(_, child)| child.finished).map(|(id, _)| id.clone()).collect();
-        done.iter().filter_map(|id| shared.children.remove(id)).collect()
     }
 
     /// This rein is the sub-agent `parent` started for task `id`: it
@@ -551,7 +609,7 @@ fn said(sent: Result<(Info, Reply), String>, task: Option<&str>) -> String {
     let error = rein_agent::tools::ERROR;
     match sent {
         Ok((peer, Reply::Delivered)) => match task {
-            Some(id) => format!("Handed to {} (task {id}). Its result will come back to you as a message when it's done.", peer.name),
+            Some(id) => format!("Handed to {} (task {id}). Its result comes back to you by itself when it's done: don't message it to ask.", peer.name),
             None => format!("Sent to {}.", peer.name),
         },
         Ok((peer, Reply::Held)) => format!("{} keeps messages for its user to let in; it'll see it once they do.", peer.name),
@@ -597,25 +655,9 @@ async fn present(shared: Arc<Mutex<Shared>>, show: Show, colors: super::strip::C
     let (mut frame, mut others, mut shown_title, mut shown_state) = (0u64, Vec::new(), String::new(), None);
     loop {
         ticks.tick().await;
-        // A sub-agent whose rein has gone: nobody will read its result.
         if frame.is_multiple_of(fps) {
-            let mut shared = locked(&shared);
-            if let Some(pid) = shared.parent {
-                match std::fs::read_to_string(shared.folder.join(format!("{pid}.json"))) {
-                    // Its parent may have been renamed: the strip groups
-                    // this one under the name it has now.
-                    Ok(text) => {
-                        if let Ok(info) = serde_json::from_str::<super::Info>(&text) {
-                            shared.status.parent = Some(info.name);
-                        }
-                    }
-                    Err(_) => {
-                        shared.parent = None;
-                        let from = shared.status.parent.clone().unwrap_or_default();
-                        let _ = shared.inbox.try_send(Incoming::Close { from });
-                    }
-                }
-            }
+            watch_parent(&shared);
+            watch_children(&shared).await;
         }
         if show.strip && frame.is_multiple_of(fps) {
             let folder = locked(&shared).folder.clone();
@@ -635,6 +677,63 @@ async fn present(shared: Arc<Mutex<Shared>>, show: Show, colors: super::strip::C
             crate::ui::screen::set_strip(lines);
         }
         frame += 1;
+    }
+}
+
+/// A sub-agent whose rein has gone: nobody will read what it does, and
+/// unless it's yours now, it goes too.
+fn watch_parent(shared: &Mutex<Shared>) {
+    let mut shared = locked(shared);
+    let Some(pid) = shared.parent else { return };
+    match std::fs::read_to_string(shared.folder.join(format!("{pid}.json"))) {
+        // Its parent may have been renamed: the strip groups this one
+        // under the name it has now.
+        Ok(text) => {
+            if let Ok(info) = serde_json::from_str::<super::Info>(&text) {
+                shared.status.parent = Some(info.name);
+            }
+        }
+        Err(_) => {
+            shared.parent = None;
+            let from = shared.status.parent.clone().unwrap_or_default();
+            let _ = shared.inbox.try_send(Incoming::ParentGone { from });
+        }
+    }
+}
+
+/// The sub-agents this rein started that have gone, its tab closed or
+/// its process killed: each is let go, and one that went before its
+/// result came is told of. Claude Code's lead showed a teammate whose
+/// pane was closed as running for good, and rein's parent counted it
+/// toward the four that may run.
+async fn watch_children(shared: &Mutex<Shared>) {
+    let (folder, watched) = {
+        let shared = locked(shared);
+        let watched: Vec<(String, u32)> = shared.children.iter().filter_map(|(id, child)| child.pid.map(|pid| (id.clone(), pid))).collect();
+        (shared.folder.clone(), watched)
+    };
+    for (id, pid) in watched {
+        if is_there(&folder, pid).await {
+            continue;
+        }
+        let mut shared = locked(shared);
+        let Some(child) = shared.children.remove(&id) else { continue };
+        // One that said how it ended, its tab closed, said so before it went.
+        if !child.finished {
+            let folder = child.root.filter(|root| *root != shared.root);
+            let gone = Incoming::Result { from: child.role, id, report: Report::gone(), folder };
+            let _ = shared.inbox.try_send(gone);
+        }
+    }
+}
+
+/// The rein whose process is `pid` is still there: its file says who it
+/// is, and its socket answers. A rein killed outright leaves its files,
+/// but nothing listens.
+async fn is_there(folder: &Path, pid: u32) -> bool {
+    match sender(folder, pid) {
+        Some(info) => super::alive(&info).await,
+        None => false,
     }
 }
 
@@ -679,8 +778,20 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
     }
     // Who it is: a rein in the folder, by the process on the other end.
     let sender = cred.pid().and_then(|pid| u32::try_from(pid).ok()).and_then(|pid| sender(&folder, pid));
-    let from = sender.as_ref().map(|info| if info.workspace == workspace { info.name.clone() } else { info.address() });
+    let sender_pid = sender.as_ref().map(|info| info.pid);
+    // The rein that started this one, and those it started: each may say
+    // what the other will hear, whatever this one holds.
+    let (parent, child, here) = {
+        let shared = locked(shared);
+        let parent = shared.parent.is_some() && shared.parent == sender_pid;
+        let child = sender_pid.is_some() && shared.children.values().any(|child| child.pid == sender_pid);
+        (parent, child, shared.root.clone())
+    };
+    // A sub-agent of this one goes by its name, wherever it works; its
+    // name is its own among all the reins.
+    let from = sender.as_ref().map(|info| if child || info.workspace == workspace { info.name.clone() } else { info.address() });
     let address = sender.as_ref().map(Info::address);
+    let works_in = sender.as_ref().map(|info| info.root.clone()).filter(|root| *root != here);
     let incoming = match (request.body, sender, from) {
         (Body::Status, _, _) => {
             let shared = locked(shared);
@@ -707,21 +818,17 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
             return match shared.children.get_mut(&id).and_then(|child| child.task.take().map(|task| (child, task))) {
                 Some((child, task)) => {
                     child.address = Some(info.address());
+                    child.pid = Some(info.pid);
+                    child.root = Some(info.root.clone());
                     Some(Reply::Task { text: task })
                 }
                 None => refused("there's no task waiting under that id"),
             };
         }
-        // Only from the rein that started this one.
-        (Body::Close, Some(info), Some(from)) => {
-            if locked(shared).parent != Some(info.pid) {
-                return refused("only the rein that started this one can close it");
-            }
-            Incoming::Close { from }
-        }
         (Body::Message { text }, Some(_), Some(from)) => Incoming::Message { from, text },
         (Body::Task { id, text }, Some(info), Some(from)) => Incoming::Task { from, reply_to: info.address(), id, text },
-        (Body::Result { id, done, summary, files }, Some(_), Some(from)) => Incoming::Result { from, id, done, summary, files },
+        (Body::Result { id, report }, Some(_), Some(from)) => Incoming::Result { from, id, report, folder: works_in },
+        (Body::Followed { id, summary, files }, Some(_), Some(from)) => Incoming::Followed { from, id, summary, files, folder: works_in },
         (Body::Changed { path }, Some(info), Some(from)) => {
             if info.root != locked(shared).root {
                 return refused("that rein works in another folder");
@@ -734,25 +841,30 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
         return refused(why);
     }
     let what = format!("{} → you: {}", incoming.from(), preview(&incoming.text()));
-    // What a sub-agent sends back for the task it was given goes in, as
-    // the rein that started it asked for it; so does its parent's word,
-    // and the result of a task this rein handed to the rein sending it.
+    // What a sub-agent sends back of the task it was given goes in, as
+    // the rein that started it asked for it, and so does what you did in
+    // its tab after, and what it says; so does the word of the rein that
+    // started this one, which may hand it more; and the result of a task
+    // this rein handed to the rein sending it. A sub-agent is known by its
+    // process, as renaming it changes its address.
     let ours = match &incoming {
         Incoming::Result { id, .. } => {
             let shared = &mut *shared;
             match shared.children.get_mut(id) {
-                Some(child) => {
+                Some(child) if child.pid.is_some() && child.pid == sender_pid => {
                     child.finished = true;
                     true
                 }
-                None if address.is_some() && shared.handed.get(id) == address.as_ref() => {
+                _ if address.is_some() && shared.handed.get(id) == address.as_ref() => {
                     shared.handed.remove(id);
                     true
                 }
-                None => false,
+                _ => false,
             }
         }
-        Incoming::Close { .. } => true,
+        Incoming::Followed { id, .. } => shared.children.get(id).is_some_and(|child| child.pid.is_some() && child.pid == sender_pid),
+        Incoming::Message { .. } => parent || child,
+        Incoming::Task { .. } => parent,
         _ => false,
     };
     let reply = match (shared.policy, &incoming) {
@@ -765,6 +877,7 @@ async fn handle(stream: &mut UnixStream, shared: &Mutex<Shared>) -> Option<Reply
             Ok(()) => Reply::Delivered,
             Err(_) => return refused("it has too much waiting already"),
         },
+        (_, Incoming::Followed { .. }) => return refused("only a sub-agent this rein started sends that"),
         (Policy::Refuse, _) => return refused("it doesn't take messages from other reins"),
         (Policy::Hold, _) => {
             if shared.held.len() >= QUEUE {
@@ -885,7 +998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_goes_to_one_sub_agent_once_and_only_its_parent_can_close_it() {
+    async fn a_task_goes_to_one_sub_agent_once_and_finished_ones_dont_count() {
         let folder = PathBuf::from(format!("/tmp/rein-child-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
         let node = Node::start(&folder, Some("web"), Some("w"), Path::new("/p"), "m", Policy::Accept, Show { title: false, strip: false }).await.unwrap();
@@ -894,11 +1007,93 @@ mod tests {
         node.expect_child("t1", "tests", "run them").unwrap();
         assert_eq!(super::super::ask(&me, Body::Claim { id: "t1".into() }).await, Ok(Reply::Task { text: "run them".into() }));
         assert!(matches!(super::super::ask(&me, Body::Claim { id: "t1".into() }).await, Ok(Reply::Refused { .. })), "handed out once");
-        assert_eq!(super::super::ask(&me, Body::Close).await, Ok(Reply::Refused { why: "only the rein that started this one can close it".into() }));
         for n in 2..=MOST_CHILDREN {
             node.expect_child(&format!("t{n}"), "x", "y").unwrap();
         }
         assert!(node.expect_child("one-more", "x", "y").unwrap_err().contains("the most at once"));
+        // One that's done stays, idle, but no longer counts.
+        locked(&node.shared).children.get_mut("t2").unwrap().finished = true;
+        assert!(node.expect_child("one-more", "x", "y").is_ok());
+        drop(node);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    fn report(ended: Ended) -> Report {
+        Report { ended, summary: "All pass.".into(), steps: vec!["Run cargo test · exit 0".into()], earlier: 0, on: None, seconds: 3, files: Vec::new() }
+    }
+
+    #[tokio::test]
+    async fn what_a_sub_agent_sends_back_goes_in_from_it_alone_and_so_does_its_parents_word() {
+        let folder = PathBuf::from(format!("/tmp/rein-back-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let mut node = Node::start(&folder, Some("web"), Some("w"), Path::new("/p"), "m", Policy::Accept, Show { title: false, strip: false }).await.unwrap();
+        let me = node.info().clone();
+        // Trust mode holds what others send; what's this rein's own goes in.
+        node.follow_mode(rein_agent::permissions::Mode::Trust);
+        node.expect_child("t1", "tests", "run them").unwrap();
+        // The sub-agent claims it: here, this process is the sub-agent too.
+        assert!(matches!(super::super::ask(&me, Body::Claim { id: "t1".into() }).await, Ok(Reply::Task { .. })));
+        let followed = Body::Followed { id: "t1".into(), summary: "Fixed the flaky one too.".into(), files: vec!["a.rs".into()] };
+        assert_eq!(super::super::ask(&me, followed).await, Ok(Reply::Delivered));
+        assert!(matches!(node.inbox.recv().await, Some(Incoming::Followed { ref summary, .. }) if summary == "Fixed the flaky one too."));
+        // What it says goes in too: a question, say.
+        assert_eq!(super::super::ask(&me, Body::Message { text: "Which test framework?".into() }).await, Ok(Reply::Delivered));
+        assert!(matches!(node.inbox.recv().await, Some(Incoming::Message { ref text, .. }) if text == "Which test framework?"));
+        let stranger = Body::Followed { id: "t9".into(), summary: "hi".into(), files: Vec::new() };
+        assert_eq!(super::super::ask(&me, stranger).await, Ok(Reply::Refused { why: "only a sub-agent this rein started sends that".into() }));
+        assert_eq!(super::super::ask(&me, Body::Result { id: "t1".into(), report: report(Ended::Done) }).await, Ok(Reply::Delivered));
+        assert!(matches!(node.inbox.recv().await, Some(Incoming::Result { ref report, .. }) if report.ended == Ended::Done));
+        assert!(locked(&node.shared).children["t1"].finished);
+        // One in a worktree of its own, in a workspace of its own, goes by
+        // its name, and what it changed is said to be there.
+        let me_file = folder.join(format!("{}.json", me.pid));
+        let elsewhere = Info { root: PathBuf::from("/w/web-sub-tests"), workspace: "sub/tests".into(), ..me.clone() };
+        std::fs::write(&me_file, serde_json::to_string(&elsewhere).unwrap()).unwrap();
+        let followed = Body::Followed { id: "t1".into(), summary: "And the docs.".into(), files: vec!["b.rs".into()] };
+        assert_eq!(super::super::ask(&me, followed).await, Ok(Reply::Delivered));
+        let heard = node.inbox.recv().await.unwrap();
+        assert_eq!(heard.from(), "web", "by its name, not sub/tests/web");
+        assert!(heard.text().contains("web works in a folder of its own, /w/web-sub-tests: what it changed is there, not in yours."), "{}", heard.text());
+        std::fs::write(&me_file, serde_json::to_string(&me).unwrap()).unwrap();
+        // From another process, a result under its id isn't its own. The
+        // others are there, as their files say, answering on this socket.
+        for pid in [4_000_000, 4_000_001] {
+            std::fs::write(folder.join(format!("{pid}.json")), serde_json::to_string(&Info { pid, ..me.clone() }).unwrap()).unwrap();
+        }
+        locked(&node.shared).children.get_mut("t1").unwrap().pid = Some(4_000_000);
+        node.expect_child("t2", "lint", "lint it").unwrap();
+        locked(&node.shared).children.get_mut("t2").unwrap().pid = Some(4_000_001);
+        assert_eq!(super::super::ask(&me, Body::Result { id: "t2".into(), report: report(Ended::Stopped) }).await, Ok(Reply::Held));
+        assert!(!locked(&node.shared).children["t2"].finished);
+        // The rein that started this one may hand it more, whatever it holds.
+        locked(&node.shared).parent = Some(me.pid);
+        assert_eq!(super::super::ask(&me, Body::Task { id: "t3".into(), text: "and the docs".into() }).await, Ok(Reply::Delivered));
+        locked(&node.shared).parent = None;
+        assert_eq!(super::super::ask(&me, Body::Task { id: "t4".into(), text: "and the site".into() }).await, Ok(Reply::Held));
+        drop(node);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_that_goes_without_a_word_is_told_of_and_let_go() {
+        let folder = PathBuf::from(format!("/tmp/rein-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let mut node = Node::start(&folder, Some("web"), Some("w"), Path::new("/p"), "m", Policy::Accept, Show { title: false, strip: false }).await.unwrap();
+        // Two sub-agents killed outright, one before its result came.
+        for (id, pid, finished) in [("t1", 4_000_002, false), ("t2", 4_000_003, true)] {
+            node.expect_child(id, if finished { "docs" } else { "tests" }, "x").unwrap();
+            let mut shared = locked(&node.shared);
+            let child = shared.children.get_mut(id).unwrap();
+            (child.pid, child.finished) = (Some(pid), finished);
+        }
+        let heard = tokio::time::timeout(Duration::from_secs(5), node.inbox.recv()).await;
+        assert!(matches!(heard, Ok(Some(Incoming::Result { ref from, ref id, ref report, .. })) if from == "tests" && id == "t1" && report.ended == Ended::Gone), "{heard:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !locked(&node.shared).children.is_empty() {
+            assert!(Instant::now() < deadline, "both are let go");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(node.inbox.try_recv().is_err(), "the one that was done goes without a word");
         drop(node);
         std::fs::remove_dir_all(folder).unwrap();
     }
@@ -924,7 +1119,7 @@ mod tests {
         }
         std::fs::remove_file(&file).unwrap();
         let closed = tokio::time::timeout(Duration::from_secs(5), node.inbox.recv()).await;
-        assert!(matches!(closed, Ok(Some(Incoming::Close { ref from })) if from == "lead"), "{closed:?}");
+        assert!(matches!(closed, Ok(Some(Incoming::ParentGone { ref from })) if from == "lead"), "{closed:?}");
         drop(node);
         std::fs::remove_dir_all(folder).unwrap();
     }

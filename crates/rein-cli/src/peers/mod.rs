@@ -15,6 +15,7 @@
 //! terminal rein runs in.
 
 pub(crate) mod dashboard;
+pub(crate) mod farewell;
 pub(crate) mod node;
 pub(crate) mod spawn;
 pub(crate) mod strip;
@@ -30,8 +31,8 @@ use tokio::net::UnixStream;
 
 pub(crate) use node::Node;
 
-/// The most one request or reply may be.
-pub(crate) const MAX_LINE: usize = 64 * 1024;
+/// The most one request or reply may be: a sub-agent's whole report fits.
+pub(crate) const MAX_LINE: usize = 128 * 1024;
 /// How long a peer has to answer, from connecting to its reply.
 const ANSWER_WITHIN: Duration = Duration::from_secs(3);
 /// The longest a socket's path may be: macOS allows 104 bytes, Linux 108.
@@ -157,7 +158,13 @@ pub(crate) enum Body {
     /// How a task handed over went.
     Result {
         id: String,
-        done: bool,
+        report: Report,
+    },
+    /// What you did in a sub-agent's tab after its task `id`, for the
+    /// rein that started it: your follow-up's last answer, and the files
+    /// it changed.
+    Followed {
+        id: String,
         summary: String,
         files: Vec<String>,
     },
@@ -171,14 +178,58 @@ pub(crate) enum Body {
     Claim {
         id: String,
     },
-    /// From the rein that started this one: its result has been read, and
-    /// its tab may go.
-    Close,
     /// Your answer to `question`, given in another tab.
     Answer {
         question: u64,
         yes: bool,
     },
+}
+
+/// How a task handed over went.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Report {
+    pub(crate) ended: Ended,
+    /// Its last answer; for one that stopped early, its last words.
+    pub(crate) summary: String,
+    /// The steps it finished, a line each: the latest, after `earlier` more.
+    pub(crate) steps: Vec<String>,
+    pub(crate) earlier: usize,
+    /// The step it was in the middle of when it ended, which may have
+    /// partly run.
+    pub(crate) on: Option<String>,
+    pub(crate) seconds: u64,
+    /// The files it changed.
+    pub(crate) files: Vec<String>,
+}
+
+impl Report {
+    /// Of one that went without a word: there's nothing it said.
+    pub(crate) fn gone() -> Report {
+        Report { ended: Ended::Gone, summary: String::new(), steps: Vec::new(), earlier: 0, on: None, seconds: 0, files: Vec::new() }
+    }
+
+    pub(crate) fn step_count(&self) -> usize {
+        self.earlier.saturating_add(self.steps.len())
+    }
+}
+
+/// How a task handed over ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Ended {
+    /// Its turn finished: the summary is its answer.
+    Done,
+    /// Its turn stopped before it finished: Esc, an error, its step
+    /// limit. It's still there, with what it knows.
+    Stopped,
+    /// Its tab was closed while it worked.
+    Closed,
+    /// It was ended while it worked: `kill`.
+    Killed,
+    /// It went without a word, a crash or `kill -9`: its parent found it
+    /// gone. Never sent; a sub-agent that can say anything says more.
+    Gone,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -238,7 +289,7 @@ pub(crate) async fn list(folder: &Path) -> Vec<Info> {
 }
 
 /// Its socket takes a connection. A dead rein's doesn't: nothing listens.
-async fn alive(info: &Info) -> bool {
+pub(crate) async fn alive(info: &Info) -> bool {
     matches!(tokio::time::timeout(Duration::from_millis(500), UnixStream::connect(&info.socket)).await, Ok(Ok(_)))
 }
 

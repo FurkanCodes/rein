@@ -373,8 +373,25 @@ you first, then opens a new tab, names it for its role (`tests`, `docs`),
 and starts a rein there that's already working. It shows in your strip as
 `↳ tests`, you can watch it, type into it, answer what it asks, or stop it,
 and its result comes back to the tab that started it, with the files it
-changed. Once that result is read, the sub-agent goes and its tab closes,
-unless you've typed into it: then it's yours, and stays.
+changed. You see the report there whole, under how it went
+(`✓ tests is done · 14 steps · 2m · changed 3 files`), as the model there
+reads it: up to 16,000 characters, then its start and how much more.
+
+Once it's done, the sub-agent stays, idle, with what it knows, and its tab
+says so. Type to go on with it there, and what it does goes back to the tab
+that started it too, which hears of it with its next turn; or the model
+there hands it more with `delegate`. Finished ones don't count toward the
+four at once. Ctrl-D or `/exit` in it closes its tab. Closing the tab
+yourself asks first in Ghostty, kitty and WezTerm, as rein still runs in
+it. When the rein that started it ends, a sub-agent you haven't typed into
+goes too.
+
+A sub-agent ended before it's done still reports. Closing its tab, or
+`kill`, sends what it did so far: the steps it finished, the one it was in
+the middle of (which may have partly run), the files it changed, its last
+words, and, for one in a worktree, where those files are, so the model
+there goes on from it rather than doing it again. One killed outright (`kill -9`, a crash) is found gone within a
+second, and the model there is told.
 
 rein opens the tab itself in tmux (a new window, in the background), kitty
 (`allow_remote_control yes`), WezTerm, iTerm2 and Ghostty (macOS asks you
@@ -387,9 +404,9 @@ ssh, rein shows the command to paste into a new tab, and copies it; or set
 
 Nothing is ever typed into a terminal: the new tab runs `rein --child`, and
 the sub-agent fetches its task from the rein that started it. At most four
-run at once, a sub-agent can't start sub-agents of its own, it runs in the
+work at once, a sub-agent can't start sub-agents of its own, it runs in the
 same mode as its parent, and one that changes files (`edits`) works in a git
-worktree of its own. A sub-agent whose parent has gone stops.
+worktree of its own.
 
 `rein peers` keeps the same table up in a tab of its own, refreshed every
 second. Pick a rein with ↑↓ and press y or n to answer what it asks, without
@@ -411,8 +428,9 @@ writes too often or repeats itself is turned away, and once other reins
 have started 12 turns in a row without you, what they send waits in
 `/inbox`. A rein in trust mode, where almost nothing asks you, always holds
 what comes in; `peers = hold` does that in every mode, `refuse` takes nothing,
-and `off` keeps a rein out of it. What a rein's own sub-agents send back,
-and the result of a task it handed out, always go in.
+and `off` keeps a rein out of it. What a rein's own sub-agents send back or
+say to it, the word of the rein that started it, and the result of a task
+it handed out, always go in.
 
 ## Settings
 

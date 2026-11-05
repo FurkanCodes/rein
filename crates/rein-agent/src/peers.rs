@@ -85,9 +85,11 @@ pub fn specs() -> Vec<Tool> {
             name: ToolName::Spawn.as_str().into(),
             description: "Start a sub-agent: a new rein in a terminal tab of its own, which the user can watch and steer, \
                           working on a task. The user is asked first. It returns at once; the sub-agent's result comes back \
-                          to you as a message when it's done, with the files it changed. Use it for work that can go on \
-                          alongside yours, or that's better done by another model. Give it everything it needs: it hasn't \
-                          seen this conversation. At most four run at once."
+                          to you as a message when it's done, with the files it changed, and the user sees it too. It stays \
+                          after, with what it knows: `delegate` it more by its name rather than starting another. Use it \
+                          for work that can go on alongside yours, or that's better done by another model. Give it \
+                          everything it needs: it hasn't seen this conversation. At most four work at once; finished ones \
+                          don't count."
                 .into(),
             parameters: object(json!({
                 "role": { "type": "string", "description": "What it's for, in a word or two, which is also its name: tests, docs, review." },

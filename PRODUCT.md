@@ -175,25 +175,40 @@ the alternatives.
 
 ### 3. Sub-agents' tabs stay
 
-**Today:** a sub-agent's tab closes once its result is read, unless
-you've typed into it.
+**Built.** A finished sub-agent stays, idle, in its tab with what it
+knows, until you close it (Ctrl-D in it closes the tab without the
+terminal asking) or the rein that started it ends, unless you typed into
+it. Its report shows whole in the parent's window, under a line of how it
+went, and goes to the model there up to 16,000 characters. You can go on
+with it in its tab, and what it does goes back to its parent, which hears
+of it with its next turn; the parent's model can hand it more. Finished
+ones don't count toward the four at once.
 
-**Change:**
+A sub-agent ended early reports anyway: closing its tab or `kill` sends
+the steps it finished, the one it was in the middle of, the files it
+changed and its last words, and one killed outright is found gone within
+a second. In a real run, the parent heard 30 ms after the window closed,
+in a report of about 180 tokens.
 
-- **The tab stays when a sub-agent finishes.** It's marked done, with its
-  report there to read. You close it when you're done with it.
-- **The report also comes back to the tab that started it.** You see it
-  there in full, not only the model.
-- **Closing a tab before the sub-agent is done still reports.** The
-  parent hears what it did so far.
+What others do, researched for it:
 
-**To research:** how Claude Code shows a sub-agent's work and report,
-Codex's sub-agents, and what tmux, iTerm2 and Ghostty allow for a tab
-that stays.
+- **Claude Code** shows a finished sub-agent as one line,
+  `Done (N tool uses · tokens · time)`, its report only under Ctrl-O; a
+  background one vanishes from view after 30 s. A teammate's answer is cut
+  at 4,000 characters, and a pane closed by hand goes unnoticed (issues
+  #27882, #24385).
+- **Codex** keeps finished threads to look at, read-only, and shows the
+  parent nothing of the report; OpenCode and Kilo keep child sessions,
+  and Kilo tells the model the user can't see the result.
+- **oh-my-pi** alone sends what was done when a sub-agent is stopped, and
+  a follow-up you type in one back to its parent.
+- **Terminals**: none kills a tab's program after SIGHUP, so there's time
+  to report. Ghostty, kitty and WezTerm ask before closing a tab where a
+  program still runs, and no terminal lets rein switch that off for one
+  tab; only tmux, kitty, Ghostty on macOS and zellij can hold a tab open
+  after its program exits.
 
-**Done when:** a finished sub-agent's tab is still there with its
-report; its report shows in the parent's window; and closing a tab early
-still sends back what was done.
+An idle rein takes about 18 MB and almost no CPU, plus its MCP servers.
 
 ### 4. Memory across conversations
 
@@ -311,8 +326,6 @@ where.
 
 - **Plan limits:** do ChatGPT's figures come to rein's requests as they
   come to Codex's? (First thing to check in 2.)
-- **Sub-agent tabs:** should a finished one stay open always, or only
-  until its report is read in the parent? (Decide in 3.)
 - **Memory:** where should a project's memories live: beside its
   conversations in `~/.config/rein/`, or in the repository, where a team
   shares them? (Decide in 4.)

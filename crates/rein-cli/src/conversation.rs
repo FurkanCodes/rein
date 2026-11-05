@@ -606,7 +606,6 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
             Said::Ended => {
                 terminal.start_turn(None);
                 let outcome = turn(agent, Start::Ended, terminal).await;
-                crate::peers::talk::close_finished(terminal).await;
                 if let Err(e) = outcome {
                     say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&format!("✗ {e}")));
                 }
@@ -690,9 +689,12 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 terminal.start_turn(echo);
                 let outcome = turn(agent, Start::You(line.to_owned()), terminal).await;
                 crate::skills::count(agent.take_loaded());
-                // A task that came in during the turn gets its result.
-                crate::peers::talk::report(agent, terminal, outcome.as_ref().ok()).await;
-                crate::peers::talk::close_finished(terminal).await;
+                // A task that came in during the turn gets its result; a
+                // sub-agent's parent hears what you did with it after.
+                if terminal.tasks.is_empty() {
+                    crate::peers::talk::follow_up(terminal).await;
+                }
+                crate::peers::talk::report(terminal, outcome.as_ref().ok()).await;
                 if let Err(e) = outcome {
                     say!("{pad}{}", terminal.err.red(&format!("✗ {e}")));
                 }
@@ -708,17 +710,17 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
     Ok(())
 }
 
-/// A sub-agent whose rein is done with it goes, its tab with it, unless
+/// A sub-agent whose parent has gone goes too, its tab with it, unless
 /// you've typed into it: then it says so, and stays.
 fn leaves(terminal: &mut Terminal) -> bool {
     if !std::mem::take(&mut terminal.closing) {
         return false;
     }
     if terminal.adopted {
-        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(the rein that started this one is done with it; it's yours now)"));
+        say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(the rein that started this one has ended; this one is yours now)"));
         return false;
     }
-    say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(its result was read: this sub-agent is done)"));
+    say!("{}{}", " ".repeat(GUTTER), terminal.err.dim("(the rein that started this one has ended, and so does this sub-agent)"));
     true
 }
 

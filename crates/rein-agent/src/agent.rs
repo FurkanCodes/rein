@@ -82,6 +82,13 @@ pub enum Heard {
     You(String),
     /// What another rein sent.
     Peer { from: String, text: String },
+    /// A sub-agent's report, shown whole where you saw it come: it goes
+    /// in as another rein's word, and the model answers it.
+    Reported { from: String, text: String },
+    /// What another rein told while no turn ran, shown as it came (what
+    /// you did in a sub-agent's tab): it goes in as the next turn starts,
+    /// and starts nothing itself.
+    Told { from: String, text: String },
     /// Another rein in this folder changed `path`. It's said only if this
     /// conversation has read or changed that file.
     Changed { by: String, path: String },
@@ -139,6 +146,11 @@ pub trait Ui {
     }
     /// Something heard has gone into the conversation, here.
     fn steered(&mut self, _heard: &Heard) {}
+    /// What came in while no turn ran, taken as one starts: it goes in
+    /// before what starts it, so the model knows it from its first step.
+    fn waiting(&mut self) -> Vec<Heard> {
+        Vec::new()
+    }
     /// A background command ended, and the model is told, here.
     fn background_ended(&mut self, _ended: &crate::background::Ended) {}
     /// The project's check runs: before the turn's first change, or after
@@ -463,6 +475,7 @@ impl<M: Model> Agent<M> {
         self.note_skills()?;
         // What ended unannounced (one you stopped), before what you say of it.
         self.note_ended(ui).await?;
+        self.steer(ui.waiting(), ui).await?;
         self.record(Item::User(prompt.clone()))?;
         self.attach(&prompt, ui).await?;
         self.hooks_add(&heard.context, ui)?;
@@ -534,6 +547,7 @@ impl<M: Model> Agent<M> {
     pub async fn hear_ended(&mut self, ui: &mut impl Ui) -> Result<Outcome> {
         self.begin("[a background command ended]").await?;
         self.offer_servers_tools(ui).await;
+        self.steer(ui.waiting(), ui).await?;
         if !self.note_ended(ui).await? {
             return Ok(Outcome::Done);
         }
@@ -657,6 +671,7 @@ impl<M: Model> Agent<M> {
         self.begin(&format!("{from}: {text}")).await?;
         self.offer_servers_tools(ui).await;
         self.note_ended(ui).await?;
+        self.steer(ui.waiting(), ui).await?;
         self.record(Item::User(crate::peers::heard(from, text)))?;
         self.work(ui).await
     }
@@ -1201,7 +1216,8 @@ impl<M: Model> Agent<M> {
     /// Adds what came in to steer the turn, where it is now: the user's
     /// messages with what they point at, other reins' framed as theirs, and
     /// notes of files changed by others that this conversation has seen.
-    /// Says whether there was a message, which keeps the turn going.
+    /// Says whether there was a message, which keeps the turn going; what
+    /// another rein told while no turn ran doesn't.
     async fn steer(&mut self, heard: Vec<Heard>, ui: &mut impl Ui) -> Result<bool> {
         let mut any = false;
         for heard in heard {
@@ -1212,8 +1228,12 @@ impl<M: Model> Agent<M> {
                     self.record(Item::User(message.clone()))?;
                     self.attach(message, ui).await?;
                 }
-                Heard::Peer { from, text } => {
+                Heard::Peer { from, text } | Heard::Reported { from, text } => {
                     any = true;
+                    ui.steered(&heard);
+                    self.record(Item::User(crate::peers::heard(from, text)))?;
+                }
+                Heard::Told { from, text } => {
                     ui.steered(&heard);
                     self.record(Item::User(crate::peers::heard(from, text)))?;
                 }
