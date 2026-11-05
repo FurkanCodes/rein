@@ -178,6 +178,12 @@ finding. Each says why in a line.
   the name, and a later commit swapped the command behind it
   (CVE-2025-54136). What a server says of its tools is its own word: none
   runs without asking for it.
+- What a command may write whatever its walls (a tool's records: rtk's
+  stats) is a file, never a link or a folder, and never the settings
+  beside it: rtk outside the walls writes where those say, and through a
+  link planted in place of its stats. Not rtk's `tee` folder either: a
+  folder of links moved there could take its next file, whose names can
+  be guessed.
 - Network access is the internet, never other programs' sockets: with all
   network allowed, a command reached Docker's socket, and Docker can mount
   your home.

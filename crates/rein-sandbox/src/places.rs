@@ -78,6 +78,8 @@ const READABLE: &[&str] = &[
     // Skills, whose scripts a skill has commands run: read, never changed.
     // Claude Code's are in what's hidden: see `SKILLS_IN_HIDDEN`.
     ".agents/skills",
+    // rtk's settings on Linux; on macOS they're in its records (below).
+    ".config/rtk",
     // Git's and Go's own settings, and the text encoding macOS programs
     // read at start.
     ".gitconfig",
@@ -148,6 +150,33 @@ const HIDDEN: &[&str] = &[
 /// a plugin keeps of its own is in `plugins/data`, which stays hidden.
 const SKILLS_IN_HIDDEN: &[&str] = &[".claude/skills", ".claude/plugins/cache"];
 
+/// In your home folder, where everyday tools keep a record of their own
+/// work, which every command may read and add to, whatever its walls:
+/// rtk's stats, and the marker that it warned today. Walled off, `rtk gain`
+/// failed in rein, and every rtk command told the model its hook wasn't
+/// installed.
+const RECORDS: &[&str] = &[
+    // rtk on macOS: its records, and its settings beside them.
+    "Library/Application Support/rtk",
+    // rtk on Linux: its records; its settings are in `.config/rtk`.
+    ".local/share/rtk",
+];
+
+/// In a folder of records, what's written, and only as a file, never a
+/// link or a folder: a link planted in place of the stats would have the
+/// tool write through it, to whatever it named, the next time it runs
+/// outside the walls. Not rtk's `tee` either, the full output of what
+/// failed: a folder of links moved there could take rtk's next file, as
+/// its names can be guessed. macOS says so file by file; on Linux the
+/// folder is written, but no link or folder made or moved in, and what's
+/// [`RECORDS_SETTINGS`] in it is guarded.
+const RECORDED: &[&str] = &["history.db", "history.db-wal", "history.db-shm", "history.db-journal", ".hook_warn_last"];
+
+/// In a folder of records, what's never written: what says what the tool
+/// does the next time it runs, outside the walls too. rtk's `tee` setting
+/// says where it writes, and its trusted filters what it hides.
+const RECORDS_SETTINGS: &[&str] = &["config.toml", "filters.toml", "trusted_filters.json"];
+
 /// Variables that move something [`READABLE`] or [`HIDDEN`] names, maybe
 /// out of your home folder, and what each stands for there: wherever one
 /// points, what's inside is readable or hidden as it would be at home.
@@ -217,6 +246,11 @@ pub struct Places {
     hidden: Vec<PathBuf>,
     /// In what's hidden, what may be read all the same: skills.
     unhidden: Vec<PathBuf>,
+    /// Where everyday tools keep a record of their own work: read and
+    /// added to by every command, whatever its walls (see [`RECORDS`]).
+    records: Vec<PathBuf>,
+    /// In those, what's written, as files ([`RECORDED`]).
+    recorded: Vec<PathBuf>,
     /// Your home folder: none of it is read but what `readable` names.
     home: Option<PathBuf>,
     /// In your home folder, what may be read all the same, but for what's
@@ -274,6 +308,13 @@ impl Places {
             places.hidden.push(resolve(rein));
         }
         places.temp = temp_dirs();
+        places.records = RECORDS.iter().flat_map(|name| locations(home.as_deref(), name, env)).filter(|dir| !places.hidden.iter().any(|hidden| dir.starts_with(hidden))).collect();
+        for dir in places.records.clone() {
+            places.recorded.extend(RECORDED.iter().map(|name| dir.join(name)));
+            for name in RECORDS_SETTINGS {
+                places.protect(&dir.join(name));
+            }
+        }
         if let Some(home) = home {
             places.protected.extend(RUN_AT_LOGIN.iter().map(|name| resolve(&home.join(name))));
             places.readable = readable(&places, &home, env);
@@ -309,6 +350,16 @@ impl Places {
 
     pub(crate) fn own(&self) -> &[PathBuf] {
         &self.own
+    }
+
+    /// Where everyday tools keep a record of their own work.
+    pub(crate) fn records(&self) -> &[PathBuf] {
+        &self.records
+    }
+
+    /// In those, what's written, as files.
+    pub(crate) fn recorded(&self) -> &[PathBuf] {
+        &self.recorded
     }
 
     /// The same places, with `dir` one of the command's own (see `own`),
@@ -455,6 +506,7 @@ fn readable(places: &Places, home: &Path, env: Env) -> Vec<PathBuf> {
         readable.extend(std::env::split_paths(&path).filter(|dir| dir.is_absolute()).map(|dir| resolve(&dir)));
     }
     readable.extend(git_files(home, env));
+    readable.extend(places.records.iter().cloned());
     readable.retain(|place| !home.starts_with(place));
     // The project may be your home folder, or hold it.
     readable.push(places.root.clone());
@@ -688,6 +740,26 @@ mod tests {
         assert_eq!(config_values(text, &["core"], "hookspath"), ["x y", "w", "v"]);
         let text = "[include]\n\tpath = ~/.gitconfig.local\n[includeIf \"gitdir:~/work/\"]\n\tpath = work.inc\n[user]\n\tpath = no\n";
         assert_eq!(config_values(text, &["include", "includeif"], "path"), ["~/.gitconfig.local", "work.inc"]);
+    }
+
+    #[test]
+    fn a_tools_records_are_read_and_added_to_but_never_its_settings_there() {
+        let root = project("records");
+        let home = project("records-home");
+        let data = project("records-data");
+        let env = |name: &str| (name == "XDG_DATA_HOME").then(|| data.clone().into_os_string());
+        let places = Places::with(&root, Some(&home), None, &env);
+        let mac = home.join("Library/Application Support/rtk");
+        for records in [mac.clone(), home.join(".local/share/rtk"), data.join("rtk")] {
+            assert!(places.records().contains(&records), "{records:?} in {:?}", places.records());
+            assert!(places.recorded().contains(&records.join("history.db")) && places.recorded().contains(&records.join(".hook_warn_last")));
+            assert!(!places.recorded().iter().any(|path| path.ends_with("tee") || path.ends_with("config.toml")), "never a folder, nor its settings");
+            for settings in ["config.toml", "filters.toml", "trusted_filters.json"] {
+                assert!(places.protected().contains(&records.join(settings)), "{settings}");
+            }
+        }
+        assert!(places.readable().contains(&mac) && places.readable().contains(&home.join(".config/rtk")), "read, with rtk's settings on Linux");
+        assert!(!places.hides(&mac.join("config.toml")));
     }
 
     #[test]

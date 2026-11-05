@@ -296,18 +296,18 @@ impl Sandbox {
         }
     }
 
-    /// A guard over what's protected in the project, for a command within
-    /// `walls`, where this sandbox can't keep the command from it itself;
-    /// `None` where it can, or the command can't write. What's wrong if
-    /// what's protected is too much to guard.
+    /// A guard over what's protected in what a command within `walls` may
+    /// write (the project, and tools' records), where this sandbox can't
+    /// keep the command from it itself; `None` where it can. What's wrong
+    /// if what's protected is too much to guard.
     pub fn guard(&self, walls: Walls) -> Result<Option<Guard>, String> {
-        if !walls.write {
-            return Ok(None);
-        }
         match self.how {
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            How::Landlock(_) => Guard::new(&self.places).map(Some),
-            _ => Ok(None),
+            How::Landlock(_) => Guard::new(&self.places, walls).map(Some),
+            _ => {
+                let _ = walls;
+                Ok(None)
+            }
         }
     }
 }

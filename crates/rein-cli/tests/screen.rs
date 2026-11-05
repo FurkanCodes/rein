@@ -3075,6 +3075,30 @@ fn in_trust_a_server_without_walls_of_its_own_runs_as_your_commands_do() {
     assert_eq!(results(&model), ["read", "blocked"], "started again in ask: in its walls");
 }
 
+/// Read-only asks before a server's tool, as ask does: turned off, a
+/// lookup the mode is for, codegraph's, was lost to it.
+#[cfg(target_os = "macos")]
+#[test]
+fn read_only_asks_before_a_servers_tool_instead_of_turning_it_off() {
+    let echo = || calls("mcp__fake__echo", json!({ "text": "hi" }));
+    let mut model = Model::start(vec![echo(), says("Echoed."), echo(), says("Again.")]).with_env("REIN_MODE", "read-only");
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] } } }).to_string()));
+    let mut term = Term::start_with(&model, "mcp-read-only", 30, 110, &[("server.sh", rein_mcp::FAKE_SERVER)]);
+    term.wait_for(IDLE);
+    term.keys("echo it\r");
+    term.wait_for("Let fake's echo run?");
+    std::thread::sleep(Duration::from_millis(700));
+    // Yes, and don't ask again for this tool.
+    term.keys("a");
+    term.wait_for("Echoed.");
+    assert_eq!(results(&model), ["hi"], "it ran");
+    term.wait_for(IDLE);
+    term.keys("again\r");
+    term.wait_for("Again.");
+    assert_eq!(results(&model), ["hi", "hi"], "it ran again");
+    assert_eq!(term.text().matches("won't ask again for this tool").count(), 1, "without asking:\n{}", term.text());
+}
+
 /// A server whose tools are held back is named in the tool search, not
 /// shown: the model finds the tool it needs, which is added to its tools
 /// where it found it, and calls it. `/mcp` says they're found when needed.

@@ -349,8 +349,6 @@ const AUTO_PROTECTED: &str = "rein is in auto mode, where nothing asks, and this
                               changing it takes the user's approval. Leave it, or tell the user what to change.";
 const AUTO_MCP: &str = "rein is in auto mode, where nothing asks, and this MCP tool isn't one the user's own mcp.json allows \
                         (\"allow\": [...]). Do without it, or tell the user what you need it for.";
-const READ_ONLY_MCP: &str = "rein is in read-only mode, and an MCP tool may change things wherever its server reaches: \
-                             they're turned off.";
 const READ_ONLY_CHANGES: &str = "File changes are turned off: rein is in read-only mode.";
 const READ_ONLY_COMMANDS: &str = "rein is in read-only mode: commands run with look access only, and change nothing.";
 const READ_ONLY_NO_SANDBOX: &str = "Commands are turned off: rein is in read-only mode, and there's no sandbox here \
@@ -432,16 +430,16 @@ impl Permissions {
     /// An MCP server's tool: what it does, it does wherever its server
     /// reaches (an issue tracker, a database), beyond any wall of rein's,
     /// and what the server says of it (that it only reads, say) is its own
-    /// word. So it asks, but for what you allowed yourself, and a mode that
-    /// doesn't ask refuses it instead.
+    /// word. So it asks, but for what you allowed yourself; read-only too,
+    /// where turned off, codegraph's lookups were lost to a mode meant for
+    /// looking. Auto, which never asks, refuses it instead.
     fn decide_tool(&self, name: &str) -> Decision {
         let allowed = self.allowed_tools.iter().chain(&self.approved_tools).any(|allowed| allowed == name);
         match self.mode {
-            Mode::ReadOnly => Decision::Deny(READ_ONLY_MCP.into()),
             Mode::Trust => Decision::Allow,
             _ if allowed => Decision::Allow,
             Mode::Auto => Decision::Deny(AUTO_MCP.into()),
-            Mode::Ask | Mode::Edits => Decision::Ask,
+            Mode::Ask | Mode::Edits | Mode::ReadOnly => Decision::Ask,
         }
     }
 
@@ -659,10 +657,11 @@ mod tests {
     }
 
     /// A server's tool may do anything wherever its server reaches, so it
-    /// asks, but for what your own mcp.json allows; a project's rules
-    /// never allow one, and the modes that don't ask refuse it.
+    /// asks, but for what your own mcp.json allows, in read-only too; a
+    /// project's rules never allow one, and auto, which never asks,
+    /// refuses it.
     #[test]
-    fn an_mcp_tool_asks_but_for_what_you_allowed_and_modes_that_dont_ask_refuse_it() {
+    fn an_mcp_tool_asks_but_for_what_you_allowed_and_auto_refuses_it() {
         let call = |name: &str| ToolCall { call_id: "1".into(), name: name.into(), arguments: "{}".into() };
         let (issue, merge) = (call("mcp__github__get_issue"), call("mcp__github__merge"));
         let mut p = Permissions::new(Mode::Ask, "allow mcp__github__merge\nallow merge").unwrap();
@@ -678,7 +677,10 @@ mod tests {
         p.mode = Mode::Auto;
         assert_eq!((p.decide(&issue), p.decide(&merge)), (Decision::Allow, Decision::Deny(AUTO_MCP.into())));
         p.mode = Mode::ReadOnly;
-        assert_eq!((p.decide(&issue), p.decide(&merge)), (Decision::Deny(READ_ONLY_MCP.into()), Decision::Deny(READ_ONLY_MCP.into())));
+        assert_eq!((p.decide(&issue), p.decide(&merge)), (Decision::Allow, Decision::Ask), "read-only asks, not refuses");
+        p.remember(&merge);
+        assert_eq!(p.decide(&merge), Decision::Allow, "and a yes for always holds there too");
+        p.forget_approvals();
         p.mode = Mode::Trust;
         assert_eq!(p.decide(&merge), Decision::Allow);
         p.allow_tools(Vec::new());

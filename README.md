@@ -767,6 +767,16 @@ programs on this computer: not Docker's socket, which would let it start a
 container with your home folder in it, and not apps, which could do things
 for it outside.
 
+Whatever its walls, a command may add to the records everyday tools keep
+of their own work: rtk's stats and the marker that it warned today, so
+`rtk gain` works, and rtk says once a day, not with every command, that
+it can't see its hook (it can't read Claude Code's settings). Only
+as files, never a link or a folder, and never the tool's settings beside
+them: changed, those would change what the tool does outside the walls
+the next time it runs. rtk's `tee`, the full output of what failed, isn't
+written from the sandbox, as a folder of links moved there could take
+its next file.
+
 A sandboxed command that fails says what its walls were, so the model knows
 when to ask for more. Installing packages into a cache in your home folder,
 `docker`, `ssh` and signed commits need `outside`.
@@ -775,8 +785,9 @@ On macOS the sandbox is the system's own (Seatbelt), and costs about 10 ms
 per command. On Linux 5.13 or later it's Landlock for files and seccomp for
 sockets, with nothing to install and no user namespaces needed, so it works
 on Ubuntu 24.04 and in containers too. Landlock can only wall off whole
-folders, though, so on Linux what's protected inside the project is guarded
-instead: rein notes it before a command that writes, and puts it back after
+folders, though, so on Linux what's protected inside the project, and a
+tool's settings beside its records, is guarded instead: rein notes it
+before a command that may change it, and puts it back after
 (something the command leaves running in the background could still change
 it later). Where there's no sandbox (Windows, older kernels), or with
 `sandbox = off`, commands ask before they run: rein never runs one
@@ -986,8 +997,9 @@ and the prompt cache isn't lost. A call
 asks first in `ask` and `edits`: a server's tool may do anything wherever
 the server reaches, and what a server says of a tool (that it only reads,
 say) is only its word. `/mcp allow`, or `allow` in your own file, lets
-tools run without asking, and `"*"` allows all of one server's. `auto` runs only those, and
-`read-only` none. Neither a project's `.mcp.json` nor its
+tools run without asking, and `"*"` allows all of one server's. `read-only`
+asks too, as a lookup (codegraph's, say) is what it's for; `auto`, which
+never asks, runs only those. Neither a project's `.mcp.json` nor its
 `.rein/permissions` can allow one.
 
 ### Tool search
