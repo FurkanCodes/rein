@@ -3382,6 +3382,28 @@ fn your_claude_code_hooks_run_in_rein_as_they_are() {
     assert_eq!(results(&model), ["rewritten[exit code 0]", "original[exit code 0]"], "off: the model's own runs");
 }
 
+/// Your hooks run as you'd run them, in every mode: read-only walls in
+/// what the model runs, never your own setup. handoff-at-limit.py lives in
+/// ~/.claude/hooks, which the sandbox hides from commands: walled in, the
+/// hook couldn't open its own script, and the message was turned away.
+#[test]
+fn your_hooks_work_in_read_only_mode_with_their_scripts_in_your_claude_folder() {
+    let mut model = Model::start(vec![says("Heard.")]).with_env("REIN_MODE", "read-only");
+    let settings = json!({ "hooks": {
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "sh \"$HOME/.claude/hooks/notes.sh\"" }] }]
+    } });
+    model.home.push((".claude/settings.json".into(), settings.to_string()));
+    model.home.push((".claude/hooks/notes.sh".into(), "printf 'notes from your own hook'\n".into()));
+    let mut term = Term::start_with(&model, "hooks-read-only", 30, 120, &[]);
+    term.wait_for(IDLE);
+    term.keys("hello\r");
+    term.wait_for("Heard.");
+    let text = term.text();
+    assert!(text.contains("↳ sh added about"), "{text}");
+    let first = model.requests()[0]["input"].to_string();
+    assert!(first.contains("notes from your own hook"), "{first}");
+}
+
 /// A skill you turned off, called by name, is offered back: say no and
 /// what you typed is in the box again; yes, and it's on and called. One
 /// only the model loads says so, not "no such command".

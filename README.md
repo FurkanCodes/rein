@@ -608,9 +608,13 @@ Where it does better:
   cache holds; at most 10,000 characters, and more is cut and said so,
   never dropped. A hook that doesn't work says so once, and what it was
   for goes ahead.
-- **Hooks run as your mode runs commands:** outside the sandbox in trust,
-  in its walls in the other modes, and never unwalled where the mode walls
-  commands in.
+- **Your hooks run as you'd run them,** outside the sandbox in every mode,
+  as Claude Code's do: they're yours, from your settings, and the walls are
+  for what the model runs. Walled in, a hook couldn't open its own script
+  in `~/.claude/hooks`, and in read-only mode every message was turned
+  away. Nothing the model runs can plant one: `~/.claude`, rein's folder
+  and the project's `.claude` are out of its commands' reach in every
+  walled mode.
 
 They run with no terminal, in a process group of their own, stopped with
 everything they started when they take too long (10 minutes, as Claude

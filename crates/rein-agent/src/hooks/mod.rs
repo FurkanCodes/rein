@@ -11,8 +11,16 @@
 //! don't race (Claude Code runs them at once, and the last to finish wins);
 //! a rewritten call is decided on as the model's own is, and rein's ask and
 //! deny rules on the call as it was too; what a hook adds is said where
-//! you see it, as its words, not yours; and a hook runs as your mode runs
-//! commands: outside the sandbox in trust, in its walls in the others.
+//! you see it, as its words, not yours.
+//!
+//! Your hooks run as you'd run them yourself, outside the sandbox, in every
+//! mode, as Claude Code's do: they're yours, from your own settings, and
+//! the walls are for what the model runs. Walled in, a hook couldn't open
+//! its own script in `~/.claude/hooks`, Python's exit code for that (2)
+//! read as a no, and every message was turned away in read-only mode.
+//! Nothing the model runs can plant one: your settings, `~/.claude`, rein's
+//! own folder and a project's `.claude` are out of its commands' reach in
+//! every walled mode. A project's hooks, someone else's, don't run.
 
 mod answer;
 mod config;
@@ -30,9 +38,7 @@ use rein_llm::ToolCall;
 use serde_json::{Value, json};
 
 use crate::permissions::Mode;
-use crate::sandbox::{Access, Shared};
 use answer::Said;
-use run::How;
 
 /// The events a hook runs on: Claude Code's, those rein has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -261,7 +267,6 @@ pub struct Here<'a> {
     /// The conversation's file: rein's own, not Claude Code's.
     pub transcript: Option<&'a Path>,
     pub mode: Mode,
-    pub sandbox: &'a Shared,
 }
 
 /// What one hook said, by its name.
@@ -340,7 +345,7 @@ pub struct Hooks {
     hooks: Vec<Hook>,
     left_out: Vec<LeftOut>,
     last: Mutex<HashMap<String, Last>>,
-    /// What was said once already: no sandbox to run hooks in.
+    /// What was said once already: a hook that doesn't work.
     told: Mutex<HashSet<String>>,
     /// Those running in the background, stopped when rein lets them go.
     background: Mutex<tokio::task::JoinSet<()>>,
@@ -411,12 +416,11 @@ impl Hooks {
         if hooks.is_empty() {
             return heard;
         }
-        let Some(how) = self.how(here, &hooks, &mut heard) else { return heard };
         if name == EventName::PreToolUse {
             let Event::PreToolUse(call) = event else { return heard };
             let mut current = call.clone();
             for hook in hooks {
-                let said = self.run_one(hook, &input(&Event::PreToolUse(&current), here), here, how).await;
+                let said = self.run_one(hook, &input(&Event::PreToolUse(&current), here), here).await;
                 heard.ran.push(hook.name());
                 if let Some(updated) = &said.input {
                     match named::rewritten(&current, updated, here.root) {
@@ -441,7 +445,7 @@ impl Hooks {
             return heard;
         }
         let given = input(&event, here);
-        let runs = hooks.iter().map(|hook| self.run_one(hook, &given, here, how)).collect();
+        let runs = hooks.iter().map(|hook| self.run_one(hook, &given, here)).collect();
         for (hook, said) in hooks.iter().zip(crate::agent::all(runs).await) {
             heard.ran.push(hook.name());
             gather(&mut heard, hook, said);
@@ -449,39 +453,18 @@ impl Hooks {
         heard
     }
 
-    /// How hooks run here, as your mode runs commands: `None` if they
-    /// can't, said once.
-    fn how(&self, here: &Here<'_>, hooks: &[&Hook], heard: &mut Heard) -> Option<How> {
-        if here.mode == Mode::Trust {
-            return Some(How::Outside);
-        }
-        if let (true, Some(walls)) = (here.sandbox.available(), Access::Network.walls()) {
-            return Some(How::Walled(walls));
-        }
-        // Never unwalled what the mode walls in.
-        for hook in hooks {
-            if lock(&self.told).insert(hook.id()) {
-                heard.failed.push(By::new(
-                    hook,
-                    format!("it didn't run: there's no sandbox here, and {} runs nothing outside it; trust runs hooks as your commands", mode_word(here.mode)),
-                ));
-            }
-        }
-        None
-    }
-
     /// Runs `hook` with `given`, or in the background, if it says so.
-    async fn run_one(&self, hook: &Hook, given: &Value, here: &Here<'_>, how: How) -> Said {
+    async fn run_one(&self, hook: &Hook, given: &Value, here: &Here<'_>) -> Said {
         let bytes = given.to_string().into_bytes();
         let timeout = hook.timeout.unwrap_or_else(|| hook.event.timeout());
         if hook.background {
-            let (hook, root, sandbox) = (hook.clone(), here.root.to_owned(), here.sandbox.clone());
+            let (hook, root) = (hook.clone(), here.root.to_owned());
             lock(&self.background).spawn(async move {
-                run::run(&hook.command, &hook.from, &bytes, &root, &sandbox, how, timeout).await;
+                run::run(&hook.command, &hook.from, &bytes, &root, timeout).await;
             });
             return Said::default();
         }
-        let ran = run::run(&hook.command, &hook.from, &bytes, here.root, here.sandbox, how, timeout).await;
+        let ran = run::run(&hook.command, &hook.from, &bytes, here.root, timeout).await;
         let said = answer::read(hook.event, &ran);
         let came = came(&said);
         lock(&self.last).insert(hook.id(), Last { at: SystemTime::now(), took: ran.took, came });
@@ -565,16 +548,6 @@ fn permission_mode(mode: Mode) -> &'static str {
         Mode::Edits => "acceptEdits",
         Mode::Auto => "dontAsk",
         Mode::ReadOnly => "plan",
-    }
-}
-
-fn mode_word(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Trust => "trust",
-        Mode::Ask => "ask",
-        Mode::Edits => "edits",
-        Mode::Auto => "auto",
-        Mode::ReadOnly => "read-only",
     }
 }
 

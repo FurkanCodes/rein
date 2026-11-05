@@ -10,15 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
 use super::config::{Command, From};
-use crate::sandbox::{self, Sandbox, Walls};
-
-/// How a hook runs: outside the sandbox, as your commands do in trust, or
-/// in its walls, as they do in the other modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum How {
-    Outside,
-    Walled(Walls),
-}
+use crate::sandbox;
 
 /// What a hook did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,58 +24,36 @@ pub(crate) struct Ran {
     pub(crate) took: Duration,
 }
 
-/// Runs `command`, set `from`, in `root`, with `input` on its input, as
-/// `how` says, for at most `timeout`.
-pub(crate) async fn run(command: &Command, from: &From, input: &[u8], root: &Path, sandbox: &Sandbox, how: How, timeout: Duration) -> Ran {
+/// Runs `command`, set `from`, in `root`, with `input` on its input, for
+/// at most `timeout`. It runs as you'd run it yourself, outside the
+/// sandbox, in every mode: see [`super`].
+pub(crate) async fn run(command: &Command, from: &From, input: &[u8], root: &Path, timeout: Duration) -> Ran {
     let began = Instant::now();
-    // Where the sandbox can't keep a command from what runs code later,
-    // that's noted now and put back once it's done, as for a command.
-    let guard = match how {
-        How::Walled(walls) => match sandbox.guard(walls) {
-            Ok(guard) => guard,
-            Err(why) => return Ran { failed: Some(why), took: began.elapsed(), ..Ran::default() },
-        },
-        How::Outside => None,
-    };
-    let mut ran = match start(command, from, root, sandbox, how) {
+    let mut ran = match start(command, from, root) {
         Ok(child) => finish(child, input, timeout).await,
         Err(why) => Ran { failed: Some(why), ..Ran::default() },
     };
-    drop(guard.map(sandbox::Guard::finish));
     ran.took = began.elapsed();
     ran
 }
 
-fn start(command: &Command, from: &From, root: &Path, sandbox: &Sandbox, how: How) -> Result<tokio::process::Child, String> {
+fn start(command: &Command, from: &From, root: &Path) -> Result<tokio::process::Child, String> {
     let shell = if command.bash { "bash" } else { "sh" };
-    let mut process = match how {
-        How::Outside => {
-            let mut process = match &command.args {
-                Some(args) => {
-                    let mut process = tokio::process::Command::new(&command.line);
-                    process.args(args);
-                    process
-                }
-                None => {
-                    let mut process = tokio::process::Command::new(shell);
-                    process.arg("-c").arg(&command.line);
-                    process
-                }
-            };
-            // Your whole environment, as a command outside the sandbox
-            // gets it.
-            process.envs(sandbox::secrets::all().iter().map(|(name, value)| (name, value)));
+    let mut process = match &command.args {
+        Some(args) => {
+            let mut process = tokio::process::Command::new(&command.line);
+            process.args(args);
             process
         }
-        How::Walled(walls) => {
-            let line = match &command.args {
-                Some(args) => format!("exec {}", std::iter::once(&command.line).chain(args).map(|word| quote(word)).collect::<Vec<_>>().join(" ")),
-                None if command.bash => format!("exec bash -c {}", quote(&command.line)),
-                None => command.line.clone(),
-            };
-            sandbox.wrap(&line, walls)?
+        None => {
+            let mut process = tokio::process::Command::new(shell);
+            process.arg("-c").arg(&command.line);
+            process
         }
     };
+    // Your whole environment, as your shell gives it: rein keeps your keys
+    // out of its own (`secrets::keep`), not out of what you run.
+    process.envs(sandbox::secrets::all().iter().map(|(name, value)| (name, value)));
     // As Claude Code gives its hooks: the project, and a plugin's folder.
     process.env("CLAUDE_PROJECT_DIR", root);
     if let From::Plugin { root: plugin, .. } = from {
@@ -120,11 +90,6 @@ async fn finish(mut child: tokio::process::Child, input: &[u8], timeout: Duratio
     }
 }
 
-/// `word` quoted for `sh`, as it is.
-fn quote(word: &str) -> String {
-    format!("'{}'", word.replace('\'', r"'\''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,8 +100,7 @@ mod tests {
 
     async fn outside(line: &str, input: &str, timeout: Duration) -> Ran {
         let root = std::env::temp_dir();
-        let sandbox = Sandbox::missing(sandbox::Places::default(), sandbox::Missing::NotHere);
-        run(&command(line), &From::Rein(root.clone()), input.as_bytes(), &root, &sandbox, How::Outside, timeout).await
+        run(&command(line), &From::Rein(root.clone()), input.as_bytes(), &root, timeout).await
     }
 
     #[tokio::test]
@@ -160,9 +124,8 @@ mod tests {
     #[tokio::test]
     async fn one_given_as_a_program_and_its_arguments_runs_with_no_shell() {
         let root = std::env::temp_dir();
-        let sandbox = Sandbox::missing(sandbox::Places::default(), sandbox::Missing::NotHere);
         let exec = Command { line: "printf".into(), args: Some(vec!["%s|".into(), "$HOME".into(), "a b".into()]), bash: false };
-        let ran = run(&exec, &From::Rein(root.clone()), b"", &root, &sandbox, How::Outside, Duration::from_secs(5)).await;
+        let ran = run(&exec, &From::Rein(root.clone()), b"", &root, Duration::from_secs(5)).await;
         assert_eq!(ran.stdout, "$HOME|a b|", "nothing in them is the shell's");
     }
 }

@@ -468,13 +468,7 @@ impl<M: Model> Agent<M> {
 
     /// Where your hooks run, and what they're told of it.
     fn here(&self) -> hooks::Here<'_> {
-        hooks::Here {
-            root: self.tools.root(),
-            session_id: self.session_id.as_deref(),
-            transcript: self.session.as_ref().map(Session::path),
-            mode: self.permissions.mode,
-            sandbox: self.tools.sandbox(),
-        }
+        hooks::Here { root: self.tools.root(), session_id: self.session_id.as_deref(), transcript: self.session.as_ref().map(Session::path), mode: self.permissions.mode }
     }
 
     /// What your hooks added, for the model: after what's there, as their

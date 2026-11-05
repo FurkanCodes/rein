@@ -140,6 +140,13 @@ finding. Each says why in a line.
   while commands run free, and walls broke what servers need. What comes
   with a project waits for your yes in every mode, which doesn't depend
   on walls.
+- Your own hooks run outside the sandbox in every mode, as Claude Code's
+  do: they're your setup, not what the model runs. Walled in, a hook
+  couldn't open its own script in `~/.claude/hooks`, Python's exit code
+  for that (2) read as a no, and every message was turned away in
+  read-only mode. That's safe because what the model runs can't plant
+  one: `~/.claude`, rein's folder and a project's `.claude` are out of its
+  reach. A project's hooks are someone else's, and wait for your yes.
 - A command meant for the sandbox never runs without one: no sandbox means
   ask, not run (`Run::Sandboxed` without one is an error). Claude Code's
   default runs commands unsandboxed when its sandbox can't start.

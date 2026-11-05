@@ -1,8 +1,5 @@
 use super::*;
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use crate::sandbox::{Missing, Places, Sandbox};
 
 /// A folder for a test, outside the temp folders, which every command in
 /// the sandbox may read and write, as a real project or home isn't.
@@ -24,12 +21,8 @@ fn hooks(name: &str, hooks: Value) -> (Hooks, PathBuf) {
     (Hooks::load(&dir.join("rein"), None, &dir.join("project"), &Chosen::default()), dir.join("project"))
 }
 
-fn no_sandbox() -> Shared {
-    Arc::new(Sandbox::missing(Places::default(), Missing::NotHere))
-}
-
-fn here<'a>(root: &'a Path, mode: Mode, sandbox: &'a Shared) -> Here<'a> {
-    Here { root, session_id: Some("s1"), transcript: None, mode, sandbox }
+fn here(root: &Path, mode: Mode) -> Here<'_> {
+    Here { root, session_id: Some("s1"), transcript: None, mode }
 }
 
 fn command(line: &str) -> Value {
@@ -52,8 +45,7 @@ fn prefixing(prefix: &str) -> Value {
 #[tokio::test]
 async fn hooks_on_a_tool_run_in_turn_each_given_the_call_as_the_last_left_it() {
     let (hooks, root) = hooks("chain", json!({ "PreToolUse": [{ "matcher": "Bash", "hooks": [prefixing("rtk"), prefixing("nice")] }] }));
-    let sandbox = no_sandbox();
-    let heard = hooks.on(Event::PreToolUse(&bash("cargo test")), &here(&root, Mode::Trust, &sandbox)).await;
+    let heard = hooks.on(Event::PreToolUse(&bash("cargo test")), &here(&root, Mode::Trust)).await;
     let (call, by) = heard.call.clone().expect("rewritten");
     assert_eq!(command_of(&call), "nice rtk cargo test", "the second was given the first's rewrite: no race");
     assert_eq!(by, ["sed", "sed"]);
@@ -65,8 +57,7 @@ async fn hooks_on_a_tool_run_in_turn_each_given_the_call_as_the_last_left_it() {
 async fn the_first_hook_that_says_no_stops_the_rest() {
     let refuses = command("echo 'not on main' >&2; exit 2");
     let (hooks, root) = hooks("no", json!({ "PreToolUse": [{ "hooks": [refuses, prefixing("rtk")] }] }));
-    let sandbox = no_sandbox();
-    let heard = hooks.on(Event::PreToolUse(&bash("git push")), &here(&root, Mode::Trust, &sandbox)).await;
+    let heard = hooks.on(Event::PreToolUse(&bash("git push")), &here(&root, Mode::Trust)).await;
     assert_eq!(heard.no, Some(By { hook: "echo".into(), said: "not on main".into() }));
     assert_eq!(heard.ran, ["echo"], "the rest didn't run");
     assert!(heard.call.is_none());
@@ -81,8 +72,7 @@ async fn a_hook_runs_for_what_its_matcher_and_its_if_say() {
             { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo git", "if": "Bash(git *)" }] }
         ] }),
     );
-    let sandbox = no_sandbox();
-    let here = here(&root, Mode::Trust, &sandbox);
+    let here = here(&root, Mode::Trust);
     assert!(hooks.on(Event::PreToolUse(&bash("ls")), &here).await.ran.is_empty(), "not an edit, not git");
     assert_eq!(hooks.on(Event::PreToolUse(&bash("cargo fmt && git commit -m x")), &here).await.ran, ["echo"], "a part of it is git");
     assert!(glob("git *", "git status") && !glob("git *", "gitk") && glob("npm run test:*", "npm run test -- --watch") && glob("src/**", "src/a/b.rs"));
@@ -93,8 +83,7 @@ async fn what_a_message_hook_prints_is_context_for_the_model_cut_where_its_long(
     let long = format!("printf '%{}s' x", MOST_SAID + 50);
     let (hooks, root) =
         hooks("context", json!({ "UserPromptSubmit": [{ "hooks": [command("cat >/dev/null; echo '<codegraph_context>a.rs</codegraph_context>'"), command(&long)] }] }));
-    let sandbox = no_sandbox();
-    let heard = hooks.on(Event::UserPromptSubmit("how does a.rs work?"), &here(&root, Mode::Trust, &sandbox)).await;
+    let heard = hooks.on(Event::UserPromptSubmit("how does a.rs work?"), &here(&root, Mode::Trust)).await;
     assert_eq!(heard.context[0].said, "<codegraph_context>a.rs</codegraph_context>");
     assert!(heard.context[1].said.ends_with("[50 more characters cut: a hook gives the model at most 10000]"), "said, not dropped");
     let said = note(&heard.context[0]);
@@ -104,11 +93,7 @@ async fn what_a_message_hook_prints_is_context_for_the_model_cut_where_its_long(
 #[tokio::test]
 async fn a_hook_is_told_what_happened_as_claude_code_tells_it() {
     let (hooks, root) = hooks("given", json!({ "PreToolUse": [{ "hooks": [command("cat > given.json")] }] }));
-    let sandbox = no_sandbox();
-    hooks.on(Event::PreToolUse(&bash("cargo test")), &here(&root, Mode::Edits, &sandbox)).await;
-    // In edits, with no sandbox here, it didn't run: given nothing.
-    assert!(!root.join("given.json").exists(), "walled modes never run a hook unwalled");
-    hooks.on(Event::PreToolUse(&bash("cargo test")), &here(&root, Mode::Trust, &sandbox)).await;
+    hooks.on(Event::PreToolUse(&bash("cargo test")), &here(&root, Mode::Trust)).await;
     let given: Value = serde_json::from_str(&std::fs::read_to_string(root.join("given.json")).unwrap()).unwrap();
     assert_eq!(given["hook_event_name"], "PreToolUse");
     assert_eq!((given["tool_name"].clone(), given["tool_input"]["command"].clone()), (json!("Bash"), json!("cargo test")));
@@ -116,30 +101,20 @@ async fn a_hook_is_told_what_happened_as_claude_code_tells_it() {
 }
 
 #[tokio::test]
-async fn with_no_sandbox_a_walled_mode_says_once_its_hooks_dont_run() {
-    let (hooks, root) = hooks("walls", json!({ "Stop": [{ "hooks": [command("true")] }] }));
-    let sandbox = no_sandbox();
-    let here = here(&root, Mode::Ask, &sandbox);
-    let first = hooks.on(Event::Stop { again: false, last: None }, &here).await;
-    assert!(first.failed[0].said.contains("there's no sandbox here, and ask runs nothing outside it"), "{first:?}");
-    assert!(first.ran.is_empty());
-    assert!(hooks.on(Event::Stop { again: false, last: None }, &here).await.failed.is_empty(), "said once");
-}
-
-#[tokio::test]
-async fn hooks_in_the_sandbox_reach_the_project_but_not_your_home_folder() {
-    let home = dir("walled-home");
-    let line = format!("if cat {}/.ssh/id_test >/dev/null 2>&1; then echo read; else echo blocked; fi; echo made > made.txt", home.display());
-    let (hooks, root) = hooks("walled", json!({ "SessionStart": [{ "hooks": [command(&line)] }] }));
-    std::fs::create_dir_all(home.join(".ssh")).unwrap();
-    std::fs::write(home.join(".ssh/id_test"), "FAKE-hooks-secret").unwrap();
-    let sandbox: Shared = Arc::new(Sandbox::detect(Places::new(&root, Some(&home), None)).await);
-    if !sandbox.available() {
-        return;
+async fn your_hooks_run_as_you_would_in_every_mode_reaching_their_own_scripts() {
+    // As handoff-at-limit.py lives in ~/.claude/hooks, which the sandbox
+    // hides from what the model runs: walled in, the hook couldn't open
+    // its own script, and every message in read-only mode was turned away.
+    let home = dir("own-home");
+    std::fs::create_dir_all(home.join(".claude/hooks")).unwrap();
+    std::fs::write(home.join(".claude/hooks/say.sh"), "echo \"ran in $PWD\"; echo made > made.txt\n").unwrap();
+    let line = format!("sh {}/.claude/hooks/say.sh", home.display());
+    let (hooks, root) = hooks("own", json!({ "UserPromptSubmit": [{ "hooks": [command(&line)] }] }));
+    for mode in Mode::ALL {
+        let heard = hooks.on(Event::UserPromptSubmit("hi"), &here(&root, mode)).await;
+        assert!(heard.failed.is_empty() && heard.no.is_none(), "{mode:?}: {heard:?}");
+        assert_eq!(heard.context[0].said, format!("ran in {}", root.display()), "{mode:?}");
+        assert!(root.join("made.txt").exists(), "{mode:?}: in the project, as you'd run it there");
+        std::fs::remove_file(root.join("made.txt")).unwrap();
     }
-    let heard = hooks.on(Event::SessionStart(Source::Startup), &here(&root, Mode::Edits, &sandbox)).await;
-    assert_eq!(heard.context[0].said, "blocked", "your home folder, beyond the project");
-    assert!(root.join("made.txt").exists(), "it may change the project");
-    let outside = hooks.on(Event::SessionStart(Source::Startup), &here(&root, Mode::Trust, &sandbox)).await;
-    assert_eq!(outside.context[0].said, "read", "trust: as your commands, outside");
 }
