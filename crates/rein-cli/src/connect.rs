@@ -97,6 +97,13 @@ pub fn usable(provider: &Provider, keys: &Keys) -> bool {
     }
 }
 
+/// You're signed in to nothing that runs the model `spec`: no sign-in, no
+/// key, and its provider needs one. A model rein can't place isn't this: connecting to
+/// it says what's wrong.
+pub fn unpaid(spec: &str, providers: &[Provider], keys: &Keys) -> bool {
+    resolve(spec, providers).is_ok_and(|(provider, _)| payment(provider, keys).is_none())
+}
+
 /// The model to use when none is named: OpenAI's if you can pay for it,
 /// otherwise the first provider's you have a key for.
 pub fn default_model(providers: &[Provider], keys: &Keys) -> String {

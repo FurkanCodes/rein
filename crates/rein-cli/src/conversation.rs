@@ -8,7 +8,7 @@ use crate::input::{Menu, Read};
 use crate::terminal::{Last, Terminal, you_said};
 use crate::ui::history::{self, History};
 use crate::ui::style::GUTTER;
-use crate::{CREDENTIALS_FILE, CliResult, config_dir, describe, login};
+use crate::{CREDENTIALS_FILE, CliResult, config_dir, describe};
 use rein_agent::agent::{Agent, Llm, Outcome};
 use rein_agent::compact;
 use rein_agent::permissions::{Mode, Permissions, Sandboxing, Whose};
@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 
 pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option<String>) -> CliResult {
     let dir = config_dir()?;
-    let keys = crate::connect::load_keys(&dir)?;
+    let mut keys = crate::connect::load_keys(&dir)?;
     let providers = crate::connect::providers(&dir)?;
     if args.worktree
         && let Some(workspace) = &args.workspace
@@ -47,8 +47,10 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     let wanted = args.model.clone().unwrap_or_else(|| crate::connect::default_model(&providers, &keys));
     // Whoever serves the model, as soon as that's known: the model list,
     // which says how big each model's context window is, loads while
-    // everything else gets ready.
+    // everything else gets ready. A model you're not signed in for waits:
+    // once the box is up, it asks you to sign in.
     let early = if args.model_given || args.resume == Resume::New { Some(wanted.clone()) } else { latest.as_deref().and_then(session::peek).map(|header| header.model) };
+    let early = early.filter(|spec| args.prompt.is_some() || !crate::connect::unpaid(spec, &providers, &keys));
     if args.prompt.is_none() {
         crate::ui::logo::show(&root, early.as_deref());
     }
@@ -97,6 +99,15 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     let spec = match &theirs {
         Some(theirs) if !args.model_given => theirs.clone(),
         _ => wanted,
+    };
+    // The first time, or once you're signed out: with you here, rein
+    // asks you to sign in, as Codex and Claude Code do, instead of stopping.
+    let spec = if args.prompt.is_none() && crate::connect::unpaid(&spec, &providers, &keys) {
+        // A model you named, with -m or in the settings, or a conversation's.
+        let keep = args.model.is_some() || theirs.is_some();
+        crate::sign_in::first(http, &providers, &mut keys, &mut terminal, &spec, keep).await?.unwrap_or(spec)
+    } else {
+        spec
     };
     let (provider, model_name) = crate::connect::resolve(&spec, &providers)?;
     let provider = provider.clone();
@@ -956,22 +967,8 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
         Slash::Login(None) => {
             // Keys may have come or gone in another terminal since.
             setup.keys = crate::connect::load_keys(&config_dir()?)?;
-            let signed_in = config_dir()?.join(CREDENTIALS_FILE).exists();
-            let mut names = vec!["chatgpt".to_owned()];
-            let mut items =
-                vec![("chatgpt".to_owned(), if signed_in { "signed in: your ChatGPT plan pays for OpenAI's models" } else { "your ChatGPT plan, for OpenAI's models" }.to_owned())];
-            for provider in setup.providers.iter().filter(|p| p.needs_key) {
-                names.push(provider.name.clone());
-                let how = if provider.sign_in_url.is_some() { ", signs in in the browser" } else { "" };
-                let description = if provider.name == "claude-code" {
-                    "Claude Code subscription: CLI login or setup-token".to_owned()
-                } else {
-                    format!("{}{how}", crate::connect::pays(provider, &setup.keys, false))
-                };
-                items.push((provider.name.clone(), description));
-            }
-            let current = names.iter().position(|name| *name == setup.provider.name);
-            terminal.input.choose(menu("sign in to a provider", items, current)).await.map(|i| Slash::Login(Some(names[i].clone())))
+            let (names, menu) = crate::sign_in::menu(&setup.providers, &setup.keys, Some(&setup.provider.name))?;
+            terminal.input.choose(menu).await.map(|i| Slash::Login(Some(names[i].clone())))
         }
         Slash::Logout(None) => {
             setup.keys = crate::connect::load_keys(&config_dir()?)?;
@@ -1027,55 +1024,15 @@ pub(crate) async fn other_models(setup: &mut Setup, terminal: &mut Terminal) -> 
     found
 }
 
-/// `/login <name>`: signs in without leaving the conversation. A key is
-/// pasted in the box, where it shows as dots; a provider with a browser
-/// sign-in, and ChatGPT, sign in there. Once done, it's ready for /model,
-/// and if it's the provider in use, its next request pays the new way.
+/// `/login <name>`: signs in without leaving the conversation, as
+/// [`crate::sign_in::here`] does. Once done, it's ready for /model, and if
+/// it's the provider in use, its next request pays the new way.
 pub(crate) async fn login_here(name: &str, given: Option<crate::commands::Key>, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> CliResult {
     let pad = " ".repeat(GUTTER);
     let s = terminal.err;
-    let tell = |text: &str| {
-        for line in text.trim_matches('\n').lines() {
-            say!("{pad}{line}");
-        }
-    };
-    let cancelled = || say!("{pad}{}", s.dim("(cancelled; nothing was saved)"));
-    let signed_in = if name == "chatgpt" {
-        if given.is_some() {
-            return Err("ChatGPT is signed in to in the browser: /login chatgpt takes no key".into());
-        }
-        if waiting(terminal, "Waiting for you to sign in to ChatGPT in the browser", login(&setup.http, &tell)).await?.is_none() {
-            cancelled();
-            return Ok(());
-        }
-        "openai"
-    } else {
-        let provider = crate::connect::find(&setup.providers, name)?.clone();
-        // A key typed after the name is checked and saved as one pasted is.
-        let (key, made) = match given {
-            Some(key) => (Some(key.into_inner()), false),
-            None => {
-                let made = crate::connect::sign_in(&provider, false)?;
-                let key = match made {
-                    Some(auth_url) => {
-                        let what = format!("Waiting for you to sign in to {} in the browser", provider.title);
-                        waiting(terminal, &what, crate::connect::key_from_browser(&setup.http, &provider, auth_url, &tell)).await?
-                    }
-                    None => match terminal.input.read_secret(&crate::connect::paste_prompt(&provider)).await {
-                        Some(Read::Line(key)) => Some(key),
-                        Some(_) => None,
-                        None => return Err(format!("a key typed here would show; run `rein login {name}` in a terminal instead")),
-                    },
-                };
-                (key, made.is_some())
-            }
-        };
-        let Some(key) = key else {
-            cancelled();
-            return Ok(());
-        };
-        crate::connect::save_key(&setup.http, &provider, key, made, &tell).await?;
-        name
+    let Some(signed_in) = crate::sign_in::here(name, given, terminal, &setup.http, &setup.providers).await? else {
+        say!("{pad}{}", s.dim("(cancelled; nothing was saved)"));
+        return Ok(());
     };
     setup.keys = crate::connect::load_keys(&config_dir()?)?;
     setup.others = None;

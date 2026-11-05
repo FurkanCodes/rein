@@ -40,6 +40,7 @@ mod peers;
 mod rules;
 mod search;
 mod settings;
+mod sign_in;
 mod skills;
 mod tasks;
 use settings::Settings;

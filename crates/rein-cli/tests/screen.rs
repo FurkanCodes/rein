@@ -1586,6 +1586,57 @@ fn claude_code_can_be_selected_from_the_login_menu() {
 }
 
 #[test]
+fn signed_in_to_nothing_rein_opens_on_signing_in_then_goes_on_with_the_new_sign_in() {
+    // Signed in to nothing: no ChatGPT sign-in, no key, and Groq is one more
+    // provider, with no model rein starts with.
+    let mut model = Model::serve(vec![says("Hi.")], true, Wire::Chat, None);
+    let base = model.base.clone();
+    model.home.push(("providers".into(), format!("[groq]\nurl = {base}\n")));
+    let model = model.with_env("OPENAI_API_KEY", "");
+
+    // A task left to run on its own has no one to sign in: it says how.
+    let home = std::env::temp_dir().join(format!("rein-first-run-task-{}", std::process::id()));
+    let (ok, said) = run(&model, &home, &["say hi"], "");
+    assert!(!ok && said.contains("not signed in. Run `rein login`") && !said.contains("sign in to a provider"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+
+    // Esc leaves, saying how to sign in, as rein did before it asked.
+    let mut term = Term::start(&model, "first-run", 30, 100);
+    term.wait_for("Sign in to a provider to use gpt-6.1-sol, or press Esc to leave.");
+    term.wait_for("sign in to a provider");
+    term.keys("\x1b");
+    term.wait_exit();
+    assert!(term.text().contains("not signed in. Run `rein login` to continue with ChatGPT"), "{}", term.text());
+
+    // A key pasted in the box, then one of the provider's models.
+    let mut term = term.again(&model);
+    term.wait_for("sign in to a provider");
+    term.keys("groq");
+    term.wait_for("no key yet");
+    term.keys("\r");
+    term.wait_for("Paste your Groq API key");
+    term.keys("test-key\r");
+    term.wait_for("Saved. Your Groq key works: 1 model.");
+    term.wait_for("choose a model");
+    term.keys("\r");
+    term.wait_for("rein starts with groq/llama-test from now on");
+    term.wait_for(IDLE);
+    term.keys("hello\r");
+    term.wait_for("Hi.");
+    assert!(!term.text().contains("test-key"), "the key isn't shown again:\n{}", term.text());
+    let requests = model.requests();
+    assert_eq!(requests.last().unwrap()["model"], "llama-test", "{requests:?}");
+    assert!(std::fs::read_to_string(term.dir.join("home/keys.json")).unwrap().contains("test-key"));
+    assert!(std::fs::read_to_string(term.dir.join("home/config")).unwrap().contains("model = groq/llama-test"));
+
+    // The next time, the saved key and model are used, and nothing asks.
+    term.keys("\x04");
+    let term = term.again(&model);
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("sign in to a provider"), "{}", term.text());
+}
+
+#[test]
 fn claude_code_login_saves_private_tokens_or_selects_the_clis_login() {
     use std::os::unix::fs::PermissionsExt;
     let model = Model::start(Vec::new());

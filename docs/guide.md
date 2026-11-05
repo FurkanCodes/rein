@@ -57,6 +57,15 @@ OpenAI's, `gemini-*` Google's), or you name the provider first:
 | **Nothing** | Ollama, LM Studio | No key needed. |
 | **Your Claude plan** | the `claude-code` provider | Runs Anthropic's own CLI: [below](#a-claude-plan-through-claude-codes-cli). |
 
+You don't have to set any of this up first. The first time you run `rein`,
+or whenever you're signed in to nothing that runs the model, it opens on
+the same menu `/login` shows. Pick a provider and sign in, or paste its key
+into the box (it shows as dots), and the conversation starts. For a
+provider rein has no starting model for, such as Groq, rein then lists its
+models. The one you pick is saved as `model` in the [settings](#settings),
+so the next `rein` starts with it. Press Esc to leave. A one-off task
+(`rein "…"`) has no one to ask, so it tells you how to sign in instead.
+
 rein doesn't sign in to Claude or Gemini plans itself: Anthropic and Google
 don't allow other apps to. It prints what pays on every run. With no model
 named it uses `gpt-6.1-sol`, or, with no way to pay OpenAI, the first
@@ -1173,7 +1182,8 @@ sandbox = on
 
 A flag wins over the variable, which wins over the file. `/mode` and
 `/sandbox` write `mode` and `sandbox` here when you keep what you picked, and
-`/search` writes `search`, leaving the rest as it was. `REIN_HOME` moves
+`/search` writes `search`, and the first run writes `model` when you pick
+one of a provider's models, leaving the rest as it was. `REIN_HOME` moves
 rein's whole folder (`~/.config/rein`), where everything above is kept,
 readable only by you.
 
