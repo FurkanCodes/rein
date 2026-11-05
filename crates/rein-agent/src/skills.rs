@@ -23,8 +23,6 @@ mod load;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
 pub use catalog::{AS_LISTED, LEAST_ROOM, MOST_ROOM, changes, is_note, room, spec};
 pub use load::load;
 
@@ -147,66 +145,14 @@ pub fn project_folders(root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
 /// folder, and any its manifest names inside it. One installed only for a
 /// project is that project's settings' to turn on, so it's left out.
 fn plugins(claude: &Path) -> Vec<Folder> {
-    #[derive(Deserialize)]
-    struct Settings {
-        #[serde(default, rename = "enabledPlugins")]
-        enabled: HashMap<String, serde_json::Value>,
-    }
-    #[derive(Deserialize)]
-    struct Installed {
-        #[serde(default)]
-        plugins: HashMap<String, Vec<Install>>,
-    }
-    #[derive(Deserialize)]
-    struct Install {
-        #[serde(default)]
-        scope: String,
-        #[serde(rename = "installPath")]
-        path: PathBuf,
-    }
-    #[derive(Deserialize, Default)]
-    struct Manifest {
-        name: Option<String>,
-        #[serde(default)]
-        skills: Paths,
-    }
-    #[derive(Deserialize, Default)]
-    #[serde(untagged)]
-    enum Paths {
-        #[default]
-        None,
-        One(String),
-        Many(Vec<String>),
-    }
-    let read = |path: PathBuf| std::fs::read(path).ok();
-    let Some(settings) = read(claude.join("settings.json")).and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok()) else { return Vec::new() };
-    let Some(installed) = read(claude.join("plugins/installed_plugins.json")).and_then(|bytes| serde_json::from_slice::<Installed>(&bytes).ok()) else { return Vec::new() };
-    let mut on: Vec<&String> = settings.enabled.iter().filter(|(_, value)| **value == serde_json::Value::Bool(true)).map(|(key, _)| key).collect();
-    on.sort();
     let mut folders = Vec::new();
-    for key in on {
-        let Some(install) = installed.plugins.get(key).and_then(|installs| installs.iter().find(|install| install.scope == "user")) else { continue };
-        let Ok(base) = install.path.canonicalize() else { continue };
-        let manifest: Manifest = read(base.join(".claude-plugin/plugin.json")).and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        let fallback = key.split('@').next().unwrap_or(key);
-        let name = manifest.name.filter(|name| fit_name(name)).unwrap_or_else(|| fallback.to_owned());
-        if !fit_name(&name) {
-            continue;
-        }
-        let named = match manifest.skills {
-            Paths::None => Vec::new(),
-            Paths::One(path) => vec![path],
-            Paths::Many(paths) => paths,
-        };
-        let inside = |path: &str| {
-            let path = Path::new(path);
-            !path.is_absolute() && !path.components().any(|part| matches!(part, std::path::Component::ParentDir))
-        };
-        let paths = std::iter::once(base.join("skills")).chain(named.iter().filter(|path| inside(path)).map(|path| base.join(path)));
+    for plugin in crate::claude::plugins(claude) {
+        let named = crate::claude::named(&plugin.manifest, "skills");
+        let paths = std::iter::once(plugin.root.join("skills")).chain(named.iter().filter(|path| crate::claude::inside(path)).map(|path| plugin.root.join(path)));
         for path in paths {
             if path.is_dir() {
                 let single = path.join("SKILL.md").is_file();
-                folders.push(Folder { path, whose: Whose::Plugin, plugin: Some(name.clone()), single });
+                folders.push(Folder { path, whose: Whose::Plugin, plugin: Some(plugin.name.clone()), single });
             }
         }
     }

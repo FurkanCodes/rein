@@ -27,6 +27,7 @@ mod conversation;
 mod effort;
 mod format;
 mod harden;
+mod hooks;
 mod input;
 mod mcp;
 mod paste;

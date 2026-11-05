@@ -15,6 +15,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/effort", "[level|default]", "change how hard the model thinks"),
     ("/search", "[auto|off|model]", "choose which model searches the web for the model"),
     ("/skills", "", "your skills, your plugins' and the project's: pick one to use, turn off, keep for you to call, or turn on; /name calls one"),
+    ("/hooks", "", "your hooks, rein's and Claude Code's: what each runs on and how it last did; pick one to turn it off or on"),
     ("/status", "", "the model, mode, context and conversation"),
     ("/mcp", "[add|import|remove|allow …]", "the MCP servers: add one by name from the MCP Registry, bring yours from other apps, or change one"),
     ("/compact", "[focus]", "make room in the conversation now"),
@@ -55,6 +56,8 @@ pub enum Slash {
     Search(Option<crate::search::SearchWith>),
     /// The skills, to change how one's offered.
     Skills,
+    /// The hooks, to turn one off or on.
+    Hooks,
     Status,
     Mcp(Mcp),
     Compact(Option<String>),
@@ -302,6 +305,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
             Some(level) => level.parse().map(|e| Slash::Effort(Some(EffortSetting::Level(e)))).map_err(|e| Refused::Said(format!("{e}, or default"))),
         },
         "/skills" => Ok(Slash::Skills),
+        "/hooks" => Ok(Slash::Hooks),
         "/search" => match arg.as_deref() {
             None => Ok(Slash::Search(None)),
             Some(with) => with.parse().map(|with| Slash::Search(Some(with))).map_err(Refused::Said),

@@ -132,6 +132,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         mcp,
         search: args.search.clone(),
     };
+    let source = if saved.is_some() { rein_agent::hooks::Source::Resume } else { rein_agent::hooks::Source::Startup };
     let (mut loaded, context) = setup.open(saved, &spec)?;
     if theirs.is_some_and(|theirs| theirs != spec) {
         loaded.session.append_model(&spec).map_err(describe)?;
@@ -168,6 +169,8 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("({why})")));
     }
     agent.step_limit = step_limit(args.mode, args.prompt.is_some(), args.max_steps);
+    // Your hooks, and those on a session starting.
+    crate::hooks::start(&mut agent, &mut terminal, &dir, source).await;
     // A continued conversation is as full as it was.
     terminal.context_used = agent.estimated();
     terminal.input.set_bar(terminal.bar());
@@ -181,9 +184,11 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
             }
             let outcome = turn(&mut agent, Start::You(prompt), &mut terminal).await;
             crate::skills::count(agent.take_loaded());
+            agent.session_ended(rein_agent::hooks::Ended::Exit, &mut terminal).await;
             match outcome? {
                 Outcome::StepLimit(_) | Outcome::Stuck { .. } => Err("the task isn't finished".into()),
-                Outcome::Done | Outcome::Stopped => Ok(()),
+                Outcome::Refused(by) => Err(format!("your hook {} said no to the task: {}", by.hook, by.said)),
+                Outcome::Done | Outcome::Stopped | Outcome::HookStopped(_) => Ok(()),
             }
         }
         None => conversation(&mut agent, &mut terminal, &mut setup).await,
@@ -415,6 +420,10 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Te
     // Finished: the tab says so until the next turn starts. Stopped,
     // failed or cut short, it's just idle.
     terminal.state(if matches!(outcome, Ok(Outcome::Done)) { crate::peers::State::Done } else { crate::peers::State::Idle });
+    // Done while you're away: your hooks on it run, as the bell rings.
+    if matches!(outcome, Ok(Outcome::Done)) && terminal.input.away() {
+        agent.hook(rein_agent::hooks::Event::Notification(rein_agent::hooks::Notice::Idle, "rein is waiting for your input"), terminal).await;
+    }
     let outcome = outcome.map_err(describe)?;
     let said = match &outcome {
         Outcome::Done => None,
@@ -423,6 +432,16 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Te
         Outcome::Stuck { call, times } => {
             let (verb, what) = crate::ui::steps::describe(call);
             Some(format!("(stopped going round in circles: {verb} {what}, {times} times in a row with the same result; say what to do instead, or type continue)"))
+        }
+        // Not sent: what you typed is back in the box, to change.
+        Outcome::Refused(by) => {
+            if let Start::You(prompt) = &start {
+                terminal.input.insert(prompt);
+            }
+            Some(format!("(your hook {} said no to this message, so it wasn't sent: {}; it's back in the box)", by.hook, by.said.trim()))
+        }
+        Outcome::HookStopped(by) => {
+            Some(format!("(your hook {} stopped the turn{})", by.hook, if by.said.trim().is_empty() { String::new() } else { format!(": {}", by.said.trim()) }))
         }
     };
     if let Some(said) = said {
@@ -634,6 +653,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
             }
         }
     }
+    agent.session_ended(rein_agent::hooks::Ended::Exit, terminal).await;
     // Everything was saved as it went: say how to come back to it.
     let talked = agent.full().iter().skip(1).any(|item| matches!(item, Item::User(_)));
     if talked && terminal.fancy {
@@ -779,10 +799,13 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         }
         Slash::Undo => crate::undo::command(agent, terminal).await?,
         Slash::Skills => crate::skills::command(agent, terminal, &setup.root, setup.skill_room(&agent.model_name)).await?,
+        Slash::Hooks => crate::hooks::command(agent, terminal, &config_dir()?).await?,
         Slash::Search(with) => crate::search::command(with, agent, terminal, setup).await?,
         Slash::New => {
             let (loaded, context) = setup.open(None, &setup.current(agent))?;
+            agent.session_ended(rein_agent::hooks::Ended::Clear, terminal).await;
             agent.resume(loaded, context);
+            agent.session_started(rein_agent::hooks::Source::Clear, terminal).await;
             (terminal.context_used, terminal.last_cache) = (0, None);
             say!("{pad}{} a fresh conversation; the last one is saved, /resume brings it back", s.green("✓"));
         }
@@ -795,7 +818,9 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             if model != setup.current(agent) {
                 use_model(&model, agent, terminal, setup).await?;
             }
+            agent.session_ended(rein_agent::hooks::Ended::Resume, terminal).await;
             agent.resume(loaded, context);
+            agent.session_started(rein_agent::hooks::Source::Resume, terminal).await;
             (terminal.context_used, terminal.last_cache) = (agent.estimated(), None);
         }
         peers @ (Slash::Peers | Slash::Send(..) | Slash::Delegate(..) | Slash::Inbox | Slash::Spawn(_) | Slash::Name(_) | Slash::Workspace(_)) => {

@@ -446,6 +446,11 @@ impl Tools {
         &self.root
     }
 
+    /// The sandbox commands run in, where there's one.
+    pub fn sandbox(&self) -> &sandbox::Shared {
+        &self.sandbox
+    }
+
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -875,7 +880,7 @@ fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Reads all of `pipe`, keeping the first `MAX_OUTPUT` bytes: a command
 /// that prints gigabytes costs no more memory than one that prints enough.
 /// Returns what was kept, and how much there was.
-async fn read_capped(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> (Vec<u8>, usize) {
+pub(crate) async fn read_capped(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> (Vec<u8>, usize) {
     use tokio::io::AsyncReadExt;
     let Some(mut pipe) = pipe else { return (Vec::new(), 0) };
     let (mut kept, mut total, mut buf) = (Vec::new(), 0, [0u8; 8192]);

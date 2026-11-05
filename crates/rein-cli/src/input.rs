@@ -1248,6 +1248,12 @@ impl Input {
         self.boxed.is_some()
     }
 
+    /// Whether you're away: the terminal says its window is behind another,
+    /// or you haven't touched a key for a while. Without a box, never.
+    pub fn away(&self) -> bool {
+        self.boxed.as_ref().is_some_and(|boxed| locked(boxed).away())
+    }
+
     /// How wide a line in the box can be.
     pub fn text_width(&self) -> usize {
         self.boxed.as_ref().map_or(80, |boxed| locked(boxed).pinned.text_width())

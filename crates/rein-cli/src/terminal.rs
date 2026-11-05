@@ -95,6 +95,8 @@ pub(crate) struct Terminal {
     noted: Option<String>,
     /// What the step did to the project's files, to show under it.
     watched: Option<String>,
+    /// What your hooks did to the step on its way, said under its line.
+    hooked: Vec<String>,
     /// The images pasted with Ctrl-V into the message being typed, each by
     /// its label in the box.
     pub(crate) pasted: Vec<(String, rein_llm::Image)>,
@@ -243,6 +245,7 @@ impl Terminal {
             step: None,
             noted: None,
             watched: None,
+            hooked: Vec::new(),
             pasted: Vec::new(),
             last: Last::Nothing,
             labeled: false,
@@ -864,6 +867,7 @@ impl Ui for Terminal {
         };
         let note = self.noted.take().map(|note| format!("{}{} {}", " ".repeat(steps::INDENT), s.green("✓"), s.dim(&note)));
         let watched = self.watched.take().map(|watched| format!("{}{}", " ".repeat(steps::INDENT), s.dim(&format!("↳ {watched}"))));
+        let hooked: Vec<String> = std::mem::take(&mut self.hooked).iter().map(|what| format!("{}{}", " ".repeat(steps::INDENT), s.dim(&format!("↳ {what}")))).collect();
         // Reads in a row share a line.
         if ToolName::of(call) == Some(ToolName::Read)
             && outcome.ok == Some(true)
@@ -885,6 +889,7 @@ impl Ui for Terminal {
             }];
             lines.extend(steps::detail_lines(&outcome, s, width, viewer));
             lines.extend(watched.iter().map(|line| crate::ui::style::fit(line, width)));
+            lines.extend(hooked.iter().map(|line| crate::ui::style::fit(line, width)));
             lines.extend(note.clone());
             lines.extend(diff.iter().map(|line| crate::ui::style::fit(line, width)));
             lines
@@ -906,6 +911,14 @@ impl Ui for Terminal {
     }
 
     /// What a command did to the project's files: said under its line.
+    fn hooked(&mut self, _call: &ToolCall, what: &str) {
+        self.hooked.push(what.to_owned());
+    }
+
+    fn away(&self) -> bool {
+        self.input.away()
+    }
+
     fn watched(&mut self, _call: &ToolCall, what: &Watched) {
         self.watched = Some(match what {
             Watched::Changed(changed) => {

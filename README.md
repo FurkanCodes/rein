@@ -221,6 +221,7 @@ message, so typing ahead can't answer it by accident.
 | `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
 | `/search [auto\|off\|model]` | which model searches the web for the model: the one in use as rein decides, one you pick, or none (see [Web search](#web-search)) |
+| `/hooks` | your hooks: what each runs on, where it's set and how it last did; pick one to turn it off or on (see [Hooks](#hooks)) |
 | `/skills`, `/<skill> [args]`, `/skill:<name>` | your skills, your Claude Code plugins' and the project's, to put one in the box, turn one off, keep it for you to call, or turn it on; call one with your message, or name one anywhere in it (see [Skills](#skills)) |
 | `/login [provider] [key]`, `/logout [provider]` | sign in to a provider without leaving the conversation (a key typed in the box shows as dots; `/login openrouter <key>` takes one given there, and isn't shown again or kept for ↑; OpenRouter and `chatgpt` sign in in the browser), or forget one |
 | `/mcp`, `/mcp add`, `/mcp import`, `/mcp remove`, `/mcp allow` | the MCP servers and how each is doing, then pick one to change: which tools run without asking, its walls, on or off, or what would get it started; add one by name from the MCP Registry, as you'd start it in a shell, or from the JSON its README gives; bring yours in from other apps; the same changes typed (see [MCP servers](#mcp-servers)) |
@@ -564,6 +565,62 @@ terminal would act on before you or the model see it. Its scripts run as
 commands do, in the sandbox, which reads the skill folders but never
 changes them; Claude Code's are read though the rest of `~/.claude`,
 logins and settings, stays hidden.
+
+## Hooks
+
+Hooks are your own commands, run when something happens in a
+conversation: before a tool runs and after, when you send a message, when
+a turn ends, as a session starts and ends, before rein asks you, when it
+needs you while you're away, and around a compaction. rein runs Claude
+Code's, as Claude Code sets them, so yours work as they are: those in
+`~/.claude/settings.json`, those of the plugins you turned on there, and
+rein's own in `~/.config/rein/hooks.json`, in the same shape:
+
+```json
+{ "hooks": {
+    "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "rtk hook claude" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "codegraph prompt-hook" }] }]
+} }
+```
+
+A hook is told what happened as JSON on its input, and says back as
+Claude Code's do: exit code 2 says no, with why on its error output; JSON
+can allow a call, have rein ask, change a tool's input, add what the model
+is to know, or stop the turn; and what a hook on your message prints
+plainly is added to it, as codegraph's is. rein's tools go by Claude Code's
+names for them (`Bash`, `Edit`, `Read`...), with Claude Code's arguments,
+so a matcher of `Bash` or `Edit|Write` works.
+
+Where it does better:
+
+- **A rewrite is decided on as the model's own call is.** rtk turns `git
+  push --force` into `rtk git push --force`; your mode, your rules and the
+  sandbox decide on the call as it runs now, and rein's ask and deny rules
+  on the call the model made too, so a rewrite never gets past them. A hook
+  of yours may spare you a question, never one an ask rule asks.
+- **Rewrites don't race.** The hooks on a tool run in turn, each given the
+  call as the one before left it. Claude Code runs them at once, and the
+  last to finish wins.
+- **You see what a hook did.** A rewritten step says so under its line
+  (`↳ rtk rewrote it, from: git status`), and what a hook adds says how much
+  (`↳ codegraph added about 2300 tokens`). It goes to the model as the
+  hook's words, not yours, at the end of the conversation, so the prompt
+  cache holds; at most 10,000 characters, and more is cut and said so,
+  never dropped. A hook that doesn't work says so once, and what it was
+  for goes ahead.
+- **Hooks run as your mode runs commands:** outside the sandbox in trust,
+  in its walls in the other modes, and never unwalled where the mode walls
+  commands in.
+
+They run with no terminal, in a process group of their own, stopped with
+everything they started when they take too long (10 minutes, as Claude
+Code's; 30 s on your message) or the turn stops. A project's hooks, in its
+`.claude/settings.json`, are listed but don't run yet: one came with the
+project, which may be anyone's. iTerm2's status program for Claude Code is
+off unless you turn it on, as rein sets the tab's status itself.
+`disableAllHooks` in Claude Code's settings turns its hooks off here too.
+rein starts by saying in a line which hooks run, and `/hooks` lists each,
+where it's set and how it last did, to turn one off or on.
 
 ## Web search
 

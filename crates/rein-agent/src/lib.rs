@@ -3,10 +3,12 @@
 //! rein-llm's `Item`s and `Event`s.
 
 pub mod agent;
+pub mod claude;
 pub mod compact;
 pub mod context;
 mod files;
 mod finding;
+pub mod hooks;
 pub mod image;
 pub mod mentions;
 pub mod peers;

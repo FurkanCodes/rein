@@ -14,10 +14,11 @@ use rein_llm::{Client, Error, ErrorKind, Event, Item, Loading, Request, Result, 
 use crate::compact;
 use crate::context;
 use crate::finding;
+use crate::hooks::{self, By, Hooks};
 use crate::mentions;
 use crate::permissions::{Decision, Permissions, Rule};
 use crate::session::{Loaded, Session};
-use crate::tools::{ToolName, Tools};
+use crate::tools::{BashCall, ToolName, Tools};
 use crate::undo::{Listed, Plan, Watched};
 
 /// How many steps a turn nobody is watching may take: in auto mode, or a
@@ -100,6 +101,14 @@ pub trait Ui {
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str);
     /// What a command did to the project's files, before it's finished.
     fn watched(&mut self, _call: &ToolCall, _what: &Watched) {}
+    /// What one of your hooks did to `call`, before it's finished: changed
+    /// it, or added to what the model is told of it.
+    fn hooked(&mut self, _call: &ToolCall, _what: &str) {}
+    /// Whether you're away, as the terminal tells: hooks on notifications
+    /// run then, as the bell rings.
+    fn away(&self) -> bool {
+        false
+    }
     fn tool_finished(&mut self, call: &ToolCall, output: &str);
     fn usage(&mut self, usage: &Usage);
     /// A request is on its way to the model; nothing to show yet.
@@ -143,8 +152,30 @@ fn read_path(arguments: &str) -> Option<String> {
     read_args(arguments).map(|(path, _, _)| path)
 }
 
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text)
+}
+
+/// About how many tokens `text` takes, in words.
+fn about_tokens(text: &str) -> String {
+    match text.chars().count().div_ceil(4) {
+        1 => "about 1 token".to_owned(),
+        n => format!("about {n} tokens"),
+    }
+}
+
+/// What the model asked for, before a hook rewrote it: a command's line.
+fn was(call: &ToolCall) -> String {
+    BashCall::of(call).map_or_else(|| "the model's own input".to_owned(), |bash| bash.command().to_owned())
+}
+
+/// The exit code a command's result ends with, if it does.
+fn exit_code(output: &str) -> Option<i64> {
+    output.rsplit_once("[exit code ").and_then(|(_, rest)| rest.split(']').next()?.parse().ok())
+}
+
 /// Runs `futures` at the same time; their outputs, in order.
-async fn all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+pub(crate) async fn all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     let mut futures: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
     let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
     std::future::poll_fn(|cx| {
@@ -210,6 +241,8 @@ pub const LAST_STEP: &str = "\n[rein: that was the last step this turn may take.
                              say what you've done, what's left, and how to go on.]";
 /// The result of each call asked for after the last step.
 pub const NOT_RUN_PAST_LIMIT: &str = "Not run: the turn had taken all the steps it may.";
+/// What a call gets that a hook's stopping the turn kept from running.
+pub const NOT_RUN_HOOK: &str = "Not run: one of the user's hooks stopped the turn.";
 
 /// What a compaction did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,7 +287,15 @@ pub enum Outcome {
     /// The user declined a step and stopped the turn, to say what to do
     /// instead.
     Stopped,
+    /// A hook of yours said no to your message: it wasn't sent.
+    Refused(By),
+    /// A hook of yours stopped the turn (`"continue": false`).
+    HookStopped(By),
 }
+
+/// The most times in a row hooks keep a turn going once the model is
+/// done, as Claude Code's do: past it, the turn ends anyway.
+const STOP_HOOKS_MOST: usize = 8;
 
 /// How a step's calls went.
 enum Ran {
@@ -264,6 +305,8 @@ enum Ran {
     Stopped,
     /// One came out the same as before, too many times in a row.
     Stuck { call: ToolCall, times: usize },
+    /// A hook of yours stopped the turn.
+    HookStopped(By),
 }
 
 /// What each call in a turn gave, in order, so that a model going round in
@@ -372,6 +415,13 @@ pub struct Agent<M> {
     /// [`crate::context`]); it goes in when the first message does.
     context: Option<String>,
     window: Window,
+    /// Your hooks: commands of yours run when something happens.
+    hooks: std::sync::Arc<Hooks>,
+    /// What hooks said as the session started, for the model with your
+    /// next message.
+    hooks_said: Vec<String>,
+    /// A hook stopped the turn after a tool ran: it ends once the step does.
+    hook_stopped: Option<By>,
 }
 
 impl<M: Model> Agent<M> {
@@ -379,12 +429,96 @@ impl<M: Model> Agent<M> {
     /// Dropping the future cancels the turn; [`Agent::repair`] then makes
     /// the history valid again, and `send` calls it first anyway.
     pub async fn send(&mut self, prompt: String, ui: &mut impl Ui) -> Result<Outcome> {
+        // A hook may say no to it: then it isn't sent, nor kept.
+        let heard = self.hook(hooks::Event::UserPromptSubmit(&prompt), ui).await;
+        if let Some(by) = heard.no.or(heard.stop) {
+            return Ok(Outcome::Refused(by));
+        }
         self.begin(&prompt).await?;
         self.offer_servers_tools(ui).await;
         self.note_skills()?;
         self.record(Item::User(prompt.clone()))?;
         self.attach(&prompt, ui).await?;
-        self.work(ui).await
+        self.hooks_add(&heard.context, ui)?;
+        let worked = self.work(ui).await;
+        if let Err(e) = &worked {
+            self.turn_failed(e, ui).await;
+        }
+        worked
+    }
+
+    /// Runs your hooks on `event`, saying where you see it what they said
+    /// for you, and, once each, those that didn't work.
+    pub async fn hook(&self, event: hooks::Event<'_>, ui: &mut impl Ui) -> hooks::Heard {
+        if !self.hooks.runs_on(&event, self.tools.root()) {
+            return hooks::Heard::default();
+        }
+        let hooks = self.hooks.clone();
+        let heard = hooks.on(event, &self.here()).await;
+        for by in &heard.messages {
+            ui.note(&format!("{}: {}", by.hook, first_line(&by.said)));
+        }
+        for by in &heard.failed {
+            if hooks.first_time(by) {
+                ui.note(&format!("your hook {} didn't work: {}", by.hook, first_line(&by.said)));
+            }
+        }
+        heard
+    }
+
+    /// Where your hooks run, and what they're told of it.
+    fn here(&self) -> hooks::Here<'_> {
+        hooks::Here {
+            root: self.tools.root(),
+            session_id: self.session_id.as_deref(),
+            transcript: self.session.as_ref().map(Session::path),
+            mode: self.permissions.mode,
+            sandbox: self.tools.sandbox(),
+        }
+    }
+
+    /// What your hooks added, for the model: after what's there, as their
+    /// words, not yours, said where you see it.
+    fn hooks_add(&mut self, added: &[By], ui: &mut impl Ui) -> Result<()> {
+        for by in added {
+            ui.note(&format!("{} added {}", by.hook, about_tokens(&by.said)));
+            self.record(Item::User(hooks::note(by)))?;
+        }
+        Ok(())
+    }
+
+    /// Runs your hooks on a session's start, from `source`: what they add,
+    /// the model is told with your next message.
+    pub async fn session_started(&mut self, source: hooks::Source, ui: &mut impl Ui) {
+        let heard = self.hook(hooks::Event::SessionStart(source), ui).await;
+        for by in &heard.context {
+            ui.note(&format!("{} added {}", by.hook, about_tokens(&by.said)));
+            self.hooks_said.push(hooks::note(by));
+        }
+    }
+
+    /// Runs your hooks on the session's end, as `ended`.
+    pub async fn session_ended(&self, ended: hooks::Ended, ui: &mut impl Ui) {
+        self.hook(hooks::Event::SessionEnd(ended), ui).await;
+    }
+
+    /// Runs your hooks on a turn that ended on `error`.
+    async fn turn_failed(&self, error: &Error, ui: &mut impl Ui) {
+        let kind = match error {
+            Error::Auth(_) | Error::Api { status: Some(401 | 403), .. } => "authentication_failed",
+            Error::Api { kind: ErrorKind::UsageLimit, .. } | Error::Api { status: Some(429), .. } => "rate_limit",
+            Error::Api { status: Some(503 | 529), .. } => "overloaded",
+            _ => "unknown",
+        };
+        self.hook(hooks::Event::StopFailure { kind, error: &error.to_string() }, ui).await;
+    }
+
+    /// What the model said last.
+    fn last_said(&self) -> Option<String> {
+        self.history.iter().rev().find_map(|item| match item {
+            Item::Assistant(text) => Some(text.clone()),
+            _ => None,
+        })
     }
 
     /// Works on what another rein, `from`, sent, as [`Agent::send`] does
@@ -409,6 +543,9 @@ impl<M: Model> Agent<M> {
             }
             self.window.full.push(Item::User(context.clone()));
             self.history.push(Item::User(context));
+        }
+        for said in std::mem::take(&mut self.hooks_said) {
+            self.record(Item::User(said))?;
         }
         Ok(())
     }
@@ -535,10 +672,12 @@ impl<M: Model> Agent<M> {
         let (mut steps, mut compacted_at, mut no_room) = (0, None, false);
         let mut repeats = Repeats::default();
         let mut unbound = false;
+        // How many times hooks kept the turn going once the model was done.
+        let mut kept_going = 0;
         loop {
             let may_compact = !no_room && compacted_at != Some(steps);
             if may_compact && self.estimated() > self.window.limit {
-                self.compact(None, false, ui).await?;
+                self.compacting(hooks::Trigger::Auto, None, false, ui).await?;
                 (compacted_at, no_room) = (Some(steps), self.estimated() > self.window.limit);
             }
             let system = self.system();
@@ -549,7 +688,7 @@ impl<M: Model> Agent<M> {
                 // The provider says it's too long after all: make room and
                 // try again.
                 Err(e) if !no_room && compacted_at != Some(steps) && e.kind() == Some(ErrorKind::ContextFull) => {
-                    self.compact(None, true, ui).await?;
+                    self.compacting(hooks::Trigger::Auto, None, true, ui).await?;
                     compacted_at = Some(steps);
                     continue;
                 }
@@ -586,9 +725,23 @@ impl<M: Model> Agent<M> {
                     return Ok(Outcome::StepLimit(limit));
                 }
                 // Done, unless the user wrote meanwhile: then that's next.
-                if !self.steer(ui.steering(), ui).await? {
+                if self.steer(ui.steering(), ui).await? {
+                    continue;
+                }
+                // Or a hook of yours says the work isn't done.
+                let last = self.last_said();
+                let heard = self.hook(hooks::Event::Stop { again: kept_going > 0, last: last.as_deref() }, ui).await;
+                if let Some(by) = heard.stop {
+                    return Ok(Outcome::HookStopped(by));
+                }
+                let Some(by) = heard.no.or_else(|| heard.context.into_iter().next()) else { return Ok(Outcome::Done) };
+                if kept_going >= STOP_HOOKS_MOST {
+                    ui.note(&format!("{} still says the work isn't done; hooks keep a turn going {STOP_HOOKS_MOST} times at most", by.hook));
                     return Ok(Outcome::Done);
                 }
+                kept_going += 1;
+                ui.note(&format!("{} says the work isn't done: {}", by.hook, first_line(&by.said)));
+                self.record(Item::User(hooks::not_done(&by)))?;
                 continue;
             }
             if let Some(limit) = past {
@@ -603,6 +756,10 @@ impl<M: Model> Agent<M> {
                 Ran::All => {}
                 Ran::Stopped => return Ok(Outcome::Stopped),
                 Ran::Stuck { call, times } => return Ok(Outcome::Stuck { call, times }),
+                Ran::HookStopped(by) => return Ok(Outcome::HookStopped(by)),
+            }
+            if let Some(by) = self.hook_stopped.take() {
+                return Ok(Outcome::HookStopped(by));
             }
             // What the user wrote during the last step goes with its result.
             self.steer(ui.steering(), ui).await?;
@@ -611,7 +768,7 @@ impl<M: Model> Agent<M> {
 
     /// Runs one step's `calls`, lookups asked for together at once, and
     /// records each result. On the turn's `last` step, the last result tells
-    /// the model so.
+    /// the model so. Your hooks run before each, and after.
     async fn run_step(&mut self, calls: &[ToolCall], last: bool, repeats: &mut Repeats, ui: &mut impl Ui) -> Result<Ran> {
         let closing = if last { calls.last().map(|call| call.call_id.clone()) } else { None };
         let mut next = 0;
@@ -629,13 +786,23 @@ impl<M: Model> Agent<M> {
                 self.steer(steering, ui).await?;
                 return Ok(Ran::All);
             }
-            // Lookups asked for together run at once: they only look.
-            let together = calls[next..].iter().take_while(|call| ToolName::of(call).is_some_and(ToolName::only_looks) && self.permissions.decide(call) == Decision::Allow).count();
+            // Lookups asked for together run at once: they only look. One
+            // a hook runs before goes on its own.
+            let together = calls[next..]
+                .iter()
+                .take_while(|call| {
+                    ToolName::of(call).is_some_and(ToolName::only_looks)
+                        && self.permissions.decide(call) == Decision::Allow
+                        && !self.hooks.runs_on(&hooks::Event::PreToolUse(call), self.tools.root())
+                })
+                .count();
             if together > 1 {
                 let batch = &calls[next..next + together];
                 ui.tools_started(batch);
+                let began = std::time::Instant::now();
                 let outputs = all(batch.iter().map(|call| self.tools.run(call, self.permissions.how(call))).collect()).await;
                 for (i, (call, output)) in batch.iter().zip(outputs).enumerate() {
+                    let output = self.after(call, output, began, &[], ui).await;
                     if let Some(stuck) = self.finish(call, output, repeats, closing.as_deref(), ui)? {
                         return self.stop_stuck(stuck, &calls[next + i + 1..], ui);
                     }
@@ -643,13 +810,43 @@ impl<M: Model> Agent<M> {
                 next += together;
                 continue;
             }
-            let call = calls[next].clone();
+            let original = calls[next].clone();
             next += 1;
+            // Your hooks first: one may say no, change the call, or add to
+            // what the model is told of it.
+            let pre = self.hook(hooks::Event::PreToolUse(&original), ui).await;
+            if let Some(by) = pre.stop {
+                let output = format!("{}one of the user's hooks, {}, stopped the turn: {}", crate::tools::ERROR, by.hook, by.said);
+                ui.tool_finished(&original, &output);
+                self.record(Item::ToolResult { call_id: original.call_id.clone(), output })?;
+                for left in &calls[next..] {
+                    ui.tool_finished(left, NOT_RUN_HOOK);
+                    self.record(Item::ToolResult { call_id: left.call_id.clone(), output: NOT_RUN_HOOK.to_owned() })?;
+                }
+                return Ok(Ran::HookStopped(by));
+            }
+            if let Some(by) = &pre.no {
+                let reason = format!("{}one of the user's hooks, {}, said no: {}", crate::tools::ERROR, by.hook, by.said);
+                ui.tool_blocked(&original, &reason);
+                if let Some(stuck) = self.finish(&original, reason, repeats, closing.as_deref(), ui)? {
+                    return self.stop_stuck(stuck, &calls[next..], ui);
+                }
+                continue;
+            }
+            let call = match &pre.call {
+                Some((rewritten, by)) => {
+                    ui.hooked(rewritten, &format!("{} rewrote it, from: {}", by.join(" and "), was(&original)));
+                    rewritten.clone()
+                }
+                None => original.clone(),
+            };
+            let began = std::time::Instant::now();
             // Other reins are reached by whoever runs the agent. Nothing
             // runs here: what the other rein does, it asks its own user about.
             if ToolName::of(&call).is_some_and(ToolName::reaches_peers) {
                 ui.tool_started(&call);
                 let output = ui.peer(&call).await;
+                let output = self.after(&call, output, began, &pre.context, ui).await;
                 if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
                     return self.stop_stuck(stuck, &calls[next..], ui);
                 }
@@ -660,6 +857,7 @@ impl<M: Model> Agent<M> {
             if ToolName::of(&call) == Some(ToolName::Recall) {
                 ui.tool_started(&call);
                 let output = compact::recall(&self.window.full, &call.arguments);
+                let output = self.after(&call, output, began, &pre.context, ui).await;
                 if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
                     return self.stop_stuck(stuck, &calls[next..], ui);
                 }
@@ -674,6 +872,7 @@ impl<M: Model> Agent<M> {
                     Some(searcher) => searcher.run(&call.arguments, web).await,
                     None => format!("{}nothing searches the web here now", crate::tools::ERROR),
                 };
+                let output = self.after(&call, output, began, &pre.context, ui).await;
                 if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
                     return self.stop_stuck(stuck, &calls[next..], ui);
                 }
@@ -683,6 +882,7 @@ impl<M: Model> Agent<M> {
             if ToolName::of(&call) == Some(ToolName::Skill) {
                 ui.tool_started(&call);
                 let output = self.skill_output(&call.arguments);
+                let output = self.after(&call, output, began, &pre.context, ui).await;
                 if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
                     return self.stop_stuck(stuck, &calls[next..], ui);
                 }
@@ -698,39 +898,62 @@ impl<M: Model> Agent<M> {
                 }
                 continue;
             }
-            let approved = match self.permissions.decide(&call) {
+            let approved = match self.decide_hooked(&call, &original, &pre) {
                 Decision::Allow => Ok(()),
                 Decision::Deny(reason) => {
                     ui.tool_blocked(&call, &reason);
                     Err(reason)
                 }
-                Decision::Ask => match ui.approve(&call, self.permissions.asked_by(&call)).await {
-                    Approval::Yes => Ok(()),
-                    Approval::Always => {
-                        self.permissions.remember(&call);
+                Decision::Ask => {
+                    // Your hooks on a question may answer it: never over
+                    // an ask rule of rein's.
+                    let asked = self.hook(hooks::Event::PermissionRequest(&call), ui).await;
+                    let ruled = self.permissions.asked_by(&call).is_some() || self.permissions.asked_by(&original).is_some();
+                    if let Some(by) = asked.no {
+                        let reason = format!("{}one of the user's hooks, {}, said no: {}", crate::tools::ERROR, by.hook, by.said);
+                        ui.tool_blocked(&call, &reason);
+                        Err(reason)
+                    } else if asked.yes.is_some() && !ruled {
                         Ok(())
+                    } else {
+                        if let Some(by) = &pre.ask {
+                            ui.note(&format!("{} asks you first: {}", by.hook, first_line(&by.said)));
+                        }
+                        if ui.away() {
+                            let message = format!("rein needs your permission to use {}", hooks::tool_name(&call));
+                            self.hook(hooks::Event::Notification(hooks::Notice::Permission, &message), ui).await;
+                        }
+                        let rule = self.permissions.asked_by(&call).or_else(|| self.permissions.asked_by(&original));
+                        match ui.approve(&call, rule).await {
+                            Approval::Yes => Ok(()),
+                            Approval::Always => {
+                                self.permissions.remember(&call);
+                                Ok(())
+                            }
+                            Approval::No => Err(match ToolName::of(&call) {
+                                Some(ToolName::Bash) => DECLINED_COMMAND.to_owned(),
+                                Some(_) => DECLINED_CHANGE.to_owned(),
+                                None => DECLINED_CALL.to_owned(),
+                            }),
+                            Approval::Stop => {
+                                let output = DECLINED_AND_STOPPED.to_owned();
+                                ui.tool_finished(&call, &output);
+                                self.record(Item::ToolResult { call_id: call.call_id, output })?;
+                                return Ok(Ran::Stopped);
+                            }
+                        }
                     }
-                    Approval::No => Err(match ToolName::of(&call) {
-                        Some(ToolName::Bash) => DECLINED_COMMAND.to_owned(),
-                        Some(_) => DECLINED_CHANGE.to_owned(),
-                        None => DECLINED_CALL.to_owned(),
-                    }),
-                    Approval::Stop => {
-                        let output = DECLINED_AND_STOPPED.to_owned();
-                        ui.tool_finished(&call, &output);
-                        self.record(Item::ToolResult { call_id: call.call_id, output })?;
-                        return Ok(Ran::Stopped);
-                    }
-                },
+                }
             };
             let output = match approved {
                 Ok(()) => {
+                    let began = std::time::Instant::now();
                     ui.tool_started(&call);
                     let output = self.tools.run(&call, self.permissions.how(&call)).await;
                     if let Some(watched) = self.tools.take_watched() {
                         ui.watched(&call, &watched);
                     }
-                    output
+                    self.after(&call, output, began, &pre.context, ui).await
                 }
                 Err(reason) => reason,
             };
@@ -739,6 +962,51 @@ impl<M: Model> Agent<M> {
             }
         }
         Ok(Ran::All)
+    }
+
+    /// How rein decides on `call`, as your hooks before it left it from
+    /// `original`, the model's: as on the model's own, and rein's ask and
+    /// deny rules on the original too, so a rewrite can't get past them. A
+    /// hook may make rein ask; one of yours saying yes spares a question,
+    /// but never one an ask rule of rein's asks.
+    fn decide_hooked(&self, call: &ToolCall, original: &ToolCall, pre: &hooks::Heard) -> Decision {
+        let mut decision = self.permissions.decide(call);
+        if call.arguments != original.arguments {
+            if let Decision::Deny(why) = self.permissions.decide(original) {
+                return Decision::Deny(why);
+            }
+            if decision == Decision::Allow && self.permissions.asked_by(original).is_some() {
+                decision = Decision::Ask;
+            }
+        }
+        let ruled = self.permissions.asked_by(call).is_some() || self.permissions.asked_by(original).is_some();
+        match decision {
+            Decision::Allow if pre.ask.is_some() => Decision::Ask,
+            Decision::Ask if pre.yes.is_some() && pre.ask.is_none() && !ruled => Decision::Allow,
+            other => other,
+        }
+    }
+
+    /// What `call` gave, `output`, as your hooks after it leave it: one may
+    /// put another result in its place, add to what the model is told
+    /// (`before`, what hooks before it added, too), or stop the turn.
+    async fn after(&mut self, call: &ToolCall, output: String, began: std::time::Instant, before: &[By], ui: &mut impl Ui) -> String {
+        let failed = output.starts_with(crate::tools::ERROR) || exit_code(&output).is_some_and(|code| code != 0);
+        let heard = self.hook(hooks::Event::PostToolUse { call, output: &output, took: began.elapsed(), failed }, ui).await;
+        let mut output = output;
+        if let Some(by) = heard.output {
+            ui.hooked(call, &format!("{} gave the model another result", by.hook));
+            output = by.said;
+        }
+        for by in before.iter().chain(&heard.context).chain(&heard.no) {
+            ui.hooked(call, &format!("{} added {}", by.hook, about_tokens(&by.said)));
+            output.push('\n');
+            output.push_str(&hooks::note(by));
+        }
+        if let Some(by) = heard.stop {
+            self.hook_stopped = Some(by);
+        }
+        output
     }
 
     /// Records what `call` gave, noting when it has come out the same many
@@ -980,6 +1248,36 @@ impl<M: Model> Agent<M> {
     /// `focus` is what the user asked the summary to keep in mind
     /// (`/compact <focus>`).
     pub async fn compact(&mut self, focus: Option<&str>, summarize: bool, ui: &mut impl Ui) -> Result<Compacted> {
+        self.compacting(hooks::Trigger::Manual, focus, summarize, ui).await
+    }
+
+    /// Compacts as [`Agent::compact`] does, as `trigger` asked, with your
+    /// hooks before and after: one may say no to a compaction you asked for
+    /// (not to one the conversation needs); and what they add once it's
+    /// done, as a session starting again from the summary, the model is
+    /// told.
+    async fn compacting(&mut self, trigger: hooks::Trigger, focus: Option<&str>, summarize: bool, ui: &mut impl Ui) -> Result<Compacted> {
+        let heard = self.hook(hooks::Event::PreCompact { trigger, focus }, ui).await;
+        if let Some(by) = heard.no {
+            if trigger == hooks::Trigger::Manual {
+                ui.note(&format!("{} said no to compacting: {}", by.hook, first_line(&by.said)));
+                let now = self.estimated();
+                return Ok(Compacted { before: now, after: now, retired: 0, summarized: false });
+            }
+            ui.note(&format!("{} said no to compacting, but the conversation doesn't fit: compacting anyway", by.hook));
+        }
+        let report = self.compact_now(focus, summarize, ui).await?;
+        let summary = self.history.iter().find(|item| compact::is_summary(item)).and_then(|item| match item {
+            Item::User(text) => Some(text.clone()),
+            _ => None,
+        });
+        self.hook(hooks::Event::PostCompact { trigger, summary: summary.as_deref().unwrap_or_default() }, ui).await;
+        let heard = self.hook(hooks::Event::SessionStart(hooks::Source::Compact), ui).await;
+        self.hooks_add(&heard.context, ui)?;
+        Ok(report)
+    }
+
+    async fn compact_now(&mut self, focus: Option<&str>, summarize: bool, ui: &mut impl Ui) -> Result<Compacted> {
         ui.compacting();
         let before = self.estimated();
         let retired = compact::stale(&self.history);
@@ -1098,6 +1396,9 @@ impl<M> Agent<M> {
             session: Some(conversation.session),
             context,
             window: Window { limit, measured: None, full: conversation.full },
+            hooks: std::sync::Arc::default(),
+            hooks_said: Vec::new(),
+            hook_stopped: None,
         }
     }
 
@@ -1148,6 +1449,9 @@ impl<M> Agent<M> {
             session,
             context,
             window,
+            hooks,
+            hooks_said,
+            hook_stopped,
         } = self;
         Agent {
             model,
@@ -1172,7 +1476,21 @@ impl<M> Agent<M> {
             session,
             context,
             window,
+            hooks,
+            hooks_said,
+            hook_stopped,
         }
+    }
+
+    /// The hooks that run from now on: yours, Claude Code's and its
+    /// plugins', as you chose them.
+    pub fn set_hooks(&mut self, hooks: std::sync::Arc<Hooks>) {
+        self.hooks = hooks;
+    }
+
+    /// The hooks there are.
+    pub fn hooks(&self) -> &Hooks {
+        &self.hooks
     }
 
     /// The level the model is sent for the one you chose: the same where it
@@ -1943,6 +2261,9 @@ mod tests {
             session: None,
             context: None,
             window: Window::default(),
+            hooks: std::sync::Arc::default(),
+            hooks_said: Vec::new(),
+            hook_stopped: None,
         }
     }
 
@@ -2564,5 +2885,144 @@ mod tests {
         assert_eq!(repeated(&[9, 1, 2, 1, 2, 1, 2]), 3);
         assert_eq!(repeated(&[1, 2, 3, 1, 2, 3]), 2);
         assert_eq!(repeated(&[1, 2, 3, 4, 5]), 1);
+    }
+
+    /// `agent` with `hooks`, as rein's own file sets them, in trust mode,
+    /// where they run as your commands do.
+    fn with_hooks(agent: &mut Agent<Scripted>, name: &str, hooks: Value) {
+        let dir = root_of(name).join(".hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hooks.json"), json!({ "hooks": hooks }).to_string()).unwrap();
+        agent.set_hooks(std::sync::Arc::new(Hooks::load(&dir, None, &root_of(name), &hooks::Chosen::default())));
+        agent.permissions.mode = crate::permissions::Mode::Trust;
+    }
+
+    fn hook(line: &str) -> Value {
+        json!({ "type": "command", "command": line })
+    }
+
+    /// A hook that gives `to` as a command's line in place of the model's.
+    fn rewriting(to: &str) -> Value {
+        hook(&format!(r#"cat >/dev/null; echo '{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","updatedInput":{{"command":"{to}"}}}}}}'"#))
+    }
+
+    #[tokio::test]
+    async fn a_hooks_rewrite_runs_and_reins_rules_still_see_the_call_as_it_was() {
+        let turns = vec![vec![bash("b1", "printf hi"), bash("b2", "rm -rf x")], vec![Item::Assistant("Done.".into())]];
+        let mut agent = agent("hook-rewrite", turns);
+        with_hooks(&mut agent, "hook-rewrite", json!({ "PreToolUse": [{ "matcher": "Bash", "hooks": [rewriting("echo rewritten")] }] }));
+        agent.permissions.set_yours("ask rm").unwrap();
+        let mut person = Person { answer: Approval::No, log: Vec::new() };
+        agent.send("go".into(), &mut person).await.unwrap();
+        assert_eq!(result_of(&agent, "b1"), "rewritten\n[exit code 0]", "what ran is the hook's");
+        assert!(person.log.iter().any(|line| line.starts_with("asked") && line.contains("echo rewritten")), "rm, as the model asked, asks: {:?}", person.log);
+        assert_eq!(result_of(&agent, "b2"), DECLINED_COMMAND);
+        let history = &agent.history;
+        assert!(history.iter().any(|item| matches!(item, Item::ToolCall(call) if call.arguments.contains("printf hi"))), "the model's call stays as it made it");
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_says_no_keeps_the_call_from_running_and_tells_the_model_why() {
+        let turns = vec![vec![bash("b1", "touch made.txt")], vec![Item::Assistant("Ok.".into())]];
+        let mut agent = agent("hook-no", turns);
+        with_hooks(&mut agent, "hook-no", json!({ "PreToolUse": [{ "hooks": [hook("echo 'not on main' >&2; exit 2")] }] }));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("go".into(), &mut person).await.unwrap();
+        assert_eq!(result_of(&agent, "b1"), "error: one of the user's hooks, echo, said no: not on main");
+        assert!(!root_of("hook-no").join("made.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_stop_hook_keeps_the_turn_going_until_it_says_the_work_is_done() {
+        let turns = vec![vec![Item::Assistant("Done.".into())], vec![Item::Assistant("Tests pass now.".into())]];
+        let mut agent = agent("hook-stop", turns);
+        let line = r#"cat >/dev/null; if [ -e checked ]; then exit 0; fi; touch checked; echo '{"decision":"block","reason":"the tests fail"}'"#;
+        with_hooks(&mut agent, "hook-stop", json!({ "Stop": [{ "hooks": [hook(line)] }] }));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        assert_eq!(agent.send("fix it".into(), &mut person).await.unwrap(), Outcome::Done);
+        let requests = agent.model.requests.borrow();
+        assert_eq!(requests.len(), 2, "kept going once");
+        let told = requests[1].input.iter().any(|item| matches!(item, Item::User(text) if hooks::is_note(text) && text.contains("the tests fail") && text.contains("isn't done")));
+        assert!(told, "{:?}", requests[1].input);
+    }
+
+    #[tokio::test]
+    async fn what_a_hook_adds_to_your_message_goes_after_it_and_isnt_taken_for_your_words() {
+        let mut agent = agent("hook-context", vec![vec![Item::Assistant("Seen.".into())]]);
+        with_hooks(&mut agent, "hook-context", json!({ "UserPromptSubmit": [{ "hooks": [hook("cat >/dev/null; echo 'a.rs calls b.rs'")] }] }));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("how does a.rs work?".into(), &mut person).await.unwrap();
+        let input = &agent.model.requests.borrow()[0].input;
+        assert_eq!(input[0], Item::User("how does a.rs work?".into()));
+        assert!(matches!(&input[1], Item::User(text) if hooks::is_note(text) && text.ends_with("a.rs calls b.rs]")), "{:?}", input[1]);
+        assert!(!compact::record(&agent.window.full).contains("a.rs calls b.rs"), "compaction's record of your words leaves it out");
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_says_no_to_your_message_keeps_it_from_being_sent() {
+        let mut agent = agent("hook-refused", vec![vec![Item::Assistant("Never.".into())]]);
+        with_hooks(&mut agent, "hook-refused", json!({ "UserPromptSubmit": [{ "hooks": [hook("echo 'that has a key in it' >&2; exit 2")] }] }));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        let outcome = agent.send("my key is sk-123".into(), &mut person).await.unwrap();
+        assert_eq!(outcome, Outcome::Refused(By { hook: "echo".into(), said: "that has a key in it".into() }));
+        assert!(agent.model.requests.borrow().is_empty() && agent.history.is_empty(), "not sent, nor kept");
+    }
+
+    #[tokio::test]
+    async fn what_a_hook_says_as_the_session_starts_goes_with_your_first_message() {
+        let mut agent = agent("hook-start", vec![vec![Item::Assistant("Ok.".into())]]);
+        with_hooks(&mut agent, "hook-start", json!({ "SessionStart": [{ "matcher": "startup", "hooks": [hook("echo 'on branch main'")] }] }));
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.session_started(hooks::Source::Resume, &mut person).await;
+        agent.session_started(hooks::Source::Startup, &mut person).await;
+        agent.send("hi".into(), &mut person).await.unwrap();
+        let requests = agent.model.requests.borrow();
+        let notes: Vec<&Item> = requests[0].input.iter().filter(|item| matches!(item, Item::User(text) if hooks::is_note(text))).collect();
+        assert_eq!(notes.len(), 1, "only on startup, as its matcher says");
+        assert!(matches!(notes[0], Item::User(text) if text.contains("on branch main")));
+    }
+
+    #[tokio::test]
+    async fn a_hook_on_a_question_answers_it_but_never_one_an_ask_rule_asks() {
+        let turns = vec![vec![bash("b1", "touch a.txt"), bash("b2", "rm -f a.txt")], vec![Item::Assistant("Ok.".into())]];
+        let mut agent = agent("hook-permission", turns);
+        // One hook has rein ask about every command; another answers yes.
+        let ask = r#"cat >/dev/null; echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"check it"}}'"#;
+        let yes = r#"cat >/dev/null; echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'"#;
+        with_hooks(&mut agent, "hook-permission", json!({ "PreToolUse": [{ "hooks": [hook(ask)] }], "PermissionRequest": [{ "hooks": [hook(yes)] }] }));
+        agent.permissions.set_yours("ask rm").unwrap();
+        let mut person = Person { answer: Approval::No, log: Vec::new() };
+        agent.send("go".into(), &mut person).await.unwrap();
+        let asked: Vec<&String> = person.log.iter().filter(|line| line.starts_with("asked")).collect();
+        assert_eq!(asked.len(), 1, "only rm, which your rule asks about: {:?}", person.log);
+        assert!(asked[0].contains("rm -f a.txt"));
+        assert_eq!(result_of(&agent, "b1"), "[exit code 0]");
+    }
+
+    #[tokio::test]
+    async fn what_a_hook_after_a_tool_adds_goes_with_its_result() {
+        let turns = vec![vec![bash("b1", "printf done")], vec![Item::Assistant("Ok.".into())]];
+        let mut agent = agent("hook-after", turns);
+        let adds = r#"cat >/dev/null; echo '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"formatted 2 files"}}'"#;
+        with_hooks(
+            &mut agent,
+            "hook-after",
+            json!({ "PostToolUse": [{ "matcher": "Bash", "hooks": [hook(adds)] }], "PostToolUseFailure": [{ "hooks": [hook("echo failed > failed.txt")] }] }),
+        );
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        agent.send("go".into(), &mut person).await.unwrap();
+        assert_eq!(result_of(&agent, "b1"), "done[exit code 0]\n[The user's hook cat, in its own words, not the user's:\nformatted 2 files]");
+        assert!(!root_of("hook-after").join("failed.txt").exists(), "it didn't fail");
+    }
+
+    #[tokio::test]
+    async fn a_hook_may_say_no_to_a_compaction_you_ask_for() {
+        let mut agent = agent("hook-compact", vec![vec![Item::Assistant("A summary.".into())]]);
+        with_hooks(&mut agent, "hook-compact", json!({ "PreCompact": [{ "matcher": "manual", "hooks": [hook("echo 'not mid-review' >&2; exit 2")] }] }));
+        agent.history = vec![Item::User("first".into()), Item::Assistant("answer".into())];
+        let mut person = Person { answer: Approval::Yes, log: Vec::new() };
+        let report = agent.compact(None, true, &mut person).await.unwrap();
+        assert!(!report.summarized && agent.model.requests.borrow().is_empty(), "nothing asked of the model");
+        assert_eq!(agent.history.len(), 2, "the conversation as it was");
     }
 }

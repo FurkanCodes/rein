@@ -3344,6 +3344,44 @@ fn a_long_list_is_searched_by_the_words_typed() {
     term.wait_until("each short one's description", |screen| screen.contains("/react-hooks") && screen.contains("on · Write hooks."));
 }
 
+/// Your Claude Code hooks run in rein as they are: one rewrites a command
+/// before rein decides on it, one adds to what the model is told of your
+/// message, and each says what it did where you see it. `/hooks` lists
+/// them and turns one off.
+#[test]
+fn your_claude_code_hooks_run_in_rein_as_they_are() {
+    let printf = |text: &str| json!({ "command": format!("printf {text}"), "timeout_seconds": null, "access": "look", "reason": null });
+    let turns = vec![calls("bash", printf("original")), says("Ran it."), calls("bash", printf("original")), says("Ran it again.")];
+    let mut model = Model::start(turns).with_env("REIN_MODE", "trust");
+    let rewrite = r#"echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"command":"printf rewritten"}}}'"#;
+    let settings = json!({ "hooks": {
+        "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": rewrite }] }],
+        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "printf 'the code you asked about'" }] }]
+    } });
+    model.home.push((".claude/settings.json".into(), settings.to_string()));
+    let mut term = Term::start_with(&model, "hooks", 30, 120, &[]);
+    term.wait_for("Hooks: echo before Bash, printf on your messages · /hooks");
+    term.wait_for(IDLE);
+    term.keys("run it\r");
+    term.wait_for("Ran it.");
+    let text = term.text();
+    assert!(text.contains("↳ printf added about 6 tokens"), "{text}");
+    assert!(text.contains("printf rewritten") && text.contains("↳ echo rewrote it, from: printf original"), "{text}");
+    assert_eq!(results(&model), ["rewritten[exit code 0]"], "what ran is the hook's");
+    let first = model.requests()[0]["input"].to_string();
+    assert!(first.contains("[The user's hook printf, in its own words, not the user's:\\nthe code you asked about]"), "{first}");
+    term.wait_for(IDLE);
+    term.keys("/hooks\r");
+    pick(&mut term, "echo");
+    term.wait_for("✓ echo is off now");
+    let chosen = std::fs::read_to_string(term.dir.join("home/hooks-chosen.json")).unwrap();
+    assert!(chosen.contains("PreToolUse Bash echo"), "{chosen}");
+    term.wait_for(IDLE);
+    term.keys("again\r");
+    term.wait_for("Ran it again.");
+    assert_eq!(results(&model), ["rewritten[exit code 0]", "original[exit code 0]"], "off: the model's own runs");
+}
+
 /// A skill you turned off, called by name, is offered back: say no and
 /// what you typed is in the box again; yes, and it's on and called. One
 /// only the model loads says so, not "no such command".
