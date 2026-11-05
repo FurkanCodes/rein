@@ -1459,8 +1459,10 @@ fn claude_thinking_always_goes_back_after_what_it_was_signed_with() {
         says("You're welcome."),
         says("Bye."),
     ])
-    // Under the third request, over the second: see below.
-    .with_env("REIN_COMPACT_AT", "9000");
+    // Under the third request, over the second: see below. Sizes are
+    // tuned by hand, so nothing else goes in the first message.
+    .with_env("REIN_COMPACT_AT", "9000")
+    .with_env("REIN_MEMORY", "off");
     let mut term = Term::start_with(&model, "claude-compact", 30, 100, &[("big.txt", &big)]);
     term.wait_for(IDLE);
     term.keys("read big.txt\r");
@@ -3692,6 +3694,86 @@ fn a_task_run_on_its_own_runs_no_projects_hook_without_a_yes() {
     assert!(stderr.contains("printf off (it came with the project, and waits for your yes)") && !stderr.contains("this project sets?"), "{stderr}");
     assert!(!model.requests()[0]["input"].to_string().contains("from the project"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A note the model saves is a step you see, asking nothing; the next
+/// conversation starts with its line in the index, and `/memory` reads it
+/// and forgets it.
+#[test]
+fn a_note_saved_is_seen_and_the_next_conversation_starts_with_it() {
+    let save = json!({ "action": "save", "name": "rtk-hides-failures", "type": "feedback", "description": "judge checks by exit code", "text": "Run checks through rtk proxy.\nWhy: rtk summarizes output." });
+    let model = Model::start(vec![calls("memory", save), says("Noted."), says("Hello.")]);
+    let mut term = Term::start(&model, "memory-save", 30, 130);
+    term.wait_for(IDLE);
+    term.keys("remember that rtk hides failures\r");
+    term.wait_for("Noted.");
+    let text = term.text();
+    assert!(text.contains("Memory save rtk-hides-failures (feedback): judge checks by exit code") && text.contains("remembered"), "{text}");
+    assert!(!text.contains("Allow"), "saving asks nothing, even in ask mode:\n{text}");
+    assert!(model.requests()[0]["tools"].to_string().contains(r#""name":"memory""#), "the model has the tool");
+    let folders: Vec<PathBuf> = std::fs::read_dir(term.dir.join("home/memory")).unwrap().map(|entry| entry.unwrap().path()).collect();
+    let [folder] = folders.as_slice() else { panic!("one folder for the project: {folders:?}") };
+    let note = std::fs::read_to_string(folder.join("rtk-hides-failures.md")).unwrap();
+    assert!(note.contains("  type: feedback\n") && note.contains("Why: rtk summarizes output."), "{note}");
+
+    term.keys("\x04");
+    let mut term = term.again(&model);
+    term.wait_for("Memory: 1 note · /memory");
+    term.wait_for(IDLE);
+    term.keys("hi\r");
+    term.wait_for("Hello.");
+    let first = model.requests().last().unwrap()["input"][0].to_string();
+    assert!(first.contains("<memory>") && first.contains("[Rtk hides failures](rtk-hides-failures.md) — judge checks by exit code"), "{first}");
+
+    term.keys("/memory\r");
+    pick(&mut term, "rtk-hides-failures");
+    term.wait_for("Run checks through rtk proxy.");
+    term.wait_for("Forget rtk-hides-failures?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("✓ rtk-hides-failures is forgotten");
+    assert!(!folder.join("rtk-hides-failures.md").exists());
+}
+
+/// Claude Code's notes for the project carry over: the conversation starts
+/// with their index, the model reads one, and rein never changes them.
+#[test]
+fn claude_codes_notes_for_the_project_are_read_and_never_changed() {
+    let name = "memory-claude";
+    let project = std::env::temp_dir().canonicalize().unwrap().join(format!("rein-screen-{}-{name}", std::process::id())).join("project");
+    let slug: String = project.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let folder = format!(".claude/projects/{slug}/memory");
+    let act = |action: &str| json!({ "action": action, "name": "feature-workflow", "type": null, "description": null, "text": null });
+    let turn = Turn { out: vec![Out::Call("memory", act("read")), Out::Call("memory", act("forget"))] };
+    let mut model = Model::start(vec![turn, says("Read it.")]);
+    let note = "---\nname: feature-workflow\ndescription: research first, then build\nmetadata:\n  type: feedback\n---\n\nResearch how others do it, with sources.\n";
+    model.home.push((format!("{folder}/feature-workflow.md"), note.into()));
+    model.home.push((format!("{folder}/MEMORY.md"), "- [Feature workflow](feature-workflow.md) — research first, then build\n".into()));
+    let mut term = Term::start(&model, name, 30, 130);
+    term.wait_for("Memory: 1 note, 1 of them Claude Code's · /memory");
+    term.wait_for(IDLE);
+    term.keys("how do I want features done?\r");
+    term.wait_for("Read it.");
+    let first = model.requests()[0]["input"][0].to_string();
+    assert!(first.contains("Claude Code's, which you can read but not change:\\n- [Feature workflow](feature-workflow.md)"), "{first}");
+    let results = results(&model);
+    assert!(results[0].contains("Research how others do it, with sources."), "{results:?}");
+    assert!(results[1].contains("Claude Code's, which rein doesn't change"), "{results:?}");
+    assert_eq!(std::fs::read_to_string(term.dir.join("home").join(&folder).join("feature-workflow.md")).unwrap(), note, "as it was");
+}
+
+/// With memory off, the model has no memory tool and no index.
+#[test]
+fn with_memory_off_there_are_no_notes() {
+    let model = Model::start(vec![says("Hello.")]).with_env("REIN_MEMORY", "off");
+    let mut term = Term::start(&model, "memory-off", 30, 120);
+    term.wait_for(IDLE);
+    term.keys("hi\r");
+    term.wait_for("Hello.");
+    let request = &model.requests()[0];
+    assert!(!request["input"][0].to_string().contains("<memory>") && !request["tools"].to_string().contains(r#""name":"memory""#));
+    term.keys("/memory\r");
+    term.wait_for("Memory is off");
 }
 
 /// A skill you turned off, called by name, is offered back: say no and

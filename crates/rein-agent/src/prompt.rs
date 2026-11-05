@@ -26,8 +26,8 @@ what you're doing rather than starting over.
 see, search with recall before saying you don't know.
 
 The first message holds <environment> (working folder, operating system, \
-today's date) and any <project_instructions> from AGENTS.md or CLAUDE.md files. \
-Follow those instructions. When they disagree, a file deeper in the project wins \
+today's date), any <project_instructions> from AGENTS.md or CLAUDE.md files, and \
+<memory>, notes from earlier conversations. Follow those instructions. When they disagree, a file deeper in the project wins \
 over one higher up, and what the user says in the conversation wins over both.
 
 How to answer:

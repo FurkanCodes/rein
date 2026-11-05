@@ -114,6 +114,13 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     // What `/undo` puts back is kept beside the conversations, by project.
     let undo = session::folder(&dir.join("undo"), &root);
     let tools = Tools::new(root.clone()).with_sandbox(sandbox.clone()).with_secrets(secrets).with_mcp(mcp.servers.clone()).with_undo(undo).with_images(folder.join("images"));
+    // Notes across conversations, for this project: rein's, and Claude
+    // Code's, read.
+    let memory = args.memory.then(|| rein_agent::memory::Memory::for_project(&dir, std::env::home_dir().as_deref(), &root));
+    let tools = match &memory {
+        Some(memory) => tools.with_memory(memory.clone()),
+        None => tools,
+    };
     let mut setup = Setup {
         folder,
         personal: dir.join("AGENTS.md"),
@@ -131,6 +138,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         sandbox: sandbox.clone(),
         mcp,
         search: args.search.clone(),
+        memory,
     };
     let source = if saved.is_some() { rein_agent::hooks::Source::Resume } else { rein_agent::hooks::Source::Startup };
     let (mut loaded, context) = setup.open(saved, &spec)?;
@@ -232,6 +240,9 @@ pub(crate) struct Setup {
     folder: PathBuf,
     /// Your own AGENTS.md, for every project.
     personal: PathBuf,
+    /// The project's notes across conversations, with memory on: a new
+    /// conversation starts with their index.
+    memory: Option<rein_agent::memory::Memory>,
     /// `-s`: standing instructions added to the system prompt.
     system: Option<String>,
     /// The models the provider in use offers, with their context windows.
@@ -319,7 +330,19 @@ impl Setup {
         if !crate::ui::logo::update(|facts| facts.instructions.clone_from(&names)) && !names.is_empty() {
             say!("Instructions: {}", names.join(", "));
         }
-        let context = context::message(&self.root, std::env::consts::OS, &now.date(), &files);
+        let mut context = context::message(&self.root, std::env::consts::OS, &now.date(), &files);
+        // In the first message, saved with it: the same text all the
+        // conversation long, so the cache holds as notes are saved.
+        if let Some(memory) = &self.memory {
+            context.push_str("\n\n");
+            context.push_str(&memory.index());
+            let notes = memory.all();
+            if !notes.is_empty() {
+                let theirs = notes.iter().filter(|note| note.whose == rein_agent::memory::Whose::ClaudeCode).count();
+                let of_theirs = if theirs > 0 { format!(", {theirs} of them Claude Code's") } else { String::new() };
+                say!("Memory: {} note{}{of_theirs} · /memory", notes.len(), if notes.len() == 1 { "" } else { "s" });
+            }
+        }
         let session = Session::new(&self.folder, &stamp, header);
         Ok((Loaded { session, history: Vec::new(), full: Vec::new() }, Some(context)))
     }
@@ -814,6 +837,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         Slash::Undo => crate::undo::command(agent, terminal).await?,
         Slash::Skills => crate::skills::command(agent, terminal, &setup.root, setup.skill_room(&agent.model_name)).await?,
         Slash::Hooks => crate::hooks::command(agent, terminal, &config_dir()?).await?,
+        Slash::Memory => crate::memory::command(agent, terminal).await?,
         Slash::Search(with) => crate::search::command(with, agent, terminal, setup).await?,
         Slash::New => {
             let (loaded, context) = setup.open(None, &setup.current(agent))?;

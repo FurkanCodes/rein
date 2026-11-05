@@ -246,6 +246,11 @@ finding. Each says why in a line.
 - What the model should do before a task goes in its instructions, not
   only in a tool's description: told of skills only in the `skill` tool,
   a model left one unloaded for a small task that fit it.
+- What a model saves to read in later conversations is what it read
+  anywhere, a web page's words too: a note is cleaned as it's read (what a
+  terminal acts on, a way out of its `<memory>`), keys come out before
+  it's written, and every save is a step you see. Another app's notes
+  (Claude Code's) are read, never written: its own pass would fight ours.
 - A note rein adds to the conversation isn't something you said: mark it
   with a `const` (`skills::is_note`). Compaction's record lists every
   message as yours, and kept a note of skills changed as your words.

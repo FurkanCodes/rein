@@ -220,6 +220,7 @@ message, so typing ahead can't answer it by accident.
 | Drag over text | select it and copy it to the clipboard |
 | Ctrl-L | draw the window again |
 | `/mode [trust\|ask\|edits\|auto\|read-only]` | show or change what runs without asking, and keep it for new conversations if you like |
+| `/memory` | the notes kept across conversations, rein's and Claude Code's: read one, or forget one of rein's (see [Memory](#memory)) |
 | `/sandbox [on\|off]` | run commands in the sandbox, or as you'd run them, in any mode, and keep it for new conversations if you like (see [The sandbox](#the-sandbox)) |
 | `/permissions`, `/permissions add <rule>`, `/permissions remove <rule>` | what asks first or is refused: your rules and the project's, then pick "+ add" or one of yours to take out; the same typed (see [Rules](#rules)) |
 | `/model [id]`, `/effort [level]` | switch the model, from any provider; change reasoning effort, from the levels the model takes |
@@ -424,6 +425,7 @@ max_steps = 200
 bell = off
 compress = off
 sandbox = on
+memory = off
 peers = hold
 strip = off
 tab_command = "my-term --new-tab --title {title} -- {command}"
@@ -431,7 +433,7 @@ tab_command = "my-term --new-tab --title {title} -- {command}"
 
 A flag wins over `$REIN_MODEL`, `$REIN_EFFORT`, `$REIN_MODE`, `$REIN_SEARCH`,
 `$REIN_COMPACT_AT`, `$REIN_MAX_STEPS`, `$REIN_BELL`, `$REIN_COMPRESS`,
-`$REIN_SANDBOX`, `$REIN_PEERS` and `$REIN_STRIP`, which win over the file.
+`$REIN_SANDBOX`, `$REIN_MEMORY`, `$REIN_PEERS` and `$REIN_STRIP`, which win over the file.
 `/mode` and `/sandbox` write `mode` and `sandbox` here when you keep the one
 you picked, and leave the rest as it was. The sandbox is off unless it says
 `sandbox = on` (or `--sandbox on`).
@@ -598,6 +600,40 @@ terminal would act on before you or the model see it. Its scripts run as
 commands do: with the sandbox on, in it, which reads the skill folders but
 never changes them; Claude Code's are read though the rest of `~/.claude`,
 logins and settings, stays hidden.
+
+## Memory
+
+The model keeps notes across conversations, per project: a correction you
+gave and why, an approach you confirmed, who you are and how you like to
+work, what's going on that the project's files don't say, where to find
+something outside it. It saves one as it learns it, with its `memory`
+tool, and every save is a step you see (`● Memory save rtk-hides-failures
+(feedback): judge checks by exit code`), asking nothing, in any mode: it
+writes rein's folder, never the project. "Remember that" saves one, and
+"forget that" removes it. It doesn't save code patterns, git history or
+what the project's instructions say.
+
+A conversation starts with their index, a line each, in its first
+message, and the model reads a note in full when it matters, checking
+what it names still exists before relying on it. The index is at most
+200 lines or 25 KB, as Claude Code loads its own, and past that the model
+is told some aren't shown. A note saved mid-conversation is in the next
+one's index: the start of every request stays the same, so the cache
+holds.
+
+They're plain files in Claude Code's format, one per note with its name,
+description, type and the day it was saved, and a `MEMORY.md` index, in
+`~/.config/rein/memory/<project>/`, a git worktree's with its
+repository's. Claude Code's notes for the project, in
+`~/.claude/projects/<project>/memory/`, are read too, so what it learned
+carries over, but never changed: its own consolidation would fight
+rein's saves, and one of rein's of the same name wins. `/memory` lists
+both, to read one or forget one of rein's. No model runs in the
+background, as Codex's and Claude Code's do: Codex's drained users'
+limits. Keys rein knows are taken out of a note before it's written, and
+what a terminal would act on, or a note's way out of its place in the
+first message, is taken out as notes are read. `memory = off` in the
+settings turns it off.
 
 ## Hooks
 

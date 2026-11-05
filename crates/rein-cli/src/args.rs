@@ -117,10 +117,15 @@ Set peers = hold to let each message in yourself (trust mode always does),
 refuse to take none, or off to stay out.
 
 Defaults go in ~/.config/rein/config, one per line: model, effort, mode,
-compact_at, max_steps, peers, and bell, compress, sandbox and strip (on or off), like
-`mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE,
+compact_at, max_steps, peers, and bell, compress, sandbox, memory and strip (on or
+off), like `mode = edits`. Flags win over $REIN_MODEL, $REIN_EFFORT, $REIN_MODE,
 $REIN_COMPACT_AT, $REIN_MAX_STEPS, $REIN_BELL, $REIN_COMPRESS, $REIN_SANDBOX,
-$REIN_PEERS and $REIN_STRIP, which win over the file.
+$REIN_MEMORY, $REIN_PEERS and $REIN_STRIP, which win over the file.
+
+The model keeps notes across conversations, per project: corrections and why,
+who you are, what the project's files don't say. Each save is a step you see,
+a conversation starts with their index, and Claude Code's notes for the
+project are read too, never changed. /memory lists them; memory = off stops it.
 
 Each request carries the whole conversation, so rein gzips it on the way:
 about three times fewer bytes, and the same text for the model. A server that
@@ -162,6 +167,8 @@ pub(crate) struct AskArgs {
     pub(crate) compress: bool,
     /// Run commands in the sandbox, where there is one.
     pub(crate) sandbox: bool,
+    /// Keep notes across conversations, and start each with their index.
+    pub(crate) memory: bool,
     /// How many steps a turn nobody is watching may take; `None`: no limit.
     pub(crate) max_steps: Option<usize>,
     /// `None` starts a conversation instead of doing one task.
@@ -202,6 +209,7 @@ impl AskArgs {
         let (bell, compress) = (switch("bell", "REIN_BELL", true)?, switch("compress", "REIN_COMPRESS", true)?);
         // Off unless you turn it on, as in Claude Code.
         let mut sandbox = switch("sandbox", "REIN_SANDBOX", false)?;
+        let memory = switch("memory", "REIN_MEMORY", true)?;
         let strip = switch("strip", "REIN_STRIP", true)?;
         let tab_command = settings.get("tab_command", "REIN_TAB_COMMAND");
         let mut child = None;
@@ -265,6 +273,7 @@ impl AskArgs {
             bell,
             compress,
             sandbox,
+            memory,
             max_steps,
             prompt,
             name,

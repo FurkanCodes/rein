@@ -227,7 +227,7 @@ load), Codex's memories, and others'.
 
 **Done when:** a correction you give in one conversation is followed in
 the next; the index costs few tokens; and every memory is visible and
-removable.
+removable. (Built.)
 
 ### 5. Background commands
 

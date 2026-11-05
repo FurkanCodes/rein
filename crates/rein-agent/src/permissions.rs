@@ -451,8 +451,10 @@ impl Permissions {
     pub fn decide(&self, call: &ToolCall) -> Decision {
         match ToolName::of(call) {
             // `read`, `grep` and `glob` can only look, and only inside the
-            // project; `plan` only writes a checklist on screen.
-            Some(tool) if tool.only_looks() || tool == ToolName::Plan => Decision::Allow,
+            // project; `plan` only writes a checklist on screen; `memory`
+            // writes notes in rein's own folder, never the project, and each
+            // save is a step you see.
+            Some(tool) if tool.only_looks() || matches!(tool, ToolName::Plan | ToolName::Memory) => Decision::Allow,
             Some(tool) if tool.changes_files() => self.decide_change(call),
             // What doesn't read as a command doesn't run as one either.
             Some(ToolName::Bash) => match serde_json::from_str::<BashCall>(&call.arguments) {

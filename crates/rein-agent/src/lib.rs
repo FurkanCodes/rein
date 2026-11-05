@@ -10,6 +10,7 @@ mod files;
 mod finding;
 pub mod hooks;
 pub mod image;
+pub mod memory;
 pub mod mentions;
 pub mod peers;
 pub mod permissions;

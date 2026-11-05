@@ -37,6 +37,9 @@ pub struct Tools {
     mcp: Option<std::sync::Arc<rein_mcp::Servers>>,
     /// Where the images tools give are kept, once each.
     images: PathBuf,
+    /// The notes that outlast a conversation, for the project; `None` with
+    /// memory off.
+    memory: Option<crate::memory::Memory>,
     /// The images each call gave, by its ID, until the agent takes them
     /// into the conversation after its result.
     pictures: std::sync::Mutex<std::collections::HashMap<String, Vec<rein_llm::Image>>>,
@@ -239,10 +242,12 @@ pub enum ToolName {
     Delegate,
     /// A new rein in a tab of its own, for a task: a sub-agent you can see.
     Spawn,
+    /// Notes that outlast the conversation: see [`crate::memory`].
+    Memory,
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 15] = [
+    pub const ALL: [ToolName; 16] = [
         Self::Read,
         Self::Grep,
         Self::Glob,
@@ -258,6 +263,7 @@ impl ToolName {
         Self::Message,
         Self::Delegate,
         Self::Spawn,
+        Self::Memory,
     ];
 
     /// The name the model knows it by.
@@ -278,6 +284,7 @@ impl ToolName {
             Self::Message => "message",
             Self::Delegate => "delegate",
             Self::Spawn => "spawn",
+            Self::Memory => "memory",
         }
     }
 
@@ -333,6 +340,7 @@ impl Tools {
             mcp: None,
             images: std::env::temp_dir().join(format!("rein-images-{}", std::process::id())),
             pictures: Default::default(),
+            memory: None,
         }
     }
 
@@ -341,6 +349,17 @@ impl Tools {
     pub fn with_images(mut self, folder: PathBuf) -> Self {
         self.images = folder;
         self
+    }
+
+    /// Keeps notes across conversations in `memory`, with the tool to.
+    pub fn with_memory(mut self, memory: crate::memory::Memory) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// The project's notes, with memory on.
+    pub fn memory(&self) -> Option<&crate::memory::Memory> {
+        self.memory.as_ref()
     }
 
     /// The images the call `call_id` gave, taken: they go into the
@@ -480,7 +499,7 @@ impl Tools {
 
     /// What the model is told about each tool.
     pub fn specs(&self) -> Vec<Tool> {
-        vec![
+        let mut specs = vec![
             Tool {
                 loading: Loading::UpFront,
                 strict: true,
@@ -591,7 +610,11 @@ impl Tools {
                     "reason": { "type": ["string", "null"], "description": "For network or outside: why, in a few words the user will read. Null otherwise." }
                 })),
             },
-        ]
+        ];
+        if self.memory.is_some() {
+            specs.push(crate::memory::spec());
+        }
+        specs
     }
 
     /// Runs one call and returns the text to send back to the model. `how`
@@ -611,6 +634,10 @@ impl Tools {
                 let done = plan.steps.iter().filter(|step| step.status == StepStatus::Done).count();
                 format!("Plan updated: {done} of {} done.", plan.steps.len())
             }),
+            Some(ToolName::Memory) => match &self.memory {
+                Some(memory) => memory.run(&call.arguments, &crate::memory::today(), &|text| self.secrets.hide(text)),
+                None => Err(format!("there is no tool called {}", call.name)),
+            },
             // `recall` is the agent's own: it searches the conversation. The
             // peers are reached by whoever runs the agent.
             Some(ToolName::Recall | ToolName::ToolSearch | ToolName::WebSearch | ToolName::Skill | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) => {

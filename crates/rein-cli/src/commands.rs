@@ -17,6 +17,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("/search", "[auto|off|model]", "choose which model searches the web for the model"),
     ("/skills", "", "your skills, your plugins' and the project's: pick one to use, turn off, keep for you to call, or turn on; /name calls one"),
     ("/hooks", "", "your hooks, rein's and Claude Code's: what each runs on and how it last did; pick one to turn it off or on"),
+    ("/memory", "", "the notes kept across conversations, rein's and Claude Code's: read one, or forget one of rein's"),
     ("/status", "", "the model, mode, context and conversation"),
     ("/mcp", "[add|import|remove|allow …]", "the MCP servers: add one by name from the MCP Registry, bring yours from other apps, or change one"),
     ("/compact", "[focus]", "make room in the conversation now"),
@@ -61,6 +62,8 @@ pub enum Slash {
     Skills,
     /// The hooks, to turn one off or on.
     Hooks,
+    /// The notes kept across conversations.
+    Memory,
     Status,
     Mcp(Mcp),
     Compact(Option<String>),
@@ -315,6 +318,7 @@ pub fn parse(line: &str) -> Option<Result<Slash, Refused>> {
         },
         "/skills" => Ok(Slash::Skills),
         "/hooks" => Ok(Slash::Hooks),
+        "/memory" => Ok(Slash::Memory),
         "/search" => match arg.as_deref() {
             None => Ok(Slash::Search(None)),
             Some(with) => with.parse().map(|with| Slash::Search(Some(with))).map_err(Refused::Said),

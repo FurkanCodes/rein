@@ -93,6 +93,15 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             (if tool == ToolName::Message { "Message" } else { "Delegate" }, format!("{}: {first}{more}", args["to"].as_str().unwrap_or_default()))
         }
         Some(ToolName::Peers) => ("Peers", "the other reins".to_owned()),
+        // What's saved is said whole, as it's what later conversations get.
+        Some(ToolName::Memory) => {
+            let name = args["name"].as_str().unwrap_or_default();
+            match args["action"].as_str() {
+                Some("save") => ("Memory", format!("save {name} ({}): {}", args["type"].as_str().unwrap_or("note"), args["description"].as_str().unwrap_or_default())),
+                Some("forget") => ("Memory", format!("forget {name}")),
+                _ => ("Memory", format!("read {name}")),
+            }
+        }
         Some(ToolName::Spawn) => {
             ("Sub-agent", format!("{}: {}", args["role"].as_str().unwrap_or_default(), args["task"].as_str().unwrap_or_default().lines().next().unwrap_or_default()))
         }
@@ -139,6 +148,7 @@ pub fn doing(call: &ToolCall) -> String {
         "Delegate" => "Handing over to",
         "Sub-agent" => "Starting sub-agent",
         "Peers" => return "Looking at the other reins".to_owned(),
+        "Memory" => return format!("Memory: {target}"),
         _ => "Using",
     };
     format!("{verb} {target}")
@@ -318,6 +328,15 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
         Some(ToolName::Skill) => {
             let lines = output.lines().count().saturating_sub(2);
             plain(Some(true), style.dim(&format!("loaded, {lines} line{}", if lines == 1 { "" } else { "s" })))
+        }
+        Some(ToolName::Memory) => {
+            let said = match output.split_whitespace().next() {
+                Some("Saved") => "remembered",
+                Some("Updated") => "updated",
+                Some("Forgot") => "forgotten",
+                _ => "read",
+            };
+            plain(Some(true), style.dim(said))
         }
         Some(ToolName::Recall) => {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
