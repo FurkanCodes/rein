@@ -1331,6 +1331,42 @@ fn what_rein_runs_starts_with_core_dumps_off() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What rein writes for a terminal (the tab's progress, its title) goes
+/// only to a terminal: a task's output sent to a file once carried
+/// `ESC]9;4;…` in it, as iTerm2 was the terminal rein was started from.
+#[test]
+fn output_sent_to_a_file_carries_nothing_meant_for_a_terminal() {
+    let model = Model::start(vec![says("Done.")]);
+    let dir = std::env::temp_dir().join(format!("rein-piped-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (project, home) = (dir.join("project"), dir.join("home"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rein"))
+        .arg("say done")
+        .current_dir(&project)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("REIN_HOME", &home)
+        .env("OPENAI_API_KEY", "test")
+        .env("OPENAI_BASE_URL", &model.base)
+        // Started from a terminal that draws the tab's progress.
+        .env("TERM", "xterm-256color")
+        .env("TERM_PROGRAM", "ghostty")
+        .env("BROWSER", "false")
+        .env("SSH_CONNECTION", "test")
+        .envs(model.env.iter().map(|(name, value)| (name, value)))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{stderr}");
+    assert!(stdout.contains("Done."), "{stdout:?}");
+    assert!(!stdout.contains('\x1b') && !stderr.contains('\x1b'), "stdout {stdout:?}\nstderr {stderr:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_key_never_goes_over_plain_http_to_another_computer() {
     let home = std::env::temp_dir().join(format!("rein-plain-http-{}", std::process::id()));

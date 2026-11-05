@@ -26,7 +26,7 @@
 //! Three things draw at once (the answer, the keyboard's thread and the
 //! clock that moves the spinner), so every write takes [`lock`].
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::os::fd::AsRawFd;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
@@ -770,7 +770,17 @@ fn char_at(text: &str, at: usize) -> char {
 
 /// Writes one frame. Terminals that know synchronized output (mode 2026)
 /// show it all at once, never half drawn; others ignore the markers.
+/// stderr is a terminal. What `write_raw` sends means something only to
+/// one: in a file or a pipe it's noise.
+static TO_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stderr().is_terminal());
+
 fn write_raw(text: &str) {
+    // The terminal rein was started from can be named in the environment
+    // while what it writes goes to a file: a one-shot task sent there
+    // carried the tab's progress codes.
+    if !*TO_TERMINAL {
+        return;
+    }
     let mut stderr = std::io::stderr();
     let _ = stderr.write_all(format!("\x1b[?2026h{text}\x1b[?2026l").as_bytes());
     let _ = stderr.flush();
