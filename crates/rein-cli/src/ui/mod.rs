@@ -14,6 +14,7 @@ pub mod slash;
 pub mod spinner;
 pub mod steps;
 pub mod style;
+pub mod tint;
 pub mod transcript;
 pub mod viewer;
 pub mod wrap;

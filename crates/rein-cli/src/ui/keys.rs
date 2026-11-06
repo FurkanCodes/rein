@@ -64,6 +64,9 @@ pub enum Key {
     Focus(bool),
     /// Ctrl-L: draw the screen again.
     Redraw,
+    /// The terminal's background colour, as it answered rein's question
+    /// ([`super::tint::ASK`]).
+    Background(super::tint::Rgb),
     Esc,
     Paste(String),
 }
@@ -187,6 +190,7 @@ fn escape(bytes: &[u8]) -> Decoded {
         Some(0x7f | 0x08) => key(Key::DeleteWord, 2),
         Some(b'b') => key(Key::WordLeft, 2),
         Some(b'f') => key(Key::WordRight, 2),
+        Some(b']') => answer(bytes),
         Some(b'O') => match bytes.get(2) {
             None => Decoded::Incomplete,
             Some(b'H') => key(Key::Home, 3),
@@ -233,6 +237,33 @@ fn escape(bytes: &[u8]) -> Decoded {
         // Alt plus a key: not used.
         Some(_) => Decoded::Skip(2),
     }
+}
+
+/// The longest answer rein waits for: `11;rgb:ffff/ffff/ffff` and room.
+const ANSWER_MOST: usize = 40;
+
+/// What the terminal answered after `ESC ]`, up to BEL or `ESC \`: the
+/// background colour rein asked for. What can't be part of one, like
+/// Alt-] and the keys typed after it, is left for the keys it is, rather
+/// than held until an end that never comes.
+fn answer(bytes: &[u8]) -> Decoded {
+    let body = &bytes[2..];
+    let end = body.iter().position(|&b| b == 0x07 || b == 0x1b);
+    let looks = |part: &[u8]| part.first().is_none_or(u8::is_ascii_digit) && part.iter().all(|&b| b.is_ascii_graphic());
+    match end {
+        Some(at) if body[at] == 0x07 => found(&body[..at], at + 3),
+        Some(at) => match body.get(at + 1) {
+            None if looks(&body[..at]) => Decoded::Incomplete,
+            Some(b'\\') => found(&body[..at], at + 4),
+            _ => Decoded::Skip(2),
+        },
+        None if looks(body) && body.len() < ANSWER_MOST => Decoded::Incomplete,
+        None => Decoded::Skip(2),
+    }
+}
+
+fn found(answer: &[u8], used: usize) -> Decoded {
+    super::tint::parse_answer(answer).map_or(Decoded::Skip(used), |rgb| Decoded::Key(Key::Background(rgb), used))
 }
 
 /// `button ; x ; y`, from `ESC [ < … M` (pressed) or `m` (let go).
@@ -340,6 +371,20 @@ mod tests {
     fn reads_the_window_coming_and_going() {
         assert_eq!(keys(b"\x1b[O\x1b[Ix"), [Key::Focus(false), Key::Focus(true), Key::Char('x')]);
         assert_eq!(keys(b"\x1bOH"), [Key::Home], "not to be mistaken for the Home key's spelling");
+    }
+
+    #[test]
+    fn reads_the_terminals_background_and_nothing_typed_after_alt_bracket() {
+        assert_eq!(keys(b"\x1b]11;rgb:1515/1717/1c1c\x07x"), [Key::Background((21, 23, 28)), Key::Char('x')], "ended by BEL");
+        assert_eq!(keys(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"), [Key::Background((255, 255, 255))], "ended by ESC \\");
+        let mut k = Keys::default();
+        assert_eq!(k.feed(b"\x1b]11;rgb:15"), [], "the rest is on its way");
+        assert_eq!(k.feed(b"15/1717/1c1c\x1b"), []);
+        assert_eq!(k.feed(b"\\"), [Key::Background((21, 23, 28))]);
+        assert_eq!(keys(b"\x1b]10;rgb:0/0/0\x07ok"), [Key::Char('o'), Key::Char('k')], "an answer rein didn't ask for");
+        // Alt-] then words: the words are typed, not held as an answer.
+        assert_eq!(keys(b"\x1b]hi"), [Key::Char('h'), Key::Char('i')]);
+        assert_eq!(keys(b"\x1b]1 a"), [Key::Char('1'), Key::Char(' '), Key::Char('a')]);
     }
 
     #[test]

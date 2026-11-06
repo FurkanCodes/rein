@@ -110,10 +110,11 @@ impl Wrap {
     }
 }
 
-/// What starts a list item: `·`, `-`, `1.`, `☐`…
+/// What starts a list item: `·`, `-`, `1.`, `☐`…, and the `●` the
+/// model's words start with.
 fn bullet(word: &str) -> bool {
     let digits = word.chars().take_while(char::is_ascii_digit).count();
-    matches!(word, "·" | "-" | "*" | "+" | "•" | "☐" | "☑" | "▸") || (digits > 0 && matches!(&word[digits..], "." | ")"))
+    matches!(word, "·" | "-" | "*" | "+" | "•" | "●" | "☐" | "☑" | "▸") || (digits > 0 && matches!(&word[digits..], "." | ")"))
 }
 
 #[cfg(test)]

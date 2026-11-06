@@ -139,6 +139,13 @@ pub fn show(draw: Draw) {
     render(&mut state);
 }
 
+/// Lays out everything shown again, at the next draw: the colours it was
+/// drawn with have changed.
+pub fn lay_out_again() {
+    let _guard = lock();
+    state().transcript.lay_out_again();
+}
+
 /// Like [`show`], under `key`, so [`redraw`] can draw it again in place.
 pub fn show_as(key: u64, draw: Draw) {
     let full = state().full;
@@ -616,6 +623,9 @@ impl Pinned {
         state.stale = true;
         state.since = state.transcript.mark();
         write_raw(START);
+        // What the band behind your messages is made from: the answer
+        // comes with the keys (`Key::Background`).
+        write_raw(super::tint::ASK);
         Pinned { style }
     }
 

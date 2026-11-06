@@ -8,16 +8,17 @@ put together as an animated WebP. Nothing captures your desktop. Waiting on
 the model is cut short: while only the spinner moves, a moment stands for
 the wait; typing and what rein shows keep their real pace.
 
-What it shows: the / list with skills, a skill called, the model working
-in `ask` mode with the sandbox on, an edit approved with its diff in view,
-the tests passing, /mcp with Context7 (a public server at a URL), a
-question answered through it, and /undo.
+What it shows, for the README's front page: rein as it starts, in trust
+mode, talking and at work. A question and its answer, then "the tests
+fail, fix them": the run that fails, the edit with its change, the run
+that passes, and what the turn came to.
 
 Needs rein, tmux, Google Chrome, Pillow, and the `claude` CLI signed in:
 the demo runs on your Claude plan, a few requests. REIN_DEMO_MODEL names
 another model, with its key in your environment. rein runs with folders of
 its own, so the demo adds nothing to your conversations, history, hooks or
-skills, and `claude` keeps your home only to find its sign-in.
+skills, and `claude` keeps your home only to find its sign-in. tmux runs
+on a server of its own, so yours is left alone.
 
 Usage: python3 docs/screenshot/demo.py [logo | encode]
   REIN names the rein to record (default: the one on PATH); record the
@@ -59,9 +60,37 @@ QUESTION = re.compile(r"Allow this|Allow writing|Let [\w.-]+'s [\w.-]+ run\?")
 BUSY = re.compile(r"[⠀-⣿✳-✿]|\b\d+(\.\d+)?s\b")
 TYPING = random.Random(7)
 
-SLUG = '''def slugify(title):
+# Long enough that the fix is an edit, not the file written again.
+SLUG = '''"""Helpers for the blog's URLs and previews."""
+
+import re
+
+MAX_WORDS = 12
+
+
+def slugify(title):
     """A title as a piece of a URL: "Hello, World!" becomes "hello-world"."""
     return title.lower().replace(" ", "-")
+
+
+def excerpt(text, words=MAX_WORDS):
+    """The first `words` words of `text`, with … if there were more."""
+    parts = text.split()
+    return " ".join(parts[:words]) + (" …" if len(parts) > words else "")
+
+
+def reading_time(text, per_minute=200):
+    """Minutes it takes to read `text`, at least one."""
+    return max(1, round(len(re.findall(r"\\w+", text)) / per_minute))
+
+
+def tags(text):
+    """The #tags in `text`, lowercased, each once, in order."""
+    seen = []
+    for tag in re.findall(r"#(\\w+)", text):
+        if tag.lower() not in seen:
+            seen.append(tag.lower())
+    return seen
 '''
 TESTS = '''import unittest
 
@@ -82,24 +111,15 @@ class SlugifyTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 '''
-# Skills as anyone might have them in ~/.agents/skills.
-SKILLS = {
-    "python-tests": (
-        "Run a Python project's tests and fix what fails. Use when tests fail, or before saying Python work is done.",
-        "Run the tests with `python3 -m unittest -v`. Read the failing test and the code it tests before changing\n"
-        "anything, fix the code rather than the test unless the test is wrong, and run them again.\n",
-    ),
-    "release-notes": ("Write release notes from the commits since the last tag.", "List the commits with `git log`, group them, and write the notes.\n"),
-    "code-review": ("Review the current diff for bugs before a commit.", "Read `git diff`, look for bugs and missing tests, and say what you found.\n"),
-}
-
-
 def tmux(*args):
-    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=True).stdout
+    """tmux, on a server of its own: yours, and what's in it, is left alone."""
+    return subprocess.run(["tmux", "-L", "rein-demo", *args], capture_output=True, text=True, check=True).stdout
 
 
 def screen(colours=False):
-    return tmux("capture-pane", "-p", *(["-e"] if colours else []), "-t", SESSION)
+    """The pane's text; with `colours`, its colour codes too, and the spaces
+    at the ends of rows, which a band or a tint may colour to the edge."""
+    return tmux("capture-pane", "-p", *(["-e", "-N"] if colours else []), "-t", SESSION)
 
 
 def setup():
@@ -111,14 +131,8 @@ def setup():
     (WORK / MARK).touch()
     (WORK / "slugs/slug.py").write_text(SLUG)
     (WORK / "slugs/test_slug.py").write_text(TESTS)
-    for name, (description, body) in SKILLS.items():
-        folder = WORK / "home/.agents/skills" / name
-        folder.mkdir(parents=True)
-        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {description}\n---\n\n{body}")
-    # The `claude` CLI's own sign-in, as `rein login claude-code` keeps it,
-    # and Context7, a public MCP server at a URL that needs no sign-in.
+    # The `claude` CLI's own sign-in, as `rein login claude-code` keeps it.
     (WORK / "rein/claude-code.json").write_text('{"token":null}\n')
-    (WORK / "rein/mcp.json").write_text(json.dumps({"mcpServers": {"context7": {"type": "http", "url": "https://mcp.context7.com/mcp"}}}, indent=2) + "\n")
     claude = shutil.which("claude")
     if claude:
         wrapper = WORK / "bin/claude"
@@ -132,8 +146,8 @@ def start():
         "PATH": f"{WORK / 'bin'}:{os.environ['PATH']}",
         "REIN_HOME": WORK / "rein",
         "REIN_MODEL": MODEL,
-        "REIN_MODE": "ask",
-        "REIN_SANDBOX": "on",
+        # What commands print in English, whatever this computer speaks.
+        "LC_ALL": "en_US.UTF-8",
         # No __pycache__, which rein would list as made by each test run.
         "PYTHONDONTWRITEBYTECODE": "1",
         "TERM": "xterm-256color",
@@ -141,9 +155,12 @@ def start():
         "BROWSER": "false",
     }
     # CLAUDECODE unset: run from inside Claude Code, `claude` would see it.
-    line = "env -u CLAUDECODE " + " ".join(f"{k}='{v}'" for k, v in env.items()) + f" '{REIN}'"
-    tmux("new-session", "-d", "-s", SESSION, "-x", str(COLS), "-y", str(ROWS), "-c", str(WORK / "slugs"), line)
-    tmux("set-option", "-t", SESSION, "status", "off")
+    # A moment first, so the background below is set when rein asks for it.
+    line = "sleep 0.3; exec env -u CLAUDECODE " + " ".join(f"{k}='{v}'" for k, v in env.items()) + f" '{REIN}'"
+    # The pane's background is what render.py draws: tmux answers rein's
+    # question with it, so your messages show on their band.
+    tmux("new-session", "-d", "-s", SESSION, "-x", str(COLS), "-y", str(ROWS), "-c", str(WORK / "slugs"), line,
+         ";", "set-option", "-t", SESSION, "window-style", f"bg={render.BACKGROUND}", ";", "set-option", "-t", SESSION, "status", "off")
 
 
 def wait_for(pattern, timeout=600, stable=0.0):
@@ -218,40 +235,20 @@ def work(rec):
 
 def scenes(rec):
     wait_for(IDLE, stable=1.0)
-    rec.hold(1.6)
-    # The / list: rein's commands and your skills. Typing narrows it.
-    type_("/")
-    rec.hold(1.8)
-    type_("test")
-    rec.hold(1.6)
-    key("Tab")
-    time.sleep(0.4)
-    type_("the tests fail, fix them")
-    rec.hold(0.6)
-    key("Enter")
-    work(rec)
-    rec.still = time.monotonic()
-    rec.hold(2.6)
-    # Your MCP servers.
-    type_("/mcp")
-    key("Enter")
-    wait_for("change which server")
-    rec.hold(2.4)
-    key("Escape")
-    wait_for(IDLE, stable=0.5)
-    type_("how do I strip accents in python? look it up with context7")
+    rec.hold(1.4)
+    # Talking: a question, and its answer.
+    type_("hi! what's a URL slug?")
     rec.hold(0.5)
     key("Enter")
     work(rec)
-    rec.hold(3.0)
-    # What /undo can put back.
-    type_("/undo")
+    rec.hold(4.0)
+    # At work: the tests fail, and rein fixes them.
+    type_("the tests fail, fix them")
+    rec.hold(0.5)
     key("Enter")
-    wait_for("Undo rein.s last")
-    rec.hold(2.6)
-    key("Escape")
-    wait_for(IDLE, stable=0.5)
-    rec.hold(1.0)
+    work(rec)
+    rec.still = time.monotonic()
+    rec.hold(5.0)
 
 
 def changed_lines(before, after):
@@ -344,7 +341,7 @@ def main():
         if only_logo:
             return
         key("C-d")
-        while subprocess.run(["tmux", "has-session", "-t", SESSION], capture_output=True).returncode == 0:
+        while subprocess.run(["tmux", "-L", "rein-demo", "has-session", "-t", SESSION], capture_output=True).returncode == 0:
             time.sleep(0.2)
         start()
         rec = Recorder()
@@ -357,7 +354,7 @@ def main():
         KEPT.write_text(json.dumps({"items": items, "still": still}))
         finish(items, still)
     finally:
-        subprocess.run(["tmux", "kill-session", "-t", SESSION], capture_output=True)
+        subprocess.run(["tmux", "-L", "rein-demo", "kill-session", "-t", SESSION], capture_output=True)
         shutil.rmtree(WORK, ignore_errors=True)
 
 

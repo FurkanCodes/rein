@@ -686,6 +686,14 @@ impl Boxed {
             self.focused = Some(focused);
             return;
         }
+        // The terminal said its background: what's tinted is drawn again
+        // with it.
+        if let Key::Background(rgb) = key {
+            crate::ui::tint::set_background(rgb);
+            screen::lay_out_again();
+            self.redraw();
+            return;
+        }
         self.touched = Instant::now();
         // The wheel scrolls the viewer's text, when it's open.
         let key = match key {

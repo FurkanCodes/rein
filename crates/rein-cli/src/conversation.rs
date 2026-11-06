@@ -5,7 +5,7 @@ use crate::args::{AskArgs, Resume};
 use crate::commands::{EffortSetting, Slash};
 use crate::format::{local_time, shorten, shown_path, thousands, traffic};
 use crate::input::{Menu, Read};
-use crate::terminal::{Last, Terminal, you_said};
+use crate::terminal::{Last, Terminal, show_you_said};
 use crate::ui::history::{self, History};
 use crate::ui::style::GUTTER;
 use crate::{CREDENTIALS_FILE, CliResult, config_dir, describe};
@@ -683,7 +683,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
             Some(parsed) => {
                 // A line that may hold a key is shown again without it.
                 if terminal.input.pinned() {
-                    say!("\n{}", you_said(&crate::commands::shown(line), terminal.err, terminal.wrap_width().unwrap_or(80)));
+                    show_you_said(&crate::commands::shown(line), terminal.err);
                 }
                 let done = match parsed {
                     Ok(command) => run_command(command, agent, terminal, setup).await,

@@ -11,6 +11,7 @@ use crate::ui::screen::Progress;
 use crate::ui::spinner::Spinner;
 use crate::ui::steps;
 use crate::ui::style::{GUTTER, Style, strip};
+use crate::ui::tint::Tint;
 use crate::ui::wrap::Wrap;
 use rein_agent::agent::{Approval, Compacted, Heard, Ui};
 use rein_agent::compact;
@@ -119,10 +120,10 @@ pub(crate) struct Terminal {
     compacting: bool,
     /// It's been said that requests go uncompressed.
     pub(crate) said_uncompressed: bool,
-    /// The reads on screen as one line, which the next joins if nothing
-    /// came between.
-    reads: Option<Reads>,
-    /// The key the next run of reads is shown under.
+    /// The steps that only looked on screen as one line, which the next
+    /// joins if nothing came between.
+    looks: Option<Looks>,
+    /// The key the next run of looks is shown under.
     next_key: u64,
     pub(crate) turn: TurnStats,
     /// This rein among the others on this computer, when it joined them.
@@ -161,22 +162,31 @@ impl Drop for Terminal {
     }
 }
 
-/// A run of reads, shown as one line.
-pub(crate) struct Reads {
+/// Steps in a row that only looked (reads and searches), shown as one
+/// line: `Read 2 files, searched for 1 pattern`.
+pub(crate) struct Looks {
     key: u64,
     lead: String,
-    /// The first read: alone, the run looks like any step.
+    /// The first: alone, the run looks like any step.
     first: ToolCall,
+    first_status: String,
+    /// The reads' paths and what each came to, for a run of reads alone.
     paths: Vec<String>,
     statuses: Vec<String>,
+    searches: usize,
 }
 
-impl Reads {
+impl Looks {
     fn draw(&self, s: Style) -> crate::ui::transcript::Draw {
-        let (lead, first, paths, statuses) = (self.lead.clone(), self.first.clone(), self.paths.clone(), self.statuses.clone());
+        let (lead, first, first_status) = (self.lead.clone(), self.first.clone(), self.first_status.clone());
+        let (paths, statuses, searches) = (self.paths.clone(), self.statuses.clone(), self.searches);
         Box::new(move |width| {
-            let dot = s.green("●");
-            vec![if paths.len() == 1 { steps::line(&first, &lead, &dot, &statuses[0], s, width) } else { steps::reads_line(&paths, &statuses, &lead, &dot, s, width) }]
+            let mark = s.green("✓");
+            vec![match (paths.len(), searches) {
+                (1, 0) | (0, 1) => steps::line(&first, &lead, &mark, &first_status, s, width),
+                (_, 0) => steps::reads_line(&paths, &statuses, &lead, &mark, s, width),
+                (reads, searches) => steps::looks_line(reads, searches, &lead, &mark, s, width),
+            }]
         })
     }
 }
@@ -196,14 +206,38 @@ pub(crate) struct Step {
     done: bool,
 }
 
-/// What one turn cost, for the status bar.
+/// What one turn cost, for the status bar, and what it did, for the line
+/// that ends it.
 #[derive(Default)]
 pub(crate) struct TurnStats {
     input: u64,
     cached: u64,
+    /// The steps it ran.
+    steps: usize,
+    /// The files it changed, each once.
+    changed: Vec<String>,
     pub(crate) started: Option<std::time::Instant>,
     /// How long it took, once it's over.
     took: Option<Duration>,
+}
+
+impl TurnStats {
+    /// What a turn that ran steps came to: `4 steps · changed slug.py ·
+    /// 24s`. A turn that only talked has none.
+    fn summary(&self) -> Option<String> {
+        let steps = match self.steps {
+            0 => return None,
+            1 => "1 step".to_owned(),
+            n => format!("{n} steps"),
+        };
+        let changed = match self.changed.as_slice() {
+            [] => "changed no files".to_owned(),
+            [one] => format!("changed {one}"),
+            many => format!("changed {} files", many.len()),
+        };
+        let took = self.took.map(|took| format!(" · {}", crate::peers::strip::short(took.as_secs()))).unwrap_or_default();
+        Some(format!("{steps} · {changed}{took}"))
+    }
 }
 
 /// The most lines of your message the conversation shows again; the rest
@@ -261,7 +295,7 @@ impl Terminal {
             plan: Vec::new(),
             compacting: false,
             said_uncompressed: false,
-            reads: None,
+            looks: None,
             next_key: 0,
             turn: TurnStats::default(),
             peers: None,
@@ -335,6 +369,9 @@ impl Terminal {
     /// Notes that this turn changed `path`, for a task's result and the
     /// other reins.
     fn changed_path(&mut self, path: String) {
+        if !self.turn.changed.contains(&path) {
+            self.turn.changed.push(path.clone());
+        }
         crate::peers::farewell::changed(&path);
         if let Some(peers) = &mut self.peers {
             peers.changed(&path);
@@ -406,8 +443,7 @@ impl Terminal {
         if self.fancy
             && let Some(message) = echo
         {
-            let shown = self.input.shown(message);
-            say!("\n{}", you_said(&shown, self.err, self.wrap_width().unwrap_or(80)));
+            show_you_said(&self.input.shown(message), self.err);
         }
         // Without the box, the spinner's line comes straight after this one.
         if self.fancy && !self.input.pinned() {
@@ -434,6 +470,11 @@ impl Terminal {
         }
         if !self.fancy {
             return;
+        }
+        // Where a turn that did some work ended, and what it came to.
+        if let Some(summary) = self.turn.summary() {
+            say!();
+            say!("{}{}", " ".repeat(GUTTER), self.err.dim(&format!("── {summary} ──")));
         }
         let bar = self.bar();
         if self.input.pinned() {
@@ -528,23 +569,29 @@ impl Terminal {
         crate::ui::screen::show(Box::new(draw));
     }
 
-    /// A read that went well: it joins the reads on screen just before it,
-    /// if nothing came between, or starts a run of its own.
-    fn show_read(&mut self, call: &ToolCall, status: String, lead: String) {
+    /// A read or a search that went well: it joins those on screen just
+    /// before it, if nothing came between, or starts a run of its own.
+    fn show_look(&mut self, call: &ToolCall, status: String, lead: String) {
         let s = self.err;
+        let read = ToolName::of(call) == Some(ToolName::Read);
         let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).unwrap_or_default();
         let path = args["path"].as_str().unwrap_or_default().to_owned();
-        if let Some(reads) = &mut self.reads {
-            reads.paths.push(path.clone());
-            reads.statuses.push(status.clone());
-            if crate::ui::screen::redraw(reads.key, reads.draw(s)) {
+        if let Some(looks) = &mut self.looks {
+            if read {
+                looks.paths.push(path.clone());
+                looks.statuses.push(status.clone());
+            } else {
+                looks.searches += 1;
+            }
+            if crate::ui::screen::redraw(looks.key, looks.draw(s)) {
                 return;
             }
         }
         self.next_key += 1;
-        let reads = Reads { key: self.next_key, lead, first: call.clone(), paths: vec![path], statuses: vec![status] };
-        crate::ui::screen::show_as(reads.key, reads.draw(s));
-        self.reads = Some(reads);
+        let (paths, statuses) = if read { (vec![path], vec![status.clone()]) } else { (Vec::new(), Vec::new()) };
+        let looks = Looks { key: self.next_key, lead, first: call.clone(), first_status: status, paths, statuses, searches: usize::from(!read) };
+        crate::ui::screen::show_as(looks.key, looks.draw(s));
+        self.looks = Some(looks);
     }
 
     /// Prints a step's line before its question, with the change it would
@@ -567,11 +614,13 @@ impl Terminal {
             self.gap_before_step();
             let lead = self.lead();
             let s = self.err;
-            let diff = if matches!(ToolName::of(call), Some(ToolName::Edit | ToolName::Write)) { steps::diff_box(call, &self.root, s, WIDE, false) } else { Vec::new() };
+            let changes = ToolName::of(call).is_some_and(ToolName::changes_files);
+            let change = if changes { steps::change(call, &self.root, false) } else { Vec::new() };
+            let counts = if changes { steps::change_counts(call, s) } else { String::new() };
             let (call_, lead_) = (call.clone(), lead.clone());
             self.show(move |width| {
-                let mut lines = vec![steps::line(&call_, &lead_, &s.dim("○"), "", s, width)];
-                lines.extend(diff.iter().map(|line| crate::ui::style::fit(line, width)));
+                let mut lines = vec![steps::line(&call_, &lead_, &s.dim("○"), &counts, s, width)];
+                lines.extend(steps::change_lines(&change, s, width));
                 lines
             });
             self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: false });
@@ -594,11 +643,6 @@ enum Room {
 /// is laid out there.
 pub(crate) const UNWRAPPED: usize = usize::MAX / 4;
 
-/// The width a file change's frame is made at once, to be cut to the
-/// window's width as it's shown: it's worked out from the file as it is
-/// then, which may change later.
-pub(crate) const WIDE: usize = 400;
-
 /// Your message as the conversation shows it: under your label, wrapped,
 /// and only its first lines if it's long, like a big paste.
 /// What another rein said, as the conversation shows it: who from, then
@@ -615,17 +659,39 @@ pub(crate) fn peer_said(from: &str, message: &str, s: Style, columns: usize) -> 
     out
 }
 
-pub(crate) fn you_said(message: &str, s: Style, columns: usize) -> String {
+/// Your message as the conversation shows it, at `columns`: under your
+/// label, wrapped, and only its first lines if it's long, like a big
+/// paste. Where the terminal said its background, it's on a band to the
+/// window's edge, so you find your messages at a glance; without one,
+/// it's bold, as it was.
+pub(crate) fn you_said(message: &str, s: Style, columns: usize) -> Vec<String> {
     let lines: Vec<&str> = message.lines().collect();
     let shown = if lines.len() > ECHO_LINES { &lines[..ECHO_LINES - 1] } else { &lines[..] };
+    let band = crate::ui::tint::behind(Tint::Band, s).is_some();
     let mut wrap = Wrap::new(columns, GUTTER, GUTTER);
     let text = wrap.push(&shown.join("\n")) + &wrap.finish();
-    let mut out = format!("{}{}", s.you(), s.bold(&text));
+    let mut rows: Vec<String> = text
+        .split('\n')
+        .enumerate()
+        .map(|(i, row)| {
+            let lead = if i == 0 { s.you() } else { " ".repeat(GUTTER) };
+            let row = row.strip_prefix(&" ".repeat(GUTTER)).unwrap_or(row);
+            format!("{lead}{}", if band { row.to_owned() } else { s.bold(row) })
+        })
+        .collect();
     if lines.len() > shown.len() {
         let rest = lines.len() - shown.len();
-        out += &format!("\n{}{}", " ".repeat(GUTTER), s.dim(&format!("… {rest} more lines")));
+        rows.push(format!("{}{}", " ".repeat(GUTTER), s.dim(&format!("… {rest} more lines"))));
     }
-    out
+    rows.into_iter().map(|row| crate::ui::tint::fill(&row, Tint::Band, s, columns)).collect()
+}
+
+/// Shows your message, after a blank line, laid out for the window's
+/// width now and after every resize.
+pub(crate) fn show_you_said(message: &str, s: Style) {
+    say!();
+    let message = message.to_owned();
+    crate::ui::screen::show(Box::new(move |width| you_said(&message, s, width)));
 }
 
 impl Ui for Terminal {
@@ -633,17 +699,20 @@ impl Ui for Terminal {
         self.quiet();
         if self.answer.is_none() {
             let width = self.wrap_width();
+            // The model's words start with a bullet, which sets them apart
+            // from its steps; its lines after line up under the words. A
+            // summary has neither label nor bullet: it isn't an answer to you.
+            let indent = if self.compacting { GUTTER } else { GUTTER + 2 };
             if width.is_some() {
                 if matches!(std::mem::take(&mut self.last), Last::Step | Last::You) {
                     out!("\n");
                 }
-                // A summary has no label: it isn't an answer to you.
-                let lead = if self.compacting { " ".repeat(GUTTER) } else { self.lead() };
+                let lead = if self.compacting { " ".repeat(GUTTER) } else { format!("{}{} ", self.lead(), self.err.bright("●")) };
                 // The label came from stderr's style; stdout may differ.
                 let lead = if self.out.on() { lead } else { strip(&lead) };
                 out!("{lead}");
             }
-            self.answer = Some(Answer { markdown: width.map(|_| Markdown::new(self.out.on())), wrap: width.map(|width| Wrap::new(width, GUTTER, GUTTER)) });
+            self.answer = Some(Answer { markdown: width.map(|_| Markdown::new(self.out.on())), wrap: width.map(|width| Wrap::new(width, indent, indent)) });
             if !self.compacting {
                 crate::peers::farewell::writing();
             }
@@ -925,7 +994,7 @@ impl Ui for Terminal {
         let (name, target) = steps::describe(call);
         crate::peers::farewell::stepped(&format!("{name} {target} · blocked: {reason}"));
         let (call_, lead_, status) = (call.clone(), lead.clone(), s.red(&format!("blocked: {reason}")));
-        self.show(move |width| vec![steps::line(&call_, &lead_, &s.red("●"), &status, s, width)]);
+        self.show(move |width| vec![steps::line(&call_, &lead_, &s.red("✗"), &status, s, width)]);
         self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: true });
         self.last = Last::Step;
     }
@@ -937,6 +1006,7 @@ impl Ui for Terminal {
             return;
         }
         let s = self.err;
+        self.turn.steps += 1;
         let asked = step.as_ref().is_some_and(|step| step.header_shown);
         let mut outcome = steps::outcome(call, output, s);
         let (name, target) = steps::describe(call);
@@ -959,11 +1029,7 @@ impl Ui for Terminal {
             let (name, target) = steps::describe(call);
             self.input.keep_output(format!("{name}  {target} · {}", strip(&outcome.status)), output);
         }
-        let dot = match outcome.ok {
-            Some(true) => s.green("●"),
-            Some(false) => s.red("●"),
-            None => s.dim("●"),
-        };
+        let dot = steps::mark(outcome.ok, s);
         // Asked about first: its line is up there; the result goes under it.
         let lead = match step {
             Some(step) if step.header_shown => None,
@@ -978,30 +1044,37 @@ impl Ui for Terminal {
         let note = self.noted.take().map(|note| format!("{}{} {}", " ".repeat(steps::INDENT), s.green("✓"), s.dim(&note)));
         let watched = self.watched.take().map(|watched| format!("{}{}", " ".repeat(steps::INDENT), s.dim(&format!("↳ {watched}"))));
         let hooked: Vec<String> = std::mem::take(&mut self.hooked).iter().map(|what| format!("{}{}", " ".repeat(steps::INDENT), s.dim(&format!("↳ {what}")))).collect();
-        // Reads in a row share a line.
-        if ToolName::of(call) == Some(ToolName::Read)
+        // Reads and searches in a row share a line, when there's nothing
+        // to say under one.
+        if ToolName::of(call).is_some_and(ToolName::only_looks)
             && outcome.ok == Some(true)
             && note.is_none()
+            && hooked.is_empty()
             && let Some(lead) = lead.clone()
         {
-            self.show_read(call, outcome.status, lead);
+            self.show_look(call, outcome.status, lead);
             self.last = Last::Step;
             return;
         }
         // An edit made without asking shows what it changed; a question
         // showed it already. A new file's whole text is Ctrl-O away.
-        let diff = if !asked && ToolName::of(call) == Some(ToolName::Edit) && outcome.ok == Some(true) { steps::diff_box(call, &self.root, s, WIDE, true) } else { Vec::new() };
+        let change = if !asked && ToolName::of(call) == Some(ToolName::Edit) && outcome.ok == Some(true) { steps::change(call, &self.root, true) } else { Vec::new() };
+        // A change asked about shows what it changes above it; under, that
+        // it's in.
+        let saved = asked && ToolName::of(call).is_some_and(ToolName::changes_files) && outcome.ok == Some(true);
         let (call_, viewer) = (call.clone(), self.input.pinned());
         self.show(move |width| {
             let mut lines = vec![match &lead {
-                Some(lead) => steps::line(&call_, lead, &dot, &outcome.status, s, width),
-                None => format!("{}{dot} {}", " ".repeat(steps::INDENT), outcome.status),
+                Some(lead) => steps::line_saying(&call_, lead, &dot, &outcome.status, &outcome.said, s, width),
+                None if saved => format!("{}{dot} {}", " ".repeat(steps::INDENT), s.dim("saved")),
+                // Cut at the edge, like any of a step's lines.
+                None => format!("{}{dot} {}{}", " ".repeat(steps::INDENT), outcome.status, outcome.said),
             }];
             lines.extend(steps::detail_lines(&outcome, s, width, viewer));
             lines.extend(watched.iter().map(|line| crate::ui::style::fit(line, width)));
             lines.extend(hooked.iter().map(|line| crate::ui::style::fit(line, width)));
             lines.extend(note.clone());
-            lines.extend(diff.iter().map(|line| crate::ui::style::fit(line, width)));
+            lines.extend(steps::change_lines(&change, s, width));
             lines
         });
         self.last = Last::Step;
@@ -1062,10 +1135,10 @@ impl Ui for Terminal {
         }
         let lead = " ".repeat(GUTTER);
         if ToolName::of(call) == Some(ToolName::Read) && outcome.ok == Some(true) {
-            self.show_read(call, outcome.status, lead);
+            self.show_look(call, outcome.status, lead);
             return;
         }
-        let dot = if outcome.ok == Some(false) { s.red("●") } else { s.green("●") };
+        let dot = steps::mark(Some(outcome.ok != Some(false)), s);
         let (call_, viewer) = (call.clone(), self.input.pinned());
         self.show(move |width| {
             let mut lines = vec![steps::line(&call_, &lead, &dot, &outcome.status, s, width)];
@@ -1108,10 +1181,7 @@ impl Ui for Terminal {
         self.end_line();
         let columns = self.wrap_width().unwrap_or(80);
         match heard {
-            Heard::You(message) if self.fancy => {
-                let shown = self.input.shown(message);
-                say!("\n{}", you_said(&shown, self.err, columns));
-            }
+            Heard::You(message) if self.fancy => show_you_said(&self.input.shown(message), self.err),
             Heard::Peer { from, text } if self.fancy => say!("\n{}", peer_said(from, text, self.err, columns)),
             Heard::Changed { by, path } => {
                 say!("{}{}", " ".repeat(GUTTER), self.err.dim(&format!("↳ {by} changed {path}, which this conversation has seen")));

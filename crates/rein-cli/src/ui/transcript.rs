@@ -90,6 +90,12 @@ impl Transcript {
         true
     }
 
+    /// Forgets every block's rows, so the next [`Transcript::rows`] lays
+    /// them all out again.
+    pub fn lay_out_again(&mut self) {
+        self.width = 0;
+    }
+
     /// How many blocks there are, to show the ones after it later.
     pub fn mark(&self) -> usize {
         self.blocks.len()

@@ -12,7 +12,7 @@ rein is a coding agent for the terminal, written in Rust. It reads and
 edits your code and runs commands, and you see every step as it happens.
 You hold the reins.
 
-![rein in a terminal: the / list of commands and skills, the python-tests skill asked to fix failing tests, the edit approved with its diff in view, the tests passing, the Context7 MCP server asked how to strip accents in Python, and /undo](docs/screenshot/demo.webp)
+![rein in a terminal: asked what a URL slug is, it answers; asked to fix the failing tests, it searches and reads the project, edits slug.py with the lines it changes in red and green, runs the tests again, and says what it changed](docs/screenshot/demo.webp)
 
 ## Why rein
 

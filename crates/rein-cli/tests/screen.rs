@@ -516,6 +516,8 @@ struct Seen {
     progress: Vec<String>,
     /// What the tab's status under its title was told (iTerm2's OSC 21337).
     statuses: Vec<String>,
+    /// How many times rein asked for the terminal's background (OSC 11).
+    asked_background: usize,
 }
 
 impl vt100::Callbacks for Seen {
@@ -532,6 +534,9 @@ impl vt100::Callbacks for Seen {
     }
 
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params == [&b"11"[..], &b"?"[..]] {
+            self.asked_background += 1;
+        }
         if params.first() == Some(&&b"21337"[..]) {
             self.statuses.push(params[1..].iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>().join(";"));
         }
@@ -707,6 +712,21 @@ impl Term {
         runs
     }
 
+    /// Each cell of the first row that shows `text`, from the window's left
+    /// edge to its right: its background, and whether it's bold.
+    fn row_cells(&self, text: &str) -> Vec<(vt100::Color, bool)> {
+        let parser = self.screen.lock().unwrap();
+        let screen = parser.screen();
+        let (_, cols) = screen.size();
+        let row = screen.rows(0, cols).position(|row| row.contains(text)).unwrap_or_else(|| panic!("{text:?} isn't on screen"));
+        let row = u16::try_from(row).unwrap();
+        (0..cols).map(|col| screen.cell(row, col).map_or((vt100::Color::Default, false), |cell| (cell.bgcolor(), cell.bold()))).collect()
+    }
+
+    fn asked_background(&self) -> usize {
+        self.screen.lock().unwrap().callbacks().asked_background
+    }
+
     fn rows(&self) -> Vec<String> {
         let parser = self.screen.lock().unwrap();
         let (_, cols) = parser.screen().size();
@@ -872,7 +892,8 @@ fn an_answer_appears_above_the_box() {
     term.wait_for(IDLE);
     let screen = term.text();
     assert!(screen.contains("you    hi"), "{screen}");
-    assert!(screen.contains("rein   Hello there, how can I help?"), "{screen}");
+    assert!(screen.contains("rein   ● Hello there, how can I help?"), "the model's words start with a bullet:\n{screen}");
+    assert!(!screen.contains("── "), "a turn that only talked has no line to end it:\n{screen}");
     assert!(screen.contains("context"), "the status bar is under the box:\n{screen}");
     assert!(model.requests()[0].to_string().contains("\"hi\""), "the model was sent the message");
     assert_eq!(model.gzipped(), [true], "the conversation went gzipped");
@@ -928,7 +949,7 @@ fn a_command_is_asked_about_whole_and_runs_once_allowed() {
     term.keys("y");
     term.wait_for("All three lines printed.");
     let screen = term.text();
-    assert!(screen.contains("● Run") && screen.contains("exit 0"), "{screen}");
+    assert!(screen.contains("✓ Run") && screen.contains("exit 0"), "how it ended stays, at any width:\n{screen}");
     let sent = model.requests()[1].to_string();
     assert!(sent.contains("three-four-five-six-seven-eight-nine-ten"), "the output went back to the model: {sent}");
 }
@@ -947,8 +968,10 @@ fn a_narrower_window_rewraps_whole_words() {
             screen.lines().any(|row| row.starts_with('╭') && row.ends_with('╮') && row.chars().count() == usize::from(cols))
         });
         let rows = term.rows();
-        let start = rows.iter().position(|row| row.starts_with("rein   ")).expect("the answer");
-        let answer: Vec<&str> = rows[start..].iter().take_while(|row| !row.trim().is_empty()).map(|row| row.get(7..).unwrap_or("").trim()).collect();
+        let start = rows.iter().position(|row| row.starts_with("rein   ● ")).expect("the answer, after its bullet");
+        // Its rows after the first hang under its words, not its bullet.
+        let answer: Vec<String> = rows[start..].iter().take_while(|row| !row.trim().is_empty()).map(|row| row.chars().skip(9).collect::<String>().trim().to_owned()).collect();
+        assert!(rows[start + 1..start + answer.len()].iter().all(|row| row.starts_with("         ") && !row.starts_with("          ")), "{}", rows.join("\n"));
         assert_eq!(answer.join(" "), PARAGRAPH, "at {cols} columns, every word is whole:\n{}", rows.join("\n"));
         assert!(answer.len() > 1 || cols == 100, "it wraps at {cols} columns");
         let boxes = rows.iter().filter(|row| row.contains('╭')).count();
@@ -1007,7 +1030,7 @@ fn enter_while_rein_works_steers_it() {
     let at = |text: &str| screen.find(text).unwrap_or_else(|| panic!("{text:?} isn't on screen:\n{screen}"));
     assert!(at("sleep 1  exit 0") < at("touch planned.txt  skipped"), "{screen}");
     assert!(at("touch planned.txt  skipped") < at("you    use the helper instead"), "{screen}");
-    assert!(at("you    use the helper instead") < at("rein   Switching to the helper."), "{screen}");
+    assert!(at("you    use the helper instead") < at("rein   ● Switching to the helper."), "{screen}");
     let requests = model.requests();
     assert_eq!(requests.len(), 2, "one turn, steered");
     let input = requests[1]["input"].as_array().unwrap();
@@ -1104,7 +1127,7 @@ fn leaving_leaves_the_conversation_in_the_terminal() {
     term.wait_exit();
     let screen = term.text();
     assert!(!screen.contains('╭'), "the box is gone:\n{screen}");
-    assert!(screen.contains("you    hello") && screen.contains("rein   Bye for now."), "{screen}");
+    assert!(screen.contains("you    hello") && screen.contains("rein   ● Bye for now."), "{screen}");
     assert!(screen.contains("rein -c continues this conversation"), "{screen}");
 }
 
@@ -1196,8 +1219,8 @@ fn a_search_runs_without_asking() {
     term.keys("where is parse_list\r");
     term.wait_for("line 2.");
     let screen = term.text();
-    assert!(screen.contains(r#"● Search "fn parse_\w+" (*.rs)  1 match in 1 file"#), "{screen}");
-    assert!(screen.contains("└ src/parser.rs"), "{screen}");
+    assert!(screen.contains(r#"✓ Search "fn parse_\w+" (*.rs)  1 match in 1 file"#), "{screen}");
+    assert!(!screen.contains("src/parser.rs\n"), "which files is Ctrl-O away, not under the step:\n{screen}");
     assert!(!screen.contains("Allow"), "a search is never asked about:\n{screen}");
     let tools = model.requests()[0]["tools"].to_string();
     assert!(tools.contains("\"grep\"") && tools.contains("\"glob\""), "the model is told about both: {tools}");
@@ -1227,10 +1250,67 @@ fn an_at_points_at_a_file_which_goes_with_the_message() {
     term.wait_for("empty list.");
     let screen = term.text();
     // Under your message, as yours: no label of rein's on its line.
-    assert!(screen.contains("you    why does @src/parser.rs panic?\n       ● Read   src/parser.rs  2 lines"), "{screen}");
-    assert!(screen.contains("rein   It panics on an empty list."), "{screen}");
+    assert!(screen.contains("you    why does @src/parser.rs panic?\n         ✓ Read   src/parser.rs  2 lines"), "{screen}");
+    assert!(screen.contains("rein   ● It panics on an empty list."), "{screen}");
     let input = model.requests()[0]["input"].to_string();
     assert!(input.contains(r#"fn parse() {}\nfn parse_list() {}\n"#), "the model got the file with the message: {input}");
+}
+
+/// What a dark terminal answers when rein asks for its background.
+const DARK: &str = "\x1b]11;rgb:1515/1717/1c1c\x07";
+
+#[test]
+fn your_message_is_on_a_band_once_the_terminal_says_its_background() {
+    let model = Model::start(vec![says("Hi."), says("Hello again.")]);
+    let mut term = Term::start(&model, "band", 24, 80);
+    term.wait_for(IDLE);
+    assert_eq!(term.asked_background(), 1, "rein asks as its screen comes up");
+    // Until the terminal answers, or where it never does: bold, on nothing.
+    term.keys("first\r");
+    term.wait_for("Hi.");
+    let cells = term.row_cells("you    first");
+    assert!(cells.iter().all(|(back, _)| *back == vt100::Color::Default), "no band without the background: {cells:?}");
+    assert!(cells[7].1, "bold instead");
+    term.keys(DARK);
+    term.keys("second\r");
+    term.wait_for("Hello again.");
+    let cells = term.row_cells("you    second");
+    let band = cells[0].0;
+    assert!(band != vt100::Color::Default && cells.iter().all(|(back, _)| *back == band), "one band, from edge to edge: {cells:?}");
+    assert!(!cells[7].1, "on a band, it isn't bold too");
+    assert_eq!(term.row_cells("you    first")[79].0, band, "what was shown before is drawn on it too");
+    assert_eq!(term.row_cells("Hello again.")[79].0, vt100::Color::Default, "the model's words aren't on it");
+}
+
+#[test]
+fn reads_and_searches_in_a_row_are_one_line() {
+    let grep = json!({ "pattern": "two", "path": null, "glob": null, "ignore_case": false, "output": "lines", "context": null });
+    let model = Model::start(vec![Turn { out: vec![read("a.txt")] }, calls("grep", grep), Turn { out: vec![read("b.txt")] }, says("Seen them.")]);
+    let mut term = Term::start_with(&model, "looks", 24, 90, &[("a.txt", "one\n"), ("b.txt", "two\n")]);
+    term.wait_for(IDLE);
+    term.keys("look around\r");
+    term.wait_for("Seen them.");
+    let screen = term.text();
+    assert!(screen.contains("rein     ✓ Read 2 files, searched for 1 pattern\n"), "{screen}");
+    assert_eq!(screen.matches('✓').count(), 1, "one line for the three:\n{screen}");
+}
+
+#[test]
+fn a_change_shows_on_tinted_lines_and_the_turn_says_what_it_changed() {
+    let model = Model::start(vec![edits("a.py", "print(1)", "print(2)"), says("Changed.")]).with_env("REIN_MODE", "trust");
+    let mut term = Term::start_with(&model, "change", 24, 80, &[("a.py", "x = 0\nprint(1)\n")]);
+    term.wait_for(IDLE);
+    term.keys(DARK);
+    term.keys("change it\r");
+    term.wait_for("Changed.");
+    let screen = term.text();
+    assert!(screen.contains("rein     ✓ Edit   a.py  +1 -1\n"), "{screen}");
+    assert!(!screen.contains('┌') && !screen.contains("│    2"), "no frame around it:\n{screen}");
+    let (removed, added) = (term.row_cells("   2 - print(1)"), term.row_cells("   2 + print(2)"));
+    assert!(removed[79].0 != vt100::Color::Default && added[79].0 != vt100::Color::Default, "tinted to the edge");
+    assert_ne!(removed[79].0, added[79].0, "red and green");
+    assert_eq!(removed[0].0, vt100::Color::Default, "from under the step, not the window's edge");
+    assert!(screen.contains("── 1 step · changed a.py · "), "{screen}");
 }
 
 #[test]
@@ -1243,8 +1323,9 @@ fn reads_in_a_row_share_a_line() {
     term.keys("read them\r");
     term.wait_for("All read.");
     let screen = term.text();
-    assert!(screen.contains("● Read   a.txt, b.txt, c.txt  3 files · 6 lines"), "{screen}");
-    assert_eq!(screen.matches("● Read").count(), 1, "one line for the three, asked for together or not:\n{screen}");
+    assert!(screen.contains("✓ Read   a.txt, b.txt, c.txt  3 files · 6 lines"), "{screen}");
+    assert_eq!(screen.matches("✓ Read").count(), 1, "one line for the three, asked for together or not:\n{screen}");
+    assert!(screen.contains("── 3 steps · changed no files · "), "the turn did work: a line ends it\n{screen}");
 }
 
 #[test]

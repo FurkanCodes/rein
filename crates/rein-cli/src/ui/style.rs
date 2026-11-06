@@ -56,6 +56,11 @@ impl Style {
         self.paint("1", text)
     }
 
+    /// The terminal's brightest white: the bullet the model's words start with.
+    pub fn bright(self, text: &str) -> String {
+        self.paint("97", text)
+    }
+
     pub fn dim(self, text: &str) -> String {
         self.paint("90", text)
     }

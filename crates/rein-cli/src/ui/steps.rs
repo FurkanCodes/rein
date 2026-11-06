@@ -1,16 +1,21 @@
-//! How each step rein takes looks on screen: one line under rein's label,
-//! with a dot (spinning while it runs, then green or red), the tool, what
-//! it's about, and a short result. A few lines of output follow where they
-//! help; Ctrl-O shows all of it.
+//! How each step rein takes looks on screen: one line, two columns in from
+//! the model's words, with a mark (spinning while it runs, then a green ✓
+//! or a red ✗), the tool, what it's about, and a short result. The work is
+//! grey, so the model's words stand out from it; a change to a file is
+//! what you'd look at, so it isn't. Where a step failed, the lines that say
+//! why follow; Ctrl-O shows all of any step's output.
 //!
 //! ```text
-//! rein   ● Read  todo.py  164 lines
-//!        ● Search "parse_list" (*.rs)  3 matches in 2 files
-//!          └ src/main.rs
-//!            src/parser.rs
-//!        ● Run   cargo test  exit 101
-//!          └ test parser::trailing_comma ... FAILED
-//!          … 209 more lines
+//! rein   ● Fixing the trailing comma.
+//!
+//!          ✓ Read   src/parser.rs, src/lexer.rs  2 files · 360 lines
+//!          ✓ Edit   src/parser.rs  +2 -1
+//!               85 -     items.push(last)
+//!               85 +     if !last.is_empty() {
+//!               86 +         items.push(last)
+//!          ✗ Run    cargo test  exit 101
+//!            └ test parser::trailing_comma ... FAILED
+//!            … 209 more lines
 //! ```
 
 use std::path::Path;
@@ -21,9 +26,17 @@ use rein_llm::ToolCall;
 use rein_llm::serde_json::{self, Value};
 
 use super::style::{GUTTER, Style, fit as fit_width, strip, width};
+use super::tint::{self, Tint};
+
+/// How far a step's mark is in from the model's words.
+pub const STEP: usize = 2;
 
 /// Where a step's details start: under its tool name.
-pub const INDENT: usize = GUTTER + 2;
+pub const INDENT: usize = GUTTER + STEP + 2;
+
+/// The least of a step's line its target keeps: what a command printed
+/// last is cut before it is.
+const TARGET_MOST_CUT: usize = 24;
 
 /// Output lines shown under a step; the rest is summed up.
 const SHOWN: usize = 2;
@@ -163,15 +176,35 @@ pub fn doing(call: &ToolCall) -> String {
     format!("{verb} {target}")
 }
 
-/// A step's line: `lead` (rein's label, or room for it), `mark`, the tool,
-/// its target, then `status`. It never wraps: the target is cut to fit
-/// `columns`, so a long command takes one line.
+/// A step's line: `lead` (rein's label, or room for it), then two columns
+/// in, `mark`, the tool, its target, then `status`. It never wraps: the
+/// target is cut to fit `columns`, so a long command takes one line.
 pub fn line(call: &ToolCall, lead: &str, mark: &str, status: &str, style: Style, columns: usize) -> String {
+    line_saying(call, lead, mark, status, "", style, columns)
+}
+
+/// The same, with what the step `said` after its status, like a command's
+/// last line: where the target would keep less than [`TARGET_MOST_CUT`],
+/// that's cut first, and then left out. The status is never cut.
+pub fn line_saying(call: &ToolCall, lead: &str, mark: &str, status: &str, said: &str, style: Style, columns: usize) -> String {
     let (name, target) = describe(call);
-    let head = format!("{lead}{mark} {} ", style.bold(&format!("{name:<6}")));
+    // A change to a file is what you'd look at; the rest of the work is grey.
+    let changes = ToolName::of(call).is_some_and(ToolName::changes_files);
+    let name = format!("{name:<6}");
+    let head = format!("{lead}{}{mark} {} ", " ".repeat(STEP), if changes { style.bold(&name) } else { style.dim(&name) });
+    let target = |room: usize| {
+        let target = fit_width(&target, room);
+        if changes { target } else { style.dim(&target) }
+    };
     let tail = if status.is_empty() { String::new() } else { format!("  {status}") };
-    let room = columns.saturating_sub(width(&head) + width(&tail) + 1).max(8);
-    format!("{head}{}{tail}", fit_width(&target, room))
+    let left = columns.saturating_sub(width(&head) + width(&tail) + TARGET_MOST_CUT + 1);
+    let said = match left {
+        0..8 => String::new(),
+        _ if width(said) <= left => said.to_owned(),
+        _ => fit_width(said, left),
+    };
+    let room = columns.saturating_sub(width(&head) + width(&tail) + width(&said) + 1).max(8);
+    format!("{head}{}{tail}{said}", target(room))
 }
 
 /// Reads in a row, on one line: their paths, as many as fit and then how
@@ -194,7 +227,7 @@ pub fn reads_line(paths: &[String], statuses: &[String], lead: &str, mark: &str,
         Some(n) => format!("{files} · {n} lines"),
         None => files,
     };
-    let head = format!("{lead}{mark} {} ", style.bold(&format!("{:<6}", "Read")));
+    let head = format!("{lead}{}{mark} {} ", " ".repeat(STEP), style.dim(&format!("{:<6}", "Read")));
     let tail = format!("  {}", style.dim(&total));
     let room = columns.saturating_sub(width(&head) + width(&tail) + 1).max(8);
     let mut shown = String::new();
@@ -208,17 +241,46 @@ pub fn reads_line(paths: &[String], statuses: &[String], lead: &str, mark: &str,
         }
         shown = joined;
     }
-    format!("{head}{}{tail}", fit_width(&shown, room))
+    format!("{head}{}{tail}", style.dim(&fit_width(&shown, room)))
+}
+
+/// A finished step's mark: a green ✓ for one that worked, a red ✗ for one
+/// that failed, and a grey ○ for neither, like one declined.
+pub fn mark(ok: Option<bool>, style: Style) -> String {
+    match ok {
+        Some(true) => style.green("✓"),
+        Some(false) => style.red("✗"),
+        None => style.dim("○"),
+    }
+}
+
+/// Steps that only looked, in a row, on one line: what they came to,
+/// `Read 2 files, searched for 3 patterns`. Ctrl-O shows each.
+pub fn looks_line(reads: usize, searches: usize, lead: &str, mark: &str, style: Style, columns: usize) -> String {
+    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts = Vec::new();
+    if reads > 0 {
+        parts.push(format!("read {}", count(reads, "file", "files")));
+    }
+    if searches > 0 {
+        parts.push(format!("searched for {}", count(searches, "pattern", "patterns")));
+    }
+    let said = parts.join(", ");
+    let said = said.get(..1).map_or(String::new(), str::to_uppercase) + said.get(1..).unwrap_or_default();
+    format!("{lead}{}{mark} {}", " ".repeat(STEP), style.dim(&fit_width(&said, columns.saturating_sub(width(lead) + STEP + 3).max(8))))
 }
 
 /// What a step's output came to: a short result for its first line, the
 /// output lines worth showing under it, and how many more there are.
 #[derive(Clone)]
 pub struct Outcome {
-    /// It worked (a green dot), failed (red), or neither, like a declined
-    /// step (grey).
+    /// It worked (a green ✓), failed (a red ✗), or neither, like a
+    /// declined step (a grey ○).
     pub ok: Option<bool>,
     pub status: String,
+    /// What it said after its status, where there's room: ` · ` and a
+    /// command's last line.
+    pub said: String,
     pub details: Vec<String>,
     pub more: usize,
     /// What `more` counts: `line`, or `file`.
@@ -226,7 +288,7 @@ pub struct Outcome {
 }
 
 pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
-    let plain = |ok: Option<bool>, status: String| Outcome { ok, status, details: Vec::new(), more: 0, unit: "line" };
+    let plain = |ok: Option<bool>, status: String| Outcome { ok, status, said: String::new(), details: Vec::new(), more: 0, unit: "line" };
     if let Some(error) = output.strip_prefix("error: ") {
         return plain(Some(false), style.red(&first_line(error)));
     }
@@ -274,16 +336,21 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
                 None => (failed, status),
             };
             let body: Vec<&str> = lines.into_iter().filter(|line| !line.trim().is_empty()).collect();
-            // A failure shows where it says what went wrong; success, how it ended.
-            let mut shown: Vec<&str> = if failed {
-                body.iter().copied().filter(|line| ["error", "FAILED", "panicked", "Error", "failed"].iter().any(|w| line.contains(w))).take(SHOWN).collect()
-            } else {
-                Vec::new()
-            };
+            // Success is how it ended, on its line; a failure shows where it
+            // says what went wrong, under it.
+            if !failed {
+                let said = match body.last() {
+                    Some(last) if behind.is_none() => style.dim(&format!(" · {}", fit(last.trim(), 80))),
+                    _ => String::new(),
+                };
+                return Outcome { said, ..plain(Some(true), status) };
+            }
+            let mut shown: Vec<&str> =
+                body.iter().copied().filter(|line| ["error", "FAILED", "panicked", "Error", "failed"].iter().any(|w| line.contains(w))).take(SHOWN).collect();
             if shown.is_empty() {
                 shown = body[body.len().saturating_sub(SHOWN)..].to_vec();
             }
-            Outcome { ok: Some(!failed), status, more: body.len() - shown.len(), details: shown.into_iter().map(str::to_owned).collect(), unit: "line" }
+            Outcome { ok: Some(false), status, said: String::new(), more: body.len() - shown.len(), details: shown.into_iter().map(str::to_owned).collect(), unit: "line" }
         }
         Some(ToolName::Read) if output.starts_with("[unchanged:") => plain(Some(true), style.dim("unchanged: already in the conversation")),
         // An image, as rein said it: `[image a.png, 1280×800]`.
@@ -325,23 +392,15 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
                     }
                 })
                 .collect();
-            Outcome { ok: Some(true), status: String::new(), details, more: 0, unit: "line" }
+            Outcome { ok: Some(true), status: String::new(), said: String::new(), details, more: 0, unit: "line" }
         }
-        // The summary, and which files: the first few, then how many more.
+        // The summary; which files is Ctrl-O away.
         Some(ToolName::Grep | ToolName::Glob) => {
             let summary = first_line(output);
             if summary.starts_with("No ") {
                 return plain(Some(true), style.dim(if ToolName::of(call) == Some(ToolName::Grep) { "nothing found" } else { "no files" }));
             }
-            let mut files = found_files(output);
-            // A search of one file: its line names it already.
-            let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
-            if files.len() == 1 && args["path"].as_str().map(|path| path.trim_start_matches("./")) == Some(files[0].as_str()) {
-                files.clear();
-            }
-            let shown: Vec<String> = files.iter().take(SHOWN).cloned().collect();
-            let status = style.dim(summary.split(';').next().unwrap_or_default());
-            Outcome { ok: Some(true), status, more: files.len() - shown.len(), details: shown, unit: "file" }
+            plain(Some(true), style.dim(summary.split(';').next().unwrap_or_default()))
         }
         // What it found, by server, as rein said it.
         Some(ToolName::ToolSearch) => plain(Some(true), style.dim(&first_line(output))),
@@ -373,8 +432,15 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             let found = output.lines().filter(|line| line.starts_with('#')).count();
             if found == 0 { plain(Some(true), style.dim("nothing found")) } else { plain(Some(true), style.dim(&format!("{found} match{}", if found == 1 { "" } else { "es" }))) }
         }
-        // `edited a.rs: replaced 1 place` → `replaced 1 place`: the step
-        // already says which file.
+        // How many lines it adds and takes away, and how many places where
+        // it was more than one.
+        Some(ToolName::Edit) => {
+            let places = first_line(output).rsplit_once("replaced ").and_then(|(_, rest)| rest.split(' ').next()?.parse::<usize>().ok());
+            let more = places.filter(|&n| n > 1).map(|n| style.dim(&format!(" · {n} places"))).unwrap_or_default();
+            plain(Some(true), format!("{}{more}", change_counts(call, style)))
+        }
+        // `created a.rs (30 lines)` → `30 lines`: the step already says
+        // which file.
         _ => {
             let said = first_line(output);
             // `created a.rs (30 lines)` → `30 lines`.
@@ -410,25 +476,22 @@ pub fn detail_lines(outcome: &Outcome, style: Style, columns: usize, viewer: boo
     lines
 }
 
-/// A file change in a frame, with line numbers: what goes in red, what
-/// comes in green.
-///
-/// ```text
-///        ┌──────────────────
-///        │ 85 -    print("EMPTY")
-///        │ 85 +    print("No tasks yet.")
-///        └──────────────────
-/// ```
-///
-/// `applied` says the change is already in the file, so the line numbers
-/// come from where the new text is rather than the old.
-pub fn diff_box(call: &ToolCall, root: &Path, style: Style, columns: usize, applied: bool) -> Vec<String> {
+/// A line of a file change as it's shown: what it takes away or adds,
+/// at which line of the file, or a note about the rest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Changed {
+    Line { added: bool, number: Option<usize>, text: String },
+    Note(String),
+}
+
+/// What an edit or a file written changes, with line numbers. Models often
+/// repeat a few unchanged lines around a change, to make it unique; only
+/// what changes is shown. `applied` says the change is already in the
+/// file, so the line numbers come from where the new text is rather than
+/// the old.
+pub fn change(call: &ToolCall, root: &Path, applied: bool) -> Vec<Changed> {
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
-    let (old, new) = match ToolName::of(call) {
-        Some(ToolName::Edit) => (args["old_text"].as_str().unwrap_or_default(), args["new_text"].as_str().unwrap_or_default()),
-        Some(ToolName::Write) => ("", args["content"].as_str().unwrap_or_default()),
-        _ => return Vec::new(),
-    };
+    let Some((old, new)) = sides(call, &args) else { return Vec::new() };
     // Where the change starts in the file, for the line numbers.
     let first = match ToolName::of(call) {
         Some(ToolName::Edit) => args["path"]
@@ -437,38 +500,88 @@ pub fn diff_box(call: &ToolCall, root: &Path, style: Style, columns: usize, appl
             .and_then(|text| text.find(if applied { new } else { old }).map(|at| text[..at].matches('\n').count() + 1)),
         _ => Some(1),
     };
-    // Models often repeat a few unchanged lines around a change, to make
-    // it unique; only what changes is shown.
-    let (old, new): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
-    let same_start = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
-    let same_end = old[same_start..].iter().rev().zip(new[same_start..].iter().rev()).take_while(|(a, b)| a == b).count();
-    let (old, new) = (&old[same_start..old.len() - same_end], &new[same_start..new.len() - same_end]);
+    let (old, new, same_start) = changed_lines(old, new);
     let first = first.map(|first| first + same_start);
-    let pad = " ".repeat(INDENT);
-    let number = |i: usize| first.map_or(String::new(), |first| format!("{:>4} ", first + i));
-    let room = columns.saturating_sub(INDENT + 10).max(20);
-    let mut body = Vec::new();
-    for (sign, lines, paint) in [("-", old, Style::red as fn(Style, &str) -> String), ("+", new, Style::green)] {
-        for (i, line) in lines.iter().take(DIFF_LINES).enumerate() {
-            body.push(format!("{}{}", style.dim(&number(i)), paint(style, &format!("{sign} {}", fit(line, room)))));
+    let mut lines = Vec::new();
+    for (added, side) in [(false, old), (true, new)] {
+        for (i, text) in side.iter().take(DIFF_LINES).enumerate() {
+            lines.push(Changed::Line { added, number: first.map(|first| first + i), text: (*text).to_owned() });
         }
-        if lines.len() > DIFF_LINES {
-            body.push(style.dim(&format!("     … {} more lines", lines.len() - DIFF_LINES)));
+        if side.len() > DIFF_LINES {
+            lines.push(Changed::Note(format!("… {} more lines", side.len() - DIFF_LINES)));
         }
     }
     if args["replace_all"].as_bool() == Some(true) {
-        body.push(style.dim("     (every occurrence)"));
+        lines.push(Changed::Note("(every occurrence)".to_owned()));
     }
-    let rule = "─".repeat(body.iter().map(|line| width(line)).max().unwrap_or(0).clamp(20, columns.saturating_sub(INDENT + 4).max(20)) + 2);
-    let mut lines = vec![format!("{pad}{}", style.dim(&format!("┌{rule}")))];
-    lines.extend(body.into_iter().map(|line| format!("{pad}{} {line}", style.dim("│"))));
-    lines.push(format!("{pad}{}", style.dim(&format!("└{rule}"))));
     lines
+}
+
+/// A change's lines at `columns`, under the step: the lines it takes away
+/// on a red tint and those it adds on a green one, each to the window's
+/// edge, as Claude Code shows them; where the terminal didn't say its
+/// background, in red and green instead.
+pub fn change_lines(change: &[Changed], style: Style, columns: usize) -> Vec<String> {
+    let pad = " ".repeat(INDENT);
+    let room = columns.saturating_sub(INDENT + 8).max(20);
+    change
+        .iter()
+        .map(|line| match line {
+            Changed::Note(note) => format!("{pad}{}", style.dim(&format!("     {note}"))),
+            Changed::Line { added, number, text } => {
+                let number = style.dim(&number.map_or("    ".to_owned(), |n| format!("{n:>4}")));
+                let (tint, sign) = if *added { (Tint::Added, style.green("+")) } else { (Tint::Removed, style.red("-")) };
+                let text = fit(text, room);
+                let tinted = tint::behind(tint, style).is_some();
+                let text = match (tinted, added) {
+                    (true, _) => text,
+                    (false, true) => style.green(&text),
+                    (false, false) => style.red(&text),
+                };
+                format!("{pad}{}", tint::fill(&format!("{number} {sign} {text}"), tint, style, columns.saturating_sub(INDENT)))
+            }
+        })
+        .collect()
+}
+
+/// How a change to a file is said on its step's line: `+5 -1` for an
+/// edit, `+2` for one that only adds, `30 lines` for a file written whole.
+pub fn change_counts(call: &ToolCall, style: Style) -> String {
+    let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
+    let Some((old, new)) = sides(call, &args) else { return String::new() };
+    if ToolName::of(call) == Some(ToolName::Write) {
+        let lines = new.lines().count();
+        return style.dim(&format!("{lines} line{}", if lines == 1 { "" } else { "s" }));
+    }
+    let (old, new, _) = changed_lines(old, new);
+    let added = (!new.is_empty()).then(|| style.green(&format!("+{}", new.len())));
+    let removed = (!old.is_empty()).then(|| style.red(&format!("-{}", old.len())));
+    added.into_iter().chain(removed).collect::<Vec<_>>().join(" ")
+}
+
+/// The text a change takes away and puts in: an edit's, or none and the
+/// whole of a file written.
+fn sides<'a>(call: &ToolCall, args: &'a Value) -> Option<(&'a str, &'a str)> {
+    match ToolName::of(call) {
+        Some(ToolName::Edit) => Some((args["old_text"].as_str().unwrap_or_default(), args["new_text"].as_str().unwrap_or_default())),
+        Some(ToolName::Write) => Some(("", args["content"].as_str().unwrap_or_default())),
+        _ => None,
+    }
+}
+
+/// The lines that differ between `old` and `new`, without those they
+/// start and end with alike, and how many they start with alike.
+fn changed_lines<'a>(old: &'a str, new: &'a str) -> (Vec<&'a str>, Vec<&'a str>, usize) {
+    let (old, new): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    let same_start = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let same_end = old[same_start..].iter().rev().zip(new[same_start..].iter().rev()).take_while(|(a, b)| a == b).count();
+    (old[same_start..old.len() - same_end].to_vec(), new[same_start..new.len() - same_end].to_vec(), same_start)
 }
 
 /// The files a search's output names, as far as it shows them: a path per
 /// line after the summary for `glob`, `path (N matches)` per line for
 /// `grep`'s files, and each group's first line for the lines it found.
+#[cfg(test)]
 fn found_files(output: &str) -> Vec<String> {
     let mut lines = output.lines();
     let summary = lines.next().unwrap_or_default();
@@ -513,7 +626,7 @@ fn searched(output: &str, style: Style) -> Outcome {
         n => format!("{n} source{}: {}", if n == 1 { "" } else { "s" }, hosts.iter().take(3).copied().collect::<Vec<_>>().join(", ") + if n > 3 { ", …" } else { "" }),
     };
     let shown: Vec<String> = answer.iter().take(SHOWN).map(|line| (*line).to_owned()).collect();
-    Outcome { ok: Some(true), status: style.dim(&format!("{sources} · {by}")), more: answer.len() - shown.len(), details: shown, unit: "line" }
+    Outcome { ok: Some(true), status: style.dim(&format!("{sources} · {by}")), said: String::new(), more: answer.len() - shown.len(), details: shown, unit: "line" }
 }
 
 fn first_line(text: &str) -> String {
@@ -559,7 +672,7 @@ mod tests {
 
     fn status(name: &str, args: Value, output: &str) -> (String, Vec<String>, usize) {
         let o = outcome(&call(name, args), output, Style::plain());
-        (o.status, o.details, o.more)
+        (o.status + &o.said, o.details, o.more)
     }
 
     #[test]
@@ -592,18 +705,47 @@ mod tests {
     #[test]
     fn a_step_takes_one_line_however_long_its_command() {
         let long = call("bash", json!({"command": format!("python3 -c \"{}\"", "x = 1; ".repeat(40))}));
-        let shown = line(&long, "rein   ", "●", "exit 0", Style::plain(), 60);
-        assert!(shown.starts_with("rein   ● Run    python3 -c \"x = 1;"), "{shown}");
+        let shown = line(&long, "rein   ", "✓", "exit 0", Style::plain(), 60);
+        assert!(shown.starts_with("rein     ✓ Run    python3 -c \"x = 1;"), "two columns in from the words: {shown}");
         assert!(shown.ends_with("…  exit 0"), "{shown}");
         assert_eq!(width(&shown), 59);
+        // What a command said last is cut before the command is cut to
+        // nothing, then left out; how it ended stays.
+        let test = call("bash", json!({"command": "cargo test --workspace"}));
+        let said = format!(" · {}", "test result: ok. ".repeat(6));
+        let shown = line_saying(&test, "       ", "✓", "exit 0", &said, Style::plain(), 70);
+        assert!(shown.contains("cargo test --workspace  exit 0 · test result") && shown.ends_with('…'), "{shown}");
+        assert!(width(&shown) < 70, "{shown}");
+        let narrow = line_saying(&test, "rein   ", "✓", "exit 0", &said, Style::plain(), 46);
+        assert!(narrow.ends_with("  exit 0") && narrow.contains("cargo test"), "{narrow}");
+    }
+
+    #[test]
+    fn the_work_is_grey_but_a_change_to_a_file_and_marks_say_how_it_went() {
+        let s = Style::colored();
+        let run = line(&call("bash", json!({"command": "ls"})), "", &mark(Some(true), s), "", s, 60);
+        assert!(run.contains("\x1b[90mRun") && run.contains("\x1b[32m✓"), "{run:?}");
+        let edit = line(&call("edit", json!({"path": "a.rs"})), "", &mark(Some(false), s), "", s, 60);
+        assert!(edit.contains("\x1b[1mEdit") && edit.contains("\x1b[31m✗") && !edit.contains("\x1b[90ma.rs"), "{edit:?}");
+        assert_eq!(strip(&mark(None, s)), "○", "declined");
+    }
+
+    #[test]
+    fn a_run_of_reads_and_searches_says_what_it_came_to() {
+        assert_eq!(looks_line(2, 1, "rein   ", "✓", Style::plain(), 80), "rein     ✓ Read 2 files, searched for 1 pattern");
+        assert_eq!(looks_line(1, 3, "", "✓", Style::plain(), 80), "  ✓ Read 1 file, searched for 3 patterns");
+        assert_eq!(looks_line(0, 2, "", "✓", Style::plain(), 80), "  ✓ Searched for 2 patterns");
     }
 
     #[test]
     fn sums_up_commands() {
-        assert_eq!(status("bash", json!({}), "3 passed in 0.04s\n[exit code 0]"), ("exit 0".into(), vec!["3 passed in 0.04s".into()], 0));
+        // Success is how it ended, on its line; nothing under it.
+        let passed = "Compiling\n\n3 passed in 0.04s\n[exit code 0]";
+        assert_eq!(status("bash", json!({}), passed), ("exit 0 · 3 passed in 0.04s".into(), Vec::new(), 0));
         // rein's notes after the exit line don't hide it.
         let noted = "3 passed in 0.04s\n[exit code 0]\n[rein: that was the last step this turn may take.]";
-        assert_eq!(status("bash", json!({}), noted), ("exit 0".into(), vec!["3 passed in 0.04s".into()], 0));
+        assert_eq!(status("bash", json!({}), noted), ("exit 0 · 3 passed in 0.04s".into(), Vec::new(), 0));
+        assert_eq!(status("bash", json!({}), "[exit code 0]").0, "exit 0", "it printed nothing");
         let failing = "Compiling\nrunning 48 tests\ntest a ... ok\ntest b ... FAILED\nleft: 1\n\nmore\n[exit code 101]";
         let (s, details, more) = status("bash", json!({}), failing);
         assert_eq!(s, "exit 101");
@@ -634,7 +776,9 @@ mod tests {
     fn sums_up_reads_and_changes() {
         assert_eq!(status("read", json!({}), "a\nb\nc\n").0, "3 lines");
         assert_eq!(status("read", json!({}), "x\n[lines 10-14 of 900; read again with start_line 15 for more]").0, "lines 10-14 of 900");
-        assert_eq!(status("edit", json!({}), "edited a.rs: replaced 1 place").0, "replaced 1 place");
+        let edit = json!({"path": "a.rs", "old_text": "a\nb\nc", "new_text": "a\nB\nB2\nc"});
+        assert_eq!(status("edit", edit.clone(), "edited a.rs: replaced 1 place").0, "+2 -1", "the lines alike at either end don't count");
+        assert_eq!(status("edit", edit, "edited a.rs: replaced 3 places").0, "+2 -1 · 3 places");
         assert_eq!(status("write", json!({}), "created a.rs (30 lines)").0, "30 lines");
         let partial = "x\n[lines 1-100 of 164; read again with start_line 101 for more]";
         assert_eq!(status("read", json!({"path": "a", "start_line": 1, "line_count": 100}), partial).0, "of 164 lines");
@@ -646,9 +790,9 @@ mod tests {
         let paths: Vec<String> = ["src/parser.rs", "src/lexer.rs", "src/ast.rs", "src/main.rs"].map(str::to_owned).to_vec();
         let statuses: Vec<String> = ["240 lines", "120 lines", "200 lines", "52 lines"].map(str::to_owned).to_vec();
         let wide = reads_line(&paths, &statuses, "rein   ", "●", Style::plain(), 100);
-        assert_eq!(wide, "rein   ● Read   src/parser.rs, src/lexer.rs, src/ast.rs, src/main.rs  4 files · 612 lines");
-        let narrow = reads_line(&paths, &statuses, "rein   ", "●", Style::plain(), 70);
-        assert_eq!(narrow, "rein   ● Read   src/parser.rs, src/lexer.rs +2  4 files · 612 lines", "the names that fit, then how many more");
+        assert_eq!(wide, "rein     ● Read   src/parser.rs, src/lexer.rs, src/ast.rs, src/main.rs  4 files · 612 lines");
+        let narrow = reads_line(&paths, &statuses, "rein   ", "●", Style::plain(), 72);
+        assert_eq!(narrow, "rein     ● Read   src/parser.rs, src/lexer.rs +2  4 files · 612 lines", "the names that fit, then how many more");
         let parts: Vec<String> = ["240 lines", "lines 10-14 of 900"].map(str::to_owned).to_vec();
         assert!(reads_line(&paths[..2], &parts, "", "●", Style::plain(), 100).ends_with("  2 files"), "parts of files don't add up to lines");
         assert_eq!(status("read", json!({}), "[unchanged: a.rs is as it was…]").0, "unchanged: already in the conversation");
@@ -659,46 +803,60 @@ mod tests {
         let grep = call("grep", json!({"pattern": "parse_list", "path": "src", "glob": "*.rs"}));
         assert_eq!(describe(&grep), ("Search", "\"parse_list\" in src (*.rs)".into()));
         assert_eq!(doing(&grep), "Searching for \"parse_list\" in src (*.rs)");
+        // What it came to; which files is Ctrl-O away.
         let lines = "3 matches in 3 files\nsrc/main.rs\n2:    parse_list();\n\nsrc/parser.rs\n2:fn parse_list() {}\n\nsrc/lib.rs\n9:x";
-        assert_eq!(status("grep", json!({}), lines), ("3 matches in 3 files".into(), vec!["src/main.rs".into(), "src/parser.rs".into()], 1));
+        assert_eq!(status("grep", json!({}), lines), ("3 matches in 3 files".into(), Vec::new(), 0));
+        assert_eq!(found_files(lines), ["src/main.rs", "src/parser.rs", "src/lib.rs"]);
         let files = "2 files with matches (4 matching lines)\nsrc/main.rs (1 match)\nsrc/parser.rs (3 matches)";
-        assert_eq!(status("grep", json!({}), files).1, ["src/main.rs", "src/parser.rs"]);
+        assert_eq!(found_files(files), ["src/main.rs", "src/parser.rs"]);
         assert_eq!(status("grep", json!({}), "No matches in 4 files (files that .gitignore leaves out aren't searched).").0, "nothing found");
-        let one = outcome(&call("grep", json!({"pattern": "fn", "path": "src/a.rs"})), "4 matches in 1 file\nsrc/a.rs\n1:fn a", Style::plain());
-        assert!(one.details.is_empty(), "the step names the file it searched");
         let cut = "301 matches in 2 files; not all shown: narrow the pattern\na.txt\n1:match";
         assert_eq!(status("grep", json!({}), cut).0, "301 matches in 2 files");
 
         let glob = call("glob", json!({"pattern": "*.rs", "path": null}));
         assert_eq!(describe(&glob), ("Find", "*.rs".into()));
         let o = outcome(&glob, "3 files\nsrc/main.rs\nsrc/ui/box.rs\ntests/screen.rs", Style::plain());
-        assert_eq!((o.status.as_str(), o.details.len(), o.more), ("3 files", 2, 1));
-        assert_eq!(detail_lines(&o, Style::plain(), 80, true)[2], "         … 1 more file · ctrl-o to see all");
+        assert_eq!((o.status.as_str(), o.details.len(), o.more), ("3 files", 0, 0));
         assert_eq!(status("glob", json!({}), "No files match \"*.py\" (…).").0, "no files");
     }
 
     #[test]
-    fn frames_a_change_with_line_numbers() {
+    fn shows_a_change_with_line_numbers_and_no_frame() {
         let dir = std::env::temp_dir().join(format!("rein-steps-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.py"), "one\ntwo\nprint(\"EMPTY\")\n").unwrap();
         let edit = call("edit", json!({"path": "a.py", "old_text": "print(\"EMPTY\")", "new_text": "print(\"none\")", "replace_all": false}));
-        let lines = diff_box(&edit, &dir, Style::plain(), 80, false);
-        assert_eq!(lines[1], "         │    3 - print(\"EMPTY\")");
-        assert_eq!(lines[2], "         │    3 + print(\"none\")");
-        assert!(lines[0].starts_with("         ┌──") && lines[3].starts_with("         └──"));
+        let pad = " ".repeat(INDENT);
+        let lines = change_lines(&change(&edit, &dir, false), Style::plain(), 80);
+        assert_eq!(lines, [format!("{pad}   3 - print(\"EMPTY\")"), format!("{pad}   3 + print(\"none\")")]);
+        assert_eq!(change_counts(&edit, Style::plain()), "+1 -1");
+        let adds = call("edit", json!({"path": "a.py", "old_text": "one", "new_text": "import re\none"}));
+        assert_eq!(change_counts(&adds, Style::plain()), "+1", "no -0");
 
         // Unchanged lines around the change are left out.
         let padded = call("edit", json!({"path": "a.py", "old_text": "two\nprint(\"EMPTY\")", "new_text": "two\nprint(\"none\")", "replace_all": false}));
-        let lines = diff_box(&padded, &dir, Style::plain(), 80, false);
-        assert_eq!(lines.len(), 4);
-        assert_eq!(lines[1], "         │    3 - print(\"EMPTY\")");
+        let lines = change_lines(&change(&padded, &dir, false), Style::plain(), 80);
+        assert_eq!(lines, [format!("{pad}   3 - print(\"EMPTY\")"), format!("{pad}   3 + print(\"none\")")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changes_lines_are_tinted_to_the_edge_once_the_background_is_known() {
+        // Only this test sets the background, and every other one works
+        // the same with it or without.
+        crate::ui::tint::set_background((21, 23, 28));
+        let lines = [Changed::Line { added: true, number: Some(9), text: "x".into() }, Changed::Line { added: false, number: Some(9), text: "y".into() }];
+        let shown = change_lines(&lines, Style::colored(), 40);
+        assert!(shown.iter().all(|line| width(line) == 40), "to the edge: {shown:?}");
+        assert!(shown[0].contains("48;") && shown[1].contains("48;"), "{shown:?}");
+        assert!(!shown[0].contains("\x1b[32mx"), "on a tint the text keeps its own colour: {:?}", shown[0]);
     }
 
     #[test]
     fn shows_details_under_the_step() {
-        let o = Outcome { ok: Some(true), status: String::new(), details: vec!["first".into(), "second".into()], more: 1, unit: "line" };
-        assert_eq!(detail_lines(&o, Style::plain(), 80, false), ["         └ first", "           second", "         … 1 more line"]);
-        assert_eq!(detail_lines(&o, Style::plain(), 80, true)[2], "         … 1 more line · ctrl-o to see all");
+        let o = Outcome { ok: Some(true), status: String::new(), said: String::new(), details: vec!["first".into(), "second".into()], more: 1, unit: "line" };
+        let pad = " ".repeat(INDENT);
+        assert_eq!(detail_lines(&o, Style::plain(), 80, false), [format!("{pad}└ first"), format!("{pad}  second"), format!("{pad}… 1 more line")]);
+        assert_eq!(detail_lines(&o, Style::plain(), 80, true)[2], format!("{pad}… 1 more line · ctrl-o to see all"));
     }
 }

@@ -210,9 +210,24 @@ how much of your limits is used (where the provider says), how much came
 from the cache, and how long the last turn took. While rein works, a line
 above the box says what it's doing and for how long.
 
-**Steps.** Each finished step gets one line (`Read`, `Edit`, `Run`) with a
-short result and the output lines worth seeing. Edits show as a framed diff
-before you approve them. Answers are rendered from Markdown.
+**Talk and work.** What you and the model say stands apart from what it
+does. Your messages sit under `you` on a band across the window. rein asks
+the terminal for its background colour and tints the band from it, so it
+suits a dark theme or a light one; where the terminal doesn't say, your
+message is bold instead. The model's words start with a white `●` under
+`rein`, and answers are rendered from Markdown.
+
+Its work is quieter. Each step is a grey line, two columns in from the
+model's words: ✓ when it worked, ✗ when it didn't, ○ when it didn't run
+(declined or skipped), then the tool (`Read`, `Edit`, `Run`) and a short
+result, like a command's exit code and the last line it printed. A
+command that failed shows the lines that say why under it. Reads and
+searches in a row fold into one line (`Read 2 files, searched for 1
+pattern`). An edit keeps its name bold and says how many lines it adds
+and takes away (`+5 -1`). The lines themselves show on green and red tints
+under it, before you approve it when rein asks. Ctrl-O shows every step's
+whole output. A turn that ran steps ends with what it came to:
+`── 4 steps · changed slug.py · 24s ──`.
 
 **The window.** rein keeps the conversation as text and lays it out for the
 window's width, so resizing loses nothing and words wrap where they should.
@@ -323,7 +338,7 @@ a second copy. A file in a folder with its own AGENTS.md brings that file
 along, once. `@alice` is just a word unless a file has that name, and rein
 reports a missing path.
 Reads requested together run at once, and consecutive reads show as one
-line: `● Read  a.rs, b.rs +2  4 files · 612 lines`.
+line: `✓ Read   a.rs, b.rs +2  4 files · 612 lines`.
 
 **What rein tells the model.**
 
@@ -471,7 +486,7 @@ words, and a separate request to the model chosen for searching runs that
 provider's own search, reads what it needs, and answers with its sources.
 
 ```
-● Search  the latest stable Rust release   1 source: blog.rust-lang.org · gpt-6.1-sol, cached
+✓ Search  the latest stable Rust release   1 source: blog.rust-lang.org · gpt-6.1-sol, cached
   └ Rust 1.99.1, released 2026-10-15…
 ```
 
@@ -499,7 +514,7 @@ The model sees images that tools give it: a screenshot from an MCP server
 `read` opens, one you name with `@`, or one you paste with Ctrl-V.
 
 ```
-● Read   colors.png   image, 240×120
+✓ Read   colors.png   image, 240×120
 ```
 
 - **Each goes as its provider takes it:** inside the tool's result for
@@ -872,7 +887,7 @@ gave and why, an approach you confirmed, who you are and how you like to
 work, what's going on that the project's files don't say, and where to find
 something outside it. It saves one with its `memory` tool as it learns it,
 and every save is a step you see
-(`● Memory save rtk-hides-failures
+(`✓ Memory save rtk-hides-failures
 (feedback): judge checks by exit code`). Saving asks nothing in any mode,
 since it writes to rein's folder, never the project. "Remember that" saves
 a note and "forget that" removes it. It doesn't save code patterns, git
