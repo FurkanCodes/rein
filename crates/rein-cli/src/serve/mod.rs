@@ -6,6 +6,10 @@
 //! alongside it, so a client can answer a question, steer or stop it. Only
 //! messages go to standard output: what rein says goes to standard error,
 //! and nothing it runs gets its standard input.
+//!
+//! A client that says it can open panes joins this rein to the others, on
+//! the terms a tab does. Each sub-agent is a `rein serve` of its own, which
+//! the client starts when it's asked to, and drives like any other.
 
 mod ui;
 mod wire;
@@ -21,8 +25,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::args::AskArgs;
-use crate::conversation::{self, Opened, step_limit};
+use crate::args::{AskArgs, Resume};
+use crate::conversation::{self, Opened, Start, step_limit};
+use crate::peers::node::Incoming as Sent;
+use crate::peers::{self, State, talk};
 use crate::settings::{self, Settings};
 use crate::{CliResult, config_dir, describe};
 use ui::Served;
@@ -38,6 +44,8 @@ struct Link {
     asked: Rc<RefCell<HashMap<u64, oneshot::Sender<Option<Value>>>>>,
     asks: Rc<Cell<u64>>,
     heard: Rc<RefCell<Vec<Heard>>>,
+    /// The client can open a pane for a sub-agent.
+    panes: Rc<Cell<bool>>,
 }
 
 impl Link {
@@ -71,14 +79,25 @@ struct Session {
     served: Served,
     max_steps: Option<usize>,
     sandboxing: Sandboxing,
+    /// Turns other reins started since the client last said something.
+    in_a_row: usize,
     /// Kept for as long as the conversation: it holds its MCP servers.
     _setup: conversation::Setup,
-    /// What setting up reports to, which draws nothing here.
-    _terminal: crate::terminal::Terminal,
 }
 
-/// Runs until the client closes standard input.
-pub(crate) async fn run(http: &rein_llm::reqwest::Client) -> CliResult {
+/// Runs until the client closes standard input. `flags` are what a
+/// conversation takes, for a client to start this one as it wants.
+pub(crate) async fn run(http: &rein_llm::reqwest::Client, flags: Vec<String>) -> CliResult {
+    // Now, not when a client asks for a conversation: nothing's listening
+    // to a rein that was started wrong.
+    let settings = Settings::load(&config_dir()?.join(settings::FILE))?;
+    let args = AskArgs::parse(flags.clone(), &settings)?;
+    if args.prompt.is_some() {
+        return Err("rein serve takes no message: its client sends them".into());
+    }
+    if args.resume != Resume::New {
+        return Err("rein serve starts a new conversation".into());
+    }
     let (out, mut lines_out) = mpsc::unbounded_channel::<String>();
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -89,20 +108,34 @@ pub(crate) async fn run(http: &rein_llm::reqwest::Client) -> CliResult {
             }
         }
     });
-    let link = Link { out, asked: Rc::default(), asks: Rc::new(Cell::new(0)), heard: Rc::default() };
+    let link = Link { out, asked: Rc::default(), asks: Rc::new(Cell::new(0)), heard: Rc::default(), panes: Rc::default() };
     let mut input: Input = BufReader::new(tokio::io::stdin()).lines();
     let mut session: Option<Session> = None;
-    while let Ok(Some(line)) = input.next_line().await {
-        match Incoming::read(&line) {
-            Incoming::Request { id, request } => {
-                let Some(goes_on) = handle(request, http, &mut session, &link, &mut input).await else { break };
-                goes_on.send(&link, &id);
+    loop {
+        tokio::select! {
+            line = input.next_line() => {
+                let Ok(Some(line)) = line else { break };
+                match Incoming::read(&line) {
+                    Incoming::Request { id, request } => {
+                        let Some(goes_on) = handle(request, http, &flags, &mut session, &link, &mut input).await else { break };
+                        goes_on.send(&link, &id);
+                    }
+                    Incoming::Unreadable(refused) => link.send(wire::refuse(&Value::Null, &refused)),
+                    // Nothing's running to stop, and nothing was asked.
+                    Incoming::Cancel | Incoming::Reply { .. } | Incoming::Ignored => {}
+                }
             }
-            Incoming::Unreadable(refused) => link.send(wire::refuse(&Value::Null, &refused)),
-            // Nothing's running to stop, and nothing was asked.
-            Incoming::Cancel | Incoming::Reply { .. } | Incoming::Ignored => {}
+            sent = from_the_others(&mut session) => {
+                let Some(session) = &mut session else { continue };
+                if !take_in(session, sent, &link, &mut input).await {
+                    break;
+                }
+            }
         }
     }
+    // Its pane closed before its task was done: while this rein is still
+    // among the others, whoever's owed the result hears what it did.
+    peers::farewell::say_how_it_ended(peers::Ended::Closed).await;
     if let Some(mut session) = session {
         session.agent.session_ended(rein_agent::hooks::Ended::Exit, &mut session.served).await;
     }
@@ -127,15 +160,25 @@ impl Answer {
 }
 
 /// Answers a request. `None`: the client went away during a turn.
-async fn handle(request: Result<Request, Refused>, http: &rein_llm::reqwest::Client, session: &mut Option<Session>, link: &Link, input: &mut Input) -> Option<Answer> {
+async fn handle(
+    request: Result<Request, Refused>,
+    http: &rein_llm::reqwest::Client,
+    flags: &[String],
+    session: &mut Option<Session>,
+    link: &Link,
+    input: &mut Input,
+) -> Option<Answer> {
     let request = match request {
         Ok(request) => request,
         Err(refused) => return Some(Answer::Refused(refused)),
     };
     Some(match request {
-        Request::Initialize => Answer::Result(initialized()),
+        Request::Initialize { panes } => {
+            link.panes.set(panes);
+            Answer::Result(initialized())
+        }
         Request::NewSession { .. } if session.is_some() => Answer::Refused(Refused::new("rein serve holds one conversation: start another rein serve for another")),
-        Request::NewSession { cwd } => match open(&cwd, http, link).await {
+        Request::NewSession { cwd } => match open(&cwd, flags, http, link).await {
             Ok(opened) => {
                 let result = json!({ "sessionId": opened.id, "modes": modes(opened.agent.permissions.mode, opened.sandboxing) });
                 *session = Some(opened);
@@ -151,6 +194,10 @@ async fn handle(request: Result<Request, Refused>, http: &rein_llm::reqwest::Cli
             Ok(session) => {
                 session.agent.permissions.mode = mode;
                 session.agent.step_limit = step_limit(mode, false, session.max_steps);
+                session.served.terminal.mode = mode;
+                if let Some(peers) = &session.served.terminal.peers {
+                    peers.follow_mode(mode);
+                }
                 Answer::Result(json!({}))
             }
             Err(refused) => Answer::Refused(refused),
@@ -177,7 +224,7 @@ fn initialized() -> Value {
             "loadSession": false,
             "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
             "mcpCapabilities": { "http": false, "sse": false },
-            "_meta": { (wire::STEERS): true },
+            "_meta": { (wire::STEERS): true, (wire::PANES): true },
         },
         "agentInfo": { "name": "rein", "title": "rein", "version": env!("CARGO_PKG_VERSION") },
         "authMethods": [],
@@ -199,21 +246,63 @@ fn modes(mode: Mode, sandboxing: Sandboxing) -> Value {
 
 /// Opens the conversation in `cwd`, as a task run on its own: nobody's there
 /// for what a project brings to wait on, so that stays off.
-async fn open(cwd: &Path, http: &rein_llm::reqwest::Client, link: &Link) -> CliResult<Session> {
+async fn open(cwd: &Path, flags: &[String], http: &rein_llm::reqwest::Client, link: &Link) -> CliResult<Session> {
     std::env::set_current_dir(cwd).map_err(|e| format!("can't go into {}: {e}", cwd.display()))?;
     let dir = config_dir()?;
     let settings = Settings::load(&dir.join(settings::FILE))?;
     let compact_at = settings.get("compact_at", "REIN_COMPACT_AT");
-    let args = AskArgs::parse(Vec::new(), &settings)?;
+    let args = AskArgs::parse(flags.to_vec(), &settings)?;
     let (mode, max_steps) = (args.mode, args.max_steps);
+    let (joining, name, workspace, child) = (args.joining, args.name.clone(), args.workspace.clone(), args.child.clone());
+    // Its task waits on its parent, and nothing here would ever fetch it.
+    if child.is_some() && !link.panes.get() {
+        return Err("a sub-agent needs a client that opens panes".into());
+    }
     let opened = conversation::open(http, args, compact_at, true).await?.ok_or("the conversation didn't open")?;
-    let Opened { mut agent, terminal, setup } = opened;
+    let Opened { mut agent, mut terminal, setup } = opened;
+    if link.panes.get() {
+        // A sub-agent's worktree, if it has one.
+        let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
+        let claiming = child.as_ref().map(|(pid, id)| (*pid, id.as_str()));
+        if talk::join(joining, name.as_deref(), workspace.as_deref(), claiming, false, &dir, &root, mode, &mut terminal).await {
+            // A sub-agent doesn't start sub-agents: one level, no further.
+            agent = if child.is_some() { agent.with_child_peer_tools() } else { agent.with_peer_tools() };
+        }
+    }
     // Someone's there, to press stop.
     agent.step_limit = step_limit(mode, false, max_steps);
     let id = format!("rein-{}", std::process::id());
     let sandboxing = agent.permissions.sandboxing();
-    let served = Served::new(id.clone(), link.clone(), terminal.context_limit);
-    Ok(Session { id, agent, served, max_steps, sandboxing, _setup: setup, _terminal: terminal })
+    let served = Served::new(id.clone(), link.clone(), terminal);
+    Ok(Session { id, agent, served, max_steps, sandboxing, in_a_row: 0, _setup: setup })
+}
+
+/// The next thing another rein sends; never, before there's a conversation
+/// or for one not among them.
+async fn from_the_others(session: &mut Option<Session>) -> Sent {
+    match session {
+        Some(session) => conversation::from_peers(&mut session.served.terminal.peers).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// What another rein sent while nothing ran, which may start a turn nobody
+/// prompted: the client hears it start and end. `false`: the client went
+/// away during it.
+async fn take_in(session: &mut Session, sent: Sent, link: &Link, input: &mut Input) -> bool {
+    let Some(sent) = talk::starts_a_turn(sent, &mut session.in_a_row, &mut session.served.terminal) else { return true };
+    // A sub-agent whose parent has gone stays: its pane is the client's to close.
+    let (Some(Heard::Peer { from, text }) | Some(Heard::Reported { from, text })) = session.served.terminal.heard_of(sent) else { return true };
+    link.send(wire::heard(&session.id, &from, &text));
+    link.send(wire::turn_started(&session.id));
+    let ended = work(session, Start::Peer { from, text }, link, input).await;
+    link.send(match ended {
+        Ended::Finished(Ok(outcome)) => wire::turn_ended(&session.id, stop_reason(&outcome)),
+        Ended::Finished(Err(e)) => wire::turn_failed(&session.id, &describe(e)),
+        Ended::Cancelled => wire::turn_ended(&session.id, "cancelled"),
+        Ended::ClientGone => return false,
+    });
+    true
 }
 
 /// How a turn ended.
@@ -224,13 +313,33 @@ enum Ended {
     ClientGone,
 }
 
-/// Runs a turn, reading what comes in alongside it.
+/// What a client's prompt comes to. `None`: it went away.
 async fn turn(session: &mut Session, prompt: String, link: &Link, input: &mut Input) -> Option<Answer> {
+    session.in_a_row = 0;
     for (skill, given) in crate::skills::called(&prompt, session.agent.skills()) {
         session.agent.call_skill(&skill, given);
     }
+    Some(match work(session, Start::You(prompt), link, input).await {
+        Ended::Finished(Ok(outcome)) => Answer::Result(json!({ "stopReason": stop_reason(&outcome) })),
+        Ended::Finished(Err(e)) => Answer::Refused(Refused::new(describe(e))),
+        Ended::Cancelled => Answer::Result(json!({ "stopReason": "cancelled" })),
+        Ended::ClientGone => return None,
+    })
+}
+
+/// Runs a turn, reading what comes in alongside it, then sends each task
+/// it took on its result.
+async fn work(session: &mut Session, start: Start, link: &Link, input: &mut Input) -> Ended {
+    session.served.starting();
     let ended = {
-        let work = session.agent.send(prompt, &mut session.served);
+        let Session { agent, served, .. } = &mut *session;
+        let work = async {
+            match &start {
+                Start::You(prompt) => agent.send(prompt.clone(), served).await,
+                Start::Peer { from, text } => agent.hear(from, text, served).await,
+                Start::Ended => agent.hear_ended(served).await,
+            }
+        };
         tokio::pin!(work);
         loop {
             tokio::select! {
@@ -255,22 +364,20 @@ async fn turn(session: &mut Session, prompt: String, link: &Link, input: &mut In
     crate::skills::count(session.agent.take_loaded());
     // Whatever was waiting on an answer has gone with the turn.
     link.asked.borrow_mut().clear();
-    let stop = match ended {
-        Ended::Finished(Ok(outcome)) => stop_reason(&outcome),
-        Ended::Finished(Err(e)) => {
-            session.agent.repair();
-            return Some(Answer::Refused(Refused::new(describe(e))));
+    if !matches!(ended, Ended::Finished(Ok(_))) {
+        session.agent.repair();
+    }
+    let terminal = &mut session.served.terminal;
+    let outcome = if let Ended::Finished(Ok(outcome)) = &ended { Some(outcome) } else { None };
+    terminal.state(if outcome == Some(&Outcome::Done) { State::Done } else { State::Idle });
+    // A client that went gets its results sent as `run` ends.
+    if !matches!(ended, Ended::ClientGone) {
+        if matches!(start, Start::You(_)) && terminal.tasks.is_empty() {
+            talk::follow_up(terminal).await;
         }
-        Ended::Cancelled => {
-            session.agent.repair();
-            "cancelled"
-        }
-        Ended::ClientGone => {
-            session.agent.repair();
-            return None;
-        }
-    };
-    Some(Answer::Result(json!({ "stopReason": stop })))
+        talk::report(terminal, outcome).await;
+    }
+    ended
 }
 
 fn stop_reason(outcome: &Outcome) -> &'static str {

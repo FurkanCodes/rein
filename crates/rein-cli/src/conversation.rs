@@ -1179,7 +1179,7 @@ pub(crate) enum Said {
 }
 
 /// The next thing another rein sends; never, for a rein not among them.
-async fn from_peers(peers: &mut Option<crate::peers::Node>) -> crate::peers::node::Incoming {
+pub(crate) async fn from_peers(peers: &mut Option<crate::peers::Node>) -> crate::peers::node::Incoming {
     match peers {
         Some(peers) => match peers.inbox.recv().await {
             Some(incoming) => incoming,

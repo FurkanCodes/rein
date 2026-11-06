@@ -4853,18 +4853,38 @@ struct Client {
     seen: Vec<Value>,
     next: u64,
     dir: PathBuf,
+    /// A pane shares the folder of the rein that asked for it.
+    leaves_folder: bool,
 }
+
+const PANES: &str = "io.github.furkancodes/panes";
+const OPEN_PANE: &str = "_io.github.furkancodes/open_pane";
+const HEARD: &str = "_io.github.furkancodes/heard";
+const TURN_STARTED: &str = "_io.github.furkancodes/turn_started";
+const TURN_ENDED: &str = "_io.github.furkancodes/turn_ended";
 
 impl Client {
     fn start(model: &Model, name: &str) -> Client {
-        use std::io::BufRead;
-        let dir = std::env::temp_dir().join(format!("rein-serve-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rs-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (project, home) = (dir.join("project"), dir.join("home"));
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rein"))
-            .arg("serve")
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        Client::run(model, env!("CARGO_BIN_EXE_rein"), &["serve".to_owned()], dir, false)
+    }
+
+    /// What a client does when `rein` asks for a pane in `asked`: starts
+    /// what it says to, as it says to.
+    fn pane(rein: &Client, model: &Model, asked: &Value) -> Client {
+        let params = &asked["params"];
+        let args: Vec<String> = params["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap().to_owned()).collect();
+        Client::run(model, params["command"].as_str().unwrap(), &args, rein.dir.clone(), true)
+    }
+
+    fn run(model: &Model, program: &str, args: &[String], dir: PathBuf, leaves_folder: bool) -> Client {
+        use std::io::BufRead;
+        let home = dir.join("home");
+        let mut child = Command::new(program)
+            .args(args)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &home)
@@ -4888,7 +4908,7 @@ impl Client {
             }
         });
         let stdin = child.stdin.take();
-        Client { child, stdin, lines, seen: Vec::new(), next: 100, dir }
+        Client { child, stdin, lines, seen: Vec::new(), next: 100, dir, leaves_folder }
     }
 
     fn project(&self) -> PathBuf {
@@ -4932,11 +4952,35 @@ impl Client {
 
     /// Up to a conversation in the project: its id.
     fn open(&mut self) -> String {
-        let id = self.call("initialize", json!({ "protocolVersion": 1, "clientCapabilities": {} }));
+        self.open_saying(&json!({}))
+    }
+
+    /// The same, for a client that can open panes.
+    fn open_panes(&mut self) -> String {
+        self.open_saying(&json!({ "_meta": { PANES: true } }))
+    }
+
+    fn open_saying(&mut self, capabilities: &Value) -> String {
+        let id = self.call("initialize", json!({ "protocolVersion": 1, "clientCapabilities": capabilities }));
         assert_eq!(self.answer(id)["result"]["protocolVersion"], 1);
         let cwd = self.project();
         let id = self.call("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
-        self.answer(id)["result"]["sessionId"].as_str().unwrap().to_owned()
+        self.answer(id)["result"]["sessionId"].as_str().unwrap_or_else(|| panic!("no conversation: {:#?}", self.seen)).to_owned()
+    }
+
+    /// What rein asks next of this client, under `method`.
+    fn asked(&mut self, method: &str) -> Value {
+        self.until(method, |message| message["method"] == method)
+    }
+
+    fn reply(&mut self, asked: &Value, result: &Value) {
+        self.write(&json!({ "jsonrpc": "2.0", "id": asked["id"], "result": result }));
+    }
+
+    /// Says yes to the next thing rein asks.
+    fn allow(&mut self) {
+        let asked = self.asked("session/request_permission");
+        self.reply(&asked, &json!({ "outcome": { "outcome": "selected", "optionId": "allow" } }));
     }
 
     fn prompt(&mut self, session: &str, text: &str) -> u64 {
@@ -4954,7 +4998,9 @@ impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.leaves_folder {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -5070,6 +5116,221 @@ fn a_program_steers_a_turn_while_it_runs() {
     let requests = model.requests();
     assert!(requests[0].to_string().contains("start on it") && !requests[0].to_string().contains("use the other file"), "{}", requests[0]);
     assert!(requests[1].to_string().contains("use the other file"), "the next step heard it: {}", requests[1]);
+}
+
+/// A rein that asks its client for a sub-agent, up to the client's pane
+/// being asked for; what the model says after goes in `then`.
+fn asks_for_a_pane(name: &str, then: Vec<Turn>) -> (Model, Client, String, u64, Value) {
+    let spawn = calls("spawn", json!({ "role": "tests", "task": "run the test suite", "model": null, "edits": false }));
+    let model = Model::start(std::iter::once(spawn).chain(then).collect());
+    let mut rein = Client::start(&model, name);
+    let session = rein.open_panes();
+    let turn = rein.prompt(&session, "get the tests run");
+    rein.allow();
+    let asked = rein.asked(OPEN_PANE);
+    (model, rein, session, turn, asked)
+}
+
+#[test]
+fn a_sub_agent_runs_in_a_pane_of_its_own_to_steer_and_its_parent_hears_how_it_went() {
+    let (model, mut rein, _session, turn, asked) = asks_for_a_pane("pane", vec![says("Started tests."), says("tests says they pass.")]);
+    let params = &asked["params"];
+    assert_eq!((&params["name"], &params["args"][0]), (&json!("tests"), &json!("serve")), "{params}");
+    assert!(params["args"].to_string().contains("--child"), "{params}");
+    assert_eq!(std::fs::canonicalize(params["cwd"].as_str().unwrap()).unwrap(), std::fs::canonicalize(rein.project()).unwrap());
+    let child_model = Model::start(vec![runs("sleep 0.6"), says("They pass.")]);
+    let mut tests = Client::pane(&rein, &child_model, &asked);
+    let sub_agent = tests.open_panes();
+    rein.reply(&asked, &json!({}));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(results(&model)[0].contains("Started sub-agent tests"), "{:?}", results(&model));
+
+    // It starts on its task by itself, in its own pane, and asks there.
+    let task = tests.asked(HEARD);
+    assert_eq!(task["params"]["from"], "project");
+    assert!(task["params"]["text"].as_str().unwrap().contains("run the test suite"), "{task}");
+    tests.asked(TURN_STARTED);
+    tests.allow();
+    tests.update("tool_call_update", |update| update["status"] == "in_progress");
+    let steer = tests.call("_io.github.furkancodes/steer", json!({ "sessionId": sub_agent, "message": "only the fast ones" }));
+    assert_eq!(tests.answer(steer)["result"], json!({}));
+    assert_eq!(tests.update("user_message_chunk", |_| true)["content"]["text"], "only the fast ones");
+    assert_eq!(tests.asked(TURN_ENDED)["params"]["stopReason"], "end_turn");
+    assert!(child_model.requests()[1].to_string().contains("only the fast ones"), "the next step heard it");
+
+    // Its report starts a turn in its parent, which nobody prompted.
+    let report = rein.asked(HEARD);
+    assert_eq!(report["params"]["from"], "tests");
+    assert!(report["params"]["text"].as_str().unwrap().contains("is done"), "{report}");
+    rein.asked(TURN_STARTED);
+    assert_eq!(rein.asked(TURN_ENDED)["params"]["stopReason"], "end_turn");
+    assert!(rein.said().contains("tests says they pass."), "{}", rein.said());
+    let asked_model = model.requests()[2].to_string();
+    assert!(asked_model.contains("They pass.") && asked_model.contains("It's not from the user"), "{asked_model}");
+
+    // It stays, with what it knows: a sub-agent is a conversation like any other.
+    assert_eq!(rein.child.try_wait().unwrap(), None);
+    assert_eq!(tests.child.try_wait().unwrap(), None);
+}
+
+#[test]
+fn a_client_that_opens_no_panes_stays_out_of_the_others() {
+    let model = Model::start(vec![says("Hello.")]);
+    let mut rein = Client::start(&model, "nopanes");
+    let session = rein.open();
+    let turn = rein.prompt(&session, "hi");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    let tools: Vec<String> = model.requests()[0]["tools"][0]["tools"].as_array().unwrap().iter().filter_map(|tool| tool["name"].as_str().map(str::to_owned)).collect();
+    assert!(tools.contains(&"bash".to_owned()), "{tools:?}");
+    for reaches_others in ["spawn", "delegate", "message", "peers"] {
+        assert!(!tools.contains(&reaches_others.to_owned()), "{tools:?}");
+    }
+    let others = rein.dir.join("home").join("peers");
+    let listed = std::fs::read_dir(others).map(Iterator::count).unwrap_or(0);
+    assert_eq!(listed, 0, "no other rein finds it");
+}
+
+#[test]
+fn a_sub_agent_cant_start_without_a_client_that_opens_panes() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "nochild");
+    let flags = ["serve", "--child", "1:abc"].map(str::to_owned);
+    let mut child = Client::run(&model, env!("CARGO_BIN_EXE_rein"), &flags, rein.dir.clone(), true);
+    let id = child.call("initialize", json!({ "protocolVersion": 1, "clientCapabilities": {} }));
+    child.answer(id);
+    let cwd = rein.project();
+    let id = child.call("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    assert!(child.answer(id)["error"]["message"].as_str().unwrap().contains("opens panes"));
+    let _ = rein.call("initialize", json!({ "protocolVersion": 1 }));
+}
+
+#[test]
+fn a_pane_that_doesnt_open_is_said_and_its_place_is_free_again() {
+    // Each its own, or five the same in a row would be stopped as stuck.
+    let spawn = |role: &str| calls("spawn", json!({ "role": role, "task": "run the test suite", "model": null, "edits": false }));
+    let model = Model::start(["a", "b", "c", "d", "e"].map(spawn).into_iter().chain([says("No panes today.")]).collect());
+    let mut rein = Client::start(&model, "nopane");
+    let session = rein.open_panes();
+    let turn = rein.prompt(&session, "get the tests run");
+    let asked = rein.asked("session/request_permission");
+    rein.reply(&asked, &json!({ "outcome": { "outcome": "selected", "optionId": "always" } }));
+    for _ in 0..5 {
+        let asked = rein.asked(OPEN_PANE);
+        rein.write(&json!({ "jsonrpc": "2.0", "id": asked["id"], "error": { "code": -32000, "message": "no room" } }));
+    }
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    let told = results(&model);
+    assert_eq!(told.iter().filter(|result| result.contains("didn't open a pane")).count(), 5, "{told:?}");
+    assert!(!told.iter().any(|result| result.contains("most at once")), "those that never opened aren't running: {told:?}");
+}
+
+#[test]
+fn a_sub_agent_nobody_said_yes_to_never_gets_a_pane() {
+    let spawn = calls("spawn", json!({ "role": "tests", "task": "run the test suite", "model": null, "edits": false }));
+    let model = Model::start(vec![spawn, says("Fine.")]);
+    let mut rein = Client::start(&model, "nopermit");
+    let session = rein.open_panes();
+    let turn = rein.prompt(&session, "get the tests run");
+    let asked = rein.asked("session/request_permission");
+    rein.reply(&asked, &json!({ "outcome": { "outcome": "selected", "optionId": "reject" } }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.seen.iter().all(|message| message["method"] != OPEN_PANE), "{:#?}", rein.seen);
+    assert!(results(&model)[0].contains("declined"), "{:?}", results(&model));
+}
+
+#[test]
+fn a_pane_closed_before_its_done_tells_its_parent_what_it_did() {
+    let (_model, mut rein, _session, turn, asked) = asks_for_a_pane("closed", vec![says("Started tests."), says("I'll carry on.")]);
+    let child_model = Model::start(vec![runs("sleep 30")]).with_env("REIN_MODE", "trust");
+    let mut tests = Client::pane(&rein, &child_model, &asked);
+    tests.open_panes();
+    rein.reply(&asked, &json!({}));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    tests.allow();
+    tests.update("tool_call_update", |update| update["status"] == "in_progress");
+    tests.stdin = None;
+    let report = rein.asked(HEARD);
+    let said = report["params"]["text"].as_str().unwrap();
+    assert!(said.contains("stopped before it was done: the user closed its tab"), "{said}");
+    assert!(said.contains("sleep 30"), "it says what it was in the middle of: {said}");
+    assert_eq!(tests.child.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn stopping_a_sub_agents_turn_goes_back_to_its_parent() {
+    let (_model, mut rein, _session, turn, asked) = asks_for_a_pane("stop", vec![says("Started tests."), says("I'll carry on.")]);
+    let child_model = Model::start(vec![runs("sleep 30")]);
+    let mut tests = Client::pane(&rein, &child_model, &asked);
+    let sub_agent = tests.open_panes();
+    rein.reply(&asked, &json!({}));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    tests.allow();
+    tests.update("tool_call_update", |update| update["status"] == "in_progress");
+    tests.write(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": sub_agent } }));
+    assert_eq!(tests.asked(TURN_ENDED)["params"]["stopReason"], "cancelled");
+    let said = rein.asked(HEARD)["params"]["text"].as_str().unwrap().to_owned();
+    assert!(said.contains("stopped before it was done") && said.contains("still there with what it knows"), "{said}");
+}
+
+#[test]
+fn another_reins_word_is_never_the_users() {
+    let (_model, mut rein, _session, turn, asked) = asks_for_a_pane("word", vec![says("Started tests."), says("Heard.")]);
+    // Held at its question: its report comes after its parent's turn.
+    let child_model = Model::start(vec![runs("true"), says("They pass.")]);
+    let mut tests = Client::pane(&rein, &child_model, &asked);
+    tests.open_panes();
+    rein.reply(&asked, &json!({}));
+    rein.answer(turn);
+    tests.allow();
+    tests.asked(TURN_ENDED);
+    rein.asked(TURN_ENDED);
+    for client in [&rein, &tests] {
+        let yours: Vec<&Value> = client.seen.iter().filter(|message| message["params"]["update"]["sessionUpdate"] == "user_message_chunk").collect();
+        assert_eq!(yours, Vec::<&Value>::new(), "shown as what you said");
+    }
+}
+
+#[test]
+fn what_another_rein_says_during_a_turn_goes_into_that_turn() {
+    let (model, mut rein, _session, turn, asked) = asks_for_a_pane("during", vec![says("Heard it on the way.")]);
+    let child_model = Model::start(vec![says("They pass.")]);
+    let mut tests = Client::pane(&rein, &child_model, &asked);
+    tests.open_panes();
+    // Done and reported while its parent still waits on the pane.
+    tests.asked(TURN_ENDED);
+    rein.reply(&asked, &json!({}));
+    assert_eq!(rein.asked(HEARD)["params"]["from"], "tests");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.seen.iter().all(|message| message["method"] != TURN_STARTED), "it's the turn that was running: {:#?}", rein.seen);
+    assert!(model.requests().last().unwrap().to_string().contains("They pass."));
+}
+
+#[test]
+fn a_summary_of_the_conversation_isnt_the_models_answer() {
+    let model = Model::start(vec![says("Goal: greet."), says("Hello.")]).with_env("REIN_COMPACT_AT", "100").with_env("REIN_MEMORY", "off");
+    let mut rein = Client::start(&model, "summary");
+    let session = rein.open();
+    let turn = rein.prompt(&session, &"say hello ".repeat(100));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    let thought: String = rein
+        .seen
+        .iter()
+        .filter(|message| message["params"]["update"]["sessionUpdate"] == "agent_thought_chunk")
+        .filter_map(|message| message["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert!(thought.contains("Goal: greet."), "{thought}");
+    assert_eq!(rein.said(), "Hello.");
+}
+
+#[test]
+fn rein_serve_turns_down_what_it_cant_do_as_it_starts() {
+    for (args, says) in [(&["serve", "hello"][..], "takes no message"), (&["serve", "-c"][..], "new conversation"), (&["serve", "--nonsense"][..], "--nonsense")] {
+        let output =
+            Command::new(env!("CARGO_BIN_EXE_rein")).args(args).env("HOME", std::env::temp_dir()).env("REIN_HOME", std::env::temp_dir().join("rein-serve-flags")).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(says), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.stdout.is_empty(), "standard output is only for messages");
+    }
 }
 
 #[test]

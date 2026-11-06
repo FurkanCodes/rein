@@ -3,7 +3,7 @@
 //! (<https://agentclientprotocol.com>). Read into types here, once; written
 //! here too, so the rest of `serve` doesn't spell a field.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rein_agent::permissions::Mode;
 use serde::Deserialize;
@@ -17,6 +17,22 @@ pub(super) const VERSION: u64 = 1;
 const STEER: &str = "_io.github.furkancodes/steer";
 /// How `initialize` says rein takes [`STEER`].
 pub(super) const STEERS: &str = "io.github.furkancodes/steer";
+
+/// A client that can start another `rein serve` says so as it starts, in
+/// its `clientCapabilities`, and only then does rein join the other reins:
+/// what they send starts turns nobody asked for, and a sub-agent needs
+/// somewhere to run. ACP's draft for sub-agents lets a client stop one, but
+/// not prompt or steer it, and here each one is a `rein serve` of its own.
+pub(super) const PANES: &str = "io.github.furkancodes/panes";
+/// Asks a client that said [`PANES`] to start a `rein serve` for a sub-agent.
+const OPEN_PANE: &str = "_io.github.furkancodes/open_pane";
+/// Another rein's words went into the conversation. They're never the
+/// user's, so they aren't a `user_message_chunk`.
+const HEARD: &str = "_io.github.furkancodes/heard";
+/// A turn nobody prompted starts, on what another rein sent: ACP's turns
+/// are all `session/prompt`s, with an answer to say they ended.
+const TURN_STARTED: &str = "_io.github.furkancodes/turn_started";
+const TURN_ENDED: &str = "_io.github.furkancodes/turn_ended";
 
 const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -43,7 +59,7 @@ impl Refused {
 /// What a client can ask of rein.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Request {
-    Initialize,
+    Initialize { panes: bool },
     NewSession { cwd: PathBuf },
     Prompt { session: String, text: String },
     SetMode { session: String, mode: Mode },
@@ -136,7 +152,7 @@ fn request(method: &str, params: Value) -> Result<Request, Refused> {
         serde_json::from_value(params).map_err(|e| Refused::params(e.to_string()))
     }
     match method {
-        "initialize" => Ok(Request::Initialize),
+        "initialize" => Ok(Request::Initialize { panes: params["clientCapabilities"]["_meta"][PANES] == true }),
         "session/new" => parse::<NewSession>(params).map(|new| Request::NewSession { cwd: new.cwd }),
         "session/prompt" => {
             let prompt: Prompt = parse(params)?;
@@ -187,6 +203,45 @@ pub(super) fn ask_permission(id: u64, session: &str, call: &str, options: &Value
     json!({ "jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": params }).to_string()
 }
 
+/// What a client starts for a sub-agent, with no shell in between: it
+/// runs `command` with `args`, in `cwd`.
+pub(super) struct Pane<'a> {
+    pub(super) name: &'a str,
+    pub(super) model: &'a str,
+    pub(super) command: &'a str,
+    pub(super) args: &'a [String],
+    pub(super) cwd: &'a Path,
+}
+
+/// Asks a client to open `pane`, under the number `id`.
+pub(super) fn open_pane(id: u64, session: &str, pane: &Pane<'_>) -> String {
+    let params = json!({ "sessionId": session, "name": pane.name, "model": pane.model, "command": pane.command, "args": pane.args, "cwd": pane.cwd });
+    json!({ "jsonrpc": "2.0", "id": id, "method": OPEN_PANE, "params": params }).to_string()
+}
+
+fn notification(method: &str, params: &Value) -> String {
+    json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string()
+}
+
+/// `from`, another rein, said `text`, and it went into the conversation.
+pub(super) fn heard(session: &str, from: &str, text: &str) -> String {
+    notification(HEARD, &json!({ "sessionId": session, "from": from, "text": text }))
+}
+
+pub(super) fn turn_started(session: &str) -> String {
+    notification(TURN_STARTED, &json!({ "sessionId": session }))
+}
+
+/// A turn nobody prompted ended, for `stop`, ACP's word for why.
+pub(super) fn turn_ended(session: &str, stop: &str) -> String {
+    notification(TURN_ENDED, &json!({ "sessionId": session, "stopReason": stop }))
+}
+
+/// A turn nobody prompted failed, so there's no answer to carry the error.
+pub(super) fn turn_failed(session: &str, error: &str) -> String {
+    notification(TURN_ENDED, &json!({ "sessionId": session, "error": error }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +272,15 @@ mod tests {
         let unknown = json!({ "id": 1, "method": "session/fork", "params": {} });
         assert_eq!(asked(unknown).unwrap_err().code, METHOD_NOT_FOUND);
         assert!(matches!(Incoming::read("not json"), Incoming::Unreadable(Refused { code: PARSE_ERROR, .. })));
+    }
+
+    #[test]
+    fn only_a_client_that_says_so_opens_panes() {
+        let starts = |capabilities: Value| asked(json!({ "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": capabilities } }));
+        assert_eq!(starts(json!({ "_meta": { PANES: true } })), Ok(Request::Initialize { panes: true }));
+        assert_eq!(starts(json!({ "_meta": { PANES: "yes" } })), Ok(Request::Initialize { panes: false }), "not a clear yes");
+        assert_eq!(starts(json!({ "fs": { "readTextFile": true } })), Ok(Request::Initialize { panes: false }));
+        assert_eq!(asked(json!({ "id": 1, "method": "initialize" })), Ok(Request::Initialize { panes: false }));
     }
 
     #[test]

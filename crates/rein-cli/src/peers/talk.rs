@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use rein_agent::agent::{Agent, Heard, Llm, Outcome};
-use rein_agent::permissions::Mode;
+use rein_agent::permissions::{Mode, Sandboxing};
 
 use super::node::{Incoming, Joining, Policy, Show, preview};
 use super::{Body, Ended, Node, Reply, Report, State};
@@ -95,10 +95,19 @@ pub(crate) async fn join(
 /// the next turn; a message starts one, unless other reins have started
 /// too many in a row, when it waits in `/inbox`.
 pub(crate) async fn take_in(incoming: Incoming, in_a_row: &mut usize, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
+    match starts_a_turn(incoming, in_a_row, terminal) {
+        Some(incoming) => work_on(incoming, agent, terminal).await,
+        None => Ok(()),
+    }
+}
+
+/// What came in while nothing ran, if it's to start a turn: what doesn't
+/// is noted for the next one, or held.
+pub(crate) fn starts_a_turn(incoming: Incoming, in_a_row: &mut usize, terminal: &mut Terminal) -> Option<Incoming> {
     if matches!(incoming, Incoming::Changed { .. }) {
         let note = terminal.heard_of(incoming);
         terminal.notes.extend(note);
-        return Ok(());
+        return None;
     }
     // You went on in a sub-agent's tab: you see it here now, and this
     // conversation hears of it with its next turn. It starts none: you're
@@ -111,17 +120,17 @@ pub(crate) async fn take_in(incoming: Incoming, in_a_row: &mut usize, agent: &mu
         }
         let note = terminal.heard_of(incoming);
         terminal.notes.extend(note);
-        return Ok(());
+        return None;
     }
     if *in_a_row >= TURNS_IN_A_ROW {
         if let Some(peers) = &terminal.peers {
             peers.hold(incoming);
         }
         terminal.input.notice(&format!("other reins have started {TURNS_IN_A_ROW} turns in a row: what they send now waits in /inbox"));
-        return Ok(());
+        return None;
     }
     *in_a_row += 1;
-    work_on(incoming, agent, terminal).await
+    Some(incoming)
 }
 
 /// A turn on what another rein sent, then its result back, if it was a task.
@@ -153,7 +162,7 @@ pub(crate) async fn spawn(call: &rein_llm::ToolCall, terminal: &mut Terminal) ->
 /// comes by itself. Told only that it comes back as a message, the model
 /// messaged the sub-agent to ask for it, and the sub-agent answered with
 /// a message too.
-const AWAITED: &str =
+pub(crate) const AWAITED: &str =
     "Its result comes back to you by itself when it's done, and starts a turn: don't message it to ask, and end your turn if there's nothing else to do meanwhile.";
 
 /// What a sub-agent's tab is given of this rein's environment: where rein
@@ -169,15 +178,11 @@ const CARRIED: [&str; 4] = ["REIN_HOME", "PATH", "XDG_CONFIG_HOME", "CLAUDE_CONF
 async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &mut Terminal) -> String {
     let error = rein_agent::tools::ERROR;
     let Some(node) = &terminal.peers else { return format!("{error}this rein isn't among the others, so it can't start sub-agents") };
-    if node.parent().is_some() {
-        return format!("{error}a sub-agent can't start sub-agents of its own");
-    }
-    let role = match super::clean_name(&args.role) {
-        Ok(role) => role,
+    let child = match Child::wanted(&args, &terminal.spec, node).await {
+        Ok(child) => child,
         Err(e) => return format!("{error}{e}"),
     };
-    let name = super::free_name(&role, &node.peers().await);
-    let model = args.model.clone().unwrap_or_else(|| terminal.spec.clone());
+    let (name, model) = (child.name.clone(), child.model.clone());
     if ask && !terminal.spawn_always {
         match ask_to_spawn(&name, &model, &args.task, args.edits, terminal).await {
             Some(true) => {}
@@ -186,29 +191,11 @@ async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &m
         }
     }
     let Some(node) = &terminal.peers else { return format!("{error}this rein left the others") };
-    let id: String = rein_llm::new_session_id().unwrap_or_default().replace('-', "").chars().take(10).collect();
+    let id = task_id();
     if let Err(e) = node.expect_child(&id, &name, &args.task) {
         return format!("{error}{e}");
     }
-    // Its own command line: the task isn't on it, only where to fetch it.
-    let exe = std::env::current_exe().map_or_else(|_| "rein".to_owned(), |path| path.to_string_lossy().into_owned());
-    let mut argv = vec![
-        exe,
-        "--name".to_owned(),
-        name.clone(),
-        "--child".to_owned(),
-        format!("{}:{id}", std::process::id()),
-        "--mode".to_owned(),
-        terminal.mode.as_str().to_owned(),
-        "--sandbox".to_owned(),
-        if terminal.sandboxing == rein_agent::permissions::Sandboxing::Off { "off" } else { "on" }.to_owned(),
-    ];
-    if !model.is_empty() {
-        argv.extend(["-m".to_owned(), model.clone()]);
-    }
-    if args.edits {
-        argv.extend(["--workspace".to_owned(), format!("sub/{name}"), "--worktree".to_owned()]);
-    }
+    let argv: Vec<String> = std::iter::once(rein_program()).chain(child.flags(&id, args.edits, terminal.mode, terminal.sandboxing)).collect();
     let env: Vec<(String, String)> = CARRIED.iter().filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_owned(), value))).collect();
     let folder = super::folder(&crate::config_dir().unwrap_or_default());
     let opener = super::spawn::Opener::detect(&|key| std::env::var(key).ok(), terminal.tab_command.as_deref());
@@ -245,6 +232,52 @@ async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &m
             format!("{error}couldn't start the sub-agent: {e}")
         }
     }
+}
+
+/// A sub-agent about to start.
+pub(crate) struct Child {
+    pub(crate) name: String,
+    pub(crate) model: String,
+}
+
+impl Child {
+    /// The sub-agent `args` asks for of this rein, running `spec` itself,
+    /// or why it can't have one.
+    pub(crate) async fn wanted(args: &rein_agent::peers::SpawnArgs, spec: &str, node: &Node) -> Result<Child, String> {
+        if node.parent().is_some() {
+            return Err("a sub-agent can't start sub-agents of its own".to_owned());
+        }
+        let role = super::clean_name(&args.role)?;
+        let name = super::free_name(&role, &node.peers().await);
+        let model = args.model.clone().unwrap_or_else(|| spec.to_owned());
+        Ok(Child { name, model })
+    }
+
+    /// What it's started with for task `id`, in a tab or a client's pane:
+    /// the task isn't on its command line, only where to fetch it.
+    pub(crate) fn flags(&self, id: &str, edits: bool, mode: Mode, sandboxing: Sandboxing) -> Vec<String> {
+        let name = &self.name;
+        let sandbox = if sandboxing == Sandboxing::Off { "off" } else { "on" };
+        let mut flags = vec!["--name".to_owned(), name.clone(), "--child".to_owned(), format!("{}:{id}", std::process::id()), "--mode".to_owned(), mode.as_str().to_owned()];
+        flags.extend(["--sandbox".to_owned(), sandbox.to_owned()]);
+        if !self.model.is_empty() {
+            flags.extend(["-m".to_owned(), self.model.clone()]);
+        }
+        if edits {
+            flags.extend(["--workspace".to_owned(), format!("sub/{name}"), "--worktree".to_owned()]);
+        }
+        flags
+    }
+}
+
+/// A task's id, which the rein doing it claims it by.
+pub(crate) fn task_id() -> String {
+    rein_llm::new_session_id().unwrap_or_default().replace('-', "").chars().take(10).collect()
+}
+
+/// This program, to start another of.
+pub(crate) fn rein_program() -> String {
+    std::env::current_exe().map_or_else(|_| "rein".to_owned(), |path| path.to_string_lossy().into_owned())
 }
 
 /// Asks whether to open a tab for sub-agent `name`: `Some(true)` for yes,

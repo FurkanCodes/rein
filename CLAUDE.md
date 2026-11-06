@@ -361,6 +361,14 @@ finding. Each says why in a line.
 - `rein serve`'s standard output is the protocol, and nothing else may write
   to it: a stray line stops every client reading. What rein runs gets no
   standard input, or a command could eat the client's messages.
+- A client joins the other reins only by saying it can open panes: what they
+  send starts turns nobody prompted, and Zed would have nothing to do with
+  them. Another rein's words are never a `user_message_chunk`, even over the
+  protocol: they can't approve anything, and a client mustn't show them as
+  yours.
+- What a turn leaves for the others (a task's result, the steps it ran) is
+  noted in `Terminal`'s `step_*` methods, which any `Ui` calls: written into
+  the terminal's drawing, a sub-agent in `rein serve` would report nothing.
 - `pub(crate)` unless something outside the crate needs it.
 - The sandbox is its own crate, `rein-sandbox`, with no C in its
   dependencies: its tests build for Linux from a Mac and run in a container.

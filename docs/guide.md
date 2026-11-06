@@ -1227,10 +1227,44 @@ program that wants another conversation starts another `rein serve`.
   It goes in before the next step, and `initialize` says rein takes it under
   `agentCapabilities._meta`. Sent as a turn is ending, it goes in with your
   next message.
+- **Flags.** `rein serve` takes what a conversation takes, such as `--mode`,
+  `--sandbox`, `-m` and `--name`, but no message: its client sends those.
+
+### Agents side by side
+
+A program that can run several `rein serve`s says so in `initialize`, with
+`"io.github.furkancodes/panes": true` under `clientCapabilities._meta`. Only
+then does this rein join the others, as a rein in a tab does: it gets the
+`peers`, `message`, `delegate` and `spawn` tools, and what other reins send
+can start turns. A client that doesn't say so, like Zed, gets none of this.
+
+- **Starting a sub-agent.** When the model calls `spawn`, rein asks with
+  `session/request_permission`, then sends the request
+  `_io.github.furkancodes/open_pane` with `name`, `model`, `command`, `args`
+  and `cwd`. Run `command` with `args` in `cwd`, with no shell between them,
+  and answer. An error tells the model the sub-agent didn't start.
+- **Driving it.** It's a `rein serve` like any other: `initialize` it the same
+  way, then `session/new`. It starts on its task by itself, and its questions,
+  steering and stopping are its own. It reports to its parent when its turn
+  ends, and it stays, with what it knows, until you close its input.
+- **Closing it early.** Close its input before it's done and its parent hears
+  what it did so far.
+- **Turns nobody prompted.** What another rein sends can start a turn with no
+  `session/prompt`, so there's no answer to end it. `_io.github.furkancodes/turn_started`
+  says one started, and `_io.github.furkancodes/turn_ended` says how it ended,
+  with `stopReason`, or `error` if it failed. Stop one with `session/cancel`.
+  A `session/prompt` during one is turned down, as in any turn.
+- **What other reins say.** `_io.github.furkancodes/heard` carries `from` and
+  `text`. It's never sent as your own message: another rein's words can't
+  approve anything.
+
+ACP's own draft for sub-agents lets a client stop one, but not prompt or steer
+it, which is why each one is a `rein serve` here.
 
 Not there yet: continuing a saved conversation (`session/load`), MCP servers
-a client passes in `session/new`, which are ignored, images in a prompt,
-rein's slash commands, and sub-agents.
+a client passes in `session/new`, which are ignored, images in a prompt, and
+rein's slash commands. What another rein sends in `trust` mode, or past 12
+turns in a row, waits in `/inbox`, which only a terminal has so far.
 
 ## What's left of your limits
 

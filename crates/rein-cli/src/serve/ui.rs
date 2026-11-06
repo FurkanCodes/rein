@@ -4,12 +4,16 @@
 use std::collections::HashSet;
 
 use rein_agent::agent::{Approval, Compacted, Heard, Ui};
+use rein_agent::peers::SpawnArgs;
 use rein_agent::permissions::Rule;
-use rein_agent::tools::ToolName;
+use rein_agent::tools::{ERROR, ToolName};
 use rein_llm::{ToolCall, Usage};
 use serde_json::{Value, json};
 
 use super::{Link, wire};
+use crate::peers::talk::{self, Child};
+use crate::terminal::Terminal;
+use crate::ui::steps;
 
 const ALLOW: &str = "allow";
 const ALWAYS: &str = "always";
@@ -19,15 +23,28 @@ const REJECT: &str = "reject";
 pub(super) struct Served {
     session: String,
     link: Link,
-    /// The context window, for what's used of it.
-    limit: u64,
     /// Calls the client knows of: one is announced once, and updated after.
     announced: HashSet<String>,
+    /// What a rein at a terminal has too, which draws nothing here: what
+    /// setting up reported to, the other reins, and the tasks it owes.
+    pub(super) terminal: Terminal,
+    /// The model has said something since its last step: more is the same
+    /// answer.
+    answering: bool,
+    /// What the model writes now is the conversation's summary, not an answer.
+    compacting: bool,
 }
 
 impl Served {
-    pub(super) fn new(session: String, link: Link, limit: u64) -> Served {
-        Served { session, link, limit, announced: HashSet::new() }
+    pub(super) fn new(session: String, link: Link, terminal: Terminal) -> Served {
+        Served { session, link, announced: HashSet::new(), terminal, answering: false, compacting: false }
+    }
+
+    /// A turn starts.
+    pub(super) fn starting(&mut self) {
+        self.terminal.start_turn(None);
+        self.answering = false;
+        self.compacting = false;
     }
 
     fn update(&self, update: &Value) {
@@ -56,7 +73,59 @@ impl Served {
     }
 
     fn used(&self, tokens: u64) {
-        self.update(&json!({ "sessionUpdate": "usage_update", "used": tokens, "size": self.limit }));
+        self.update(&json!({ "sessionUpdate": "usage_update", "used": tokens, "size": self.terminal.context_limit }));
+    }
+
+    /// Asks whether `call` may go ahead.
+    async fn asked(&mut self, call: &ToolCall) -> Approval {
+        self.announce(call, "pending");
+        let options = json!([
+            { "optionId": ALLOW, "name": "Allow", "kind": "allow_once" },
+            { "optionId": ALWAYS, "name": "Allow for this conversation", "kind": "allow_always" },
+            { "optionId": REJECT, "name": "Reject", "kind": "reject_once" },
+        ]);
+        let (id, answer) = self.link.ask();
+        self.link.send(wire::ask_permission(id, &self.session, &call.call_id, &options));
+        // Never answered, as the client left: not a yes.
+        answer.await.map_or(Approval::Stop, |result| approval(result.as_ref()))
+    }
+
+    /// What the model asked for with `spawn`: you're asked, then the client
+    /// starts a `rein serve` for it, which claims the task. What the model
+    /// is told of how that went.
+    async fn spawn(&mut self, call: &ToolCall) -> String {
+        let args: SpawnArgs = match serde_json::from_str(&call.arguments) {
+            Ok(args) => args,
+            Err(e) => return format!("{ERROR}bad arguments: {e}"),
+        };
+        let Some(node) = &self.terminal.peers else { return format!("{ERROR}this rein isn't among the others, so it can't start sub-agents") };
+        let child = match Child::wanted(&args, &self.terminal.spec, node).await {
+            Ok(child) => child,
+            Err(e) => return format!("{ERROR}{e}"),
+        };
+        if !self.terminal.spawn_always {
+            match self.asked(call).await {
+                Approval::Yes => {}
+                Approval::Always => self.terminal.spawn_always = true,
+                _ => return "The user declined to start this sub-agent.".to_owned(),
+            }
+        }
+        let Some(node) = &self.terminal.peers else { return format!("{ERROR}this rein left the others") };
+        let id = talk::task_id();
+        if let Err(e) = node.expect_child(&id, &child.name, &args.task) {
+            return format!("{ERROR}{e}");
+        }
+        let flags = child.flags(&id, args.edits, self.terminal.mode, self.terminal.sandboxing);
+        let serve: Vec<String> = std::iter::once("serve".to_owned()).chain(flags).collect();
+        let command = talk::rein_program();
+        let pane = wire::Pane { name: &child.name, model: &child.model, command: &command, args: &serve, cwd: &node.info().root };
+        let (asked, answer) = self.link.ask();
+        self.link.send(wire::open_pane(asked, &self.session, &pane));
+        if let Ok(Some(_)) = answer.await {
+            return format!("Started sub-agent {} ({}) in a pane of its own (task {id}). {}", child.name, child.model, talk::AWAITED);
+        }
+        node.forget_child(&id);
+        format!("{ERROR}the client didn't open a pane for sub-agent {}", child.name)
     }
 }
 
@@ -104,6 +173,14 @@ fn approval(result: Option<&Value>) -> Approval {
 
 impl Ui for Served {
     fn text(&mut self, delta: &str) {
+        if self.compacting {
+            self.chunk("agent_thought_chunk", delta);
+            return;
+        }
+        if !std::mem::replace(&mut self.answering, true) {
+            crate::peers::farewell::writing();
+        }
+        crate::peers::farewell::wrote(delta);
         self.chunk("agent_message_chunk", delta);
     }
 
@@ -116,49 +193,70 @@ impl Ui for Served {
     }
 
     async fn approve(&mut self, call: &ToolCall, _rule: Option<&Rule>) -> Approval {
-        self.announce(call, "pending");
-        let options = json!([
-            { "optionId": ALLOW, "name": "Allow", "kind": "allow_once" },
-            { "optionId": ALWAYS, "name": "Allow for this conversation", "kind": "allow_always" },
-            { "optionId": REJECT, "name": "Reject", "kind": "reject_once" },
-        ]);
-        let (id, answer) = self.link.ask();
-        self.link.send(wire::ask_permission(id, &self.session, &call.call_id, &options));
-        // Never answered, as the client left: not a yes.
-        answer.await.map_or(Approval::Stop, |result| approval(result.as_ref()))
+        self.asked(call).await
+    }
+
+    async fn peer(&mut self, call: &ToolCall) -> String {
+        if ToolName::of(call) == Some(ToolName::Spawn) {
+            return self.spawn(call).await;
+        }
+        match &self.terminal.peers {
+            Some(peers) => peers.tool(call).await,
+            None => format!("{ERROR}this rein isn't among the others"),
+        }
     }
 
     fn tool_started(&mut self, call: &ToolCall) {
+        self.answering = false;
+        self.terminal.step_started(call);
         self.announce(call, "in_progress");
     }
 
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
+        self.terminal.step_blocked(call, reason);
         self.finish(call, "failed", reason);
     }
 
     fn tool_finished(&mut self, call: &ToolCall, output: &str) {
+        let outcome = steps::outcome(call, output, self.terminal.err);
+        self.terminal.step_finished(call, &outcome);
         self.finish(call, if rein_agent::agent::failed(output) { "failed" } else { "completed" }, output);
     }
 
     fn usage(&mut self, usage: &Usage) {
+        self.terminal.tokens_used(usage);
         self.used(usage.input_tokens);
     }
 
+    fn compacting(&mut self) {
+        self.compacting = true;
+    }
+
     fn compacted(&mut self, report: &Compacted) {
+        self.compacting = false;
         self.used(report.after);
     }
 
+    /// What the client said, then what came in from other reins.
     fn steering(&mut self) -> Vec<Heard> {
-        std::mem::take(&mut *self.link.heard.borrow_mut())
+        let mut heard = std::mem::take(&mut *self.link.heard.borrow_mut());
+        for one in self.terminal.take_incoming() {
+            heard.extend(self.terminal.heard_of(one));
+        }
+        heard
     }
 
     fn waiting(&mut self) -> Vec<Heard> {
-        self.steering()
+        let mut heard = std::mem::take(&mut *self.link.heard.borrow_mut());
+        heard.append(&mut self.terminal.notes);
+        heard
     }
 
     fn steered(&mut self, heard: &Heard) {
-        if let Heard::You(text) = heard {
-            self.chunk("user_message_chunk", text);
+        match heard {
+            Heard::You(text) => self.chunk("user_message_chunk", text),
+            Heard::Peer { from, text } | Heard::Reported { from, text } | Heard::Told { from, text } => self.link.send(wire::heard(&self.session, from, text)),
+            Heard::Changed { by, path } => self.chunk("agent_thought_chunk", &format!("{by} changed {path}, which this conversation has seen")),
         }
     }
 }

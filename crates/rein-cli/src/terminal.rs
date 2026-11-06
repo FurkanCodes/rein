@@ -366,6 +366,49 @@ impl Terminal {
         }
     }
 
+    /// What came in from the other reins, oldest first.
+    pub(crate) fn take_incoming(&mut self) -> Vec<Incoming> {
+        let mut incoming = Vec::new();
+        if let Some(peers) = &mut self.peers {
+            while let Ok(one) = peers.inbox.try_recv() {
+                incoming.push(one);
+            }
+        }
+        incoming
+    }
+
+    /// A step starts: the others see it, and a task's result will say so.
+    /// These four hold for any `Ui` running this conversation.
+    pub(crate) fn step_started(&self, call: &ToolCall) {
+        let (name, target) = steps::describe(call);
+        crate::peers::farewell::running(&format!("{name} {target}"));
+        if let Some(peers) = &self.peers {
+            peers.doing(&steps::doing(call));
+        }
+    }
+
+    /// A step was turned down, for a task's result.
+    pub(crate) fn step_blocked(&self, call: &ToolCall, reason: &str) {
+        let (name, target) = steps::describe(call);
+        crate::peers::farewell::stepped(&format!("{name} {target} · blocked: {reason}"));
+    }
+
+    /// A step ran, for a task's result and the others in this folder.
+    pub(crate) fn step_finished(&mut self, call: &ToolCall, outcome: &steps::Outcome) {
+        let (name, target) = steps::describe(call);
+        crate::peers::farewell::stepped(&format!("{name} {target} · {}", strip(&outcome.status)));
+        if ToolName::of(call).is_some_and(ToolName::changes_files) && outcome.ok == Some(true) {
+            self.changed_file(call);
+        }
+    }
+
+    /// What a request used, which the others see.
+    pub(crate) fn tokens_used(&self, usage: &Usage) {
+        if let Some(peers) = &self.peers {
+            peers.add_tokens(usage.input_tokens.saturating_add(usage.output_tokens));
+        }
+    }
+
     /// Notes that this turn changed `path`, for a task's result and the
     /// other reins.
     fn changed_path(&mut self, path: String) {
@@ -958,11 +1001,7 @@ impl Ui for Terminal {
             let lead = self.lead();
             self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: false, done: false });
         }
-        let (name, target) = steps::describe(call);
-        crate::peers::farewell::running(&format!("{name} {target}"));
-        if let Some(peers) = &self.peers {
-            peers.doing(&steps::doing(call));
-        }
+        self.step_started(call);
         if self.input.pinned() {
             self.doing(&steps::doing(call));
             return;
@@ -992,8 +1031,7 @@ impl Ui for Terminal {
         self.step = None;
         let lead = self.lead();
         let s = self.err;
-        let (name, target) = steps::describe(call);
-        crate::peers::farewell::stepped(&format!("{name} {target} · blocked: {reason}"));
+        self.step_blocked(call, reason);
         let (call_, lead_, status) = (call.clone(), lead.clone(), s.red(&format!("blocked: {reason}")));
         self.show(move |width| vec![steps::line(&call_, &lead_, &s.red("✗"), &status, s, width)]);
         self.step = Some(Step { call_id: call.call_id.clone(), lead, header_shown: true, done: true });
@@ -1010,11 +1048,7 @@ impl Ui for Terminal {
         self.turn.steps += 1;
         let asked = step.as_ref().is_some_and(|step| step.header_shown);
         let mut outcome = steps::outcome(call, output, s);
-        let (name, target) = steps::describe(call);
-        crate::peers::farewell::stepped(&format!("{name} {target} · {}", strip(&outcome.status)));
-        if ToolName::of(call).is_some_and(ToolName::changes_files) && outcome.ok == Some(true) {
-            self.changed_file(call);
-        }
+        self.step_finished(call, &outcome);
         if ToolName::of(call) == Some(ToolName::Plan) {
             // The same steps as before: just say where things stand.
             let names: Vec<String> = outcome.details.iter().map(|line| strip(line).chars().skip(2).collect()).collect();
@@ -1082,9 +1116,7 @@ impl Ui for Terminal {
     }
 
     fn usage(&mut self, usage: &Usage) {
-        if let Some(peers) = &self.peers {
-            peers.add_tokens(usage.input_tokens.saturating_add(usage.output_tokens));
-        }
+        self.tokens_used(usage);
         self.turn.input += usage.input_tokens;
         self.turn.cached += usage.cached_input_tokens;
         self.context_used = usage.input_tokens;
@@ -1154,13 +1186,7 @@ impl Ui for Terminal {
         let mut heard: Vec<Heard> = self.input.steering().into_iter().map(Heard::You).collect();
         // Typed into a sub-agent while it works: it's yours now too.
         self.adopted |= !heard.is_empty();
-        let mut incoming = Vec::new();
-        if let Some(peers) = &mut self.peers {
-            while let Ok(one) = peers.inbox.try_recv() {
-                incoming.push(one);
-            }
-        }
-        for one in incoming {
+        for one in self.take_incoming() {
             if self.fancy
                 && let Some(shown) = crate::peers::talk::reported(&one, self.err, self.wrap_width().unwrap_or(80))
             {
