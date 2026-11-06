@@ -321,9 +321,52 @@ rein runs the project's own check once per step that changed files
 project, and tells only what the turn broke, by what each error is, not
 where.
 
+### 7. Windows through WSL, then a GUI
+
+**The order:** release on macOS and Linux first. Then Windows, through
+WSL, then a GUI, each with a test of its own before the next starts.
+
+**Windows through WSL:** the Linux build, with its sandbox, in WSL2.
+What's left is what a Linux desktop has and WSL hasn't: opening a browser
+to sign in, and pasting an image. A build for Windows itself would need a
+sandbox of its own, and waits until people ask for it.
+
+**`rein serve`:** rein with no screen, saying what happens and taking
+what you say over its standard input and output. The GUI starts it as a
+process, and so does a window on Windows, through `wsl.exe`, with no port
+of the agent or the sandbox. Each sub-agent is a process already, so each
+can be a pane.
+
+**A feature is never written for one screen.** What rein knows goes into a
+shared crate as typed data, and the terminal and the GUI each show it in
+their own way. `/learn`, where the model teaches you any concept, and a
+better look at what's in the context, come to both.
+
+**The GUI:** all your agents side by side, each one to read and steer.
+That's what the terminal can't show as well, and it's "every agent has a
+window" taken further. It's a program of its own, with GPUI, in a workspace
+of its own (`gui/`): `rein` stays one small binary, and nothing of GPUI's
+reaches its dependencies or its checks.
+
+**Steps, each done when:**
+
+1. WSL: every test passes in real WSL2, and sign-in, paste and sub-agents'
+   tabs work by hand.
+2. `rein serve`: the terminal's tests pass unchanged, and a test with no
+   screen runs a turn with an approval, a stop and steering.
+3. A throwaway GPUI window on macOS: long conversations stay smooth,
+   text can be selected, and input methods work. If not, GPUI is out.
+4. A beta on macOS, which you use instead of the terminal.
+5. The GUI on Linux and Windows, where a window drives a turn through
+   `wsl.exe`.
+6. Signed builds, updates and install pages, then a release.
+
 ---
 
 ## Open questions
+
+- **`rein serve`:** does Zed's Agent Client Protocol fit, so rein would
+  work in Zed too, or does it need its own? (First thing to check.)
 
 - **Plan limits:** do ChatGPT's figures come to rein's requests as they
   come to Codex's? (First thing to check in 2.)
