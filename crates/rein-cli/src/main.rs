@@ -40,6 +40,7 @@ mod paste;
 mod peers;
 mod rules;
 mod search;
+mod serve;
 mod settings;
 mod sign_in;
 mod skills;
@@ -119,6 +120,7 @@ async fn run(args: Vec<String>) -> CliResult {
         ["models"] => connect::models(&http, None).await,
         ["models", provider] => connect::models(&http, Some(provider)).await,
         ["peers"] => peers::dashboard::run(&peers::folder(&config_dir()?)).await,
+        ["serve"] => serve::run(&http).await,
         _ => {
             let settings = Settings::load(&config_dir()?.join(settings::FILE))?;
             let compact_at = settings.get("compact_at", "REIN_COMPACT_AT");

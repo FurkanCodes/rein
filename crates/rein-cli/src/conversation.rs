@@ -24,6 +24,41 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option<String>) -> CliResult {
+    let prompt = args.prompt.clone();
+    let Some(Opened { mut agent, mut terminal, mut setup }) = open(http, args, compact_at, prompt.is_some()).await? else { return Ok(()) };
+    match prompt {
+        // A task left to run on its own that didn't finish says so in how
+        // rein exits, for whatever started it.
+        Some(prompt) => {
+            terminal.start_turn(Some(&prompt));
+            for (skill, given) in crate::skills::called(&prompt, agent.skills()) {
+                agent.call_skill(&skill, given);
+            }
+            let outcome = turn(&mut agent, Start::You(prompt), &mut terminal).await;
+            crate::skills::count(agent.take_loaded());
+            agent.session_ended(rein_agent::hooks::Ended::Exit, &mut terminal).await;
+            match outcome? {
+                Outcome::StepLimit(_) | Outcome::Stuck { .. } => Err("the task isn't finished".into()),
+                Outcome::Refused(by) => Err(format!("your hook {} said no to the task: {}", by.hook, by.said)),
+                Outcome::Done | Outcome::Stopped | Outcome::HookStopped(_) => Ok(()),
+            }
+        }
+        None => conversation(&mut agent, &mut terminal, &mut setup).await,
+    }
+}
+
+/// A conversation ready to start.
+pub(crate) struct Opened {
+    pub(crate) agent: Agent<Llm>,
+    pub(crate) terminal: Terminal,
+    pub(crate) setup: Setup,
+}
+
+/// Gets a conversation ready. `alone`, nobody's at a terminal to ask, as
+/// for a task run on its own or `rein serve`: there's no box, and what a
+/// project brings waits for a yes. `None` when you left without picking a
+/// conversation to continue.
+pub(crate) async fn open(http: &rein_llm::reqwest::Client, args: AskArgs, compact_at: Option<String>, alone: bool) -> CliResult<Option<Opened>> {
     let dir = config_dir()?;
     let mut keys = crate::connect::load_keys(&dir)?;
     let providers = crate::connect::providers(&dir)?;
@@ -50,8 +85,8 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     // everything else gets ready. A model you're not signed in for waits:
     // once the box is up, it asks you to sign in.
     let early = if args.model_given || args.resume == Resume::New { Some(wanted.clone()) } else { latest.as_deref().and_then(session::peek).map(|header| header.model) };
-    let early = early.filter(|spec| args.prompt.is_some() || !crate::connect::unpaid(spec, &providers, &keys));
-    if args.prompt.is_none() {
+    let early = early.filter(|spec| alone || !crate::connect::unpaid(spec, &providers, &keys));
+    if !alone {
         crate::ui::logo::show(&root, early.as_deref());
     }
     let mut connected = match &early {
@@ -70,8 +105,8 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     let permissions = load_permissions(&root, &dir, args.mode, args.sandbox, sandbox.clone())?;
     // What you sent from this folder before, for ↑ and Ctrl-R: only a
     // conversation has a box to bring it back in.
-    let sent = if args.prompt.is_none() { History::load(history::file(&dir, &root)) } else { History::default() };
-    let mut terminal = Terminal::new(root.clone(), sandbox.clone(), args.mode, args.prompt.is_none(), sent, args.bell);
+    let sent = if !alone { History::load(history::file(&dir, &root)) } else { History::default() };
+    let mut terminal = Terminal::new(root.clone(), sandbox.clone(), args.mode, !alone, sent, args.bell);
     terminal.sandboxing = permissions.sandboxing();
     // The box goes up now, so typing can start while the model list loads.
     terminal.model = connected.as_ref().map(|c| provider::shown(&c.provider, &c.model)).unwrap_or_default();
@@ -79,13 +114,13 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     terminal.input.set_bar(terminal.bar());
     // Your MCP servers and the project's start now, while the rest gets
     // ready; the project's only once you've said yes to each as it is.
-    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), http.clone(), &mut terminal, args.prompt.is_none()).await;
+    let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), http.clone(), &mut terminal, !alone).await;
     let saved = match args.resume {
         Resume::New => None,
         Resume::Latest => latest,
         Resume::Pick => match pick(&folder, &mut terminal).await? {
             Some(path) => Some(path),
-            None => return Ok(()),
+            None => return Ok(None),
         },
     };
     if saved.is_some() && args.system.is_some() {
@@ -102,7 +137,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     };
     // The first time, or once you're signed out: with you here, rein
     // asks you to sign in, as Codex and Claude Code do, instead of stopping.
-    let spec = if args.prompt.is_none() && crate::connect::unpaid(&spec, &providers, &keys) {
+    let spec = if !alone && crate::connect::unpaid(&spec, &providers, &keys) {
         // A model you named, with -m or in the settings, or a conversation's.
         let keep = args.model.is_some() || theirs.is_some();
         crate::sign_in::first(http, &providers, &mut keys, &mut terminal, &spec, keep).await?.unwrap_or(spec)
@@ -132,7 +167,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
         Some(memory) => tools.with_memory(memory.clone()),
         None => tools,
     };
-    let mut setup = Setup {
+    let setup = Setup {
         folder,
         personal: dir.join("AGENTS.md"),
         root: root.clone(),
@@ -169,9 +204,7 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     // Only a conversation joins the others: a task done on its own has no
     // one to answer what they send.
     let child = args.child.as_ref().map(|(pid, id)| (*pid, id.as_str()));
-    if args.prompt.is_none()
-        && crate::peers::talk::join(args.joining, args.name.as_deref(), args.workspace.as_deref(), child, args.strip, &dir, &root, args.mode, &mut terminal).await
-    {
+    if !alone && crate::peers::talk::join(args.joining, args.name.as_deref(), args.workspace.as_deref(), child, args.strip, &dir, &root, args.mode, &mut terminal).await {
         // A sub-agent doesn't start sub-agents: one level, no further.
         agent = if child.is_some() { agent.with_child_peer_tools() } else { agent.with_peer_tools() };
     }
@@ -183,42 +216,24 @@ pub(crate) async fn ask(http: &rein_llm::reqwest::Client, args: AskArgs, compact
     crate::search::follow(&mut agent, &setup).await;
     // A task run with -p asks nothing: a project's skills wait for a yes.
     let room = setup.skill_room(&agent.model_name);
-    crate::skills::refresh(&mut agent, &mut terminal, &root, room, crate::skills::Look::Start { ask: args.prompt.is_none() }).await;
+    crate::skills::refresh(&mut agent, &mut terminal, &root, room, crate::skills::Look::Start { ask: !alone }).await;
     terminal.effort = crate::effort::now(&agent);
     if let Some(why) = crate::effort::unlike_chosen(&agent) {
         say!("{}{}", " ".repeat(GUTTER), terminal.err.dim(&format!("({why})")));
     }
-    agent.step_limit = step_limit(args.mode, args.prompt.is_some(), args.max_steps);
+    agent.step_limit = step_limit(args.mode, alone, args.max_steps);
     // Your hooks, and those on a session starting.
     // A project's that wait for a yes are asked about where there's someone
     // to ask: not in a task run on its own, nor in a sub-agent's tab, which
     // has its task to do.
-    crate::hooks::start(&mut agent, &mut terminal, &dir, source, args.prompt.is_none() && args.child.is_none()).await;
+    crate::hooks::start(&mut agent, &mut terminal, &dir, source, !alone && args.child.is_none()).await;
     // The project's check after edits: one rein found asks first, as the
     // project's hooks do.
-    crate::check::start(&mut agent, &mut terminal, &dir, &args.check, args.prompt.is_none() && args.child.is_none()).await;
+    crate::check::start(&mut agent, &mut terminal, &dir, &args.check, !alone && args.child.is_none()).await;
     // A continued conversation is as full as it was.
     terminal.context_used = agent.estimated();
     terminal.input.set_bar(terminal.bar());
-    match args.prompt {
-        // A task left to run on its own that didn't finish says so in how
-        // rein exits, for whatever started it.
-        Some(prompt) => {
-            terminal.start_turn(Some(&prompt));
-            for (skill, given) in crate::skills::called(&prompt, agent.skills()) {
-                agent.call_skill(&skill, given);
-            }
-            let outcome = turn(&mut agent, Start::You(prompt), &mut terminal).await;
-            crate::skills::count(agent.take_loaded());
-            agent.session_ended(rein_agent::hooks::Ended::Exit, &mut terminal).await;
-            match outcome? {
-                Outcome::StepLimit(_) | Outcome::Stuck { .. } => Err("the task isn't finished".into()),
-                Outcome::Refused(by) => Err(format!("your hook {} said no to the task: {}", by.hook, by.said)),
-                Outcome::Done | Outcome::Stopped | Outcome::HookStopped(_) => Ok(()),
-            }
-        }
-        None => conversation(&mut agent, &mut terminal, &mut setup).await,
-    }
+    Ok(Some(Opened { agent, terminal, setup }))
 }
 
 /// What pays for the model: beside the logo, or said, `dim` and indented

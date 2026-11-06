@@ -337,6 +337,20 @@ process, and so does a window on Windows, through `wsl.exe`, with no port
 of the agent or the sandbox. Each sub-agent is a process already, so each
 can be a pane.
 
+It speaks the Agent Client Protocol, so other editors can use it too: no
+editor will write a client for a protocol only rein speaks. ACP covers a
+turn, its questions and stopping it, and rein adds steering as a method of
+its own, as ACP allows. The GUI will need more of that kind: sub-agents,
+what's used of your limits.
+
+ACP doesn't decide what the GUI can do. Its draft for sub-agents lets a
+client stop one, but not prompt or steer it, and steering each one is what
+the GUI is for. So each pane has a `rein serve` of its own, and a sub-agent
+can be prompted and steered like any other agent. rein adds a method for
+starting one. If the GUI comes to rest mostly on rein's own methods, rein
+gets a protocol of its own, as Codex did, with ACP as an adapter for
+editors. The cost is small: all of it is in `crates/rein-cli/src/serve/`.
+
 **A feature is never written for one screen.** What rein knows goes into a
 shared crate as typed data, and the terminal and the GUI each show it in
 their own way. `/learn`, where the model teaches you any concept, and a
@@ -354,19 +368,22 @@ reaches its dependencies or its checks.
    tabs work by hand.
 2. `rein serve`: the terminal's tests pass unchanged, and a test with no
    screen runs a turn with an approval, a stop and steering.
-3. A throwaway GPUI window on macOS: long conversations stay smooth,
+3. Agents with no screen: a test has one `rein serve` ask for a sub-agent,
+   starts it in a second one, steers it, and sees its result reach its
+   parent. A program can reopen a saved conversation. This comes before the
+   window: it's what the GUI is for, and a window wouldn't show it's missing.
+4. A throwaway GPUI window on macOS: long conversations stay smooth,
    text can be selected, and input methods work. If not, GPUI is out.
-4. A beta on macOS, which you use instead of the terminal.
-5. The GUI on Linux and Windows, where a window drives a turn through
-   `wsl.exe`.
-6. Signed builds, updates and install pages, then a release.
+5. A beta on macOS, which you use instead of the terminal.
+6. The GUI on Linux and Windows, where a window drives a turn through
+   `wsl.exe`. It runs the rein it came with, and checks the version when
+   they meet: one installed in WSL could disagree with the window on rein's
+   own methods. Codex ships the binary it tested in its apps for this reason.
+7. Signed builds, updates and install pages, then a release.
 
 ---
 
 ## Open questions
-
-- **`rein serve`:** does Zed's Agent Client Protocol fit, so rein would
-  work in Zed too, or does it need its own? (First thing to check.)
 
 - **Plan limits:** do ChatGPT's figures come to rein's requests as they
   come to Codex's? (First thing to check in 2.)

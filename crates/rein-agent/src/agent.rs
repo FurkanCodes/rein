@@ -200,6 +200,11 @@ fn was(call: &ToolCall) -> String {
     BashCall::of(call).map_or_else(|| "the model's own input".to_owned(), |bash| bash.command().to_owned())
 }
 
+/// Whether a tool's result says it failed.
+pub fn failed(output: &str) -> bool {
+    output.starts_with(crate::tools::ERROR) || exit_code(output).is_some_and(|code| code != 0)
+}
+
 /// The exit code a command's result ends with, if it does.
 fn exit_code(output: &str) -> Option<i64> {
     output.rsplit_once("[exit code ").and_then(|(_, rest)| rest.split(']').next()?.parse().ok())
@@ -1153,7 +1158,7 @@ impl<M: Model> Agent<M> {
     /// put another result in its place, add to what the model is told
     /// (`before`, what hooks before it added, too), or stop the turn.
     async fn after(&mut self, call: &ToolCall, output: String, began: std::time::Instant, before: &[By], ui: &mut impl Ui) -> String {
-        let failed = output.starts_with(crate::tools::ERROR) || exit_code(&output).is_some_and(|code| code != 0);
+        let failed = failed(&output);
         let heard = self.hook(hooks::Event::PostToolUse { call, output: &output, took: began.elapsed(), failed }, ui).await;
         let mut output = output;
         if let Some(by) = heard.output {

@@ -1199,6 +1199,39 @@ and copies it. Or set `tab_command` to your terminal's own, with
 tab runs `rein --child`, and the sub-agent fetches its task from the rein
 that started it.
 
+## Driving rein from another program
+
+`rein serve` is rein with no screen, for an editor, a window of your own or a
+script to drive. It speaks the [Agent Client
+Protocol](https://agentclientprotocol.com) (version 1) on standard input and
+output, one JSON-RPC message a line. What it has to say to people goes to
+standard error. It stops when the program closes its standard input.
+
+Sign in first, with `rein login`: there's no signing in over the protocol. One
+`rein serve` holds one conversation, in the folder `session/new` names, so a
+program that wants another conversation starts another `rein serve`.
+
+- **Mode.** It starts in the mode your settings say, which is `trust` unless
+  you've changed that, so check it before you hand it to anything automatic.
+  `session/new` lists the modes, ⚠ marks included, and `session/set_mode`
+  changes it between turns.
+- **What a project brings.** Nobody's at a terminal to say yes, so a project's
+  hooks, MCP servers, skills and check stay off until you've said yes to them
+  in `rein`, as in a task run on its own.
+- **Questions.** `session/request_permission` offers allow, allow for this
+  conversation, and reject. Any other answer is a no.
+- **Stopping.** `session/cancel` stops the turn, and whatever it was running.
+  The conversation goes on.
+- **Steering.** ACP has no way to add to a running turn, so rein has a method
+  of its own, `_io.github.furkancodes/steer`, taking `sessionId` and `message`.
+  It goes in before the next step, and `initialize` says rein takes it under
+  `agentCapabilities._meta`. Sent as a turn is ending, it goes in with your
+  next message.
+
+Not there yet: continuing a saved conversation (`session/load`), MCP servers
+a client passes in `session/new`, which are ignored, images in a prompt,
+rein's slash commands, and sub-agents.
+
 ## What's left of your limits
 
 When the provider says how much of your limits is used, the bar shows it

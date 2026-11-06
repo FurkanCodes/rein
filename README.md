@@ -88,6 +88,9 @@ set up each one.
   including what its commands did.
 - [Usage limits](docs/guide.md#whats-left-of-your-limits): your plan's
   usage in the status bar, only when the provider reports it.
+- [`rein serve`](docs/guide.md#driving-rein-from-another-program): rein with
+  no screen, for an editor or another program to drive over the Agent
+  Client Protocol.
 
 ## Status
 

@@ -355,6 +355,12 @@ finding. Each says why in a line.
   was 2,000 lines; it's now `args`, `conversation`, `terminal` and `format`.
 - Code the provider formats share (grouping items by role, call IDs, parsing
   arguments) lives once, not in each format.
+- What the agent has to show goes through its `Ui`, never straight to the
+  terminal: `rein serve` is another `Ui`, and a feature that prints from
+  `Terminal` alone never reaches a client.
+- `rein serve`'s standard output is the protocol, and nothing else may write
+  to it: a stray line stops every client reading. What rein runs gets no
+  standard input, or a command could eat the client's messages.
 - `pub(crate)` unless something outside the crate needs it.
 - The sandbox is its own crate, `rein-sandbox`, with no C in its
   dependencies: its tests build for Linux from a Mac and run in a container.

@@ -27,6 +27,8 @@ Usage:
   rein models [<provider>]       List the models you can use
   rein peers                     Watch the reins running in your other terminals,
                                  and answer what they ask (y/n)
+  rein serve                     Run with no screen, for another program to drive
+                                 over standard input and output (Agent Client Protocol)
 
 rein can read, write and edit files in this folder and run commands. In a
 conversation, type /exit or press Ctrl-D to leave. Conversations are saved in
