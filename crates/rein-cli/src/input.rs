@@ -1423,12 +1423,19 @@ impl Input {
     /// show as it's typed.
     pub async fn read_secret(&mut self, prompt: &str) -> Option<Read> {
         self.boxed.as_ref()?;
-        self.with(|boxed| boxed.secret = true);
+        // It starts empty: what's in the box is what you were typing, and
+        // Enter would send it to a provider as your key. It comes back after.
+        let mut draft = String::new();
+        self.with(|boxed| {
+            boxed.secret = true;
+            draft = boxed.editor.take();
+        });
         let read = self.read(prompt, false).await;
         self.with(|boxed| {
             boxed.secret = false;
             // A cancelled one mustn't stay in the box, half typed.
             boxed.editor.take();
+            boxed.editor.replace(&draft);
         });
         Some(read)
     }

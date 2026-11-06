@@ -144,7 +144,8 @@ finding. Each says why in a line.
   `Credentials`) have a hand-written `Debug` that leaves them out. A derived
   `Debug` prints them into any log or panic message.
 - A secret typed in the terminal is never echoed, never kept in history, and the
-  terminal is put back even on Ctrl-C.
+  terminal is put back even on Ctrl-C. Its box opens empty: what you were
+  typing, shown as dots, would go to a provider as your key on Enter.
 - Never sign in as another app: no borrowed OAuth client IDs, no spoofed
   headers or system prompts. Official sign-ins and API keys only.
 - A token that runs out is asked for before each request, never kept from
@@ -359,7 +360,10 @@ finding. Each says why in a line.
   touches your clipboard, servers on port 0, never a fixed port. A test once
   opened real OpenRouter sign-in pages.
 - Wait for the state you need (`wait_for`, `wait_until`), never `sleep` and then
-  look: a menu's title can be drawn before its list.
+  look: a menu's title can be drawn before its list. And wait for what only
+  that state shows: `/login`'s line in the list of commands has the words of
+  its menu's title, and on a slow machine the letters typed "in the menu"
+  went to the box, then into a key box.
 - Tests of state the whole process shares (the armed process groups) take
   one lock: `stop_all` in one test killed the group another test was
   checking, and it failed one run in three.

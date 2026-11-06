@@ -1655,9 +1655,11 @@ fn claude_code_can_be_selected_from_the_login_menu() {
     let mut term = Term::start(&model, "login-claude-code-menu", 40, 110);
     term.wait_for(IDLE);
     term.keys("/login\r");
-    term.wait_for("sign in to a provider");
-    term.keys("claude-code");
+    // Not the menu's title: `/login`'s line in the list of commands says
+    // that too, and letters typed before the menu go to the box.
     term.wait_for("CLI login or setup-token");
+    term.keys("claude-code");
+    term.wait_until("only that one left", |screen| !screen.contains("your ChatGPT plan"));
     term.keys("\r");
     term.wait_for("press Enter to use an existing");
     term.keys("\r");
@@ -1666,6 +1668,28 @@ fn claude_code_can_be_selected_from_the_login_menu() {
     let saved: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/claude-code.json")).unwrap()).unwrap();
     assert!(saved["token"].is_null());
     assert!(model.requests().is_empty(), "selecting CLI login doesn't call a model");
+}
+
+/// A key box opens empty. Text in it would be sent as your key on Enter:
+/// letters typed just before a menu opened once picked the wrong provider,
+/// and stayed in its key box as dots.
+#[test]
+fn a_key_box_opens_empty_and_what_you_were_typing_comes_back_after() {
+    let slow = calls("bash", json!({ "command": "sleep 2", "timeout_seconds": null, "access": "write", "reason": null }));
+    let model = Model::start(vec![slow, says("Done.")]);
+    let mut term = Term::start_with(&model, "key-box-empty", 30, 100, &[ALLOWED]);
+    term.wait_for(IDLE);
+    term.keys("make the file\r");
+    term.wait_for("Running sleep 2");
+    // It waits for the end of the turn, by when there's a draft in the box.
+    term.keys("/login groq\r");
+    term.keys("half a thought");
+    term.wait_for("half a thought");
+    term.wait_for("Paste your Groq API key");
+    assert!(!term.text().contains("••"), "nothing typed for it yet\n{}", term.text());
+    term.keys("\x1b");
+    term.wait_for("half a thought");
+    assert!(model.requests().iter().all(|request| !request.to_string().contains("half a thought")), "it's a draft");
 }
 
 #[test]
@@ -2063,7 +2087,7 @@ fn signing_in_from_the_conversation_makes_a_provider_ready_to_switch_to() {
     term.wait_for(IDLE);
     // /login alone: a menu of who to sign in to, and which you're signed in to now.
     term.keys("/login\r");
-    term.wait_for("sign in to a provider");
+    term.wait_for("your ChatGPT plan");
     let screen = term.text();
     let row = |name: &str| screen.lines().find(|l| l.trim_start().trim_start_matches('›').trim_start().starts_with(name)).unwrap_or_default().to_owned();
     assert!(row("openai").contains("$OPENAI_API_KEY") && row("openai").trim_start().starts_with('›'), "it starts on the one in use:\n{screen}");
