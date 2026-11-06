@@ -6,6 +6,8 @@ name: Release builds
 on:
   push:
     tags: ["v*"]
+    # Until this is on main, where GitHub lets it be started by hand.
+    branches: ["feature/release-builds"]
   workflow_dispatch:
 
 permissions:
