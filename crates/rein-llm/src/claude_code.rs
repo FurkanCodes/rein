@@ -535,8 +535,13 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("rein-claude-code-{}", crate::oauth::random_token().unwrap()));
             std::fs::create_dir_all(&dir).unwrap();
             let program = dir.join("claude");
-            std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // Made by a process of its own: a file open for writing here, handed
+            // to a child another test is forking just then, can't be run
+            // ("Text file busy", on Linux).
+            let text = dir.join("claude.txt");
+            std::fs::write(&text, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&text, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(std::process::Command::new("cp").arg(&text).arg(&program).status().unwrap().success());
             Self { dir, program: program.to_str().unwrap().into() }
         }
     }

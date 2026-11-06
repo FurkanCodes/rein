@@ -324,6 +324,10 @@ finding. Each says why in a line.
   would have copied your keys, and `/undo` written them into the project.
   And it's a copy or a clone of its own, never a hard link to the file,
   which an edit in place would change too.
+- A file's times can stand still while it changes: ext4 stamps files from
+  a clock that ticks up to every 10 ms, and two same-size writes in a row
+  looked the same 188 times in 200, so `/undo` missed the second. A look
+  waits out the tick (`TICK`) when a file has only just changed.
 - Measure what a file system costs before building on it: hard links take
   about 200 µs each on APFS, and a pool linked from each conversation made
   the first look at 20,000 files 7 s; clones alone made it 2 s.
@@ -359,6 +363,9 @@ finding. Each says why in a line.
 - Tests of state the whole process shares (the armed process groups) take
   one lock: `stop_all` in one test killed the group another test was
   checking, and it failed one run in three.
+- A test that runs a script it wrote has another process write it: a file
+  open for writing here, inherited by a child another test is forking, makes
+  the run fail with "Text file busy" on Linux, about one run in fifteen.
 - Check processes by their exact command, not `pgrep -f`, which also matches the
   shell that started the test.
 - An opt-in test is `#[ignore = "why"]`, so it shows as ignored, not passed.

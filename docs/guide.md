@@ -1279,6 +1279,10 @@ cargo fmt --check
     <an image with python3 and git, a user, and /work> /t/rein_sandbox-<hash>
   ```
 
+  The whole suite runs on Linux too, on a kernel with Landlock: its screen
+  tests check the walls through the real binary, and fail where there are
+  none, so a container without Landlock runs only the two crates above.
+
   `rein-mcp`'s tests start a small MCP server written in `sh` in the
   sandbox, so they run there the same way (`/t/rein_mcp-<hash>`). One
   opt-in test fetches a real server from npm and starts it in the sandbox,

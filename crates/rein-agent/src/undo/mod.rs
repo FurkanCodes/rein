@@ -6,7 +6,8 @@
 //! each one that's new or changed since it last looked. After the command
 //! it looks again, and what differs is what the command did. A file's size,
 //! times and inode say whether it changed, so after the first look only
-//! what changed is read. The copies are kept in rein's folder, readable only
+//! what changed is read, and a look waits for the clock if a file has only
+//! just changed, or a change right after it wouldn't show. The copies are kept in rein's folder, readable only
 //! by you, as clones where the file system makes them (APFS, Btrfs, XFS),
 //! which take no room until the file changes.
 //!
@@ -22,7 +23,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,11 @@ pub const MOST_FILES: usize = 20_000;
 pub const MOST_BYTES: u64 = 1 << 30;
 /// How many turns a conversation keeps to undo.
 const TURNS: usize = 30;
+/// How long a file's times can stand still while it changes. Linux stamps
+/// files from a clock that moves once a tick, up to 10 ms, so on ext4 a
+/// rewrite of the same size just after a look leaves everything rein
+/// compares as it was.
+const TICK: Duration = Duration::from_millis(20);
 
 /// A file as rein last saw it, and the copy kept of it then.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +85,14 @@ impl Seen {
     /// new change time too.
     fn same(&self, other: &Seen) -> bool {
         (self.len, self.modified, self.changed, self.device, self.inode) == (other.len, other.modified, other.changed, other.device, other.inode)
+    }
+
+    /// How long ago anything about it last changed, if that's in the past.
+    /// The change time is the one a program can't set.
+    fn age(&self, now: SystemTime) -> Option<Duration> {
+        let (seconds, nanos) = (u64::try_from(self.changed.0).ok()?, u64::try_from(self.changed.1).ok()?);
+        let changed = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?.checked_add(Duration::from_nanos(nanos))?;
+        now.duration_since(changed).ok()
     }
 
     /// What a copy of it as it is now is called: found again by that, by
@@ -202,6 +216,16 @@ impl Plan {
     /// Whether it does anything to a file.
     pub fn does_anything(&self) -> bool {
         !self.put_back.is_empty() || !self.take_away.is_empty()
+    }
+}
+
+/// Waits until a change after this moment can't have the times of a file
+/// in `seen`, which are all that says a file changed. Only a file changed
+/// [`TICK`] ago or less makes it wait; `/undo` is off the loop's thread.
+fn outlast_the_tick(seen: &BTreeMap<String, Seen>) {
+    let now = SystemTime::now();
+    if let Some(age) = seen.values().filter_map(|file| file.age(now)).min() {
+        std::thread::sleep(TICK.saturating_sub(age));
     }
 }
 
@@ -427,6 +451,7 @@ impl Undo {
         }
         let root = self.root();
         ready.extend(self.copies.keep(&root, wanted));
+        outlast_the_tick(&ready);
         ready
     }
 

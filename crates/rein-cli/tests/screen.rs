@@ -624,8 +624,9 @@ impl Term {
 
         let (mut master, mut slave) = (0, 0);
         let mut size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
-        // SAFETY: openpty writes two descriptors into the ints we pass.
-        let opened = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) };
+        // SAFETY: openpty writes two descriptors into the ints we pass. Its
+        // size is `*mut` on macOS and `*const` on Linux, and a raw pointer suits both.
+        let opened = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut size) };
         assert_eq!(opened, 0, "can't open a pseudo-terminal");
         // SAFETY: openpty just gave us these, and nothing else owns them.
         let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
@@ -1541,8 +1542,9 @@ fn claude_thinking_always_goes_back_after_what_it_was_signed_with() {
         says("Bye."),
     ])
     // Under the third request, over the second: see below. Sizes are
-    // tuned by hand, so nothing else goes in the first message.
-    .with_env("REIN_COMPACT_AT", "9500")
+    // tuned by hand, so nothing else goes in the first message, and the
+    // prompt differs by system: 10000 to 10500 suits macOS and Linux.
+    .with_env("REIN_COMPACT_AT", "10250")
     .with_env("REIN_MEMORY", "off");
     let mut term = Term::start_with(&model, "claude-compact", 30, 100, &[("big.txt", &big)]);
     term.wait_for(IDLE);
@@ -2285,6 +2287,15 @@ fn bash(command: &str, access: &str, reason: Option<&str>) -> Out {
     Out::Call("bash", json!({ "command": command, "timeout_seconds": null, "access": access, "reason": reason }))
 }
 
+/// What the sandbox is called on this system.
+const WALLS: &str = if cfg!(target_os = "macos") { "macOS Seatbelt" } else { "Linux Landlock" };
+
+/// Whether a command's output says it was refused: Seatbelt's word for that
+/// is EPERM, Landlock's EACCES.
+fn refused(output: &str) -> bool {
+    output.contains("Operation not permitted") || output.contains("Permission denied")
+}
+
 /// What rein sent back for each step, in the latest request.
 fn results(model: &Model) -> Vec<String> {
     let requests = model.requests();
@@ -2292,7 +2303,6 @@ fn results(model: &Model) -> Vec<String> {
     input.iter().filter_map(|item| item["output"].as_str().map(str::to_owned)).collect()
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn a_command_that_only_looks_runs_without_asking_and_changes_nothing() {
     let model = Model::start(vec![Turn { out: vec![bash("cat notes.txt", "look", None), bash("echo changed > notes.txt", "look", None)] }, says("Read them.")]);
@@ -2303,11 +2313,10 @@ fn a_command_that_only_looks_runs_without_asking_and_changes_nothing() {
     assert!(!term.text().contains("Allow this"), "nothing was asked:\n{}", term.text());
     let results = results(&model);
     assert_eq!(results[0], "kept\n[exit code 0]");
-    assert!(results[1].contains("Operation not permitted") && results[1].contains("It ran in the sandbox with look access"), "{results:?}");
+    assert!(refused(&results[1]) && results[1].contains("It ran in the sandbox with look access"), "{results:?}");
     assert_eq!(std::fs::read_to_string(term.dir.join("project/notes.txt")).unwrap(), "kept\n");
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn going_past_the_sandbox_asks_and_says_why() {
     let fetch = bash("echo fetched", "network", Some("to download the crates"));
@@ -2325,7 +2334,6 @@ fn going_past_the_sandbox_asks_and_says_why() {
     assert_eq!(results(&model)[0], "fetched\n[exit code 0]");
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn read_only_runs_what_looks_and_refuses_the_rest() {
     let model = Model::start(vec![Turn { out: vec![bash("ls", "look", None), bash("touch made.txt", "write", None)] }, says("Looked.")]).with_env("REIN_MODE", "read-only");
@@ -2339,7 +2347,6 @@ fn read_only_runs_what_looks_and_refuses_the_rest() {
     assert!(!term.dir.join("project/made.txt").exists() && !term.text().contains("Allow this"), "{}", term.text());
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn auto_never_asks_and_refuses_what_would_go_past_the_sandbox() {
     let past = bash("docker ps", "outside", Some("to see the containers"));
@@ -2354,10 +2361,9 @@ fn auto_never_asks_and_refuses_what_would_go_past_the_sandbox() {
     assert!(term.dir.join("project/made.txt").exists() && !term.text().contains("Allow this"), "{}", term.text());
     term.wait_for(IDLE);
     term.keys("/status\r");
-    term.wait_for("on: macOS Seatbelt");
+    term.wait_for(&format!("on: {WALLS}"));
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn keys_and_secrets_stay_out_of_commands() {
     let mut model = Model::start(vec![Turn { out: vec![bash("echo key=${OPENAI_API_KEY:-none}", "look", None), bash("cat ~/.ssh/id_test", "look", None)] }, says("Checked.")]);
@@ -2369,7 +2375,7 @@ fn keys_and_secrets_stay_out_of_commands() {
     let results = results(&model);
     // rein has a key in its environment; the command doesn't.
     assert_eq!(results[0], "key=none\n[exit code 0]");
-    assert!(results[1].contains("Operation not permitted") && !results[1].lines().any(|line| line == "secret"), "{results:?}");
+    assert!(refused(&results[1]) && !results[1].lines().any(|line| line == "secret"), "{results:?}");
 }
 
 /// The sandbox is off unless you turn it on, as in Claude Code: then a
@@ -2412,7 +2418,6 @@ fn auto_without_the_sandbox_runs_every_command_but_what_asks() {
 /// `/sandbox` turns it on or off in any mode, there and then: on, a
 /// command that writes runs in edits without asking, and can't read what
 /// the walls hide; off, it asks. A pick isn't kept unless you say so.
-#[cfg(target_os = "macos")]
 #[test]
 fn sandbox_turns_the_walls_on_and_off_in_the_conversation() {
     let read = || Turn { out: vec![bash("cat ~/.ssh/id_test; touch made.txt", "write", None)] };
@@ -2423,7 +2428,7 @@ fn sandbox_turns_the_walls_on_and_off_in_the_conversation() {
     // Picked from the menu.
     term.keys("/sandbox\r");
     term.wait_for("the sandbox, in any mode");
-    term.wait_for("macOS Seatbelt");
+    term.wait_for(WALLS);
     term.keys("\x1b[A");
     term.wait_for("› on");
     term.keys("\r");
@@ -2436,7 +2441,7 @@ fn sandbox_turns_the_walls_on_and_off_in_the_conversation() {
     term.keys("go\r");
     term.wait_for("In the walls.");
     let walled = results(&model);
-    assert!(walled[0].contains("Operation not permitted") && !walled[0].contains("FAKE-sandbox-switch-secret"), "{walled:?}");
+    assert!(refused(&walled[0]) && !walled[0].contains("FAKE-sandbox-switch-secret"), "{walled:?}");
     assert!(term.dir.join("project/made.txt").exists() && !term.text().contains("Allow this"), "{}", term.text());
     // Typed.
     term.wait_for(IDLE);
@@ -2588,7 +2593,6 @@ fn a_mode_chosen_can_be_kept_for_new_conversations() {
     assert!(!term.text().contains("from now on?"), "{}", term.text());
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn a_command_cant_read_what_you_type() {
     // rein's terminal is the command's too: reading it would take your keys.
@@ -2598,7 +2602,7 @@ fn a_command_cant_read_what_you_type() {
     term.keys("read the terminal\r");
     term.wait_for("Tried.");
     let results = results(&model);
-    assert!(results[0].contains("Operation not permitted"), "{results:?}");
+    assert!(refused(&results[0]), "{results:?}");
 }
 
 #[cfg(target_os = "macos")]
@@ -2629,6 +2633,21 @@ print("leaked" if b"OPENAI_API_KEY=test" in buf.raw[: size.value] else ("kept" i
     term.wait_for(IDLE);
     term.keys("again\r");
     term.wait_for("Still signed in.");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn even_outside_the_sandbox_a_command_cant_read_the_environment_rein_started_with() {
+    // Linux keeps a process's first environment in /proc. Walled in, Landlock
+    // refuses that by itself; outside, only rein being undumpable does.
+    let command = "cat /proc/$PPID/comm /proc/$PPID/environ";
+    let model = Model::start(vec![Turn { out: vec![bash(command, "outside", Some("to look"))] }, says("Probed.")]).with_env("REIN_SANDBOX", "off").with_env("REIN_MODE", "auto");
+    let mut term = Term::start(&model, "proc-environment", 30, 100);
+    term.wait_for(IDLE);
+    term.keys("probe\r");
+    term.wait_for("Probed.");
+    let results = results(&model);
+    assert!(results[0].starts_with("rein\n") && refused(&results[0]) && !results[0].contains("OPENAI_API_KEY"), "{results:?}");
 }
 
 #[test]
@@ -3397,7 +3416,6 @@ fn pick(term: &mut Term, typed: &str) {
 /// Your own MCP server starts with rein, in the walls you gave it, and its
 /// tools are the model's from the first message: one your mcp.json allows
 /// runs, the rest ask, and the server can't read your home folder.
-#[cfg(target_os = "macos")]
 #[test]
 fn an_mcp_server_of_yours_starts_in_walls_of_its_own_and_its_tools_ask_unless_allowed() {
     let secret = std::env::temp_dir().join(format!("rein-screen-{}-mcp-yours", std::process::id())).join("home/.ssh/id_test");
@@ -3433,7 +3451,6 @@ fn an_mcp_server_of_yours_starts_in_walls_of_its_own_and_its_tools_ask_unless_al
 /// A server with no walls of its own runs outside the sandbox, as in
 /// Codex and Claude Code, whatever the mode, and with the sandbox on for
 /// commands: walls broke what servers need. A new mode says nothing of it.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_server_without_walls_of_its_own_runs_outside_the_sandbox_in_every_mode() {
     let secret = std::env::temp_dir().join(format!("rein-screen-{}-mcp-unset", std::process::id())).join("home/.ssh/id_test");
@@ -3457,7 +3474,6 @@ fn a_server_without_walls_of_its_own_runs_outside_the_sandbox_in_every_mode() {
 
 /// Read-only asks before a server's tool, as ask does: turned off, a
 /// lookup the mode is for, codegraph's, was lost to it.
-#[cfg(target_os = "macos")]
 #[test]
 fn read_only_asks_before_a_servers_tool_instead_of_turning_it_off() {
     let echo = || calls("mcp__fake__echo", json!({ "text": "hi" }));
@@ -3482,7 +3498,6 @@ fn read_only_asks_before_a_servers_tool_instead_of_turning_it_off() {
 /// A server whose tools are held back is named in the tool search, not
 /// shown: the model finds the tool it needs, which is added to its tools
 /// where it found it, and calls it. `/mcp` says they're found when needed.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_held_back_servers_tool_is_found_with_the_search_and_then_called() {
     let mut model = Model::start(vec![calls("tool_search", json!({ "query": "echo it back", "limit": null })), calls("mcp__fake__echo", json!({ "text": "hi" })), says("Echoed.")]);
@@ -3512,7 +3527,6 @@ fn a_held_back_servers_tool_is_found_with_the_search_and_then_called() {
 
 /// `/mcp` changes when the model is shown a server's tools: picked, it's
 /// kept in your mcp.json, and the next message holds them back.
-#[cfg(target_os = "macos")]
 #[test]
 fn mcp_chooses_when_the_model_is_shown_a_servers_tools() {
     let mut model = Model::start(vec![says("Shown."), says("Held back.")]);
@@ -3592,7 +3606,6 @@ const DOT: &[u8] = &[
 /// An image a tool gives reaches the model inside that tool's result: a
 /// file `read` opens, and a server's screenshot. The conversation's file
 /// names where each is kept, never holding its bytes.
-#[cfg(target_os = "macos")]
 #[test]
 fn an_image_a_tool_gives_reaches_the_model_inside_its_result() {
     let turn =
@@ -4103,7 +4116,6 @@ fn a_task_run_on_its_own_calls_a_skill_too() {
 /// A project's .mcp.json may be anyone's: its server starts only once
 /// you've said yes to it as it is, and is asked about again once it
 /// changes.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_projects_mcp_server_starts_only_once_you_say_yes_to_it_as_it_is() {
     let model = Model::start(Vec::new());
@@ -4158,7 +4170,6 @@ fn servers_tools(request: &Value) -> Vec<String> {
 /// `/mcp add` writes your mcp.json and starts the server, saying how it
 /// did; `/mcp allow` lets a tool run without asking, and `/mcp remove`
 /// stops it: each from the next message on, with nothing to edit by hand.
-#[cfg(target_os = "macos")]
 #[test]
 fn mcp_add_allow_and_remove_change_the_servers_without_editing_a_file() {
     let model = Model::start(vec![Turn { out: vec![Out::Call("mcp__fake__echo", json!({ "text": "hi" }))] }, says("Echoed."), says("No tools now.")]);
@@ -4201,7 +4212,6 @@ fn mcp_add_allow_and_remove_change_the_servers_without_editing_a_file() {
 /// A server that doesn't start in the sandbox is offered to run outside
 /// it, there and then: a yes writes it in your mcp.json and starts it, and
 /// nothing needs typing again.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_server_that_fails_in_the_sandbox_is_offered_to_run_outside_it() {
     let model = Model::start(Vec::new());
@@ -4225,7 +4235,6 @@ fn a_server_that_fails_in_the_sandbox_is_offered_to_run_outside_it() {
 
 /// `/mcp` lists the servers to pick one and change it: which of its tools
 /// run without asking, on and off, each kept in your mcp.json.
-#[cfg(target_os = "macos")]
 #[test]
 fn mcp_lets_you_pick_a_server_and_change_it_without_typing_its_name() {
     let mut model = Model::start(Vec::new());
@@ -4270,7 +4279,6 @@ fn mcp_lets_you_pick_a_server_and_change_it_without_typing_its_name() {
 /// `/mcp` lists each server once, in the list to pick from, a line each
 /// cut to the window: how it's doing, its tools counted, and where it runs.
 /// Picked, it shows its tools by name, or why it didn't start in full.
-#[cfg(target_os = "macos")]
 #[test]
 fn mcp_lists_each_server_once_a_line_each_cut_to_the_window() {
     let mut model = Model::start(Vec::new());
@@ -4299,7 +4307,6 @@ fn mcp_lists_each_server_once_a_line_each_cut_to_the_window() {
 /// A server that needs a variable you haven't set asks for it as rein
 /// starts, in dots: kept in rein's folder, filled in from then on, and
 /// hidden wherever it shows up.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_key_a_server_needs_is_asked_for_kept_and_hidden() {
     let mut model = Model::start(vec![Turn { out: vec![Out::Call("mcp__fake__given", json!({}))] }, says("Got it.")]);
@@ -4348,7 +4355,6 @@ fn fake_npx(name: &str) -> (PathBuf, String) {
 /// published each it finds, the real one first, asks for what it needs,
 /// shows what it runs, and once you say yes, adds it pinned to its version
 /// and starts it, its key asked for in dots and kept out of your mcp.json.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_server_is_added_by_name_from_the_mcp_registry() {
     let package = |id: &str| {
@@ -4400,7 +4406,6 @@ fn a_server_is_added_by_name_from_the_mcp_registry() {
 /// `/mcp import` finds the servers you set up in other apps, offers each
 /// to bring in, one another app has off left unmarked, and adds those you
 /// keep, each app's way of naming your variables read as rein's.
-#[cfg(target_os = "macos")]
 #[test]
 fn mcp_import_brings_your_servers_from_other_apps() {
     let mut model = Model::start(Vec::new());
@@ -4431,7 +4436,6 @@ fn mcp_import_brings_your_servers_from_other_apps() {
 /// rein registers itself, you sign in in the browser, it starts, and its
 /// tools are the model's. The token is kept only in rein's folder, and
 /// never reaches the model.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_server_at_a_url_is_signed_in_to_in_the_browser_and_its_tools_work() {
     let model = Model::start(vec![Turn { out: vec![Out::Call("mcp__far__hello", json!({}))] }, says("Far said hello.")]);
@@ -4480,7 +4484,6 @@ fn a_server_at_a_url_is_signed_in_to_in_the_browser_and_its_tools_work() {
 /// A server added with a key written in is kept in your mcp.json and
 /// nowhere else: the line isn't shown again or kept for ↑, and what the
 /// server says has the key hidden.
-#[cfg(target_os = "macos")]
 #[test]
 fn a_server_added_with_its_key_keeps_it_out_of_the_screen_history_and_conversation() {
     let model = Model::start(vec![Turn { out: vec![Out::Call("mcp__fake__given", json!({}))] }, says("Got it.")]);

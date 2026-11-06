@@ -1275,7 +1275,8 @@ mod tests {
         assert!(none.starts_with("No line matched never in 1s."), "{none}");
         assert!(waited.elapsed() >= Duration::from_millis(900), "it waited");
         let stopped = run(&tools, &call("background", json!({ "id": "b1", "action": "stop", "until": null, "seconds": null }))).await;
-        assert!(stopped.contains("was stopped.") && stopped.ends_with("bye\n"), "asked first, so it said goodbye: {stopped}");
+        // Not last: dash goes on to say "Terminated" of the sleep it was in.
+        assert!(stopped.contains("was stopped.") && stopped.contains("\nbye\n"), "asked first, so it said goodbye: {stopped}");
         assert!(tools.ended().await.is_empty(), "the model stopped it, so it knows");
         let unknown = run(&tools, &call("background", json!({ "id": "b9", "action": "read", "until": null, "seconds": null }))).await;
         assert_eq!(unknown, "error: there's no background command called b9; there are b1");
@@ -1561,7 +1562,9 @@ mod tests {
         let look = Run::Sandboxed(Access::Look.walls().unwrap());
         assert_eq!(tools.run(&bash_call("cat a.txt", None), look).await, "hi\n[exit code 0]", "a command that worked says nothing more");
         let answer = tools.run(&bash_call("echo x > a.txt", None), look).await;
-        assert!(answer.contains("Operation not permitted") && answer.contains("[exit code 1]\n[It ran in the sandbox with look access"), "{answer}");
+        // Seatbelt and Landlock refuse in different words, and sh's exit code
+        // differs too: what's rein's is the note.
+        assert!(!answer.contains("[exit code 0]") && answer.contains("]\n[It ran in the sandbox with look access"), "{answer}");
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "hi\n");
     }
 

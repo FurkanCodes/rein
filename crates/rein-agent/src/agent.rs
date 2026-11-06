@@ -2738,7 +2738,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_background_command_that_ends_mid_turn_is_told_with_the_next_step_once() {
-        let turns = vec![vec![in_background("bg", "echo built; exit 4")], vec![bash("wait", "sleep 0.6")], vec![Item::Assistant("Seen.".into())]];
+        // It ends when the second step says so: a Linux shell can finish before the next request, so it can't be left to timing.
+        let command = "until [ -e go ]; do sleep 0.01; done; echo built; exit 4";
+        let turns = vec![vec![in_background("bg", command)], vec![bash("wait", "touch go; sleep 0.6")], vec![Item::Assistant("Seen.".into())]];
         let mut agent = agent("bg-mid-turn", turns);
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("build in the background".into(), &mut person).await.unwrap();
@@ -2749,7 +2751,7 @@ mod tests {
         assert_eq!(notes(last), 1);
         // After the step it ended during, at the end of the conversation.
         let Some(Item::User(note)) = last.last() else { panic!("{last:?}") };
-        assert!(note.contains("b1 (echo built; exit 4) ended: [exit code 4]") && note.contains("\nbuilt"), "{note}");
+        assert!(note.contains(&format!("b1 ({command}) ended: [exit code 4]")) && note.contains("\nbuilt"), "{note}");
         assert!(matches!(&last[last.len() - 2], Item::ToolResult { call_id, .. } if call_id == "wait"));
         assert!(!compact::record(&agent.window.full).contains("ended: [exit code 4]"), "not as something you said");
     }
