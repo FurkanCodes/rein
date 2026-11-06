@@ -1229,6 +1229,13 @@ program that wants another conversation starts another `rein serve`.
   next message.
 - **Flags.** `rein serve` takes what a conversation takes, such as `--mode`,
   `--sandbox`, `-m` and `--name`, but no message: its client sends those.
+- **Saved conversations.** `session/list` gives them 100 at a time, the most
+  recently used first: those saved in `cwd`, or every project's without it,
+  with `nextCursor` while more follow. `session/load` opens one by its
+  `sessionId`, in the folder it was saved in, and says it back as updates
+  before it answers: what you typed, the model's answers and its steps, and
+  what other reins said as `heard` (see below). What rein added for the model
+  isn't shown. It needs a `rein serve` that holds no conversation yet.
 
 ### Agents side by side
 
@@ -1261,10 +1268,10 @@ can start turns. A client that doesn't say so, like Zed, gets none of this.
 ACP's own draft for sub-agents lets a client stop one, but not prompt or steer
 it, which is why each one is a `rein serve` here.
 
-Not there yet: continuing a saved conversation (`session/load`), MCP servers
-a client passes in `session/new`, which are ignored, images in a prompt, and
-rein's slash commands. What another rein sends in `trust` mode, or past 12
-turns in a row, waits in `/inbox`, which only a terminal has so far.
+Not there yet: MCP servers a client passes in `session/new`, which are
+ignored, images in a prompt, and rein's slash commands. What another rein
+sends in `trust` mode, or past 12 turns in a row, waits in `/inbox`, which
+only a terminal has so far.
 
 ## What's left of your limits
 

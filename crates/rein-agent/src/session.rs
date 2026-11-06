@@ -301,6 +301,9 @@ pub fn folder(sessions: &Path, cwd: &Path) -> PathBuf {
 /// A saved conversation, as listed for choosing one to continue.
 pub struct Summary {
     pub path: PathBuf,
+    pub id: String,
+    /// The folder it was held in.
+    pub cwd: PathBuf,
     /// When something was last added to it.
     pub modified: SystemTime,
     pub started: String,
@@ -312,16 +315,20 @@ pub struct Summary {
 
 /// The conversations saved in `folder`, the most recently used first.
 pub fn list(folder: &Path, limit: usize) -> Vec<Summary> {
-    let Ok(entries) = fs::read_dir(folder) else { return Vec::new() };
-    let mut files: Vec<(SystemTime, PathBuf)> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-        .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
-        .collect();
+    page(std::slice::from_ref(&folder.to_owned()), 0, limit).0
+}
+
+/// The conversations saved in `folders`, the most recently used first:
+/// `limit` of them after the first `skip`, and whether there are more. Only
+/// those are read, as a conversation's file can be long.
+pub fn page(folders: &[PathBuf], skip: usize, limit: usize) -> (Vec<Summary>, bool) {
+    let mut files: Vec<(SystemTime, PathBuf)> =
+        folders.iter().flat_map(|folder| saved_in(folder)).filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path))).collect();
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    files
+    let more = files.len() > skip.saturating_add(limit);
+    let summaries = files
         .into_iter()
+        .skip(skip)
         .take(limit)
         .filter_map(|(modified, path)| {
             let text = fs::read_to_string(&path).ok()?;
@@ -333,9 +340,32 @@ pub fn list(folder: &Path, limit: usize) -> Vec<Summary> {
                     _ => None,
                 })
                 .collect();
-            Some(Summary { path, modified, started: header.started, first: typed.first().cloned(), messages: typed.len() })
+            Some(Summary { path, id: header.id, cwd: header.cwd, modified, started: header.started, first: typed.first().cloned(), messages: typed.len() })
         })
-        .collect()
+        .collect();
+    (summaries, more)
+}
+
+/// The files of conversations in `folder`.
+fn saved_in(folder: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(folder) else { return Vec::new() };
+    entries.filter_map(|entry| entry.ok()).map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|ext| ext == "jsonl")).collect()
+}
+
+/// Each project's folder under `sessions`.
+pub fn folders(sessions: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(sessions) else { return Vec::new() };
+    entries.filter_map(|entry| entry.ok()).map(|entry| entry.path()).filter(|path| path.is_dir()).collect()
+}
+
+/// The conversation `id` in `folder`, by what its file says: the name holds
+/// only the start of the id, and `id` may come from another program, so it
+/// never becomes part of a path.
+pub fn find(folder: &Path, id: &str) -> Option<PathBuf> {
+    saved_in(folder).into_iter().find(|path| {
+        let short: String = id.chars().take(8).collect();
+        path.file_stem().is_some_and(|stem| stem.to_string_lossy().ends_with(&format!("-{short}"))) && peek(path).is_some_and(|header| header.id == id)
+    })
 }
 
 #[cfg(test)]
@@ -482,6 +512,44 @@ mod tests {
         assert_eq!(listed.iter().map(|s| s.first.clone().unwrap()).collect::<Vec<_>>(), ["first", "second"]);
         assert_eq!(listed[0].messages, 2);
         assert!(list(&dir.join("missing"), 10).is_empty());
+    }
+
+    #[test]
+    fn a_page_says_whether_more_follow_and_reads_across_projects() {
+        let dir = dir("page");
+        let (first, second) = (dir.join("first"), dir.join("second"));
+        for (i, folder) in [&first, &second, &first].into_iter().enumerate() {
+            let mut session = Session::new(folder, &format!("s{i}"), header(&format!("id{i}")));
+            session.append(&Item::User(format!("message {i}"))).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        fs::create_dir_all(dir.join("empty")).unwrap();
+        fs::write(dir.join("a-file"), "not a project").unwrap();
+        let mut found = folders(&dir);
+        found.sort();
+        assert_eq!(found, [dir.join("empty"), first.clone(), second.clone()]);
+        let ids = |listed: &[Summary]| listed.iter().map(|summary| summary.id.clone()).collect::<Vec<_>>();
+        let (head, more) = page(&found, 0, 2);
+        assert_eq!((ids(&head), more), (vec!["id2".to_owned(), "id1".to_owned()], true));
+        let (rest, more) = page(&found, 2, 2);
+        assert_eq!((ids(&rest), more), (vec!["id0".to_owned()], false));
+        assert_eq!(head[0].cwd, PathBuf::from("/work"));
+        let (past_the_end, more) = page(&found, usize::MAX, 2);
+        assert!(past_the_end.is_empty() && !more);
+    }
+
+    #[test]
+    fn a_conversation_is_found_by_its_whole_id_as_its_file_says() {
+        let dir = dir("find");
+        let mut wanted = Session::new(&dir, "a", header("abcdefgh-one"));
+        wanted.append(&Item::User("mine".into())).unwrap();
+        let mut other = Session::new(&dir, "b", header("abcdefgh-two"));
+        other.append(&Item::User("not mine".into())).unwrap();
+        let path = wanted.path().to_owned();
+        assert_eq!(find(&dir, "abcdefgh-one"), Some(path), "the same start, another conversation");
+        assert_eq!(find(&dir, "abcdefgh"), None, "a start isn't an id");
+        assert_eq!(find(&dir, "../../keys"), None);
+        assert_eq!(find(&dir.join("missing"), "abcdefgh-one"), None);
     }
 
     #[test]

@@ -21,12 +21,14 @@ use std::rc::Rc;
 
 use rein_agent::agent::{Agent, Heard, Llm, Outcome};
 use rein_agent::permissions::{Mode, Sandboxing};
+use rein_agent::session;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::args::{AskArgs, Resume};
 use crate::conversation::{self, Opened, Start, step_limit};
+use crate::format::{shorten, utc_stamp};
 use crate::peers::node::Incoming as Sent;
 use crate::peers::{self, State, talk};
 use crate::settings::{self, Settings};
@@ -35,6 +37,11 @@ use ui::Served;
 use wire::{Incoming, Refused, Request};
 
 type Input = Lines<BufReader<Stdin>>;
+
+/// How many saved conversations `session/list` gives at once.
+const PAGE: usize = 100;
+/// The longest a conversation's title is.
+const TITLE: usize = 70;
 
 /// What the parts of `serve` share: the way out, and what came in for a
 /// turn that's running.
@@ -177,13 +184,27 @@ async fn handle(
             link.panes.set(panes);
             Answer::Result(initialized())
         }
-        Request::NewSession { .. } if session.is_some() => Answer::Refused(Refused::new("rein serve holds one conversation: start another rein serve for another")),
-        Request::NewSession { cwd } => match open(&cwd, flags, http, link).await {
+        Request::NewSession { .. } | Request::LoadSession { .. } if session.is_some() => {
+            Answer::Refused(Refused::new("rein serve holds one conversation: start another rein serve for another"))
+        }
+        Request::NewSession { cwd } => match open(&cwd, Resume::New, flags, http, link).await {
             Ok(opened) => {
                 let result = json!({ "sessionId": opened.id, "modes": modes(opened.agent.permissions.mode, opened.sandboxing) });
                 *session = Some(opened);
                 Answer::Result(result)
             }
+            Err(said) => Answer::Refused(Refused::new(said)),
+        },
+        Request::LoadSession { session: id, cwd } => match load(&id, &cwd, flags, http, link).await {
+            Ok(opened) => {
+                let result = json!({ "modes": modes(opened.agent.permissions.mode, opened.sandboxing) });
+                *session = Some(opened);
+                Answer::Result(result)
+            }
+            Err(said) => Answer::Refused(Refused::new(said)),
+        },
+        Request::ListSessions { cwd, skip } => match listed(cwd.as_deref(), skip) {
+            Ok(result) => Answer::Result(result),
             Err(said) => Answer::Refused(Refused::new(said)),
         },
         Request::Prompt { session: id, text } => match mine(session, &id) {
@@ -221,7 +242,8 @@ fn initialized() -> Value {
     json!({
         "protocolVersion": wire::VERSION,
         "agentCapabilities": {
-            "loadSession": false,
+            "loadSession": true,
+            "sessionCapabilities": { "list": {} },
             "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
             "mcpCapabilities": { "http": false, "sse": false },
             "_meta": { (wire::STEERS): true, (wire::PANES): true },
@@ -246,12 +268,13 @@ fn modes(mode: Mode, sandboxing: Sandboxing) -> Value {
 
 /// Opens the conversation in `cwd`, as a task run on its own: nobody's there
 /// for what a project brings to wait on, so that stays off.
-async fn open(cwd: &Path, flags: &[String], http: &rein_llm::reqwest::Client, link: &Link) -> CliResult<Session> {
+async fn open(cwd: &Path, resume: Resume, flags: &[String], http: &rein_llm::reqwest::Client, link: &Link) -> CliResult<Session> {
     std::env::set_current_dir(cwd).map_err(|e| format!("can't go into {}: {e}", cwd.display()))?;
     let dir = config_dir()?;
     let settings = Settings::load(&dir.join(settings::FILE))?;
     let compact_at = settings.get("compact_at", "REIN_COMPACT_AT");
-    let args = AskArgs::parse(flags.to_vec(), &settings)?;
+    let mut args = AskArgs::parse(flags.to_vec(), &settings)?;
+    args.resume = resume;
     let (mode, max_steps) = (args.mode, args.max_steps);
     let (joining, name, workspace, child) = (args.joining, args.name.clone(), args.workspace.clone(), args.child.clone());
     // Its task waits on its parent, and nothing here would ever fetch it.
@@ -271,10 +294,49 @@ async fn open(cwd: &Path, flags: &[String], http: &rein_llm::reqwest::Client, li
     }
     // Someone's there, to press stop.
     agent.step_limit = step_limit(mode, false, max_steps);
-    let id = format!("rein-{}", std::process::id());
+    // The saved conversation's own, for `session/load` to find it by.
+    let id = agent.session().map(|session| session.header().id.clone()).ok_or("the conversation has no file")?;
     let sandboxing = agent.permissions.sandboxing();
     let served = Served::new(id.clone(), link.clone(), terminal);
     Ok(Session { id, agent, served, max_steps, sandboxing, in_a_row: 0, _setup: setup })
+}
+
+/// Where the conversations held in `cwd` are saved.
+fn saved_in(cwd: &Path) -> CliResult<std::path::PathBuf> {
+    // As `open` will find it: on macOS /tmp is /private/tmp.
+    let root = std::fs::canonicalize(cwd).map_err(|e| format!("can't find {}: {e}", cwd.display()))?;
+    Ok(session::folder(&config_dir()?.join("sessions"), &root))
+}
+
+/// Opens the conversation `id`, saved in `cwd`, and says it so far.
+async fn load(id: &str, cwd: &Path, flags: &[String], http: &rein_llm::reqwest::Client, link: &Link) -> CliResult<Session> {
+    let path = session::find(&saved_in(cwd)?, id).ok_or_else(|| format!("there's no saved conversation {id} in {}", cwd.display()))?;
+    let opened = open(cwd, Resume::Saved(path), flags, http, link).await?;
+    opened.served.replay(opened.agent.full());
+    Ok(opened)
+}
+
+/// A page of saved conversations: `cwd`'s, or every project's, most
+/// recently used first, with a cursor to the next page if there's one.
+fn listed(cwd: Option<&Path>, skip: usize) -> CliResult<Value> {
+    let folders = match cwd {
+        Some(cwd) => vec![saved_in(cwd)?],
+        None => session::folders(&config_dir()?.join("sessions")),
+    };
+    let (saved, more) = session::page(&folders, skip, PAGE);
+    let sessions: Vec<Value> = saved
+        .iter()
+        .map(|saved| {
+            // A sub-agent's first message is its task, from another rein.
+            let first = saved.first.as_deref().map(|first| rein_agent::peers::unheard(first).map_or(first, |(_, text)| text));
+            json!({ "sessionId": saved.id, "cwd": saved.cwd, "title": first.map(|first| shorten(first, TITLE)), "updatedAt": utc_stamp(saved.modified) })
+        })
+        .collect();
+    let mut listed = json!({ "sessions": sessions });
+    if more {
+        listed["nextCursor"] = json!(skip.saturating_add(PAGE).to_string());
+    }
+    Ok(listed)
 }
 
 /// The next thing another rein sends; never, before there's a conversation

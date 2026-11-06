@@ -147,13 +147,15 @@ variable, like $ANTHROPIC_API_KEY, or from `rein login <provider>`. Signed in
 with ChatGPT, OpenAI's models use your plan.";
 
 /// Which conversation to work in.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Resume {
     New,
     /// The most recently used one in this folder.
     Latest,
     /// One the user picks from a list.
     Pick,
+    /// The one in this file, as a program asked for it by its id.
+    Saved(std::path::PathBuf),
 }
 
 pub(crate) struct AskArgs {

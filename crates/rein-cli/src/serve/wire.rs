@@ -59,11 +59,33 @@ impl Refused {
 /// What a client can ask of rein.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Request {
-    Initialize { panes: bool },
-    NewSession { cwd: PathBuf },
-    Prompt { session: String, text: String },
-    SetMode { session: String, mode: Mode },
-    Steer { session: String, text: String },
+    Initialize {
+        panes: bool,
+    },
+    NewSession {
+        cwd: PathBuf,
+    },
+    /// Saved conversations: `cwd`'s, or all of them, after the first `skip`.
+    ListSessions {
+        cwd: Option<PathBuf>,
+        skip: usize,
+    },
+    LoadSession {
+        session: String,
+        cwd: PathBuf,
+    },
+    Prompt {
+        session: String,
+        text: String,
+    },
+    SetMode {
+        session: String,
+        mode: Mode,
+    },
+    Steer {
+        session: String,
+        text: String,
+    },
 }
 
 /// One line that came in.
@@ -93,6 +115,20 @@ struct Line {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NewSession {
+    cwd: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListSessions {
+    cwd: Option<PathBuf>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadSession {
+    session_id: String,
     cwd: PathBuf,
 }
 
@@ -154,6 +190,13 @@ fn request(method: &str, params: Value) -> Result<Request, Refused> {
     match method {
         "initialize" => Ok(Request::Initialize { panes: params["clientCapabilities"]["_meta"][PANES] == true }),
         "session/new" => parse::<NewSession>(params).map(|new| Request::NewSession { cwd: new.cwd }),
+        "session/list" => {
+            // Nothing's required of it, so a client may send no params.
+            let list: ListSessions = parse(if params.is_null() { json!({}) } else { params })?;
+            let skip = list.cursor.map_or(Ok(0), |cursor| cursor.parse().map_err(|_| Refused::params(format!("that isn't a cursor rein gave: {cursor}"))))?;
+            Ok(Request::ListSessions { cwd: list.cwd, skip })
+        }
+        "session/load" => parse::<LoadSession>(params).map(|load| Request::LoadSession { session: load.session_id, cwd: load.cwd }),
         "session/prompt" => {
             let prompt: Prompt = parse(params)?;
             Ok(Request::Prompt { session: prompt.session_id, text: text_of(prompt.prompt)? })
@@ -269,9 +312,18 @@ mod tests {
         assert_eq!(asked(image).unwrap_err().code, INVALID_PARAMS);
         let mode = json!({ "id": 1, "method": "session/set_mode", "params": { "sessionId": "s", "modeId": "yolo" } });
         assert_eq!(asked(mode).unwrap_err().code, INVALID_PARAMS);
+        let cursor = json!({ "id": 1, "method": "session/list", "params": { "cursor": "anywhere" } });
+        assert_eq!(asked(cursor).unwrap_err().code, INVALID_PARAMS);
         let unknown = json!({ "id": 1, "method": "session/fork", "params": {} });
         assert_eq!(asked(unknown).unwrap_err().code, METHOD_NOT_FOUND);
         assert!(matches!(Incoming::read("not json"), Incoming::Unreadable(Refused { code: PARSE_ERROR, .. })));
+    }
+
+    #[test]
+    fn a_list_needs_nothing_and_a_page_goes_by_the_cursor_rein_gave() {
+        assert_eq!(asked(json!({ "id": 1, "method": "session/list" })), Ok(Request::ListSessions { cwd: None, skip: 0 }));
+        let next = json!({ "id": 1, "method": "session/list", "params": { "cwd": "/p", "cursor": "100" } });
+        assert_eq!(asked(next), Ok(Request::ListSessions { cwd: Some("/p".into()), skip: 100 }));
     }
 
     #[test]

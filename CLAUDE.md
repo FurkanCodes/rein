@@ -366,6 +366,9 @@ finding. Each says why in a line.
   them. Another rein's words are never a `user_message_chunk`, even over the
   protocol: they can't approve anything, and a client mustn't show them as
   yours.
+- An id a client sends is never made into a path: a saved conversation is
+  found by reading what's in the folder (`session::find`), so `../../keys`
+  finds nothing.
 - What a turn leaves for the others (a task's result, the steps it ran) is
   noted in `Terminal`'s `step_*` methods, which any `Ui` calls: written into
   the terminal's drawing, a sub-agent in `rein serve` would report nothing.

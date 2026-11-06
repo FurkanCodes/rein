@@ -4968,6 +4968,29 @@ impl Client {
         self.answer(id)["result"]["sessionId"].as_str().unwrap_or_else(|| panic!("no conversation: {:#?}", self.seen)).to_owned()
     }
 
+    /// Closes this rein and starts another in its folder, up to `initialize`.
+    fn start_again(mut self, model: &Model) -> (Client, Client) {
+        self.stdin = None;
+        self.child.wait().unwrap();
+        let serve = ["serve".to_owned()];
+        let mut again = Client::run(model, env!("CARGO_BIN_EXE_rein"), &serve, self.dir.clone(), true);
+        let id = again.call("initialize", json!({ "protocolVersion": 1, "clientCapabilities": {} }));
+        again.answer(id);
+        // Holds the folder until the test ends.
+        (self, again)
+    }
+
+    fn load(&mut self, session: &str) -> Value {
+        let cwd = self.project();
+        let id = self.call("session/load", json!({ "sessionId": session, "cwd": cwd, "mcpServers": [] }));
+        self.answer(id)
+    }
+
+    /// The kinds of update seen so far, in order.
+    fn updates(&self) -> Vec<String> {
+        self.seen.iter().filter_map(|message| message["params"]["update"]["sessionUpdate"].as_str().map(str::to_owned)).collect()
+    }
+
     /// What rein asks next of this client, under `method`.
     fn asked(&mut self, method: &str) -> Value {
         self.until(method, |message| message["method"] == method)
@@ -5320,6 +5343,134 @@ fn a_summary_of_the_conversation_isnt_the_models_answer() {
         .collect();
     assert!(thought.contains("Goal: greet."), "{thought}");
     assert_eq!(rein.said(), "Hello.");
+}
+
+#[test]
+fn a_program_lists_a_saved_conversation_reopens_it_and_goes_on() {
+    let model = Model::start(vec![runs("echo hi"), says("First answer."), says("Second answer.")]);
+    let mut first = Client::start(&model, "load");
+    let session = first.open();
+    let turn = first.prompt(&session, "say hi");
+    first.allow();
+    assert_eq!(first.answer(turn)["result"]["stopReason"], "end_turn");
+
+    let (_first, mut again) = first.start_again(&model);
+    assert_eq!(again.seen[0]["result"]["agentCapabilities"]["loadSession"], true);
+    assert_eq!(again.seen[0]["result"]["agentCapabilities"]["sessionCapabilities"]["list"], json!({}));
+    let cwd = again.project();
+    for asked_for in [json!({ "cwd": cwd }), json!({})] {
+        let id = again.call("session/list", asked_for);
+        let listed = again.answer(id)["result"].clone();
+        let sessions = listed["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "{listed}");
+        assert_eq!((&sessions[0]["sessionId"], &sessions[0]["title"]), (&json!(session), &json!("say hi")));
+        assert_eq!(std::fs::canonicalize(sessions[0]["cwd"].as_str().unwrap()).unwrap(), std::fs::canonicalize(&cwd).unwrap());
+        let updated = sessions[0]["updatedAt"].as_str().unwrap();
+        assert!(updated.len() == 20 && updated.ends_with('Z') && updated.contains('T'), "{updated}");
+        assert_eq!(listed.get("nextCursor"), None);
+    }
+
+    let loaded = again.load(&session);
+    assert_eq!(loaded["result"]["modes"]["currentModeId"], "ask");
+    assert_eq!(again.updates(), ["user_message_chunk", "tool_call", "tool_call_update", "agent_message_chunk"]);
+    let said = again.seen.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+    assert!(said.contains("say hi") && said.contains("First answer.") && said.contains("hi\\n[exit code 0]"), "{said}");
+    assert!(!said.contains("<environment>"), "what rein added for the model isn't something you said: {said}");
+    let step = again.seen.iter().find(|message| message["params"]["update"]["sessionUpdate"] == "tool_call_update").unwrap();
+    assert_eq!(step["params"]["update"]["status"], "completed");
+
+    let turn = again.prompt(&session, "and again");
+    assert_eq!(again.answer(turn)["result"]["stopReason"], "end_turn");
+    let asked = model.requests().last().unwrap().to_string();
+    assert!(asked.contains("say hi") && asked.contains("First answer.") && asked.contains("and again"), "it remembers: {asked}");
+    assert_eq!(again.said().matches("Second answer.").count(), 1);
+}
+
+#[test]
+fn what_another_rein_said_stays_its_own_in_a_reopened_conversation() {
+    let (model, mut rein, session, turn, asked) = asks_for_a_pane("again", vec![says("Started tests."), says("Noted."), says("Back again.")]);
+    let child_model = Model::start(vec![runs("true"), says("They pass.")]);
+    let mut tests = Client::pane(&rein, &child_model, &asked);
+    tests.open_panes();
+    rein.reply(&asked, &json!({}));
+    rein.answer(turn);
+    tests.allow();
+    rein.asked(TURN_ENDED);
+    drop(tests);
+
+    let (_rein, mut again) = rein.start_again(&model);
+    again.load(&session);
+    let theirs = again.seen.iter().find(|message| message["method"] == HEARD).unwrap_or_else(|| panic!("{:#?}", again.seen));
+    assert_eq!(theirs["params"]["from"], "tests");
+    assert!(theirs["params"]["text"].as_str().unwrap().contains("They pass."), "{theirs}");
+    let yours: Vec<&Value> = again
+        .seen
+        .iter()
+        .filter(|message| message["params"]["update"]["sessionUpdate"] == "user_message_chunk")
+        .map(|message| &message["params"]["update"]["content"]["text"])
+        .collect();
+    assert_eq!(yours, [&json!("get the tests run")], "only what you typed is yours");
+}
+
+#[test]
+fn a_conversation_is_reopened_only_in_a_rein_with_room_for_it() {
+    let model = Model::start(vec![says("Hello.")]);
+    let mut rein = Client::start(&model, "room");
+    let session = rein.open();
+    let turn = rein.prompt(&session, "hi");
+    rein.answer(turn);
+    assert!(rein.load(&session)["error"]["message"].as_str().unwrap().contains("holds one conversation"));
+    let (_rein, mut again) = rein.start_again(&model);
+    assert!(again.load("not-a-conversation")["error"]["message"].as_str().unwrap().contains("no saved conversation"), "{:#?}", again.seen);
+    let id = again.call("session/load", json!({ "sessionId": session, "cwd": "/nowhere/at/all", "mcpServers": [] }));
+    assert!(again.answer(id)["error"].is_object());
+    assert!(again.load(&session)["result"]["modes"].is_object(), "a failed try leaves it free: {:#?}", again.seen);
+}
+
+#[test]
+fn a_list_for_one_folder_leaves_out_the_others() {
+    let model = Model::start(vec![says("Hello."), says("Hello there.")]);
+    let mut rein = Client::start(&model, "folders");
+    let here = rein.open();
+    let turn = rein.prompt(&here, "hi");
+    rein.answer(turn);
+    let (rein, mut elsewhere) = rein.start_again(&model);
+    let other = rein.dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let id = elsewhere.call("session/new", json!({ "cwd": other, "mcpServers": [] }));
+    let there = elsewhere.answer(id)["result"]["sessionId"].as_str().unwrap().to_owned();
+    let turn = elsewhere.prompt(&there, "hi there");
+    elsewhere.answer(turn);
+    let ids = |listed: &Value| listed["result"]["sessions"].as_array().unwrap().iter().map(|saved| saved["sessionId"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    let cwd = elsewhere.project();
+    let id = elsewhere.call("session/list", json!({ "cwd": cwd }));
+    assert_eq!(ids(&elsewhere.answer(id)), std::slice::from_ref(&here));
+    let id = elsewhere.call("session/list", json!({ "cwd": other }));
+    assert_eq!(ids(&elsewhere.answer(id)), std::slice::from_ref(&there));
+    let id = elsewhere.call("session/list", json!({}));
+    assert_eq!(ids(&elsewhere.answer(id)), [there, here], "every project's, the latest first");
+}
+
+#[test]
+fn a_long_list_of_conversations_comes_in_pages() {
+    let model = Model::start(vec![says("Hello.")]);
+    let mut rein = Client::start(&model, "pages");
+    let session = rein.open();
+    let turn = rein.prompt(&session, "hi");
+    rein.answer(turn);
+    let (rein, mut again) = rein.start_again(&model);
+    let sessions = rein.dir.join("home/sessions");
+    let folder = std::fs::read_dir(&sessions).unwrap().next().unwrap().unwrap().path();
+    let saved = std::fs::read_dir(&folder).unwrap().next().unwrap().unwrap().path();
+    for n in 0..100 {
+        std::fs::copy(&saved, folder.join(format!("copy{n}-x.jsonl"))).unwrap();
+    }
+    let id = again.call("session/list", json!({}));
+    let page = again.answer(id)["result"].clone();
+    assert_eq!((page["sessions"].as_array().unwrap().len(), &page["nextCursor"]), (100, &json!("100")));
+    let id = again.call("session/list", json!({ "cursor": "100" }));
+    let page = again.answer(id)["result"].clone();
+    assert_eq!((page["sessions"].as_array().unwrap().len(), page.get("nextCursor")), (1, None));
 }
 
 #[test]

@@ -4,10 +4,11 @@
 use std::collections::HashSet;
 
 use rein_agent::agent::{Approval, Compacted, Heard, Ui};
+use rein_agent::compact;
 use rein_agent::peers::SpawnArgs;
 use rein_agent::permissions::Rule;
 use rein_agent::tools::{ERROR, ToolName};
-use rein_llm::{ToolCall, Usage};
+use rein_llm::{Item, ToolCall, Usage};
 use serde_json::{Value, json};
 
 use super::{Link, wire};
@@ -68,12 +69,35 @@ impl Served {
         if !self.announced.remove(&call.call_id) {
             self.update(&tool_call(call, status));
         }
-        let content = [json!({ "type": "content", "content": { "type": "text", "text": said } })];
-        self.update(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": call.call_id, "status": status, "content": content }));
+        self.update(&result_of(&call.call_id, status, said));
     }
 
     fn used(&self, tokens: u64) {
         self.update(&json!({ "sessionUpdate": "usage_update", "used": tokens, "size": self.terminal.context_limit }));
+    }
+
+    /// Says the conversation so far, as `session/load` asks: what you typed,
+    /// what other reins said, the model's answers and its steps. What rein
+    /// added for the model isn't anything you said, and isn't shown.
+    pub(super) fn replay(&self, items: &[Item]) {
+        for item in items {
+            match item {
+                Item::User(_) => {
+                    if let Some(said) = compact::typed(item) {
+                        match rein_agent::peers::unheard(said) {
+                            Some((from, text)) => self.link.send(wire::heard(&self.session, from, text)),
+                            None => self.chunk("user_message_chunk", said),
+                        }
+                    }
+                }
+                Item::Assistant(text) => self.chunk("agent_message_chunk", text),
+                // Failed, until its result says otherwise: a turn cut off
+                // may have left it with none.
+                Item::ToolCall(call) => self.update(&tool_call(call, "failed")),
+                Item::ToolResult { call_id, output } => self.update(&result_of(call_id, finished(output), output)),
+                Item::Found { .. } | Item::Image { .. } | Item::Opaque(_) => {}
+            }
+        }
     }
 
     /// Asks whether `call` may go ahead.
@@ -127,6 +151,17 @@ impl Served {
         node.forget_child(&id);
         format!("{ERROR}the client didn't open a pane for sub-agent {}", child.name)
     }
+}
+
+/// The word for how a step went, from what it gave.
+fn finished(output: &str) -> &'static str {
+    if rein_agent::agent::failed(output) { "failed" } else { "completed" }
+}
+
+/// The update saying what the call `id` came to.
+fn result_of(id: &str, status: &str, said: &str) -> Value {
+    let content = [json!({ "type": "content", "content": { "type": "text", "text": said } })];
+    json!({ "sessionUpdate": "tool_call_update", "toolCallId": id, "status": status, "content": content })
 }
 
 fn tool_call(call: &ToolCall, status: &str) -> Value {
@@ -220,7 +255,7 @@ impl Ui for Served {
     fn tool_finished(&mut self, call: &ToolCall, output: &str) {
         let outcome = steps::outcome(call, output, self.terminal.err);
         self.terminal.step_finished(call, &outcome);
-        self.finish(call, if rein_agent::agent::failed(output) { "failed" } else { "completed" }, output);
+        self.finish(call, finished(output), output);
     }
 
     fn usage(&mut self, usage: &Usage) {

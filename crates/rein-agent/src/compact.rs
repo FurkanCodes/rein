@@ -101,7 +101,7 @@ fn rein_note(text: &str) -> bool {
 }
 
 /// A message the user actually typed: not rein's first message, not a summary.
-fn typed(item: &Item) -> Option<&str> {
+pub fn typed(item: &Item) -> Option<&str> {
     match item {
         // rein's notes of the skills, background commands and checks, and
         // what your hooks said, aren't anything you said.

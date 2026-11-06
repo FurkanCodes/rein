@@ -62,6 +62,19 @@ impl LocalTime {
     }
 }
 
+/// `time` in UTC, as ISO 8601 has it: `2026-11-07T09:30:00Z`.
+pub(crate) fn utc_stamp(time: SystemTime) -> String {
+    let seconds = time.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as libc::time_t;
+    // SAFETY: an all-zero `tm` is a valid value, and gmtime_r only writes
+    // into the one we pass.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::gmtime_r(&seconds, &mut tm) }.is_null() {
+        return "1970-01-01T00:00:00Z".to_owned();
+    }
+    format!("{}-{:02}-{:02}T{:02}:{:02}:{:02}Z", i64::from(tm.tm_year) + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 pub(crate) fn local_time(time: SystemTime) -> LocalTime {
     let seconds = time.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as libc::time_t;
     // SAFETY: an all-zero `tm` is a valid value, and localtime_r only

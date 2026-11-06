@@ -72,19 +72,21 @@ pub(crate) async fn open(http: &rein_llm::reqwest::Client, args: AskArgs, compac
     }
     let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
     let folder = session::folder(&dir.join("sessions"), &root);
-    let latest = match args.resume {
+    // The conversation, where it's known without asking.
+    let known = match &args.resume {
         Resume::Latest => match session::list(&folder, 1).into_iter().next() {
             Some(latest) => Some(latest.path),
             None => return Err("no saved conversation in this folder yet".into()),
         },
-        _ => None,
+        Resume::Saved(path) => Some(path.clone()),
+        Resume::New | Resume::Pick => None,
     };
     let wanted = args.model.clone().unwrap_or_else(|| crate::connect::default_model(&providers, &keys));
     // Whoever serves the model, as soon as that's known: the model list,
     // which says how big each model's context window is, loads while
     // everything else gets ready. A model you're not signed in for waits:
     // once the box is up, it asks you to sign in.
-    let early = if args.model_given || args.resume == Resume::New { Some(wanted.clone()) } else { latest.as_deref().and_then(session::peek).map(|header| header.model) };
+    let early = if args.model_given || args.resume == Resume::New { Some(wanted.clone()) } else { known.as_deref().and_then(session::peek).map(|header| header.model) };
     let early = early.filter(|spec| alone || !crate::connect::unpaid(spec, &providers, &keys));
     if !alone {
         crate::ui::logo::show(&root, early.as_deref());
@@ -117,7 +119,7 @@ pub(crate) async fn open(http: &rein_llm::reqwest::Client, args: AskArgs, compac
     let mcp = crate::mcp::open(&dir, &root, sandbox.clone(), http.clone(), &mut terminal, !alone).await;
     let saved = match args.resume {
         Resume::New => None,
-        Resume::Latest => latest,
+        Resume::Latest | Resume::Saved(_) => known,
         Resume::Pick => match pick(&folder, &mut terminal).await? {
             Some(path) => Some(path),
             None => return Ok(None),
