@@ -97,14 +97,20 @@ pub fn is_summary(item: &Item) -> bool {
 
 /// `text` is a note rein added, not something the user said.
 fn rein_note(text: &str) -> bool {
-    crate::skills::is_note(text) || crate::hooks::is_note(text) || crate::background::is_note(text) || crate::check::is_note(text)
+    crate::skills::is_note(text)
+        || crate::hooks::is_note(text)
+        || crate::background::is_note(text)
+        || crate::check::is_note(text)
+        || crate::peers::is_note(text)
+        || crate::agent::is_undo_note(text)
 }
 
 /// A message the user actually typed: not rein's first message, not a summary.
 pub fn typed(item: &Item) -> Option<&str> {
     match item {
-        // rein's notes of the skills, background commands and checks, and
-        // what your hooks said, aren't anything you said.
+        // rein's notes of the skills, background commands, checks, undos and
+        // other reins' changes, and what your hooks said, aren't anything
+        // you said.
         Item::User(text) if !crate::context::is_context(item) && !is_summary(item) && !rein_note(text) => Some(text),
         _ => None,
     }
@@ -528,6 +534,12 @@ mod tests {
     use rein_llm::ToolCall;
 
     use super::*;
+
+    #[test]
+    fn a_note_of_another_reins_change_isnt_what_you_typed() {
+        assert_eq!(typed(&Item::User("fix it".into())), Some("fix it"));
+        assert_eq!(typed(&Item::User(crate::peers::changed("api", "src/a.rs"))), None);
+    }
 
     #[test]
     fn an_image_from_before_the_last_messages_makes_room_with_a_note() {

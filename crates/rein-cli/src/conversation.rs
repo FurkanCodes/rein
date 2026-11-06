@@ -206,9 +206,13 @@ pub(crate) async fn open(http: &rein_llm::reqwest::Client, args: AskArgs, compac
     // Only a conversation joins the others: a task done on its own has no
     // one to answer what they send.
     let child = args.child.as_ref().map(|(pid, id)| (*pid, id.as_str()));
-    if !alone && crate::peers::talk::join(args.joining, args.name.as_deref(), args.workspace.as_deref(), child, args.strip, &dir, &root, args.mode, &mut terminal).await {
-        // A sub-agent doesn't start sub-agents: one level, no further.
-        agent = if child.is_some() { agent.with_child_peer_tools() } else { agent.with_peer_tools() };
+    if !alone {
+        // What went wrong it has said on screen, and a tab goes on.
+        let _ = crate::peers::talk::join(args.joining, args.name.as_deref(), args.workspace.as_deref(), child, args.strip, &dir, &root, args.mode, &mut terminal).await;
+        if terminal.peers.is_some() {
+            // A sub-agent doesn't start sub-agents: one level, no further.
+            agent = if child.is_some() { agent.with_child_peer_tools() } else { agent.with_peer_tools() };
+        }
     }
     agent.max_output = max_output;
     agent.reasoning_effort = args.effort;

@@ -220,7 +220,6 @@ struct Shared {
 #[derive(Debug, Clone)]
 pub(crate) struct Child {
     /// What it's for, which is its name.
-    #[allow(dead_code)]
     pub(crate) role: String,
     /// The task, until it's claimed.
     task: Option<String>,
@@ -277,7 +276,7 @@ impl Node {
                 }
                 name
             }
-            None => super::free_name(&super::default_name(root), &peers),
+            None => super::free_name(&super::default_name(root), &peers.iter().map(|peer| peer.name.clone()).collect::<Vec<_>>()),
         };
         let workspace = workspace.map(str::to_owned).unwrap_or_else(|| super::default_workspace(root));
         let pid = std::process::id();
@@ -529,9 +528,24 @@ impl Node {
         Ok(running + 1)
     }
 
-    /// A sub-agent that never claimed its task: its tab didn't open.
+    /// Gives up the place of a sub-agent that never claimed its task: its
+    /// tab didn't open. One that has claimed it is running, and stays.
     pub(crate) fn forget_child(&self, id: &str) {
-        locked(&self.shared).children.remove(id);
+        let mut shared = locked(&self.shared);
+        if shared.children.get(id).is_some_and(|child| child.pid.is_none()) {
+            shared.children.remove(id);
+        }
+    }
+
+    /// The sub-agent `id` has claimed its task.
+    pub(crate) fn claimed(&self, id: &str) -> bool {
+        locked(&self.shared).children.get(id).is_some_and(|child| child.pid.is_some())
+    }
+
+    /// The names of the sub-agents that haven't claimed their tasks yet:
+    /// taken, though no rein goes by them so far.
+    pub(crate) fn names_kept(&self) -> Vec<String> {
+        locked(&self.shared).children.values().filter(|child| child.pid.is_none()).map(|child| child.role.clone()).collect()
     }
 
     /// This rein is the sub-agent `parent` started for task `id`: it
@@ -961,6 +975,28 @@ mod tests {
         }
         assert_eq!(too_much(&mut sent, &message("api", "one more")), Some("too many messages this minute"));
         assert_eq!(too_much(&mut sent, &Incoming::Changed { from: "api".into(), path: "a".into() }), None, "a change isn't a message");
+    }
+
+    #[tokio::test]
+    async fn a_sub_agents_name_and_place_are_kept_until_it_claims_its_task() {
+        let folder = PathBuf::from(format!("/tmp/rein-node-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        let node = Node::start(&folder, Some("api"), Some("w"), Path::new("/p"), "m", Policy::Accept, Show { title: false, strip: false }).await.unwrap();
+        node.expect_child("t1", "tests", "run them").unwrap();
+        let args = rein_agent::peers::SpawnArgs { role: "tests".into(), task: "and again".into(), model: None, edits: false };
+        let second = crate::peers::talk::Child::wanted(&args, "m", &node).await.unwrap();
+        assert_eq!(second.name, "tests-2", "the first hasn't joined, but the name is its own");
+
+        node.expect_child("t2", "lint", "lint it").unwrap();
+        assert!(!node.claimed("t1"));
+        locked(&node.shared).children.get_mut("t1").unwrap().pid = Some(4_000_000);
+        assert!(node.claimed("t1"));
+        node.forget_child("t1");
+        node.forget_child("t2");
+        assert!(node.claimed("t1"), "one that has its task is running, whatever becomes of the turn that started it");
+        assert_eq!(locked(&node.shared).children.len(), 1, "one that never claimed it is gone");
+        drop(node);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[tokio::test]

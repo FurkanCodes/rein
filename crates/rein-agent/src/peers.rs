@@ -122,9 +122,18 @@ pub fn unheard(message: &str) -> Option<(&str, &str)> {
     message.strip_prefix(HEARD_START)?.split_once(HEARD_MIDDLE)
 }
 
+/// How rein's note of a change by another rein says so, after its name.
+const CHANGED: &str = ", another rein working in this folder, changed ";
+
 /// The note that a file this conversation has read was changed by another rein.
 pub fn changed(by: &str, path: &str) -> String {
-    format!("[rein: {by}, another rein working in this folder, changed {path} since you last read it. Read it again before you change it.]")
+    format!("[rein: {by}{CHANGED}{path} since you last read it. Read it again before you change it.]")
+}
+
+/// `text` is rein's note of a change by another rein, not something the
+/// user said.
+pub fn is_note(text: &str) -> bool {
+    text.starts_with("[rein: ") && text.contains(CHANGED)
 }
 
 #[cfg(test)]

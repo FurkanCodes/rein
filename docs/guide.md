@@ -1247,18 +1247,22 @@ can start turns. A client that doesn't say so, like Zed, gets none of this.
 
 - **Starting a sub-agent.** When the model calls `spawn`, rein asks with
   `session/request_permission`, then sends the request
-  `_io.github.furkancodes/open_pane` with `name`, `model`, `command`, `args`
-  and `cwd`. Run `command` with `args` in `cwd`, with no shell between them,
-  and answer. An error tells the model the sub-agent didn't start.
+  `_io.github.furkancodes/open_pane` with `name`, `model`, `command`, `args`,
+  `cwd` and `env`. Run `command` with `args` in `cwd`, with no shell between
+  them and `env` (a list of `name` and `value`) added to its environment, and
+  answer once its `session/new` has come back. An error, or an answer before
+  then, tells the model the sub-agent didn't start, and its place is free
+  again. If you stop the turn first, the same goes.
 - **Driving it.** It's a `rein serve` like any other: `initialize` it the same
-  way, then `session/new`. It starts on its task by itself, and its questions,
-  steering and stopping are its own. It reports to its parent when its turn
-  ends, and it stays, with what it knows, until you close its input.
+  way, then `session/new`, which is turned down, and says why, if it can't have
+  its task. It starts on its task by itself, and its questions, steering and
+  stopping are its own. It reports to its parent when its turn ends, and it
+  stays, with what it knows, until you close its input.
 - **Closing it early.** Close its input before it's done and its parent hears
   what it did so far.
-- **Turns nobody prompted.** What another rein sends can start a turn with no
-  `session/prompt`, so there's no answer to end it. `_io.github.furkancodes/turn_started`
-  says one started, and `_io.github.furkancodes/turn_ended` says how it ended,
+- **Turns nobody prompted.** What another rein sends, and a background command
+  ending, can start a turn with no `session/prompt`, so there's no answer to
+  end it. `_io.github.furkancodes/turn_started` says one started, and `_io.github.furkancodes/turn_ended` says how it ended,
   with `stopReason`, or `error` if it failed. Stop one with `session/cancel`.
   A `session/prompt` during one is turned down, as in any turn.
 - **What other reins say.** `_io.github.furkancodes/heard` carries `from` and
@@ -1270,8 +1274,9 @@ it, which is why each one is a `rein serve` here.
 
 Not there yet: MCP servers a client passes in `session/new`, which are
 ignored, images in a prompt, and rein's slash commands. What another rein
-sends in `trust` mode, or past 12 turns in a row, waits in `/inbox`, which
-only a terminal has so far.
+sends in `trust` mode waits in `/inbox`, which only a terminal has so far.
+Past 12 turns in a row that other reins started, what they send starts no
+turn: rein says so as a thought, and it goes in with your next message.
 
 ## What's left of your limits
 

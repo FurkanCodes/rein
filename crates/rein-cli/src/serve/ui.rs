@@ -8,10 +8,12 @@ use rein_agent::compact;
 use rein_agent::peers::SpawnArgs;
 use rein_agent::permissions::Rule;
 use rein_agent::tools::{ERROR, ToolName};
+use rein_agent::undo::Watched;
 use rein_llm::{Item, ToolCall, Usage};
 use serde_json::{Value, json};
 
 use super::{Link, wire};
+use crate::peers::Node;
 use crate::peers::talk::{self, Child};
 use crate::terminal::Terminal;
 use crate::ui::steps;
@@ -34,11 +36,28 @@ pub(super) struct Served {
     answering: bool,
     /// What the model writes now is the conversation's summary, not an answer.
     compacting: bool,
+    /// The call just turned down: all of it's been said, and what it came
+    /// to comes round again as any step's does.
+    blocked: Option<String>,
+}
+
+/// A place kept for a sub-agent that hasn't claimed its task, given up
+/// when this is dropped. In a `Drop`: a turn stopped while a client takes
+/// its time is this future dropped, and the place would be kept for good.
+struct Awaited<'a> {
+    node: &'a Node,
+    id: &'a str,
+}
+
+impl Drop for Awaited<'_> {
+    fn drop(&mut self) {
+        self.node.forget_child(self.id);
+    }
 }
 
 impl Served {
     pub(super) fn new(session: String, link: Link, terminal: Terminal) -> Served {
-        Served { session, link, announced: HashSet::new(), terminal, answering: false, compacting: false }
+        Served { session, link, announced: HashSet::new(), terminal, answering: false, compacting: false, blocked: None }
     }
 
     /// A turn starts.
@@ -139,16 +158,22 @@ impl Served {
         if let Err(e) = node.expect_child(&id, &child.name, &args.task) {
             return format!("{ERROR}{e}");
         }
+        let _awaited = Awaited { node, id: &id };
         let flags = child.flags(&id, args.edits, self.terminal.mode, self.terminal.sandboxing);
         let serve: Vec<String> = std::iter::once("serve".to_owned()).chain(flags).collect();
         let command = talk::rein_program();
-        let pane = wire::Pane { name: &child.name, model: &child.model, command: &command, args: &serve, cwd: &node.info().root };
+        let env = talk::carried();
+        let pane = wire::Pane { name: &child.name, model: &child.model, command: &command, args: &serve, cwd: &node.info().root, env: &env };
         let (asked, answer) = self.link.ask();
         self.link.send(wire::open_pane(asked, &self.session, &pane));
-        if let Ok(Some(_)) = answer.await {
+        // A client answers once the sub-agent's `session/new` has, so it has
+        // its task by now. If it hasn't, nothing will come of it, and the
+        // model is told so now: its result would never come.
+        if let Ok(Some(_)) = answer.await
+            && node.claimed(&id)
+        {
             return format!("Started sub-agent {} ({}) in a pane of its own (task {id}). {}", child.name, child.model, talk::AWAITED);
         }
-        node.forget_child(&id);
         format!("{ERROR}the client didn't open a pane for sub-agent {}", child.name)
     }
 }
@@ -250,9 +275,19 @@ impl Ui for Served {
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
         self.terminal.step_blocked(call, reason);
         self.finish(call, "failed", reason);
+        self.blocked = Some(call.call_id.clone());
+    }
+
+    fn watched(&mut self, _call: &ToolCall, what: &Watched) {
+        if let Watched::Changed(changed) = what {
+            self.terminal.step_watched(changed);
+        }
     }
 
     fn tool_finished(&mut self, call: &ToolCall, output: &str) {
+        if self.blocked.take().is_some_and(|id| id == call.call_id) {
+            return;
+        }
         let outcome = steps::outcome(call, output, self.terminal.err);
         self.terminal.step_finished(call, &outcome);
         self.finish(call, finished(output), output);

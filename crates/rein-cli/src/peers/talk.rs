@@ -19,7 +19,7 @@ use crate::ui::wrap::Wrap;
 
 /// How many turns in a row other reins may start before you say anything:
 /// past that, what they send waits in `/inbox`.
-const TURNS_IN_A_ROW: usize = 12;
+pub(crate) const TURNS_IN_A_ROW: usize = 12;
 
 /// The most of a turn's last answer that goes back as a task's result,
 /// about 4,000 tokens: Claude Code's teammates send 4,000 characters, and
@@ -45,7 +45,9 @@ pub(crate) fn capped(text: &str, ask: Option<&str>) -> String {
 
 /// Joins the other reins, as the settings say, and says who this one is.
 /// `child` is the rein that started this one and the task it's for, for a
-/// sub-agent: it claims the task as soon as it's in.
+/// sub-agent: it claims the task as soon as it's in. Why it couldn't do
+/// what it set out to, which has been said too: `terminal.peers` says
+/// whether it's among the others.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn join(
     joining: Joining,
@@ -57,8 +59,8 @@ pub(crate) async fn join(
     root: &Path,
     mode: Mode,
     terminal: &mut Terminal,
-) -> bool {
-    let Joining::On(policy) = joining else { return false };
+) -> Result<(), String> {
+    let Joining::On(policy) = joining else { return Ok(()) };
     let s = terminal.err;
     let show = Show { title: terminal.fancy, strip: strip && terminal.input.pinned() };
     match Node::start(&super::folder(rein), name, workspace, root, &terminal.model, policy, show).await {
@@ -75,18 +77,22 @@ pub(crate) async fn join(
             if !crate::ui::logo::is_shown() {
                 say!("{}", s.dim(&format!("You're {} in {} · {about}", node.info().name, node.info().workspace)));
             }
+            let mut claimed = Ok(());
             if let Some((parent, id)) = child {
                 match node.claim(parent, id).await {
                     Ok(from) => say!("{}", s.dim(&format!("A sub-agent of {from}: its task follows, and the result goes back to it"))),
-                    Err(e) => say!("{}", s.red(&format!("✗ no task: {e}"))),
+                    Err(e) => {
+                        say!("{}", s.red(&format!("✗ no task: {e}")));
+                        claimed = Err(format!("no task: {e}"));
+                    }
                 }
             }
             terminal.peers = Some(node);
-            true
+            claimed
         }
         Err(e) => {
             say!("{}", s.dim(&format!("Peers: off ({e})")));
-            false
+            Err(e)
         }
     }
 }
@@ -96,18 +102,35 @@ pub(crate) async fn join(
 /// too many in a row, when it waits in `/inbox`.
 pub(crate) async fn take_in(incoming: Incoming, in_a_row: &mut usize, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
     match starts_a_turn(incoming, in_a_row, terminal) {
-        Some(incoming) => work_on(incoming, agent, terminal).await,
-        None => Ok(()),
+        Taken::Turn(incoming) => work_on(incoming, agent, terminal).await,
+        Taken::Noted => Ok(()),
+        Taken::TooMany(incoming) => {
+            if let Some(peers) = &terminal.peers {
+                peers.hold(incoming);
+            }
+            terminal.input.notice(&format!("other reins have started {TURNS_IN_A_ROW} turns in a row: what they send now waits in /inbox"));
+            Ok(())
+        }
     }
 }
 
-/// What came in while nothing ran, if it's to start a turn: what doesn't
-/// is noted for the next one, or held.
-pub(crate) fn starts_a_turn(incoming: Incoming, in_a_row: &mut usize, terminal: &mut Terminal) -> Option<Incoming> {
+/// What's done with what came in while nothing ran.
+pub(crate) enum Taken {
+    /// It starts a turn.
+    Turn(Incoming),
+    /// It's noted for the next turn.
+    Noted,
+    /// It would start a turn, but other reins have started too many in a
+    /// row. Where it waits depends on what's there to let it in.
+    TooMany(Incoming),
+}
+
+/// What's done with what came in while nothing ran.
+pub(crate) fn starts_a_turn(incoming: Incoming, in_a_row: &mut usize, terminal: &mut Terminal) -> Taken {
     if matches!(incoming, Incoming::Changed { .. }) {
         let note = terminal.heard_of(incoming);
         terminal.notes.extend(note);
-        return None;
+        return Taken::Noted;
     }
     // You went on in a sub-agent's tab: you see it here now, and this
     // conversation hears of it with its next turn. It starts none: you're
@@ -120,17 +143,13 @@ pub(crate) fn starts_a_turn(incoming: Incoming, in_a_row: &mut usize, terminal: 
         }
         let note = terminal.heard_of(incoming);
         terminal.notes.extend(note);
-        return None;
+        return Taken::Noted;
     }
     if *in_a_row >= TURNS_IN_A_ROW {
-        if let Some(peers) = &terminal.peers {
-            peers.hold(incoming);
-        }
-        terminal.input.notice(&format!("other reins have started {TURNS_IN_A_ROW} turns in a row: what they send now waits in /inbox"));
-        return None;
+        return Taken::TooMany(incoming);
     }
     *in_a_row += 1;
-    Some(incoming)
+    Taken::Turn(incoming)
 }
 
 /// A turn on what another rein sent, then its result back, if it was a task.
@@ -165,13 +184,19 @@ pub(crate) async fn spawn(call: &rein_llm::ToolCall, terminal: &mut Terminal) ->
 pub(crate) const AWAITED: &str =
     "Its result comes back to you by itself when it's done, and starts a turn: don't message it to ask, and end your turn if there's nothing else to do meanwhile.";
 
-/// What a sub-agent's tab is given of this rein's environment: where rein
-/// keeps its files, and where programs and their settings are found. A
-/// tab a terminal app opens has the app's environment, not your shell's:
-/// on macOS its `PATH` is the system's alone, and a sub-agent couldn't
-/// find `claude`, or `cargo` for a command. None is a key: the script is
-/// a file, and keys never go in one.
+/// What a sub-agent's tab or pane is given of this rein's environment:
+/// where rein keeps its files, and where programs and their settings are
+/// found. A tab a terminal app opens has the app's environment, not your
+/// shell's: on macOS its `PATH` is the system's alone, and a sub-agent
+/// couldn't find `claude`, or `cargo` for a command. With another
+/// `REIN_HOME` it couldn't find this rein, or its task. None is a key:
+/// the script is a file, and keys never go in one.
 const CARRIED: [&str; 4] = ["REIN_HOME", "PATH", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR"];
+
+/// Each of [`CARRIED`] this rein has, and its value.
+pub(crate) fn carried() -> Vec<(String, String)> {
+    CARRIED.iter().filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_owned(), value))).collect()
+}
 
 /// Starts the sub-agent `args` asks for, asking you first if `ask`: what
 /// the model is told of how it went.
@@ -196,7 +221,7 @@ async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &m
         return format!("{error}{e}");
     }
     let argv: Vec<String> = std::iter::once(rein_program()).chain(child.flags(&id, args.edits, terminal.mode, terminal.sandboxing)).collect();
-    let env: Vec<(String, String)> = CARRIED.iter().filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_owned(), value))).collect();
+    let env = carried();
     let folder = super::folder(&crate::config_dir().unwrap_or_default());
     let opener = super::spawn::Opener::detect(&|key| std::env::var(key).ok(), terminal.tab_command.as_deref());
     let script = super::spawn::script(&opener, &node.info().root, &env, &argv);
@@ -248,7 +273,10 @@ impl Child {
             return Err("a sub-agent can't start sub-agents of its own".to_owned());
         }
         let role = super::clean_name(&args.role)?;
-        let name = super::free_name(&role, &node.peers().await);
+        // Two asked for at once: the first hasn't joined when the second's named.
+        let mut taken: Vec<String> = node.peers().await.into_iter().map(|peer| peer.name).collect();
+        taken.extend(node.names_kept());
+        let name = super::free_name(&role, &taken);
         let model = args.model.clone().unwrap_or_else(|| spec.to_owned());
         Ok(Child { name, model })
     }

@@ -1951,12 +1951,20 @@ impl Model for Llm {
     }
 }
 
+/// How rein's note of an undo starts.
+const UNDONE: &str = "[rein: the user undid what ";
+
+/// `text` is rein's note of an undo, not something the user said.
+pub(crate) fn is_undo_note(text: &str) -> bool {
+    text.starts_with(UNDONE)
+}
+
 /// What the model is told when the user undoes its turns: what's back,
 /// and what was left, so it doesn't go on as if its work were still there.
 fn undone(done: &Plan) -> String {
     let list = |paths: &[String]| paths.join(", ");
     let turns = if done.turns == 1 { "your last turn".to_owned() } else { format!("your last {} turns", done.turns) };
-    let mut told = format!("[rein: the user undid what {turns} did to the project's files, back to before \"{}\".", done.said);
+    let mut told = format!("{UNDONE}{turns} did to the project's files, back to before \"{}\".", done.said);
     if !done.put_back.is_empty() {
         told.push_str(&format!(" Back as they were: {}.", list(&done.put_back)));
     }
@@ -1988,6 +1996,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_note_of_an_undo_isnt_what_you_typed() {
+        let note = undone(&Plan { said: "fix it".into(), turns: 1, ..Plan::default() });
+        assert_eq!(compact::typed(&Item::User(note)), None);
+    }
     use crate::permissions::Mode;
 
     /// What a test model kept of a request it was sent: requests borrow,

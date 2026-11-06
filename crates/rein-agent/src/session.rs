@@ -334,13 +334,16 @@ pub fn page(folders: &[PathBuf], skip: usize, limit: usize) -> (Vec<Summary>, bo
             let text = fs::read_to_string(&path).ok()?;
             let mut lines = text.lines().filter_map(|line| serde_json::from_str::<Line>(line).ok());
             let Some(Line::Session(header)) = lines.next() else { return None };
-            let typed: Vec<String> = lines
+            // What rein added before you said anything isn't what you said.
+            let typed: Vec<Item> = lines
                 .filter_map(|line| match line {
-                    Line::User { text } => Some(text),
+                    Line::User { text } => Some(Item::User(text)),
                     _ => None,
                 })
+                .filter(|item| crate::compact::typed(item).is_some())
                 .collect();
-            Some(Summary { path, id: header.id, cwd: header.cwd, modified, started: header.started, first: typed.first().cloned(), messages: typed.len() })
+            let first = typed.first().and_then(crate::compact::typed).map(str::to_owned);
+            Some(Summary { path, id: header.id, cwd: header.cwd, modified, started: header.started, first, messages: typed.len() })
         })
         .collect();
     (summaries, more)
@@ -495,6 +498,16 @@ mod tests {
         let loaded = Session::load(session.path()).unwrap();
         assert_eq!(loaded.session.header().model, "other");
         assert_eq!(loaded.history, vec![Item::User("one".into()), Item::User("two".into())]);
+    }
+
+    #[test]
+    fn what_rein_added_before_you_said_anything_isnt_your_first_message() {
+        let dir = dir("first");
+        let mut session = Session::new(&dir, "a", header("notes"));
+        session.append(&Item::User(crate::skills::AS_LISTED.into())).unwrap();
+        session.append(&Item::User("hi".into())).unwrap();
+        let listed = list(&dir, 10);
+        assert_eq!((listed[0].first.as_deref(), listed[0].messages), (Some("hi"), 1));
     }
 
     #[test]

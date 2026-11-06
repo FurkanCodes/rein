@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use rein_agent::agent::{Agent, Heard, Llm, Outcome};
+use rein_agent::agent::{Agent, Heard, Llm, Outcome, Ui};
+use rein_agent::background::Jobs;
 use rein_agent::permissions::{Mode, Sandboxing};
 use rein_agent::session;
 use serde_json::{Value, json};
@@ -30,6 +31,7 @@ use crate::args::{AskArgs, Resume};
 use crate::conversation::{self, Opened, Start, step_limit};
 use crate::format::{shorten, utc_stamp};
 use crate::peers::node::Incoming as Sent;
+use crate::peers::talk::Taken;
 use crate::peers::{self, State, talk};
 use crate::settings::{self, Settings};
 use crate::{CliResult, config_dir, describe};
@@ -119,6 +121,8 @@ pub(crate) async fn run(http: &rein_llm::reqwest::Client, flags: Vec<String>) ->
     let mut input: Input = BufReader::new(tokio::io::stdin()).lines();
     let mut session: Option<Session> = None;
     loop {
+        // A client that takes no turn nobody prompted hears with its next.
+        let jobs = session.as_ref().filter(|_| link.panes.get()).map(|session| session.agent.tools.jobs().clone());
         tokio::select! {
             line = input.next_line() => {
                 let Ok(Some(line)) = line else { break };
@@ -135,6 +139,12 @@ pub(crate) async fn run(http: &rein_llm::reqwest::Client, flags: Vec<String>) ->
             sent = from_the_others(&mut session) => {
                 let Some(session) = &mut session else { continue };
                 if !take_in(session, sent, &link, &mut input).await {
+                    break;
+                }
+            }
+            () = job_ended(jobs.as_deref()) => {
+                let Some(session) = &mut session else { continue };
+                if !unprompted(session, Start::Ended, &link, &mut input).await {
                     break;
                 }
             }
@@ -287,7 +297,16 @@ async fn open(cwd: &Path, resume: Resume, flags: &[String], http: &rein_llm::req
         // A sub-agent's worktree, if it has one.
         let root = std::env::current_dir().map_err(|e| format!("can't find the current directory: {e}"))?;
         let claiming = child.as_ref().map(|(pid, id)| (*pid, id.as_str()));
-        if talk::join(joining, name.as_deref(), workspace.as_deref(), claiming, false, &dir, &root, mode, &mut terminal).await {
+        let joined = talk::join(joining, name.as_deref(), workspace.as_deref(), claiming, false, &dir, &root, mode, &mut terminal).await;
+        // Without its task it would sit there with nothing to do, and the
+        // rein that started it would wait: its client should hear.
+        if child.is_some() {
+            joined?;
+            if terminal.peers.is_none() {
+                return Err("a sub-agent needs to be among the other reins, and they're turned off here".into());
+            }
+        }
+        if terminal.peers.is_some() {
             // A sub-agent doesn't start sub-agents: one level, no further.
             agent = if child.is_some() { agent.with_child_peer_tools() } else { agent.with_peer_tools() };
         }
@@ -348,16 +367,41 @@ async fn from_the_others(session: &mut Option<Session>) -> Sent {
     }
 }
 
+/// The next background command to end; never, without `jobs` to watch.
+async fn job_ended(jobs: Option<&Jobs>) {
+    match jobs {
+        Some(jobs) => jobs.ended().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// What another rein sent while nothing ran, which may start a turn nobody
-/// prompted: the client hears it start and end. `false`: the client went
-/// away during it.
+/// prompted. `false`: the client went away during it.
 async fn take_in(session: &mut Session, sent: Sent, link: &Link, input: &mut Input) -> bool {
-    let Some(sent) = talk::starts_a_turn(sent, &mut session.in_a_row, &mut session.served.terminal) else { return true };
+    let sent = match talk::starts_a_turn(sent, &mut session.in_a_row, &mut session.served.terminal) {
+        Taken::Turn(sent) => sent,
+        Taken::Noted => return true,
+        // There's no `/inbox` here. Not what your rules hold back: that
+        // stays there, and only a terminal can let it in.
+        Taken::TooMany(sent) => {
+            let terminal = &mut session.served.terminal;
+            let note = terminal.heard_of(sent);
+            terminal.notes.extend(note);
+            session.served.note(&format!("other reins have started {} turns in a row: what they send now goes in with your next message", talk::TURNS_IN_A_ROW));
+            return true;
+        }
+    };
     // A sub-agent whose parent has gone stays: its pane is the client's to close.
     let (Some(Heard::Peer { from, text }) | Some(Heard::Reported { from, text })) = session.served.terminal.heard_of(sent) else { return true };
     link.send(wire::heard(&session.id, &from, &text));
+    unprompted(session, Start::Peer { from, text }, link, input).await
+}
+
+/// A turn nobody prompted: the client hears it start and end. `false`: the
+/// client went away during it.
+async fn unprompted(session: &mut Session, start: Start, link: &Link, input: &mut Input) -> bool {
     link.send(wire::turn_started(&session.id));
-    let ended = work(session, Start::Peer { from, text }, link, input).await;
+    let ended = work(session, start, link, input).await;
     link.send(match ended {
         Ended::Finished(Ok(outcome)) => wire::turn_ended(&session.id, stop_reason(&outcome)),
         Ended::Finished(Err(e)) => wire::turn_failed(&session.id, &describe(e)),

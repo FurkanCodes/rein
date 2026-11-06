@@ -5161,6 +5161,10 @@ fn a_sub_agent_runs_in_a_pane_of_its_own_to_steer_and_its_parent_hears_how_it_we
     assert_eq!((&params["name"], &params["args"][0]), (&json!("tests"), &json!("serve")), "{params}");
     assert!(params["args"].to_string().contains("--child"), "{params}");
     assert_eq!(std::fs::canonicalize(params["cwd"].as_str().unwrap()).unwrap(), std::fs::canonicalize(rein.project()).unwrap());
+    let carried = |name: &str| params["env"].as_array().unwrap().iter().find(|one| one["name"] == name).map(|one| one["value"].as_str().unwrap().to_owned());
+    assert_eq!(carried("REIN_HOME").map(PathBuf::from), Some(rein.dir.join("home")), "{params}");
+    assert!(carried("PATH").is_some(), "{params}");
+    assert_eq!(carried("OPENAI_API_KEY"), None, "a key never goes that way: {params}");
     let child_model = Model::start(vec![runs("sleep 0.6"), says("They pass.")]);
     let mut tests = Client::pane(&rein, &child_model, &asked);
     let sub_agent = tests.open_panes();
@@ -5245,6 +5249,155 @@ fn a_pane_that_doesnt_open_is_said_and_its_place_is_free_again() {
     let told = results(&model);
     assert_eq!(told.iter().filter(|result| result.contains("didn't open a pane")).count(), 5, "{told:?}");
     assert!(!told.iter().any(|result| result.contains("most at once")), "those that never opened aren't running: {told:?}");
+}
+
+#[test]
+fn a_client_may_answer_for_a_pane_with_nothing_at_all() {
+    let (model, mut rein, _session, turn, asked) = asks_for_a_pane("null", vec![says("Started tests."), says("Noted.")]);
+    let child_model = Model::start(vec![says("They pass.")]);
+    let mut tests = Client::pane(&rein, &child_model, &asked);
+    tests.open_panes();
+    rein.reply(&asked, &Value::Null);
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(results(&model)[0].contains("Started sub-agent tests"), "{:?}", results(&model));
+}
+
+#[test]
+fn a_pane_said_to_be_open_that_never_took_its_task_didnt_start() {
+    let (model, mut rein, _session, turn, asked) = asks_for_a_pane("unclaimed", vec![says("It didn't start.")]);
+    rein.reply(&asked, &json!({}));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(results(&model)[0].contains("didn't open a pane"), "its result would never come: {:?}", results(&model));
+}
+
+#[test]
+fn a_turn_stopped_while_a_pane_opens_gives_its_place_back() {
+    let spawn = |role: &str| calls("spawn", json!({ "role": role, "task": "run the test suite", "model": null, "edits": false }));
+    let model = Model::start(["a", "b", "c", "d", "e"].map(spawn).into_iter().chain([says("Done.")]).collect());
+    let mut rein = Client::start(&model, "stopopen");
+    let session = rein.open_panes();
+    let mut turn = rein.prompt(&session, "get the tests run");
+    let asked = rein.asked("session/request_permission");
+    rein.reply(&asked, &json!({ "outcome": { "outcome": "selected", "optionId": "always" } }));
+    for _ in 0..4 {
+        rein.asked(OPEN_PANE);
+        rein.write(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session } }));
+        assert_eq!(rein.answer(turn)["result"]["stopReason"], "cancelled");
+        turn = rein.prompt(&session, "try again");
+    }
+    // Four kept for good would have told the model that four are running.
+    rein.asked(OPEN_PANE);
+}
+
+#[test]
+fn a_sub_agent_that_cant_have_its_task_says_so_instead_of_sitting_idle() {
+    let (_model, rein, _session, _turn, asked) = asks_for_a_pane("notask", vec![says("It didn't start.")]);
+    let params = &asked["params"];
+    let args: Vec<String> = params["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap().to_owned()).collect();
+    let at = args.iter().position(|arg| arg == "--child").unwrap() + 1;
+    let wrong: Vec<String> = args.iter().enumerate().map(|(i, arg)| if i == at { format!("{}:wrong", arg.split(':').next().unwrap()) } else { arg.clone() }).collect();
+    let child_model = Model::start(vec![]);
+    let mut tests = Client::run(&child_model, params["command"].as_str().unwrap(), &wrong, rein.dir.clone(), true);
+    let id = tests.call("initialize", json!({ "protocolVersion": 1, "clientCapabilities": { "_meta": { PANES: true } } }));
+    tests.answer(id);
+    let cwd = tests.project();
+    let id = tests.call("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    let refused = tests.answer(id);
+    assert!(refused["error"]["message"].as_str().unwrap_or_default().contains("no task"), "{refused}");
+}
+
+#[test]
+fn what_a_sub_agents_commands_change_is_in_its_report() {
+    let (_model, mut rein, _session, turn, asked) = asks_for_a_pane("commands", vec![says("Started tests."), says("Noted.")]);
+    let child_model = Model::start(vec![runs("touch made.txt"), says("Made it.")]);
+    let mut tests = Client::pane(&rein, &child_model, &asked);
+    tests.open_panes();
+    rein.reply(&asked, &json!({}));
+    rein.answer(turn);
+    tests.allow();
+    let said = rein.asked(HEARD)["params"]["text"].as_str().unwrap().to_owned();
+    assert!(said.contains("made.txt"), "the model would be told it changed no files: {said}");
+}
+
+#[test]
+fn a_step_your_rules_turn_down_is_said_once() {
+    let model = Model::start(vec![runs("touch made.txt"), says("Fine.")]);
+    let mut rein = Client::start(&model, "blocked");
+    std::fs::write(rein.dir.join("home").join("permissions"), "deny touch\n").unwrap();
+    let session = rein.open();
+    let turn = rein.prompt(&session, "make it");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert_eq!(rein.updates().iter().filter(|kind| *kind == "tool_call").count(), 1, "{:#?}", rein.seen);
+    assert!(!rein.project().join("made.txt").exists());
+}
+
+/// Waits on `go` in the project, so it ends after its turn does.
+const WAITS: &str = "until [ -e go ]; do sleep 0.05; done; touch ended; exit 3";
+
+#[test]
+fn a_background_command_that_ends_starts_a_turn_for_a_client_with_panes() {
+    let model = Model::start(vec![starts(WAITS), says("It's running."), says("It failed.")]);
+    let mut rein = Client::start(&model, "bgpanes");
+    let session = rein.open_panes();
+    let turn = rein.prompt(&session, "build it");
+    rein.allow();
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    std::fs::write(rein.project().join("go"), "").unwrap();
+    rein.asked(TURN_STARTED);
+    assert_eq!(rein.asked(TURN_ENDED)["params"]["stopReason"], "end_turn");
+    assert!(rein.said().contains("It failed."), "{}", rein.said());
+    assert!(model.requests().last().unwrap().to_string().contains("exit code 3"), "the model heard how it ended");
+}
+
+#[test]
+fn a_client_with_no_panes_hears_of_a_background_command_with_its_next_message() {
+    let model = Model::start(vec![starts(WAITS), says("It's running."), says("It failed.")]);
+    let mut rein = Client::start(&model, "bgnopanes");
+    let session = rein.open();
+    let turn = rein.prompt(&session, "build it");
+    rein.allow();
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    std::fs::write(rein.project().join("go"), "").unwrap();
+    let ended = rein.project().join("ended");
+    let start = Instant::now();
+    while !ended.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "it never ended");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // It has ended, and nothing should come of that until the next message.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(model.requests().len(), 2, "no turn starts for a client that can't take one");
+    let turn = rein.prompt(&session, "how did it go?");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.seen.iter().all(|message| message["method"] != TURN_STARTED), "{:#?}", rein.seen);
+    assert!(model.requests().last().unwrap().to_string().contains("exit code 3"), "the model heard how it ended");
+}
+
+#[test]
+fn past_twelve_turns_in_a_row_what_others_send_goes_in_with_your_next_message() {
+    let one = |i: usize| [calls("message", json!({ "to": "project", "text": format!("note {i}") })), says("Sent.")];
+    let sending = Model::start((0..13).flat_map(one).collect()).with_env("REIN_MODE", "trust");
+    let model = Model::start((0..13).map(|_| says("Heard.")).collect());
+    let mut rein = Client::start(&model, "inarow");
+    let session = rein.open_panes();
+    let flags = ["serve", "--name", "sender"].map(str::to_owned);
+    let mut sender = Client::run(&sending, env!("CARGO_BIN_EXE_rein"), &flags, rein.dir.clone(), true);
+    let sent = sender.open_panes();
+    // One at a time, or those sent during a turn would go into that turn.
+    for _ in 0..12 {
+        let turn = sender.prompt(&sent, "tell it");
+        sender.answer(turn);
+        rein.asked(TURN_STARTED);
+        rein.asked(TURN_ENDED);
+    }
+    let turn = sender.prompt(&sent, "tell it");
+    sender.answer(turn);
+    rein.update("agent_thought_chunk", |update| update["content"]["text"].as_str().unwrap_or_default().contains("your next message"));
+    assert_eq!(rein.seen.iter().filter(|message| message["method"] == TURN_STARTED).count(), 12, "it started no turn");
+
+    let turn = rein.prompt(&session, "anything else?");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(model.requests().last().unwrap().to_string().contains("note 12"), "it went in with what you said");
 }
 
 #[test]

@@ -95,7 +95,9 @@ pub(super) enum Incoming {
     Request { id: Value, request: Result<Request, Refused> },
     /// `session/cancel`: stop the turn.
     Cancel,
-    /// The answer to something rein asked, under the number it asked with.
+    /// The answer to something rein asked, under the number it asked with:
+    /// `None` for an error. `null` is an answer: it's what a method with
+    /// nothing to say comes back with.
     Reply { id: u64, result: Option<Value> },
     /// A notification rein doesn't know, which ACP says to ignore.
     Ignored,
@@ -109,7 +111,9 @@ struct Line {
     method: Option<String>,
     #[serde(default)]
     params: Value,
-    result: Option<Value>,
+    #[serde(default)]
+    result: Value,
+    error: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -177,7 +181,7 @@ impl Incoming {
             (Some(method), None) if method == "session/cancel" => Incoming::Cancel,
             (Some(_), None) => Incoming::Ignored,
             // rein numbers what it asks, so any other id is nothing it asked.
-            (None, Some(id)) => id.as_u64().map_or(Incoming::Ignored, |id| Incoming::Reply { id, result: line.result }),
+            (None, Some(id)) => id.as_u64().map_or(Incoming::Ignored, |id| Incoming::Reply { id, result: line.error.is_none().then_some(line.result) }),
             (None, None) => Incoming::Unreadable(Refused::params("a message needs a method or an id")),
         }
     }
@@ -247,18 +251,21 @@ pub(super) fn ask_permission(id: u64, session: &str, call: &str, options: &Value
 }
 
 /// What a client starts for a sub-agent, with no shell in between: it
-/// runs `command` with `args`, in `cwd`.
+/// runs `command` with `args`, in `cwd`, with `env` added to what it has.
 pub(super) struct Pane<'a> {
     pub(super) name: &'a str,
     pub(super) model: &'a str,
     pub(super) command: &'a str,
     pub(super) args: &'a [String],
     pub(super) cwd: &'a Path,
+    pub(super) env: &'a [(String, String)],
 }
 
 /// Asks a client to open `pane`, under the number `id`.
 pub(super) fn open_pane(id: u64, session: &str, pane: &Pane<'_>) -> String {
-    let params = json!({ "sessionId": session, "name": pane.name, "model": pane.model, "command": pane.command, "args": pane.args, "cwd": pane.cwd });
+    // As ACP says an MCP server's environment.
+    let env: Vec<Value> = pane.env.iter().map(|(name, value)| json!({ "name": name, "value": value })).collect();
+    let params = json!({ "sessionId": session, "name": pane.name, "model": pane.model, "command": pane.command, "args": pane.args, "cwd": pane.cwd, "env": env });
     json!({ "jsonrpc": "2.0", "id": id, "method": OPEN_PANE, "params": params }).to_string()
 }
 
@@ -345,6 +352,7 @@ mod tests {
     fn a_reply_goes_by_the_number_rein_asked_with() {
         assert_eq!(Incoming::read(r#"{"id":7,"result":{"a":1}}"#), Incoming::Reply { id: 7, result: Some(json!({ "a": 1 })) });
         assert_eq!(Incoming::read(r#"{"id":7,"error":{"code":1,"message":"no"}}"#), Incoming::Reply { id: 7, result: None });
+        assert_eq!(Incoming::read(r#"{"id":7,"result":null}"#), Incoming::Reply { id: 7, result: Some(Value::Null) }, "nothing to say isn't an error");
         assert_eq!(Incoming::read(r#"{"id":"x","result":{}}"#), Incoming::Ignored);
     }
 }

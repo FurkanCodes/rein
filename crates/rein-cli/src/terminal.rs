@@ -18,7 +18,7 @@ use rein_agent::compact;
 use rein_agent::permissions::{Mode, Rule, Sandboxing, Whose};
 use rein_agent::sandbox::{Access, Sandbox};
 use rein_agent::tools::{BashCall, ToolName};
-use rein_agent::undo::Watched;
+use rein_agent::undo::{Changed, Watched};
 use rein_llm::{Effort, ToolCall, Usage};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -378,7 +378,7 @@ impl Terminal {
     }
 
     /// A step starts: the others see it, and a task's result will say so.
-    /// These four hold for any `Ui` running this conversation.
+    /// These five hold for any `Ui` running this conversation.
     pub(crate) fn step_started(&self, call: &ToolCall) {
         let (name, target) = steps::describe(call);
         crate::peers::farewell::running(&format!("{name} {target}"));
@@ -406,6 +406,14 @@ impl Terminal {
     pub(crate) fn tokens_used(&self, usage: &Usage) {
         if let Some(peers) = &self.peers {
             peers.add_tokens(usage.input_tokens.saturating_add(usage.output_tokens));
+        }
+    }
+
+    /// What a command did to files, for a task's result and the others in
+    /// this folder.
+    pub(crate) fn step_watched(&mut self, changed: &Changed) {
+        for path in changed.changed.iter().chain(&changed.made).chain(&changed.removed) {
+            self.changed_path(path.clone());
         }
     }
 
@@ -1138,9 +1146,7 @@ impl Ui for Terminal {
     fn watched(&mut self, _call: &ToolCall, what: &Watched) {
         self.watched = Some(match what {
             Watched::Changed(changed) => {
-                for path in changed.changed.iter().chain(&changed.made).chain(&changed.removed) {
-                    self.changed_path(path.clone());
-                }
+                self.step_watched(changed);
                 crate::format::changes(changed)
             }
             Watched::NotHere(off) => format!("/undo won't put back what commands do here: {off}"),

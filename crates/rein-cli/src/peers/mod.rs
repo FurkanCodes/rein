@@ -365,9 +365,9 @@ pub(crate) fn default_name(root: &Path) -> String {
     if name.is_empty() { "rein".to_owned() } else { name }
 }
 
-/// `wanted`, or the first of `wanted-2`, `wanted-3`... none of `peers` has.
-pub(crate) fn free_name(wanted: &str, peers: &[Info]) -> String {
-    let taken = |name: &str| peers.iter().any(|p| p.name == name);
+/// `wanted`, or the first of `wanted-2`, `wanted-3`... that's none of `taken`.
+pub(crate) fn free_name(wanted: &str, taken: &[String]) -> String {
+    let taken = |name: &str| taken.iter().any(|t| t == name);
     if !taken(wanted) {
         return wanted.to_owned();
     }
@@ -470,7 +470,7 @@ mod tests {
         assert!(clean_name("a/b").is_err());
         assert!(clean_name("\x1b]2;x").is_err(), "nothing that reaches the terminal as a sequence");
         assert_eq!(default_name(Path::new("/home/me/My Project")), "my-project");
-        assert_eq!(free_name("api", &[info("api", "w"), info("api-2", "w")]), "api-3");
+        assert_eq!(free_name("api", &["api".to_owned(), "api-2".to_owned()]), "api-3");
     }
 
     #[test]
