@@ -51,8 +51,8 @@ and `NO_COLOR` turns the colour off.
 [Each release](https://github.com/FurkanCodes/rein/releases/latest) has the
 builds to download by hand too. They aren't signed, so macOS stops one
 downloaded in a browser until you run `xattr -d com.apple.quarantine rein`.
-The Linux builds need glibc 2.35 or newer (Ubuntu 22.04), and there's none
-for musl (Alpine). There's no build for Windows, where rein doesn't compile
+The Linux builds need glibc 2.34 or newer (Ubuntu 22.04 or later), and
+there's none for musl (Alpine). There's no build for Windows, where rein doesn't compile
 yet.
 
 To build it yourself, with Rust 1.95 or newer (1.92 can't build rein), from

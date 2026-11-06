@@ -187,7 +187,7 @@ main() {
     tar -xzf "$folder/$archive" -C "$folder" || fail "can't unpack $archive"
 
     # Tried before it replaces a rein that works.
-    said=$("$folder/$name/rein" --version 2>&1) || fail "this build can't run here: $said (the Linux builds need glibc 2.35 or newer)"
+    said=$("$folder/$name/rein" --version 2>&1) || fail "this build can't run here: $said (the Linux builds need glibc 2.34 or newer)"
     mv -f "$folder/$name/rein" "$place/rein"
 
     if tinted 1; then
