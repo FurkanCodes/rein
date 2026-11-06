@@ -10,6 +10,31 @@ use crate::{CliResult, config_dir};
 use rein_agent::permissions::{Mode, Sandboxing};
 use rein_agent::sandbox::Sandbox;
 
+/// What marks a mode with nothing to hold a command back.
+const DANGER: &str = "⚠";
+
+/// Whether commands run unasked with nothing to hold them: `trust`, where
+/// the model can go past the sandbox too, and `auto` with none on. Marked
+/// wherever such a mode is named, as rein starts in one.
+pub(crate) fn dangerous(mode: Mode, sandboxing: Sandboxing) -> bool {
+    mode == Mode::Trust || (mode == Mode::Auto && sandboxing == Sandboxing::Off)
+}
+
+/// `text`, about `mode`, marked if that's dangerous.
+fn marked(mode: Mode, sandboxing: Sandboxing, text: &str) -> String {
+    if dangerous(mode, sandboxing) { format!("{DANGER} {text}") } else { text.to_owned() }
+}
+
+/// `mode`'s name, as the bar and `/mode` show it.
+pub(crate) fn shown_name(mode: Mode, sandboxing: Sandboxing) -> String {
+    marked(mode, sandboxing, mode.as_str())
+}
+
+/// [`description`], as it's said on screen.
+pub(crate) fn said(mode: Mode, sandboxing: Sandboxing) -> String {
+    marked(mode, sandboxing, description(mode, sandboxing))
+}
+
 /// What `mode` lets through, `name: what`, as it is with the sandbox
 /// on, off, or on with none here.
 pub(crate) fn description(mode: Mode, sandboxing: Sandboxing) -> &'static str {
@@ -129,4 +154,27 @@ async fn keep_setting(keep: Keep, kept: impl Fn(&crate::settings::Settings) -> S
         say!("{pad}{}", terminal.err.dim(&format!("({} in your environment still wins over the settings)", keep.env)));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_mode_with_nothing_to_hold_a_command_back_is_marked() {
+        use Sandboxing::{Missing, Off, On};
+        let mut marked = Vec::new();
+        for mode in Mode::ALL {
+            for sandboxing in [On, Off, Missing] {
+                if dangerous(mode, sandboxing) {
+                    marked.push((mode, sandboxing));
+                }
+            }
+        }
+        assert_eq!(marked, [(Mode::Trust, On), (Mode::Trust, Off), (Mode::Trust, Missing), (Mode::Auto, Off)]);
+        assert_eq!(shown_name(Mode::Trust, On), "⚠ trust");
+        assert_eq!(shown_name(Mode::Ask, Off), "ask");
+        assert!(said(Mode::Auto, Off).starts_with("⚠ auto: nothing asks"), "{}", said(Mode::Auto, Off));
+        assert!(said(Mode::Auto, On).starts_with("auto: nothing asks"), "{}", said(Mode::Auto, On));
+    }
 }

@@ -52,8 +52,8 @@ and `NO_COLOR` turns the colour off.
 builds to download by hand too. They aren't signed, so macOS stops one
 downloaded in a browser until you run `xattr -d com.apple.quarantine rein`.
 The Linux builds need glibc 2.34 or newer (Ubuntu 22.04 or later), and
-there's none for musl (Alpine). There's no build for Windows, where rein doesn't compile
-yet.
+there's none for musl (Alpine). There's no build for Windows itself, where
+rein doesn't compile yet: run the Linux one in WSL.
 
 To build it yourself, with Rust 1.95 or newer (1.92 can't build rein), from
 a clone of this repo:
@@ -591,6 +591,11 @@ rein starts in `trust`, where everything runs without asking except what
 your rules say to ask about first, which at the start is deleting.
 `--mode`, `mode` in the settings, `/mode` (which offers to keep what you
 pick) or Shift-Tab change it.
+
+`trust` is dangerous, and rein marks it with ⚠ wherever it names it: a
+command can do anything you can, so a bad instruction in a file or on a web
+page the model reads could cost you your files or your keys. `auto` gets the
+same mark with the sandbox off.
 
 With the sandbox **off** (the default), nothing holds a command to what it
 says it needs:

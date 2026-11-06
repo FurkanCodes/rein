@@ -631,7 +631,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                     peers.follow_mode(mode);
                 }
                 terminal.input.set_bar(terminal.bar());
-                terminal.input.notice(&format!("{} · shift-tab for the next", crate::modes::description(mode, terminal.sandboxing)));
+                terminal.input.notice(&format!("{} · shift-tab for the next", crate::modes::said(mode, terminal.sandboxing)));
                 continue;
             }
             Said::Paste => {
@@ -768,7 +768,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             if let Some(peers) = &terminal.peers {
                 peers.follow_mode(mode);
             }
-            say!("{pad}{} {}", s.green("✓"), crate::modes::description(mode, terminal.sandboxing));
+            say!("{pad}{} {}", s.green("✓"), crate::modes::said(mode, terminal.sandboxing));
             // The bar says so while it asks whether to keep it.
             terminal.input.set_bar(terminal.bar());
             crate::modes::keep_mode(mode, terminal).await?;
@@ -778,7 +778,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             terminal.sandboxing = agent.permissions.sandboxing();
             say!("{pad}{} {}", s.green("✓"), crate::modes::sandbox_now(terminal.sandboxing, agent.permissions.sandbox()));
             // What the mode does now, as it depends on it.
-            say!("{pad}{}", s.dim(crate::modes::description(agent.permissions.mode, terminal.sandboxing)));
+            say!("{pad}{}", s.dim(&crate::modes::said(agent.permissions.mode, terminal.sandboxing)));
             terminal.input.set_bar(terminal.bar());
             crate::modes::keep_sandbox(on, terminal).await?;
         }
@@ -826,7 +826,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
                 ("model", terminal.model.clone()),
                 ("provider", format!("{} · {}", setup.provider.title, agent.model.client.base_url())),
                 ("effort", crate::effort::words(agent)),
-                ("mode", crate::modes::description(agent.permissions.mode, terminal.sandboxing).to_owned()),
+                ("mode", crate::modes::said(agent.permissions.mode, terminal.sandboxing)),
                 ("sandbox", crate::modes::sandbox_status(terminal.sandboxing, agent.permissions.sandbox())),
                 (
                     "steps",
@@ -915,7 +915,7 @@ pub(crate) async fn choose(command: Slash, agent: &Agent<Llm>, terminal: &mut Te
                 let description = crate::modes::description(m, terminal.sandboxing);
                 description.split_once(": ").map_or(description, |(_, about)| about).to_owned()
             };
-            let items = modes.iter().map(|&m| (m.to_string(), about(m))).collect();
+            let items = modes.iter().map(|&m| (crate::modes::shown_name(m, terminal.sandboxing), about(m))).collect();
             let current = modes.iter().position(|&m| m == agent.permissions.mode);
             terminal.input.choose(menu("what runs without asking", items, current)).await.map(|i| Slash::Mode(Some(modes[i])))
         }
@@ -1134,7 +1134,7 @@ pub(crate) fn load_permissions(root: &Path, dir: &Path, mode: Mode, on: bool, sa
     let (yours, first_time) = crate::rules::load(dir)?;
     permissions.set_yours(&yours).map_err(|e| format!("{} {e}", crate::rules::shown(&dir.join(crate::rules::FILE))))?;
     if first_time {
-        say!("{}", crate::rules::first_time(mode == Mode::Trust));
+        say!("{}", crate::rules::first_time(mode, sandboxing));
     }
     let count = permissions.rule_count(Whose::Project);
     if count > 0 {
@@ -1142,8 +1142,8 @@ pub(crate) fn load_permissions(root: &Path, dir: &Path, mode: Mode, on: bool, sa
     }
     if mode != Mode::default() {
         let description = crate::modes::description(mode, sandboxing);
-        let (name, about) = description.split_once(": ").unwrap_or((description, ""));
-        say!("Mode: {name} ({about})");
+        let about = description.split_once(": ").map_or("", |(_, about)| about);
+        say!("Mode: {} ({about})", crate::modes::shown_name(mode, sandboxing));
     }
     Ok(permissions)
 }

@@ -2516,7 +2516,7 @@ fn auto_without_the_sandbox_runs_every_command_but_what_asks() {
     let turn = Turn { out: vec![bash("touch made.txt", "outside", Some("to make it")), bash("rm made.txt", "write", None)] };
     let model = Model::start(vec![turn, says("Made it.")]).with_env("REIN_SANDBOX", "off").with_env("REIN_MODE", "auto");
     let mut term = Term::start(&model, "sandbox-off-auto", 30, 100);
-    term.wait_for("Mode: auto (nothing asks, and every command runs, without the sandbox");
+    term.wait_for("Mode: ⚠ auto (nothing asks, and every command runs, without the sandbox");
     term.wait_for(IDLE);
     term.keys("make it\r");
     term.wait_for("Made it.");
@@ -2603,15 +2603,50 @@ fn shift_tab_goes_through_the_modes_auto_among_them() {
     }
 }
 
+/// With nothing to hold a command back, a mode says so wherever it's named,
+/// and the mark goes when something does.
+#[test]
+fn a_mode_with_nothing_to_hold_a_command_back_is_marked() {
+    let model = Model::start(Vec::new()).with_env("REIN_SANDBOX", "off");
+    let mut term = Term::start(&model, "mode-marked", 30, 100);
+    term.wait_for(IDLE);
+    let bar = |term: &Term| term.text().lines().last().unwrap_or_default().to_owned();
+    assert!(!bar(&term).contains('⚠'), "ask asks: {}", bar(&term));
+    for (notice, marked) in [("edits: ", false), ("⚠ auto: nothing asks", true), ("read-only: ", false), ("⚠ trust: ", true), ("ask: ", false)] {
+        term.keys("\x1b[Z");
+        term.wait_for(notice);
+        term.wait_until("the bar to follow", |screen| screen.lines().last().unwrap_or_default().contains('⚠') == marked);
+    }
+    term.keys("/mode\r");
+    term.wait_for("what runs without asking");
+    term.wait_for("⚠ trust");
+    term.wait_for("⚠ auto");
+    assert!(!term.text().contains("⚠ edits") && !term.text().contains("⚠ ask"), "{}", term.text());
+    term.keys("\x1b");
+    term.wait_for(IDLE);
+    // Walls hold auto's commands, but trust's can still go past them.
+    term.keys("/sandbox on\r");
+    term.wait_for("Keep the sandbox on from now on?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("n");
+    term.wait_for(IDLE);
+    for (notice, marked) in [("edits: ", false), ("auto: nothing asks", false), ("read-only: ", false), ("⚠ trust: ", true)] {
+        term.keys("\x1b[Z");
+        term.wait_for(notice);
+        term.wait_until("the bar to follow", |screen| screen.lines().last().unwrap_or_default().contains('⚠') == marked);
+    }
+}
+
 #[test]
 fn rein_starts_in_trust_mode_and_asks_before_deleting() {
     let turns = vec![Turn { out: vec![bash("touch made.txt", "write", None)] }, Turn { out: vec![bash("rm made.txt", "write", None)] }, says("Made it, and took it away.")];
     // Rein's own default, with nothing set.
-    let model = Model::start(turns).with_env("REIN_MODE", "");
+    let model = Model::start(turns).with_env("REIN_MODE", "").with_env("REIN_SANDBOX", "");
     let mut term = Term::start(&model, "trust-default", 30, 120);
-    term.wait_for("rein runs everything without asking, but deleting (rm, git clean, git push --force and the like) asks first");
+    term.wait_for("⚠ rein runs everything without asking, but deleting (rm, git clean, git push --force and the like) asks first");
+    term.wait_for("can do anything you can: /sandbox walls them in.");
     term.wait_for(IDLE);
-    assert!(term.text().lines().last().unwrap_or_default().contains("trust"), "the bar says so:\n{}", term.text());
+    assert!(term.text().lines().last().unwrap_or_default().contains("⚠ trust"), "the bar says so:\n{}", term.text());
     let rules = std::fs::read_to_string(term.dir.join("home/permissions")).unwrap();
     assert!(rules.lines().any(|line| line == "ask rm") && rules.lines().any(|line| line == "ask git push --force"), "{rules}");
     term.keys("make a file, then take it away\r");

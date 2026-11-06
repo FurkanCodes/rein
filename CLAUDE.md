@@ -166,6 +166,9 @@ finding. Each says why in a line.
 - An MCP server runs outside the sandbox unless it has walls of its own
   (`"access"`), whatever the mode: Codex and Claude Code wall in none, and
   walls broke what servers need (a browser, the keychain, `npx`'s cache).
+- A mode with nothing to hold a command back says so with ⚠ wherever it's
+  named (`modes::dangerous`, in one place): rein starts in `trust`, and a
+  red word in the bar told a new user nothing about what that means.
 - Your own hooks run outside the sandbox in every mode, as Claude Code's
   do: they're your setup, not what the model runs. Walled in, a hook
   couldn't open its own script in `~/.claude/hooks`, Python's exit code

@@ -29,15 +29,15 @@ extension, desktop app or cloud version.
 
 ## Install
 
-On macOS or Linux:
+On macOS or Linux, or in WSL on Windows:
 
 ```sh
 curl -fsSL https://github.com/FurkanCodes/rein/releases/latest/download/install.sh | sh
 ```
 
 It picks the build for your computer, checks it, and puts `rein` in
-`~/.local/bin`. Run it again to update. There's no Windows build yet. To
-build it yourself, with Rust 1.95 or newer, from a clone of this repo:
+`~/.local/bin`. Run it again to update. To build it yourself, with Rust
+1.95 or newer, from a clone of this repo:
 
 ```sh
 cargo install --path crates/rein-cli --locked
@@ -81,7 +81,9 @@ set up each one.
 - [Permissions and sandbox](docs/guide.md#what-rein-may-do): rules that
   catch `rm` even behind `sudo` or `sh -c`, modes from `trust` to
   `read-only`, and an optional sandbox (Seatbelt on macOS, Landlock on
-  Linux).
+  Linux). rein starts in `trust`, marked ⚠ on screen: commands run without
+  asking, except deleting, and can do anything you can. `/mode` and
+  `/sandbox` change that.
 - [Undo](docs/guide.md#undo): `/undo` puts back files the model changed,
   including what its commands did.
 - [Usage limits](docs/guide.md#whats-left-of-your-limits): your plan's
@@ -91,10 +93,11 @@ set up each one.
 
 Early. I've just started using it to work on rein itself, on macOS. On
 Linux it passes all its tests, sandbox included, and has seen little real
-use. Windows would need a sandbox of its own; WSL should work, but nobody
-has tried it. It has run for real on a ChatGPT plan and through Claude
-Code's CLI; the other providers are built to their docs and tested against
-fake servers so far.
+use. On Windows it runs in WSL, where its tests pass and signing in and
+chatting work; it hasn't done real work there yet, and pasting an image is
+untested. A native Windows build would need a sandbox of its own. It has
+run for real on a ChatGPT plan and through Claude Code's CLI; the other
+providers are built to their docs and tested against fake servers so far.
 
 ## More
 

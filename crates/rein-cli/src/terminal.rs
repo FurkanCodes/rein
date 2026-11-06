@@ -524,9 +524,10 @@ impl Terminal {
             Some(effort) => format!("{} {}", s.bold(&self.model), s.dim(effort.as_str())),
             None => s.bold(&self.model),
         };
-        // The modes that ask less stand out.
+        // The modes that ask less stand out, and those with nothing to
+        // hold a command back most of all.
         let mode = match self.mode {
-            Mode::Trust => s.red(Mode::Trust.as_str()),
+            mode if crate::modes::dangerous(mode, self.sandboxing) => s.red(&crate::modes::shown_name(mode, self.sandboxing)),
             mode @ (Mode::Edits | Mode::Auto) => s.yellow(mode.as_str()),
             mode => mode.to_string(),
         };

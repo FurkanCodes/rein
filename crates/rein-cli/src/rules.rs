@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use rein_agent::agent::{Agent, Llm};
-use rein_agent::permissions::{FIRST_RULES, Kind, Rule, Whose, parse_rules};
+use rein_agent::permissions::{FIRST_RULES, Kind, Mode, Rule, Sandboxing, Whose, parse_rules};
 
 use crate::commands::Rules;
 use crate::input::{Menu, Question, Read};
@@ -39,13 +39,13 @@ pub(crate) fn load(dir: &Path) -> CliResult<(String, bool)> {
 
 /// What's said the first time, once your rules are written: what rein does
 /// now, in `mode`, and where to change it.
-pub(crate) fn first_time(trusting: bool) -> String {
+pub(crate) fn first_time(mode: Mode, sandboxing: Sandboxing) -> String {
     let file = shown(&config_dir().map_or_else(|_| PathBuf::from(FILE), |dir| dir.join(FILE)));
-    if trusting {
-        format!("rein runs everything without asking, but {STARTED}. /mode changes what runs without asking, /permissions what asks; your rules are in {file}")
-    } else {
-        format!("Your rules say {STARTED}: /permissions changes them, or {file}")
+    if mode != Mode::Trust {
+        return format!("Your rules say {STARTED}: /permissions changes them, or {file}");
     }
+    let walls = if sandboxing == Sandboxing::Off { " Commands can do anything you can: /sandbox walls them in." } else { "" };
+    format!("⚠ rein runs everything without asking, but {STARTED}.{walls} /mode changes what runs without asking, /permissions what asks; your rules are in {file}")
 }
 
 /// `/permissions`: your rules and the project's to pick from, or one of
