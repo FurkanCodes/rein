@@ -31,7 +31,7 @@ use std::os::fd::AsRawFd;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use super::style::{Style, fit, strip, width};
-use super::transcript::{Draw, Row, Transcript, split_at_column};
+use super::transcript::{Draw, Follows, Row, Transcript, split_at_column};
 
 static SCREEN: Mutex<()> = Mutex::new(());
 
@@ -361,7 +361,8 @@ pub fn select(x: usize, y: usize, drag: Drag) -> Option<String> {
 }
 
 /// The text between two points of the conversation, as it reads: a line
-/// wrapped over rows comes out as one line again.
+/// wrapped over rows comes out as one line again, and a word broken over
+/// them as one word.
 fn selected_text(state: &mut State, from: (usize, usize), to: (usize, usize)) -> String {
     let (from, to) = if from <= to { (from, to) } else { (to, from) };
     let (closed, open) = state.transcript.rows(size().1);
@@ -374,9 +375,11 @@ fn selected_text(state: &mut State, from: (usize, usize), to: (usize, usize)) ->
         let end = if i == to.0 { (to.1 + 1).min(plain.len()) } else { plain.len() };
         let piece: String = plain.get(start.min(plain.len())..end.max(start).min(plain.len())).unwrap_or_default().iter().collect();
         if i > from.0 {
-            if row.wrapped {
+            if row.follows != Follows::Nothing {
                 out = out.trim_end().to_owned();
-                out.push(' ');
+                if row.follows == Follows::Word {
+                    out.push(' ');
+                }
                 out += piece.trim_start();
                 continue;
             }

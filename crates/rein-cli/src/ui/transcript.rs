@@ -15,8 +15,19 @@ use super::wrap::Wrap;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     pub text: String,
-    /// It goes on from the row above: one line, wrapped.
-    pub wrapped: bool,
+    pub follows: Follows,
+}
+
+/// How a row goes on from the one above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Follows {
+    /// It doesn't: it starts a line.
+    Nothing,
+    /// One line, wrapped between two words.
+    Word,
+    /// One word, too long for a row, like a link: no space goes between
+    /// them, or a link copied from the screen leads nowhere.
+    SameWord,
 }
 
 /// Lays out a step for a width.
@@ -141,7 +152,7 @@ fn lay_out(block: &Block, width: usize) -> Vec<Row> {
     match block {
         Block::Text(line) => text_rows(line, width),
         Block::Drawn(draw, _) => {
-            draw(width).into_iter().flat_map(|line| line.split('\n').map(|l| fit(l, width)).collect::<Vec<_>>()).map(|text| Row { text, wrapped: false }).collect()
+            draw(width).into_iter().flat_map(|line| line.split('\n').map(|l| fit(l, width)).collect::<Vec<_>>()).map(|text| Row { text, follows: Follows::Nothing }).collect()
         }
     }
 }
@@ -174,17 +185,16 @@ pub fn text_rows(line: &str, cols: usize) -> Vec<Row> {
         style = in_force(&text, style);
         // A word longer than the row is broken, not cut.
         let mut text = text;
-        let mut first = true;
+        let mut follows = if i > 0 { Follows::Word } else { Follows::Nothing };
         loop {
-            let wrapped = i > 0 || !first;
             if width(&text) <= cols {
-                rows.push(Row { text, wrapped });
+                rows.push(Row { text, follows });
                 break;
             }
             let (head, tail) = split_at_column(&text, cols);
-            rows.push(Row { text: head, wrapped });
+            rows.push(Row { text: head, follows });
             text = format!("{}{tail}", " ".repeat(indent.min(cols / 2)));
-            first = false;
+            follows = Follows::SameWord;
         }
     }
     rows
@@ -265,7 +275,7 @@ mod tests {
         assert_eq!(shown(rows), ["rein   The quick brown fox jumps over the lazy dog."], "wider: one row again");
         let (rows, _) = t.rows(20);
         assert!(shown(rows).iter().all(|row| !row.contains("ju mps") && row.chars().count() <= 20));
-        assert!(rows[1].wrapped && !rows[0].wrapped);
+        assert_eq!((rows[0].follows, rows[1].follows), (Follows::Nothing, Follows::Word));
     }
 
     #[test]

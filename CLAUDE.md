@@ -211,6 +211,11 @@ finding. Each says why in a line.
   link planted in place of its stats. Not rtk's `tee` folder either: a
   folder of links moved there could take its next file, whose names can
   be guessed.
+- A link reaches the browser only if it's http or https, and through no
+  shell: an MCP server chooses its own sign-in link. mcp-remote gave one to
+  PowerShell, and `$(…)` in it ran commands (CVE-2025-6514), and `file:`
+  links started programs everywhere. So WSL and Windows use `rundll32`,
+  never `cmd /c start`, whatever escaping is added.
 - Network access is the internet, never other programs' sockets: with all
   network allowed, a command reached Docker's socket, and Docker can mount
   your home.
@@ -363,7 +368,11 @@ finding. Each says why in a line.
   look: a menu's title can be drawn before its list. And wait for what only
   that state shows: `/login`'s line in the list of commands has the words of
   its menu's title, and on a slow machine the letters typed "in the menu"
-  went to the box, then into a key box.
+  went to the box, then into a key box. The model's last word isn't the end
+  of a turn: the line that ends it and the box come after, and a test that
+  looked or pressed a key too soon failed on a first run in WSL. To find
+  such a race, slow the step that follows (a sleep in `end_turn`) and run
+  them all: a pass under load proved nothing, 40 times over.
 - Tests of state the whole process shares (the armed process groups) take
   one lock: `stop_all` in one test killed the group another test was
   checking, and it failed one run in three.

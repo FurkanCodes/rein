@@ -318,7 +318,7 @@ async fn sign_in(server: &Server, challenge: &str, mcp: &Mcp, terminal: &mut Ter
         return Ok(false);
     }
     let pending = tokens.begin(&url, &found, yours).await.map_err(describe)?;
-    if !crate::open_browser(&pending.link).await {
+    if !crate::browser::open(&pending.link).await {
         say!("{pad}Couldn't open a browser. Open this link to sign in:\n\n{}\n", pending.link);
     }
     let waited = async {

@@ -328,7 +328,7 @@ pub async fn save_key(http: &rein_llm::reqwest::Client, provider: &Provider, key
 pub async fn key_from_browser(http: &rein_llm::reqwest::Client, provider: &Provider, auth_url: &str, tell: &dyn Fn(&str)) -> CliResult<String> {
     let pending = rein_llm::openrouter::begin(auth_url, "rein").await.map_err(describe)?;
     tell(&format!("Sign in to {} in your browser, and rein gets a key of its own...", provider.title));
-    if !crate::open_browser(&pending.url).await {
+    if !crate::browser::open(&pending.url).await {
         tell(&format!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url));
     }
     let (base, _) = base_url(provider);

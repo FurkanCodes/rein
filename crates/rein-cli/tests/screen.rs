@@ -988,6 +988,7 @@ fn the_wheel_scrolls_back_and_pgdn_returns() {
     term.wait_for(IDLE);
     term.keys("count\r");
     term.wait_for("line 40");
+    term.wait_for(IDLE);
     assert!(!term.text().contains("line 20"));
     for _ in 0..5 {
         term.keys("\x1b[<64;10;5M");
@@ -1304,6 +1305,8 @@ fn a_change_shows_on_tinted_lines_and_the_turn_says_what_it_changed() {
     term.keys(DARK);
     term.keys("change it\r");
     term.wait_for("Changed.");
+    // The line that ends the turn comes after the model's last word.
+    term.wait_for("── 1 step · changed a.py · ");
     let screen = term.text();
     assert!(screen.contains("rein     ✓ Edit   a.py  +1 -1\n"), "{screen}");
     assert!(!screen.contains('┌') && !screen.contains("│    2"), "no frame around it:\n{screen}");
@@ -1311,7 +1314,6 @@ fn a_change_shows_on_tinted_lines_and_the_turn_says_what_it_changed() {
     assert!(removed[79].0 != vt100::Color::Default && added[79].0 != vt100::Color::Default, "tinted to the edge");
     assert_ne!(removed[79].0, added[79].0, "red and green");
     assert_eq!(removed[0].0, vt100::Color::Default, "from under the step, not the window's edge");
-    assert!(screen.contains("── 1 step · changed a.py · "), "{screen}");
 }
 
 #[test]
@@ -1323,10 +1325,11 @@ fn reads_in_a_row_share_a_line() {
     term.wait_for(IDLE);
     term.keys("read them\r");
     term.wait_for("All read.");
+    // The line that ends the turn comes after the model's last word.
+    term.wait_for("── 3 steps · changed no files · ");
     let screen = term.text();
     assert!(screen.contains("✓ Read   a.txt, b.txt, c.txt  3 files · 6 lines"), "{screen}");
     assert_eq!(screen.matches("✓ Read").count(), 1, "one line for the three, asked for together or not:\n{screen}");
-    assert!(screen.contains("── 3 steps · changed no files · "), "the turn did work: a line ends it\n{screen}");
 }
 
 #[test]
@@ -1737,6 +1740,7 @@ fn signed_in_to_nothing_rein_opens_on_signing_in_then_goes_on_with_the_new_sign_
     assert!(std::fs::read_to_string(term.dir.join("home/config")).unwrap().contains("model = groq/llama-test"));
 
     // The next time, the saved key and model are used, and nothing asks.
+    term.wait_for(IDLE);
     term.keys("\x04");
     let term = term.again(&model);
     term.wait_for(IDLE);
@@ -2077,6 +2081,89 @@ fn openrouter_sign_in_happens_in_the_browser_and_rein_keeps_the_key_it_makes() {
     let (ok, said) = run(&model, &home, &["logout", "openrouter"], "");
     assert!(ok && said.contains("still works there until you delete it"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// In WSL, Windows' browser is the one there is. The link reaches it as one
+/// argument, `&`s and all, and comes back to rein by Windows' localhost.
+#[test]
+fn from_wsl_a_sign_in_opens_in_the_windows_browser() {
+    let model = Model::chat(vec![], None);
+    let home = std::env::temp_dir().join(format!("rein-login-wsl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(home.join("providers"), format!("[openrouter]\nurl = {}\n", model.base)).unwrap();
+    // Windows' program, as one that notes what it's given. Another process
+    // writes it: one open for writing here would be "Text file busy".
+    let opener = bin.join("rundll32.exe");
+    let mut writer = Command::new("sh").args(["-c", "cat > \"$0\" && chmod 755 \"$0\"", opener.to_str().unwrap()]).stdin(Stdio::piped()).spawn().unwrap();
+    writer.stdin.take().unwrap().write_all(b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/opening\"\nmv \"$HOME/opening\" \"$HOME/opened\"\n").unwrap();
+    assert!(writer.wait().unwrap().success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rein"))
+        .args(["login", "openrouter"])
+        .env_clear()
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+        .env("HOME", &home)
+        .env("REIN_HOME", &home)
+        .env("WSL_DISTRO_NAME", "Ubuntu")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let opened = home.join("opened");
+    let start = Instant::now();
+    while !opened.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "rein never opened Windows' browser");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let given = std::fs::read_to_string(&opened).unwrap();
+    let given: Vec<&str> = given.lines().collect();
+    assert_eq!(given.len(), 2, "what opens links, then the link: {given:?}");
+    assert_eq!(given[0], "url.dll,FileProtocolHandler");
+    let link = rein_llm::reqwest::Url::parse(given[1]).unwrap();
+    let param = |name: &str| link.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned()).unwrap();
+    assert_eq!(param("key_label"), "rein", "the whole link: {link}");
+    let callback = rein_llm::reqwest::Url::parse(&param("callback_url")).unwrap();
+    let mut browser = TcpStream::connect(("127.0.0.1", callback.port().unwrap())).unwrap();
+    write!(browser, "GET {}?code=c1&state={} HTTP/1.1\r\nHost: localhost\r\n\r\n", callback.path(), param("state")).unwrap();
+    let mut page = String::new();
+    browser.read_to_string(&mut page).unwrap();
+    assert!(page.contains("rein is connected to OpenRouter"), "{page}");
+
+    let mut said = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut said).unwrap();
+    assert!(child.wait().unwrap().success(), "{said}");
+    assert!(said.contains("Signed in. OpenRouter made rein a key of its own"), "{said}");
+    assert!(!said.contains("Couldn't open a browser"), "it did: {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Where no browser opens, the link on screen is all there is: broken over
+/// rows, a drag across it copies it whole, with no spaces where it broke.
+#[test]
+fn a_link_broken_over_rows_is_copied_whole() {
+    let model = Model::start(vec![]);
+    let mut term = Term::start(&model, "long-link", 30, 60);
+    term.wait_for(IDLE);
+    term.keys("/login openrouter\r");
+    term.wait_for("Open this link to continue:");
+    term.wait_until("the link", |screen| screen.contains("https://openrouter.ai/auth?"));
+    term.wait_for("Waiting");
+    let text = term.text();
+    let lines: Vec<&str> = text.lines().collect();
+    let first = lines.iter().position(|line| line.contains("https://openrouter.ai/auth?")).unwrap();
+    let last = (first..lines.len()).take_while(|&row| !lines[row].trim().is_empty()).last().unwrap();
+    assert!(last > first, "it's broken over rows:\n{text}");
+    let link: String = lines[first..=last].iter().map(|line| line.trim()).collect();
+    let (from, to) = (lines[first].find("https").unwrap() + 1, lines[last].trim_end().chars().count());
+    term.keys(&format!("\x1b[<0;{from};{}M\x1b[<32;{to};{}M\x1b[<0;{to};{}m", first + 1, last + 1, last + 1));
+    let start = Instant::now();
+    while term.screen.lock().unwrap().callbacks().copied.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(10), "nothing was copied");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(term.screen.lock().unwrap().callbacks().copied, [link]);
 }
 
 #[test]
@@ -3918,6 +4005,7 @@ fn a_projects_hook_runs_once_you_say_yes_to_it_as_it_is() {
     assert!(!term.dir.join("home/hooks-approved.json").exists());
 
     // Asked again, and yes.
+    term.wait_for(IDLE);
     term.keys("\x04");
     let mut term = term.again(&model);
     term.wait_for("Run the hook this project sets?");
@@ -3933,6 +4021,7 @@ fn a_projects_hook_runs_once_you_say_yes_to_it_as_it_is() {
     assert!(!term.dir.join("project/.rein").exists(), "nothing kept in the project");
 
     // Kept: not asked. /hooks takes the yes back.
+    term.wait_for(IDLE);
     term.keys("\x04");
     let mut term = term.again(&model);
     term.wait_for("Hooks: sh on your messages · /hooks");
@@ -3944,6 +4033,7 @@ fn a_projects_hook_runs_once_you_say_yes_to_it_as_it_is() {
     term.wait_for(IDLE);
     term.keys("hello\r");
     term.wait_for("Heard.");
+    term.wait_for(IDLE);
     assert!(!last().contains("from the project"), "off once taken back: {}", last());
     let after = std::fs::read_to_string(term.dir.join("home/hooks-approved.json")).unwrap();
     assert!(!after.contains("sha256:"), "{after}");
@@ -4015,12 +4105,14 @@ fn a_note_saved_is_seen_and_the_next_conversation_starts_with_it() {
     let note = std::fs::read_to_string(folder.join("rtk-hides-failures.md")).unwrap();
     assert!(note.contains("  type: feedback\n") && note.contains("Why: rtk summarizes output."), "{note}");
 
+    term.wait_for(IDLE);
     term.keys("\x04");
     let mut term = term.again(&model);
     term.wait_for("Memory: 1 note · /memory");
     term.wait_for(IDLE);
     term.keys("hi\r");
     term.wait_for("Hello.");
+    term.wait_for(IDLE);
     let first = model.requests().last().unwrap()["input"][0].to_string();
     assert!(first.contains("<memory>") && first.contains("[Rtk hides failures](rtk-hides-failures.md) — judge checks by exit code"), "{first}");
 
@@ -4496,6 +4588,7 @@ fn a_server_at_a_url_is_signed_in_to_in_the_browser_and_its_tools_work() {
     assert_eq!(results(&model), ["hello from far away"]);
     let file: Value = serde_json::from_str(&std::fs::read_to_string(term.dir.join("home/mcp.json")).unwrap()).unwrap();
     assert_eq!(file["mcpServers"]["far"], json!({ "type": "http", "url": format!("{base}/mcp") }));
+    term.wait_for(IDLE);
     term.keys("\x04");
     term.wait_exit();
     assert!(!model.requests().iter().any(|request| request.to_string().contains("FAKE-far-token")), "the model never saw it");
@@ -4532,6 +4625,7 @@ fn a_server_added_with_its_key_keeps_it_out_of_the_screen_history_and_conversati
     term.wait_for("Got it.");
     assert_eq!(results(&model), ["[a key rein hides]"]);
     assert!(!term.text().contains("FAKE-mcp-pw"), "{}", term.text());
+    term.wait_for(IDLE);
     term.keys("\x04");
     term.wait_exit();
     assert!(!model.requests().iter().any(|request| request.to_string().contains("FAKE-mcp-pw")), "the model never saw it");

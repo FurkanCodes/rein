@@ -1,7 +1,7 @@
 //! `rein`: a tiny, fast agent harness. You hold the reins.
 
 use std::path::{Path, PathBuf};
-use std::process::{ExitCode, Stdio};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use rein_llm::openai::signin::{self, Credentials};
@@ -20,6 +20,7 @@ macro_rules! out {
 }
 
 mod args;
+mod browser;
 mod check;
 mod claude;
 mod commands;
@@ -135,7 +136,7 @@ async fn login(http: &rein_llm::reqwest::Client, tell: &dyn Fn(&str)) -> CliResu
 
     let pending = signin::begin(&host_id, AGENT_NAME, previous.as_ref()).await.map_err(describe)?;
     tell("Continue with ChatGPT: finish signing in in your browser...");
-    if !open_browser(&pending.url).await {
+    if !browser::open(&pending.url).await {
         tell(&format!("Couldn't open a browser. Open this link to continue:\n\n{}\n", pending.url));
     }
     let credentials = tokio::time::timeout(Duration::from_secs(600), pending.finish(http))
@@ -229,36 +230,6 @@ fn host_id(dir: &Path) -> CliResult<String> {
     let id = signin::new_host_id().map_err(describe)?;
     store::write_private(&path, id.as_bytes()).map_err(describe)?;
     Ok(id)
-}
-
-/// Opens `url` with `$BROWSER` if it's set, as many tools do, or else the
-/// system's way.
-///
-/// `open` and `xdg-open` hand the link over and exit at once, but a browser
-/// named in `$BROWSER` may run until it's closed, and rein has one thread:
-/// it waits a moment for a failure, and a browser still running then is
-/// showing the page.
-async fn open_browser(url: &str) -> bool {
-    let mut command = match std::env::var("BROWSER").ok().filter(|b| !b.trim().is_empty()) {
-        Some(browser) => {
-            let mut words = browser.split_whitespace();
-            let mut command = tokio::process::Command::new(words.next().unwrap_or_default());
-            command.args(words);
-            command
-        }
-        None if cfg!(target_os = "macos") => tokio::process::Command::new("open"),
-        None if cfg!(windows) => {
-            let mut command = tokio::process::Command::new("cmd");
-            command.args(["/C", "start", ""]);
-            command
-        }
-        None => tokio::process::Command::new("xdg-open"),
-    };
-    let Ok(mut child) = command.arg(url).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false };
-    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
-        Ok(status) => status.is_ok_and(|s| s.success()),
-        Err(_) => true,
-    }
 }
 
 #[cfg(test)]

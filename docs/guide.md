@@ -93,6 +93,11 @@ models. The one you pick is saved as `model` in the [settings](#settings),
 so the next `rein` starts with it. Press Esc to leave. A one-off task
 (`rein "…"`) has no one to ask, so it tells you how to sign in instead.
 
+A sign-in in the browser opens the one in `$BROWSER` if that's set, or else
+your system's default. In WSL that's your Windows browser, which comes back
+to rein through WSL's forwarding of `localhost`. If no browser opens, rein
+shows the link: drag over it to copy it.
+
 rein doesn't sign in to Claude or Gemini plans itself, because Anthropic and
 Google don't allow other apps to. Every run shows which account it uses.
 With no model named, it uses `gpt-6.1-sol`. If you're not signed in to
@@ -258,7 +263,8 @@ whole output. A turn that ran steps ends with what it came to:
 **The window.** rein keeps the conversation as text and lays it out for the
 window's width, so resizing loses nothing and words wrap where they should.
 Scroll with the mouse wheel, PgUp/PgDn or Shift-↑↓, and drag over text to
-copy it. What the terminal showed before rein is left as it was. When you
+copy it: a line wrapped over rows comes out as one line, and a link broken
+over rows as one link. What the terminal showed before rein is left as it was. When you
 leave, rein prints the conversation there, so it stays in the scrollback.
 `rein "task"` and output that isn't a terminal get plain lines instead.
 `NO_COLOR` turns colour off.
