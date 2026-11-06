@@ -370,7 +370,8 @@ finding. Each says why in a line.
   shell that started the test.
 - An opt-in test is `#[ignore = "why"]`, so it shows as ignored, not passed.
 - A sandbox test skips where there's no sandbox, so it can pass by never
-  running: break the wall it checks and watch it fail. Put the file back
+  running (`REIN_TEST_NEEDS_SANDBOX` makes that a failure, as the release
+  workflow does): break the wall it checks and watch it fail. Put the file back
   newer than the broken one (`touch` it): cargo goes by modification times,
   and a copy restored with its old time kept the broken build running. Its project lives
   outside the temp folders, which every command may write; a project in one

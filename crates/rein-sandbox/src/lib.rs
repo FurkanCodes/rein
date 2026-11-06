@@ -391,6 +391,19 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// A sandbox test skips where there's no sandbox, so it can pass by
+    /// never running. Where `REIN_TEST_NEEDS_SANDBOX` says there must be
+    /// one, as on the machines that check rein, this fails if there isn't.
+    #[tokio::test]
+    async fn where_a_sandbox_is_needed_there_is_one() {
+        if std::env::var_os("REIN_TEST_NEEDS_SANDBOX").is_none() {
+            return;
+        }
+        let (root, home) = (dir("needed"), dir("needed-home"));
+        let sandbox = Sandbox::detect(Places::new(&root, Some(&home), None)).await;
+        assert!(sandbox.available(), "{}", sandbox.describe());
+    }
+
     /// Many commands at once, in every kind of access, again and again:
     /// every one that should work does, and the walls hold under load. A
     /// sandbox profile once crashed macOS, so this is how to see one holds

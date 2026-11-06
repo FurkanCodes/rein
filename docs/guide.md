@@ -1274,6 +1274,8 @@ cargo fmt --check
   three, then builds rein, on macOS and Linux, ARM and Intel. It runs when
   you start it by hand, and on a tag such as `v0.1.0`, which must match the
   version in `Cargo.toml` and also makes a draft release with the builds.
+  It sets `REIN_TEST_NEEDS_SANDBOX`, so a machine with no sandbox fails
+  instead of skipping the sandbox tests.
 - **Replayed streams.** The tests replay saved response streams from
   `crates/rein-llm/tests/fixtures`, so they need no network and spend no
   tokens.
