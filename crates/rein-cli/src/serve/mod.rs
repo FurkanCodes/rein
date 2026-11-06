@@ -328,7 +328,7 @@ fn listed(cwd: Option<&Path>, skip: usize) -> CliResult<Value> {
         .iter()
         .map(|saved| {
             // A sub-agent's first message is its task, from another rein.
-            let first = saved.first.as_deref().map(|first| rein_agent::peers::unheard(first).map_or(first, |(_, text)| text));
+            let first = saved.first.as_deref().map(|first| rein_agent::peers::unheard(first).map_or(first, |(_, text)| crate::peers::node::task_in(text).unwrap_or(text)));
             json!({ "sessionId": saved.id, "cwd": saved.cwd, "title": first.map(|first| shorten(first, TITLE)), "updatedAt": utc_stamp(saved.modified) })
         })
         .collect();

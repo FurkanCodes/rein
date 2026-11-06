@@ -5399,6 +5399,10 @@ fn what_another_rein_said_stays_its_own_in_a_reopened_conversation() {
     drop(tests);
 
     let (_rein, mut again) = rein.start_again(&model);
+    let id = again.call("session/list", json!({}));
+    let listed = again.answer(id)["result"]["sessions"].clone();
+    let titles: Vec<&str> = listed.as_array().unwrap().iter().filter_map(|saved| saved["title"].as_str()).collect();
+    assert!(titles.contains(&"run the test suite") && titles.contains(&"get the tests run"), "a sub-agent's is its task: {titles:?}");
     again.load(&session);
     let theirs = again.seen.iter().find(|message| message["method"] == HEARD).unwrap_or_else(|| panic!("{:#?}", again.seen));
     assert_eq!(theirs["params"]["from"], "tests");

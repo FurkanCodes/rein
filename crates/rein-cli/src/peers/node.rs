@@ -82,7 +82,7 @@ impl Incoming {
     pub(crate) fn text(&self) -> String {
         match self {
             Self::Message { text, .. } => text.clone(),
-            Self::Task { text, .. } => format!("A task for you, handed over by {}. When you're done, your last message goes back to it as the result.\n\n{text}", self.from()),
+            Self::Task { text, .. } => format!("A task for you, handed over by {}. {AFTER_A_TASK}{text}", self.from()),
             Self::Result { from, id, report, folder } => result_text(from, id, report) + &elsewhere(from, folder.as_deref()),
             Self::Followed { from, id, summary, files, folder } => {
                 format!("After task {id}, the user went on with {from} in its tab. {}{}\n\nIts last answer:\n{summary}", changed(files), elsewhere(from, folder.as_deref()))
@@ -91,6 +91,15 @@ impl Incoming {
             Self::ParentGone { .. } => "the rein that started this one has gone".to_owned(),
         }
     }
+}
+
+/// What ends the words above a task.
+const AFTER_A_TASK: &str = "When you're done, your last message goes back to it as the result.\n\n";
+
+/// The task in `message`, if it's one another rein handed over: what a
+/// sub-agent's conversation is about, as they all start the same way.
+pub(crate) fn task_in(message: &str) -> Option<&str> {
+    message.split_once(AFTER_A_TASK).map(|(_, task)| task)
 }
 
 /// Where `from` works, when it isn't here: what it changed is there.
