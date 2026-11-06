@@ -8,7 +8,7 @@
   <a href="#status"><img alt="Tested on macOS" src="https://img.shields.io/badge/tested%20on-macOS-lightgrey?logo=apple"></a>
 </p>
 
-rein is a coding agent for the terminal, written in Rust. It reads and
+rein is an agent harness for the terminal, written in Rust. It reads and
 edits your code and runs commands, and you see every step as it happens.
 You hold the reins.
 

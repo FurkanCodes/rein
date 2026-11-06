@@ -1,6 +1,6 @@
 # rein: notes for anyone changing it
 
-rein is a terminal coding agent in Rust (edition 2024, tokio `current_thread`).
+rein is a terminal agent harness in Rust (edition 2024, tokio `current_thread`).
 `crates/rein-llm` speaks to providers (Responses, Messages, Gemini and Chat
 Completions APIs), `crates/rein-agent` is the agent loop and its tools,
 `crates/rein-cli` is the `rein` binary and its full-screen terminal.
