@@ -5,7 +5,7 @@
 <p align="center">
   <a href="#licence"><img alt="Licence: MIT or Apache 2.0" src="https://img.shields.io/badge/licence-MIT%20or%20Apache%202.0-blue"></a>
   <a href="#install"><img alt="Rust 1.95 or newer" src="https://img.shields.io/badge/rust-1.95%2B-orange?logo=rust"></a>
-  <a href="#status"><img alt="Tested on macOS" src="https://img.shields.io/badge/tested%20on-macOS-lightgrey?logo=apple"></a>
+  <a href="#status"><img alt="Tested on macOS and Linux" src="https://img.shields.io/badge/tested%20on-macOS%20%7C%20Linux-lightgrey"></a>
 </p>
 
 rein is an agent harness for the terminal, written in Rust. It reads and
@@ -29,8 +29,15 @@ extension, desktop app or cloud version.
 
 ## Install
 
-There are no packages yet. With Rust 1.95 or newer, from a clone of this
-repo:
+On macOS or Linux:
+
+```sh
+curl -fsSL https://github.com/FurkanCodes/rein/releases/latest/download/install.sh | sh
+```
+
+It picks the build for your computer, checks it, and puts `rein` in
+`~/.local/bin`. Run it again to update. There's no Windows build yet. To
+build it yourself, with Rust 1.95 or newer, from a clone of this repo:
 
 ```sh
 cargo install --path crates/rein-cli --locked
@@ -82,10 +89,12 @@ set up each one.
 
 ## Status
 
-Early. I've just started using it to work on rein itself, on macOS, which
-is the only system it has been used on so far. It has run for real on a
-ChatGPT plan and through Claude Code's CLI; the other providers are built
-to their docs and tested against fake servers so far.
+Early. I've just started using it to work on rein itself, on macOS. On
+Linux it passes all its tests, sandbox included, and has seen little real
+use. Windows would need a sandbox of its own; WSL should work, but nobody
+has tried it. It has run for real on a ChatGPT plan and through Claude
+Code's CLI; the other providers are built to their docs and tested against
+fake servers so far.
 
 ## More
 

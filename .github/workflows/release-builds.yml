@@ -1,0 +1,108 @@
+# Checks rein on every system it ships for and builds it there. Started by
+# hand, it leaves the builds with the run. A tag like v0.1.0 also makes a
+# draft release with them, which goes public only when you publish it.
+name: Release builds
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.99.1"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          # The oldest Ubuntu here, so the builds run on older systems too.
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          command -v rustup || curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          "$HOME/.cargo/bin/rustup" default "$RUST_VERSION"
+
+      - name: Say the version, and that a tag agrees with it
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag is $GITHUB_REF_NAME, and Cargo.toml says $version."
+            exit 1
+          fi
+
+      - name: Check
+        run: |
+          # Sandbox tests need a project outside the temp folders.
+          mkdir -p "$HOME/rein-tests"
+          export REIN_TEST_DIR="$HOME/rein-tests"
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      - name: Build
+        run: |
+          cargo build --release --locked -p rein-cli
+          target/release/rein --help > /dev/null
+
+      - name: Package
+        env:
+          # macOS's tar would add a `._` file of metadata beside each file.
+          COPYFILE_DISABLE: "1"
+        run: |
+          name="rein-$VERSION-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/rein README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: rein-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Make the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp install.sh dist/
+          cd dist
+          sha256sum rein-*.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" ./* --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --generate-notes --title "rein ${GITHUB_REF_NAME#v}"

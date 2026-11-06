@@ -30,7 +30,33 @@ short version.
 
 ## Install
 
-With Rust 1.95 or newer (1.92 can't build rein), from a clone of this repo:
+On macOS or Linux, on ARM or Intel:
+
+```sh
+curl -fsSL https://github.com/FurkanCodes/rein/releases/latest/download/install.sh | sh
+```
+
+[`install.sh`](../install.sh) picks the build for your computer from the
+release, checks it against the release's checksums, makes sure it runs, and
+only then puts `rein` in `~/.local/bin`. It needs no sudo, and `rein
+--version` says what you have. Run it again to update. `REIN_VERSION=0.1.0`
+installs that version, and `REIN_INSTALL_DIR` another folder.
+
+If that folder isn't on your `PATH`, it offers to add it in your shell's
+startup file (zsh, bash or fish), and changes nothing unless you say yes.
+With another shell, or with nobody at the terminal to answer, it shows the
+line to add instead. It shows a progress bar and colour only on a terminal,
+and `NO_COLOR` turns the colour off.
+
+[Each release](https://github.com/FurkanCodes/rein/releases/latest) has the
+builds to download by hand too. They aren't signed, so macOS stops one
+downloaded in a browser until you run `xattr -d com.apple.quarantine rein`.
+The Linux builds need glibc 2.35 or newer (Ubuntu 22.04), and there's none
+for musl (Alpine). There's no build for Windows, where rein doesn't compile
+yet.
+
+To build it yourself, with Rust 1.95 or newer (1.92 can't build rein), from
+a clone of this repo:
 
 ```sh
 cargo install --path crates/rein-cli --locked   # puts `rein` on your PATH
@@ -1244,6 +1270,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+- **On every system.** `.github/workflows/release-builds.yml` runs all
+  three, then builds rein, on macOS and Linux, ARM and Intel. It runs when
+  you start it by hand, and on a tag such as `v0.1.0`, which must match the
+  version in `Cargo.toml` and also makes a draft release with the builds.
 - **Replayed streams.** The tests replay saved response streams from
   `crates/rein-llm/tests/fixtures`, so they need no network and spend no
   tokens.

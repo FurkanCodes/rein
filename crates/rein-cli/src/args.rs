@@ -16,6 +16,7 @@ Usage:
   rein [options] <prompt...>     Do one task and exit
   rein -c [<prompt...>]          Continue the latest conversation in this folder
   rein -r [<prompt...>]          Choose a saved conversation to continue
+  rein --version                 Say which version this is
   rein login                     Continue with ChatGPT (use your ChatGPT plan)
   rein login <provider> [--key]  Save an API key for a provider, like anthropic;
                                  openrouter signs in in the browser (--key: paste one)

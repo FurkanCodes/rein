@@ -99,6 +99,10 @@ async fn run(args: Vec<String>) -> CliResult {
             println!("{HELP}");
             Ok(())
         }
+        ["-V" | "--version"] => {
+            println!("rein {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         ["login"] | ["login", "chatgpt"] => login(&http, &|line| say!("{line}")).await,
         ["login", provider] => connect::login(&http, provider, KeyFrom::Asked).await,
         ["login", provider, "--key"] => connect::login(&http, provider, KeyFrom::Pasted).await,
