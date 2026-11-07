@@ -5141,6 +5141,31 @@ fn a_client_with_a_switch_for_keeping_the_mode_is_never_asked_and_keeps_it_with_
     assert!(!settings.contains("mode") && !settings.contains("sandbox"), "rein's own hold again: {settings}");
 }
 
+/// Kept is what your file says, never rein's own defaults: as rein starts,
+/// with nothing in the file, the switch showed on, and turning it off did
+/// nothing. Kept, a mode or sandbox you change goes in the file too.
+#[test]
+fn keeping_is_what_your_file_says_and_follows_what_you_change_while_its_on() {
+    let model = Model::start(vec![]).with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "keeps-file");
+    let session = rein.open_saying(&json!({ "_meta": { ASKS: true, "io.github.furkancodes/keeps": true } }));
+    let keep = |options: &Value| options.as_array().unwrap().iter().find(|option| option["id"] == "keep").unwrap()["currentValue"].clone();
+    let set = |rein: &mut Client, option: &str, value: &str| {
+        let id = rein.call("session/set_config_option", json!({ "sessionId": session, "configId": option, "value": value }));
+        rein.answer(id)["result"]["configOptions"].clone()
+    };
+    let settings = |rein: &Client| std::fs::read_to_string(rein.dir.join("home/config")).unwrap_or_default();
+    assert_eq!(keep(&set(&mut rein, "effort", "high")), "off", "trust and no sandbox are rein's own, and nothing's in the file: {}", settings(&rein));
+    assert_eq!(keep(&set(&mut rein, "keep", "on")), "on");
+    assert!(settings(&rein).contains("mode = trust"), "{}", settings(&rein));
+    assert_eq!(keep(&set(&mut rein, "mode", "edits")), "on", "still kept");
+    assert!(settings(&rein).contains("mode = edits"), "what's kept follows the switch's word: {}", settings(&rein));
+    assert_eq!(keep(&set(&mut rein, "keep", "off")), "off");
+    assert!(!settings(&rein).contains("mode"), "{}", settings(&rein));
+    assert_eq!(keep(&set(&mut rein, "mode", "ask")), "off", "and not kept, a change stays this conversation's");
+    assert!(!settings(&rein).contains("mode"), "{}", settings(&rein));
+}
+
 #[test]
 fn a_settings_page_reads_your_settings_sets_one_only_as_rein_reads_it_and_changes_your_rules() {
     let model = Model::start(vec![]);

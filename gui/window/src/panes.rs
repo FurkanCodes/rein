@@ -226,6 +226,13 @@ impl Panes {
         self.draft.clone().filter(|_| !self.held.iter().any(|held| held.shown))
     }
 
+    /// The pane you're at, or else the one to start with, if it's showing:
+    /// what the keys and ⌘K are for. ⌘K once went by the panes alone, and
+    /// on the first run listed nothing at all.
+    pub(crate) fn at(&self, cx: &App) -> Option<Entity<Pane>> {
+        self.looking_at(cx).or_else(|| self.shown_draft())
+    }
+
     /// Asks which folder the pane to start with should work in, and starts
     /// it again there, with what you'd written.
     fn move_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -377,7 +384,7 @@ impl Panes {
     /// terminal, wherever you pressed.
     pub(crate) fn keys_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.focus.is_focused(window)
-            && let Some(pane) = self.looking_at(cx).or_else(|| self.shown_draft())
+            && let Some(pane) = self.at(cx)
         {
             pane.update(cx, |pane, cx| pane.take_keys(window, cx));
         }

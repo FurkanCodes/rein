@@ -7,16 +7,18 @@ fn the_list_of_commands_follows_what_you_type_and_enter_runs_the_one_picked() {
     let mut desk = desk();
     let file = scratch("list");
     let pane = desk.pane(&file);
-    let listed = json!({ "sessionUpdate": "available_commands_update", "availableCommands": [{ "name": "compact", "description": "make room" }, { "name": "status", "description": "how it stands" }] });
+    // Of those the window has no home of its own for: `/status` opens the
+    // Context panel, as it does sent.
+    let listed = json!({ "sessionUpdate": "available_commands_update", "availableCommands": [{ "name": "compact", "description": "make room" }, { "name": "skills", "description": "what it can do" }] });
     desk.said(&pane, vec![Said::Update(listed)]);
-    typed(&mut desk, &pane, "/sta");
-    assert_eq!(desk.cx.update(|_, cx| pane.read(cx).listed_for_test(cx)), Some("status".to_owned()));
+    typed(&mut desk, &pane, "/ski");
+    assert_eq!(desk.cx.update(|_, cx| pane.read(cx).listed_for_test(cx)), Some("skills".to_owned()));
     desk.key("enter");
     let in_box = desk.cx.update(|_, cx| pane.read(cx).input.read(cx).value().to_string());
     assert_eq!(in_box, "");
     desk.cx.update(|_, cx| pane.update(cx, |pane, _| pane.finish_agent_for_test()));
     let ran = sent_to(&file).into_iter().find(|line| line["method"] == "session/prompt").expect("it ran");
-    assert_eq!(ran["params"]["prompt"][0]["text"], "/status");
+    assert_eq!(ran["params"]["prompt"][0]["text"], "/skills");
 }
 
 #[test]

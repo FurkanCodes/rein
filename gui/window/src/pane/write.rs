@@ -337,7 +337,10 @@ impl Pane {
         if matches!(self.writing.over, Some(Over::Commands(_))) {
             cx.stop_propagation();
             self.set_box("", window, cx);
-            self.run(&format!("/{name}"), Vec::new(), cx);
+            // As if sent, or chosen from ⌘K: `/model` opens the window's list
+            // rather than going to rein as a message, which on the first run
+            // started a conversation that said `/model`.
+            self.run_chosen(&format!("/{name}"), window, cx);
         } else if name != typed {
             cx.stop_propagation();
             self.complete_pick(window, cx);
@@ -480,8 +483,9 @@ impl Pane {
 
 /// What's drawn over the box.
 impl Pane {
-    /// What's listed for the word being typed.
-    pub(super) fn listing(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+    /// What's listed for the word being typed, by the box as `opens` says:
+    /// on the first run, under it, where it was once never drawn at all.
+    pub(super) fn listing(&self, opens: super::pickers::Opens, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let over = self.writing.over.as_ref()?;
         let look = Look::of(cx);
         let mono = cx.global::<crate::parts::Monospace>().0.clone();
@@ -512,7 +516,11 @@ impl Pane {
                     .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(if picked { look.ink_2 } else { look.ink_3 }).child(about))
             })
             .collect();
-        Some(div().flex_none().ml(px(44.)).mr(px(28.)).mb(px(8.)).p(px(4.)).rounded(px(10.)).bg(look.float).border_1().border_color(look.line_2).children(rows))
+        let card = div().debug_selector(|| "listing".to_owned()).flex_none().p(px(4.)).rounded(px(10.)).bg(look.float).border_1().border_color(look.line_2).children(rows);
+        Some(match opens {
+            super::pickers::Opens::Above => card.ml(px(44.)).mr(px(28.)).mb(px(8.)),
+            super::pickers::Opens::Below => card.occlude().absolute().left_0().right_0().top(relative(1.)).mt(px(8.)),
+        })
     }
 
     /// A press on what's listed does what Enter would.

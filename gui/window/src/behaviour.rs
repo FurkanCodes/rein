@@ -749,6 +749,7 @@ fn what_a_command_asks_isnt_a_turn_to_steer() {
 }
 
 mod boards;
+mod lists;
 mod review;
 mod writing;
 

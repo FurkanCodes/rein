@@ -12,12 +12,27 @@ use super::{Pane, Sent};
 use crate::look::Look;
 use crate::parts::hairline;
 
-/// How wide each is, and how far above the pane's foot it sits.
+/// How wide each is, and how far from the box it sits.
 const MODEL_WIDE: f32 = 420.;
 const MODE_WIDE: f32 = 380.;
-const ABOVE_FOOT: f32 = 118.;
-/// As many rows as show before the list scrolls.
+const FROM_BOX: f32 = 8.;
+/// As many rows as show before the list scrolls, and the fewest: what's
+/// around them, in each card, takes the rest of the room there is.
 const LIST_MOST: f32 = 360.;
+const LIST_LEAST: f32 = 96.;
+const MODEL_AROUND: f32 = 250.;
+const MODE_AROUND: f32 = 150.;
+
+/// Where a list opens from the box it's for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Opens {
+    /// Over it, from the top of a conversation's foot: anchored there, so a
+    /// box that grows doesn't cover it.
+    Above,
+    /// Under it, on the first run, where the box sits near the top and a
+    /// list over it would run off the window.
+    Below,
+}
 
 /// Which list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +107,16 @@ impl Pane {
     /// for its end, and the models are those known so far: rein takes no
     /// lookup until then.
     pub(super) fn open_picker(&mut self, picking: Picking, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_picker_by(picking, None, window, cx);
+    }
+
+    /// The same, by a press that went down `at`: one that closed this list
+    /// on its way down, from its own cell, has done all it was for.
+    pub(super) fn open_picker_by(&mut self, picking: Picking, at: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
+        let shut = self.picker_shut.take();
+        if at.is_some() && shut == at.map(|at| (picking, at)) {
+            return;
+        }
         if self.picker.as_ref().is_some_and(|picker| picker.picking == picking) {
             self.close_picker(window, cx);
             return;
@@ -118,10 +143,7 @@ impl Pane {
             }
             // The other providers' are looked up as the list opens.
             if !self.running {
-                self.next_request += 1;
-                if self.agent.as_mut().is_some_and(|agent| agent.ask_models(self.next_request)) {
-                    self.sent.insert(self.next_request, Sent::Models);
-                }
+                self.ask_models();
             }
         } else {
             keys.focus(window, cx);
@@ -131,6 +153,37 @@ impl Pane {
         picker.at = Self::fitting(&picker, &choices, cx).iter().position(|&at| choices[at].current).unwrap_or(0);
         self.picker = Some(picker);
         cx.notify();
+    }
+
+    /// Asks every provider you're signed in to for its models.
+    pub(super) fn ask_models(&mut self) {
+        self.next_request += 1;
+        if self.agent.as_mut().is_some_and(|agent| agent.ask_models(self.next_request)) {
+            self.sent.insert(self.next_request, Sent::Models);
+        }
+    }
+
+    /// Signs in to more with a key, for a provider you choose: what it asks
+    /// comes up as any question does, and nothing goes in the conversation.
+    /// `/login` typed was written there as yours, and on the first run it
+    /// started a conversation.
+    fn sign_in_more(&mut self, cx: &mut Context<Self>) {
+        let Some(agent) = &mut self.agent else { return };
+        self.next_request += 1;
+        agent.sign_in(self.next_request, rein_transcript::signing::Way::Key);
+        self.sent.insert(self.next_request, Sent::SignInMore);
+        cx.notify();
+    }
+
+    /// The keys go to the list that's up, if one is: the models' to what
+    /// finds one, the modes' to the list itself.
+    pub(super) fn picker_takes_keys(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = &self.picker else { return false };
+        match picker.picking {
+            Picking::Model => picker.input.clone().update(cx, |input, cx| input.focus(window, cx)),
+            Picking::Mode => picker.keys.focus(window, cx),
+        }
+        true
     }
 
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -179,9 +232,12 @@ impl Pane {
         self.take_pick(window, cx);
     }
 
-    /// The list that's up, over the box.
-    pub(super) fn picker_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The list that's up, by the box, in `room`: the height there is for
+    /// it, which its rows fit in.
+    pub(super) fn picker_card(&self, opens: Opens, room: Pixels, cx: &mut Context<Self>) -> Option<AnyElement> {
         let picker = self.picker.as_ref()?;
+        let around = if picker.picking == Picking::Model { MODEL_AROUND } else { MODE_AROUND };
+        let list_most = (f32::from(room) - around).clamp(LIST_LEAST, LIST_MOST);
         let look = Look::of(cx);
         let mono = cx.global::<crate::parts::Monospace>().0.clone();
         let choices = self.choices(picker.picking);
@@ -249,16 +305,29 @@ impl Pane {
         if fits.is_empty() {
             rows.push(div().px(px(8.)).py(px(16.)).text_color(look.ink_3).child("Nothing matches every word.").into_any_element());
         }
-        let list = div().id("picker-list").flex().flex_col().max_h(px(LIST_MOST)).overflow_y_scroll().px(px(6.)).pt(px(4.)).pb(px(8.)).children(rows);
+        let list = div().id("picker-list").flex().flex_col().max_h(px(list_most)).overflow_y_scroll().px(px(6.)).pt(px(4.)).pb(px(8.)).children(rows);
         let keys = cx.listener(Self::picker_key);
         let card = div()
             .id("picker")
+            .debug_selector(|| "picker".to_owned())
             .track_focus(&picker.keys)
             .capture_key_down(keys)
             .occlude()
+            // Once the press has done what it will: a press on what takes no
+            // keys gave them to the card, where only Esc and ↑↓ are heard.
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, window, cx| cx.defer_in(window, |pane, window, cx| pane.take_keys(window, cx))))
+            // A press anywhere else closes it, as a menu does; one on the
+            // cell that opened it is that cell's own, and closes it once.
+            .on_mouse_down_out(cx.listener(|pane, event: &MouseDownEvent, window, cx| {
+                pane.picker_shut = pane.picker.as_ref().map(|picker| (picker.picking, event.position));
+                pane.close_picker(window, cx);
+            }))
             .absolute()
             .left(px(8.))
-            .bottom(px(ABOVE_FOOT))
+            .map(|card| match opens {
+                Opens::Above => card.bottom(px(FROM_BOX)),
+                Opens::Below => card.top(relative(1.)).mt(px(FROM_BOX)),
+            })
             .flex()
             .flex_col()
             .max_w(relative(0.94))
@@ -272,12 +341,13 @@ impl Pane {
                 let count = typed.then(|| div().flex_none().text_size(px(12.)).text_color(look.ink_3).child(format!("{} of {}", fits.len(), choices.len())));
                 let sign_in = cx.listener(|pane, _, window, cx| {
                     pane.close_picker(window, cx);
-                    pane.run("/login", Vec::new(), cx);
+                    pane.sign_in_more(cx);
                 });
                 let heading = div().px(px(8.)).pt(px(10.)).pb(px(4.)).text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(look.ink_3).child("Sign in to more");
                 let providers = self.more_ways.clone().unwrap_or_else(|| "Another provider".to_owned());
                 let row = div()
                     .id("sign-in-more")
+                    .debug_selector(|| "sign-in-more".to_owned())
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -400,6 +470,7 @@ fn effort_levels(effort: &Setting, cx: &mut Context<Pane>) -> impl IntoElement +
             let value = level.value.clone();
             div()
                 .id(("effort-level", at))
+                .debug_selector(move || format!("effort-{at}"))
                 .flex()
                 .flex_1()
                 .min_w_0()
@@ -478,6 +549,11 @@ impl Pane {
 
     pub(crate) fn open_picker_for_test(&mut self, picking: Picking, window: &mut Window, cx: &mut Context<Self>) {
         self.open_picker(picking, window, cx);
+    }
+
+    /// What's typed to find a model, if that list is up.
+    pub(crate) fn picker_typed_for_test(&self, cx: &App) -> Option<String> {
+        self.picker.as_ref().filter(|picker| picker.picking == Picking::Model).map(|picker| picker.input.read(cx).value().to_string())
     }
 
     pub(crate) fn type_in_picker_for_test(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {

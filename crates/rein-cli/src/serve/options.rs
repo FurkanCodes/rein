@@ -68,13 +68,19 @@ fn sandbox(agent: &Agent<Llm>) -> Value {
 /// Whether new conversations start in the mode and with the sandbox this
 /// one has now, as your settings file says: `on` keeps them there.
 fn keep(agent: &Agent<Llm>) -> Value {
+    let options = [choice("on", "on", "new conversations start this way"), choice("off", "off", "new conversations start as rein does")];
+    select("keep", "Keep for new conversations", "_keep", if kept(agent) { "on" } else { "off" }, &options)
+}
+
+/// Whether your settings file keeps the mode and sandbox `agent` has. The
+/// file must name the mode: rein's own defaults matched a conversation that
+/// started with them, and the switch showed on with nothing kept.
+pub(super) fn kept(agent: &Agent<Llm>) -> bool {
     let settings = crate::config_dir().and_then(|dir| crate::settings::Settings::load(&dir.join(crate::settings::FILE))).unwrap_or_default();
-    let kept_mode = settings.in_file("mode").and_then(|name| name.parse::<Mode>().ok()).unwrap_or_default();
+    let kept_mode = settings.in_file("mode").and_then(|name| name.parse::<Mode>().ok());
     // Off unless the file says on, as when rein starts.
     let kept_sandbox = settings.in_file("sandbox") == Some("on");
-    let kept = kept_mode == agent.permissions.mode && kept_sandbox == (agent.permissions.sandboxing() != Sandboxing::Off);
-    let options = [choice("on", "on", "new conversations start this way"), choice("off", "off", "new conversations start as rein does")];
-    select("keep", "Keep for new conversations", "_keep", if kept { "on" } else { "off" }, &options)
+    kept_mode == Some(agent.permissions.mode) && kept_sandbox == (agent.permissions.sandboxing() != Sandboxing::Off)
 }
 
 /// Keeps the mode and sandbox `agent` has for new conversations, `on`, or

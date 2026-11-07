@@ -1342,7 +1342,10 @@ another `rein serve`.
   and sandbox for new conversations says so with
   `"io.github.furkancodes/keeps": true` in `initialize`, and isn't asked as they
   change: the `keep` option, `on` or `off`, writes them to your settings or
-  takes them out. Where the project has a check after edits, the `check` option
+  takes them out. It's `on` only when your settings name the mode the
+  conversation has, and the sandbox matches, never because rein's own
+  defaults do; while it's `on`, a mode or sandbox the program sets is
+  written there too. Where the project has a check after edits, the `check` option
   switches it, with its command under `"io.github.furkancodes/command"`.
 - **Steps in a few words.** A step that's done has
   `"io.github.furkancodes/summary"` under its `_meta`, what the terminal's line

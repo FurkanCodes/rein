@@ -51,6 +51,11 @@ const BEAT: Duration = Duration::from_millis(125);
 const RAIL: f32 = 31.;
 /// The longest a box grows, in lines, before it scrolls.
 const BOX_LINES: usize = 12;
+/// How far down the first run its box ends, and how much of a pane isn't
+/// above its foot (its header, the foot, the desk's edges): what's left is
+/// the room a list by the box has.
+const DRAFT_BOX_FOOT: f32 = 330.;
+const ABOVE_THE_FOOT: f32 = 190.;
 /// What the box says when there's nothing in it.
 const WRITE: &str = "Write to rein";
 /// What it says while a command waits for your answer, which isn't a turn
@@ -155,6 +160,8 @@ enum Sent {
     Setting,
     /// Signing in, before there's a conversation.
     SignIn,
+    /// Signing in to more, from the list of models: its models come next.
+    SignInMore,
     /// The ways there are to sign in to more, for the list of models.
     Ways,
     /// Your settings, for the settings page; a key of them set to this, or
@@ -240,6 +247,9 @@ pub(crate) struct Pane {
     undoing: Option<undo::Sheet>,
     /// The model or mode list, over the box.
     picker: Option<pickers::Picker>,
+    /// The list a press outside it shut, and where that press went down:
+    /// if it was on the list's own cell, that cell mustn't open it again.
+    picker_shut: Option<(Picking, Point<Pixels>)>,
     /// It's the pane to start with: see [`About::draft`].
     draft: bool,
     /// Signed in to nothing that runs the model: the ways there are.
@@ -329,6 +339,7 @@ impl Pane {
             to_panel: None,
             undoing: None,
             picker: None,
+            picker_shut: None,
             page: None,
         }
     }
@@ -778,9 +789,12 @@ impl Render for Pane {
         }
         if self.draft {
             let welcome = self.welcome(window, cx);
-            let picker = self.picker_card(cx);
+            // Under the box, which sits this far down the first run.
+            let room = window.viewport_size().height - px(DRAFT_BOX_FOOT);
+            let picker = self.picker_card(pickers::Opens::Below, room, cx);
             let asking = self.asking_card(window, cx);
-            return div().relative().w_full().flex().flex_col().gap(px(16.)).child(welcome).children(asking).children(picker).into_any_element();
+            let listing = self.listing(pickers::Opens::Below, cx);
+            return div().relative().w_full().flex().flex_col().gap(px(16.)).child(welcome).children(asking).children(picker).children(listing).into_any_element();
         }
         let look = Look::of(cx);
         let pane = cx.weak_entity();
@@ -804,13 +818,15 @@ impl Render for Pane {
         });
         let question = self.question(window, cx);
         let asking = self.asking_card(window, cx);
-        let listing = self.listing(cx);
+        let listing = self.listing(pickers::Opens::Above, cx);
         let waiting = self.waiting(cx);
         let foot = self.foot(window, cx);
         let header = self.header(cx);
         let beside = self.beside(cx);
         let sheet = self.undo_sheet(cx);
-        let picker = self.picker_card(cx);
+        // Over the foot, in what's left above it.
+        let room = window.viewport_size().height - px(ABOVE_THE_FOOT);
+        let picker = self.picker_card(pickers::Opens::Above, room, cx);
         let sheet_of_the_conversation = div()
             .relative()
             .flex()
@@ -875,10 +891,10 @@ impl Render for Pane {
                     .children(question)
                     .children(asking)
                     .children(listing)
-                    .children(waiting),
+                    .children(waiting)
+                    .children(picker),
             )
             .child(foot)
-            .children(picker)
             .children(sheet);
         div().size_full().min_w_0().flex().gap(px(6.)).child(sheet_of_the_conversation).children(beside).into_any_element()
     }
@@ -936,7 +952,9 @@ impl Pane {
     /// You've come here, or a question has: the keys go to what's waiting,
     /// unless you've something half-written, which they stay with.
     pub(crate) fn take_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.half_written_beside(window, cx) {
+        // A list that's up is what you're in: a press inside it, on a level
+        // or a heading, left what you typed next going nowhere.
+        if self.picker_takes_keys(window, cx) || self.half_written_beside(window, cx) {
             return;
         }
         if self.asking.is_some() {

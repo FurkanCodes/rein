@@ -760,10 +760,12 @@ async fn setting(session: &mut Session, chosen: Slash, link: &Link, input: &mut 
     let Session { id, agent, served, setup, max_steps, .. } = &mut *session;
     let unsaid = served.leave_unsaid();
     let done = match chosen {
-        // A client with a switch for keeping them asks nothing.
+        // A client with a switch for keeping them asks nothing: what's kept
+        // follows the change, and what isn't stays this conversation's.
         Slash::Mode(Some(mode)) if link.keeps.get() => {
+            let kept = options::kept(agent);
             conversation::set_mode(mode, agent, &mut served.terminal, *max_steps);
-            Alongside::Done(Ok(()))
+            Alongside::Done(if kept { options::set_keep(agent, true) } else { Ok(()) })
         }
         Slash::Mode(Some(mode)) => {
             conversation::set_mode(mode, agent, &mut served.terminal, *max_steps);
@@ -771,11 +773,12 @@ async fn setting(session: &mut Session, chosen: Slash, link: &Link, input: &mut 
             alongside(crate::modes::keep_mode(mode, &mut served.terminal), false, link, input).await
         }
         Slash::Sandbox(Some(on)) if link.keeps.get() => {
+            let kept = options::kept(agent);
             conversation::set_sandbox(on, agent, &mut served.terminal);
             if let Some(missing) = crate::modes::walls_missing(served.terminal.sandboxing, agent.permissions.sandbox()) {
                 link.send(wire::noted(id, &missing));
             }
-            Alongside::Done(Ok(()))
+            Alongside::Done(if kept { options::set_keep(agent, true) } else { Ok(()) })
         }
         Slash::Sandbox(Some(on)) => {
             conversation::set_sandbox(on, agent, &mut served.terminal);

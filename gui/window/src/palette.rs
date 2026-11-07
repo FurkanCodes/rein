@@ -117,7 +117,7 @@ impl Panes {
                 Row { section: "Agents", slash: String::new(), name: read.title(), says: read.standing().word().to_owned(), does: Does::GoTo(pane.clone()) }
             })
             .collect();
-        if let Some(pane) = self.looking_at(cx) {
+        if let Some(pane) = self.at(cx) {
             rows.extend(command_rows(pane.read(cx).commands()));
         }
         rows
@@ -158,7 +158,7 @@ impl Panes {
     /// Puts it away, and gives the keys back to where you were.
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = None;
-        match self.looking_at(cx) {
+        match self.at(cx) {
             Some(pane) => pane.update(cx, |pane, cx| pane.take_keys(window, cx)),
             None => self.focus.focus(window, cx),
         }
@@ -174,7 +174,7 @@ impl Panes {
         match does {
             Does::GoTo(pane) => self.look_at(&pane, true, window, cx),
             Does::Run(line) => {
-                if let Some(pane) = self.looking_at(cx) {
+                if let Some(pane) = self.at(cx) {
                     pane.update(cx, |pane, cx| pane.run_chosen(&line, window, cx));
                 }
             }
@@ -298,6 +298,11 @@ impl Panes {
 
 #[cfg(test)]
 impl Panes {
+    /// The commands it lists, by what they run.
+    pub(crate) fn palette_runs_for_test(&self, cx: &App) -> Vec<String> {
+        self.palette_rows(cx).into_iter().filter_map(|row| if let Does::Run(line) = row.does { Some(line) } else { None }).collect()
+    }
+
     pub(crate) fn palette_open_for_test(&self) -> bool {
         self.palette.is_some()
     }

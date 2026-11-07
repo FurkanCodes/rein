@@ -129,7 +129,18 @@ impl Pane {
                 self.changes_came(id, span, &said, cx);
                 Update::default()
             }
-            (Some(Sent::Stopping | Sent::UndoTurns(_) | Sent::UndoPlan | Sent::Undoing | Sent::Setting | Sent::Models), CameTo::Busy(why) | CameTo::Refused(why)) => {
+            (Some(Sent::SignInMore), CameTo::Told(said)) => {
+                // rein takes no lookup during a turn: the list asks again as
+                // it next opens.
+                if said["signedIn"] == true && !self.running {
+                    self.ask_models();
+                }
+                Update::default()
+            }
+            (
+                Some(Sent::Stopping | Sent::UndoTurns(_) | Sent::UndoPlan | Sent::Undoing | Sent::Setting | Sent::Models | Sent::SignInMore),
+                CameTo::Busy(why) | CameTo::Refused(why),
+            ) => {
                 self.undoing = None;
                 self.transcript.note(&why)
             }

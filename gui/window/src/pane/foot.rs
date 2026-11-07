@@ -236,8 +236,12 @@ impl Pane {
     /// What a press opens.
     fn picks(picking: Picking, cx: &mut Context<Self>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + use<> {
         let pane = cx.weak_entity();
-        move |_, window, cx| {
-            let _ = pane.update(cx, |pane, cx| pane.open_picker(picking, window, cx));
+        move |event, window, cx| {
+            let at = match event {
+                ClickEvent::Mouse(click) => Some(click.down.position),
+                _ => None,
+            };
+            let _ = pane.update(cx, |pane, cx| pane.open_picker_by(picking, at, window, cx));
         }
     }
 
@@ -265,6 +269,7 @@ impl Pane {
         // A cell runs the command for what it shows, and shows its list.
         let model = self.setting("model").map(|model| {
             Press::new("model")
+                .debug_selector(|| "model-cell".to_owned())
                 .cell()
                 .yields()
                 .lit(picking(Picking::Model))
@@ -281,6 +286,7 @@ impl Pane {
             let shown = if walled { format!("{name} · sandbox") } else { name.to_owned() };
             if !self.transcript.commands().is_empty() {
                 return Press::new("mode")
+                    .debug_selector(|| "mode-cell".to_owned())
                     .cell()
                     .yields()
                     .lit(picking(Picking::Mode))
