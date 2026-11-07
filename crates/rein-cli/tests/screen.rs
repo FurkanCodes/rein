@@ -5111,7 +5111,9 @@ fn a_program_stops_a_turn_and_the_conversation_goes_on() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let busy = rein.call("session/set_mode", json!({ "sessionId": session, "modeId": "ask" }));
-    assert!(rein.answer(busy)["error"]["message"].as_str().unwrap().contains("a turn is running"));
+    let refused = rein.answer(busy);
+    assert!(refused["error"]["message"].as_str().unwrap().contains("a turn is running"));
+    assert_eq!(refused["error"]["code"], -32001, "a window tells this from a turn that failed by its number, not its words");
     rein.write(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session } }));
     assert_eq!(rein.answer(turn)["result"]["stopReason"], "cancelled");
     let start = Instant::now();

@@ -459,7 +459,7 @@ async fn work(session: &mut Session, start: Start, link: &Link, input: &mut Inpu
                             link.heard.borrow_mut().push(Heard::You(text));
                             link.send(wire::answer(&id, &json!({})));
                         }
-                        Incoming::Request { id, .. } => link.send(wire::refuse(&id, &Refused::new("a turn is running: stop it, or wait for it to end"))),
+                        Incoming::Request { id, .. } => link.send(wire::refuse(&id, &Refused::busy("a turn is running: stop it, or wait for it to end"))),
                         Incoming::Unreadable(refused) => link.send(wire::refuse(&Value::Null, &refused)),
                         Incoming::Ignored => {}
                     }

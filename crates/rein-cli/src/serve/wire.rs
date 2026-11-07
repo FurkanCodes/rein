@@ -38,6 +38,9 @@ const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
 pub(super) const INTERNAL: i64 = -32603;
 const PARSE_ERROR: i64 = -32700;
+/// A request that can't be taken while a turn runs: a number of its own, so
+/// a client needn't read the words to tell it from a turn that failed.
+const BUSY: i64 = -32001;
 
 /// Why a request isn't answered with what it asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -53,6 +56,10 @@ impl Refused {
 
     fn params(message: impl Into<String>) -> Refused {
         Refused { code: INVALID_PARAMS, message: message.into() }
+    }
+
+    pub(super) fn busy(message: impl Into<String>) -> Refused {
+        Refused { code: BUSY, message: message.into() }
     }
 }
 
