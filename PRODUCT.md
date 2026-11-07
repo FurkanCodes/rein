@@ -362,6 +362,12 @@ window" taken further. It's a program of its own, with GPUI, in a workspace
 of its own (`gui/`): `rein` stays one small binary, and nothing of GPUI's
 reaches its dependencies or its checks.
 
+**If GPUI fails:** Iced, on a pinned revision of its master branch. It stays
+in Rust, and `transcript/`, `replay/` and `gates/` carry over; the price is
+writing the message windowing by hand. Not Electron, or anything else that
+bundles a browser: too big, and too hungry for memory. Right-to-left isn't
+required for now, but if it becomes required, GPUI is out and Iced goes first.
+
 **Steps, each done when:**
 
 1. WSL: every test passes in real WSL2, and sign-in, paste and sub-agents'
@@ -374,6 +380,12 @@ reaches its dependencies or its checks.
    window: it's what the GUI is for, and a window wouldn't show it's missing.
 4. A throwaway GPUI window on macOS: long conversations stay smooth,
    text can be selected, and input methods work. If not, GPUI is out.
+   The same window then runs once on a real GNOME machine and a real
+   Windows PC, with no stall of a second or more, and input methods
+   composing. GPUI's worst open problems are there, a VM's software GPU
+   won't show them, and step 6 would otherwise find them after a beta is
+   built. If this fails, the macOS beta goes on, but step 6 isn't planned on
+   GPUI until it's fixed.
 5. A beta on macOS, which you use instead of the terminal.
 6. The GUI on Linux and Windows, where a window drives a turn through
    `wsl.exe`. It runs the rein it came with, and checks the version when

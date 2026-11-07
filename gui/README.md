@@ -50,7 +50,7 @@ Measured on one M5 at 120 Hz, on battery, with other work running, one run of ea
 | macOS 26 freeze | none on macOS 26.5.2 | Pass |
 | Build loop | clean 48 s debug, 78 s release; a one-line change 1 to 3 s | Pass; hot reload untried |
 | Upkeep | 0.9.0 is the newest release, so there's nothing to upgrade to. This code built on 0.8.1 unchanged, before the last fixes: a week's drift | Open |
-| Input methods | needs a person: Japanese, Chinese and Korean, and the Enter that confirms a candidate mustn't send | Open, stops GPUI if it fails |
+| Input methods | skipped by choice, so untested: no Japanese, Chinese or Korean keyboard has typed in it. One pasted Chinese message drew and sent, which says nothing of composing | Skipped, stops GPUI if it fails |
 | Linux and Windows | needs real machines | Open |
 
 Through a real `rein serve` with a real model, a press of Allow ran a two-line command shown whole, and a press of Reject reached the model as declined. Closing the window ended the process and `rein serve`, and stopped a background command they had started.

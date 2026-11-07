@@ -358,6 +358,10 @@ fn main() {
             cx.new(|cx| Root::new(view, window, cx))
         })
         .expect("failed to open window");
+        // Started from a terminal, an app stays behind it unless it asks.
+        if !flags.aside {
+            cx.activate(true);
+        }
         if flags.stalls {
             listen_for_stalls(probe.clone(), cx);
         }
