@@ -1,0 +1,405 @@
+{"ms":76,"update":{"content":{"text":"MCP servers: chrome-devtools (32 tools, found when needed); codegraph (1 tool); linear (70 tools, found when needed); node_repl (4 tools); playwright (25 tools, found when needed)","type":"text"},"sessionUpdate":"agent_thought_chunk"}}
+{"ms":3260,"update":{"sessionUpdate":"usage_update","size":150000,"used":14522}}
+{"ms":3283,"update":{"kind":"read","name":"read","rawInput":{"line_count":null,"path":"note.md","start_line":null},"sessionUpdate":"tool_call","status":"in_progress","title":"Read note.md","toolCallId":"call_93LJx7o6nDI4rJXXGImMwtn4"}}
+{"ms":3286,"update":{"content":[{"content":{"text":"# rein's GUI test\nA window drives `rein serve` over standard input and output. Each pane is its own process.\n","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"call_93LJx7o6nDI4rJXXGImMwtn4"}}
+{"ms":7437,"update":{"content":{"text":"##","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7456,"update":{"content":{"text":" The","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7456,"update":{"content":{"text":" window","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7456,"update":{"content":{"text":" is","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7456,"update":{"content":{"text":" a","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7457,"update":{"content":{"text":" client","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7457,"update":{"content":{"text":"\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7457,"update":{"content":{"text":"`","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7457,"update":{"content":{"text":"note","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7464,"update":{"content":{"text":".md","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7464,"update":{"content":{"text":"`","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7464,"update":{"content":{"text":" describes","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" a","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" simple","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" arrangement","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":":","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" a","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" desktop","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" window","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" launches","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" `","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":"rein","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" serve","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":"`","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7502,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" talks","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" to","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" it","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" through","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" standard","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" input","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" output","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":".","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" Each","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" pane","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" owns","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" a","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" separate","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" process","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" so","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" panes","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" can","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" have","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7503,"update":{"content":{"text":" independent","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7574,"update":{"content":{"text":" conversations","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7589,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7589,"update":{"content":{"text":" lif","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7669,"update":{"content":{"text":"etimes","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7682,"update":{"content":{"text":".\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7682,"update":{"content":{"text":"The","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7778,"update":{"content":{"text":" GUI","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7859,"update":{"content":{"text":" does","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7868,"update":{"content":{"text":" not","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7957,"update":{"content":{"text":" need","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7969,"update":{"content":{"text":" to","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7969,"update":{"content":{"text":" run","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":7969,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8049,"update":{"content":{"text":" agent","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8061,"update":{"content":{"text":" inside","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8061,"update":{"content":{"text":" its","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8153,"update":{"content":{"text":" own","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8178,"update":{"content":{"text":" process","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8178,"update":{"content":{"text":".","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8178,"update":{"content":{"text":" Instead","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8178,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8178,"update":{"content":{"text":" it","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8244,"update":{"content":{"text":" renders","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8287,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8335,"update":{"content":{"text":" conversation","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8349,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8349,"update":{"content":{"text":" translates","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8349,"update":{"content":{"text":" user","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8437,"update":{"content":{"text":" actions","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8446,"update":{"content":{"text":" into","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8446,"update":{"content":{"text":" messages","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8446,"update":{"content":{"text":".","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8529,"update":{"content":{"text":" The","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8541,"update":{"content":{"text":" agent","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8619,"update":{"content":{"text":" handles","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8718,"update":{"content":{"text":" those","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8738,"update":{"content":{"text":" messages","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8738,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8738,"update":{"content":{"text":" sends","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8815,"update":{"content":{"text":" events","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8831,"update":{"content":{"text":" back","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8831,"update":{"content":{"text":".\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8831,"update":{"content":{"text":"A","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8907,"update":{"content":{"text":" typical","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8929,"update":{"content":{"text":" flow","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8929,"update":{"content":{"text":" is","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":8929,"update":{"content":{"text":":\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9006,"update":{"content":{"text":"-","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9016,"update":{"content":{"text":" The","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9110,"update":{"content":{"text":" pane","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9123,"update":{"content":{"text":" starts","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9123,"update":{"content":{"text":" `","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9123,"update":{"content":{"text":"rein","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9123,"update":{"content":{"text":" serve","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9197,"update":{"content":{"text":"`","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9233,"update":{"content":{"text":" with","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9233,"update":{"content":{"text":" pip","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9233,"update":{"content":{"text":"ed","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9233,"update":{"content":{"text":" stdin","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9233,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9233,"update":{"content":{"text":" stdout","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9233,"update":{"content":{"text":".\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9233,"update":{"content":{"text":"-","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9234,"update":{"content":{"text":" Sending","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9234,"update":{"content":{"text":" a","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9234,"update":{"content":{"text":" prompt","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9292,"update":{"content":{"text":" writes","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":" a","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":" request","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":" to","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":" child","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":"’s","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":" stdin","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":".\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9324,"update":{"content":{"text":"-","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9381,"update":{"content":{"text":" A","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9395,"update":{"content":{"text":" background","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9395,"update":{"content":{"text":" reader","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9395,"update":{"content":{"text":" consumes","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9488,"update":{"content":{"text":" stdout","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9497,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9598,"update":{"content":{"text":" forwards","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9598,"update":{"content":{"text":" events","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9598,"update":{"content":{"text":" to","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9599,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9599,"update":{"content":{"text":" UI","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9599,"update":{"content":{"text":".\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9599,"update":{"content":{"text":"-","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9599,"update":{"content":{"text":" The","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9666,"update":{"content":{"text":" UI","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9681,"update":{"content":{"text":" updates","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9681,"update":{"content":{"text":" text","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9681,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9766,"update":{"content":{"text":" tool","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9766,"update":{"content":{"text":" activity","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9767,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9778,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9779,"update":{"content":{"text":" completion","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9781,"update":{"content":{"text":" status","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9781,"update":{"content":{"text":".\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9781,"update":{"content":{"text":"-","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9853,"update":{"content":{"text":" Closing","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9866,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9866,"update":{"content":{"text":" pane","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9954,"update":{"content":{"text":" shuts","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9972,"update":{"content":{"text":" down","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9972,"update":{"content":{"text":" its","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9972,"update":{"content":{"text":" child","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9973,"update":{"content":{"text":" process","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":9973,"update":{"content":{"text":".\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10047,"update":{"content":{"text":"Reading","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10141,"update":{"content":{"text":" must","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10151,"update":{"content":{"text":" happen","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10244,"update":{"content":{"text":" away","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10260,"update":{"content":{"text":" from","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10260,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10260,"update":{"content":{"text":" UI","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10260,"update":{"content":{"text":" thread","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10349,"update":{"content":{"text":";","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10349,"update":{"content":{"text":" otherwise","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10349,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10435,"update":{"content":{"text":" waiting","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10447,"update":{"content":{"text":" for","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10533,"update":{"content":{"text":" agent","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10606,"update":{"content":{"text":" output","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10633,"update":{"content":{"text":" would","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10650,"update":{"content":{"text":" freeze","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10652,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10652,"update":{"content":{"text":" window","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10652,"update":{"content":{"text":".\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10652,"update":{"content":{"text":"##","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10712,"update":{"content":{"text":" The","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10723,"update":{"content":{"text":" pipe","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10723,"update":{"content":{"text":" is","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10723,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10806,"update":{"content":{"text":" boundary","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10817,"update":{"content":{"text":"\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10900,"update":{"content":{"text":"In","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10912,"update":{"content":{"text":" Rust","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10912,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":10998,"update":{"content":{"text":" creating","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11009,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11011,"update":{"content":{"text":" connection","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11094,"update":{"content":{"text":" starts","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11199,"update":{"content":{"text":" like","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11199,"update":{"content":{"text":" this","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11203,"update":{"content":{"text":":\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11216,"update":{"content":{"text":"```","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11221,"update":{"content":{"text":"rust","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11221,"update":{"content":{"text":"\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11221,"update":{"content":{"text":"use","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11221,"update":{"content":{"text":" std","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11221,"update":{"content":{"text":"::","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11223,"update":{"content":{"text":"process","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11223,"update":{"content":{"text":"::{","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11223,"update":{"content":{"text":"Command","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11371,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11391,"update":{"content":{"text":" St","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11401,"update":{"content":{"text":"dio","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11406,"update":{"content":{"text":"};\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11406,"update":{"content":{"text":"let","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11406,"update":{"content":{"text":" mut","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11408,"update":{"content":{"text":" child","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11408,"update":{"content":{"text":" =","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11408,"update":{"content":{"text":" Command","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11408,"update":{"content":{"text":"::","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11408,"update":{"content":{"text":"new","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11409,"update":{"content":{"text":"(\"","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11409,"update":{"content":{"text":"rein","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11409,"update":{"content":{"text":"\")\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11409,"update":{"content":{"text":"   ","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11409,"update":{"content":{"text":" .","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11463,"update":{"content":{"text":"arg","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11494,"update":{"content":{"text":"(\"","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11499,"update":{"content":{"text":"serve","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11500,"update":{"content":{"text":"\")\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11500,"update":{"content":{"text":"   ","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11500,"update":{"content":{"text":" .","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11501,"update":{"content":{"text":"stdin","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11502,"update":{"content":{"text":"(St","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11502,"update":{"content":{"text":"dio","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11505,"update":{"content":{"text":"::","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11505,"update":{"content":{"text":"p","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11505,"update":{"content":{"text":"iped","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11505,"update":{"content":{"text":"())\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11505,"update":{"content":{"text":"   ","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11506,"update":{"content":{"text":" .","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11506,"update":{"content":{"text":"stdout","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11560,"update":{"content":{"text":"(St","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11588,"update":{"content":{"text":"dio","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11596,"update":{"content":{"text":"::","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"p","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"iped","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"())\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"   ","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":" .","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"stderr","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"(St","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"dio","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"::","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"inherit","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11602,"update":{"content":{"text":"())\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11603,"update":{"content":{"text":"   ","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11603,"update":{"content":{"text":" .","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11658,"update":{"content":{"text":"spawn","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11673,"update":{"content":{"text":"()","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11673,"update":{"content":{"text":"?;\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11673,"update":{"content":{"text":"let","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11761,"update":{"content":{"text":" input","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11761,"update":{"content":{"text":" =","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11787,"update":{"content":{"text":" child","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11792,"update":{"content":{"text":".stdin","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11792,"update":{"content":{"text":".take","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11792,"update":{"content":{"text":"().","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11792,"update":{"content":{"text":"unwrap","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11794,"update":{"content":{"text":"();\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11794,"update":{"content":{"text":"let","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11794,"update":{"content":{"text":" output","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11794,"update":{"content":{"text":" =","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11794,"update":{"content":{"text":" child","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11795,"update":{"content":{"text":".stdout","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11795,"update":{"content":{"text":".take","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11795,"update":{"content":{"text":"().","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11816,"update":{"content":{"text":"unwrap","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11861,"update":{"content":{"text":"();\n//","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11905,"update":{"content":{"text":" Write","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11907,"update":{"content":{"text":" requests","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11912,"update":{"content":{"text":" to","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11962,"update":{"content":{"text":" input","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11962,"update":{"content":{"text":";","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11962,"update":{"content":{"text":" read","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11992,"update":{"content":{"text":" events","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":11992,"update":{"content":{"text":" from","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12010,"update":{"content":{"text":" output","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12031,"update":{"content":{"text":".\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12055,"update":{"content":{"text":"``","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12078,"update":{"content":{"text":"`\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12104,"update":{"content":{"text":"This","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12104,"update":{"content":{"text":" illustrates","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12125,"update":{"content":{"text":" process","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12147,"update":{"content":{"text":" setup","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12173,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12195,"update":{"content":{"text":" not","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12216,"update":{"content":{"text":" rein","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12240,"update":{"content":{"text":"’s","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12294,"update":{"content":{"text":" message","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12294,"update":{"content":{"text":" format","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12294,"update":{"content":{"text":":","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12308,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12331,"update":{"content":{"text":" note","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12353,"update":{"content":{"text":" does","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12393,"update":{"content":{"text":" not","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12403,"update":{"content":{"text":" specify","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12424,"update":{"content":{"text":" its","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12424,"update":{"content":{"text":" protocol","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12449,"update":{"content":{"text":".\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12471,"update":{"content":{"text":"|","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12496,"update":{"content":{"text":" Channel","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12518,"update":{"content":{"text":" |","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12548,"update":{"content":{"text":" Direction","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12581,"update":{"content":{"text":" |","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12582,"update":{"content":{"text":" Purpose","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12595,"update":{"content":{"text":" |\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12616,"update":{"content":{"text":"|","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12645,"update":{"content":{"text":"---","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12666,"update":{"content":{"text":"|","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12666,"update":{"content":{"text":"---","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12690,"update":{"content":{"text":"|","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12717,"update":{"content":{"text":"---","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12741,"update":{"content":{"text":"|\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12767,"update":{"content":{"text":"|","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12767,"update":{"content":{"text":" stdin","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12788,"update":{"content":{"text":" |","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12811,"update":{"content":{"text":" Window","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12836,"update":{"content":{"text":" →","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12861,"update":{"content":{"text":" agent","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12887,"update":{"content":{"text":" |","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12887,"update":{"content":{"text":" Requests","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12910,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12935,"update":{"content":{"text":" control","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12962,"update":{"content":{"text":" messages","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12985,"update":{"content":{"text":" |\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":12986,"update":{"content":{"text":"|","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13013,"update":{"content":{"text":" stdout","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13033,"update":{"content":{"text":" |","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13058,"update":{"content":{"text":" Agent","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13079,"update":{"content":{"text":" →","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13108,"update":{"content":{"text":" window","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13108,"update":{"content":{"text":" |","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13131,"update":{"content":{"text":" Structured","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13154,"update":{"content":{"text":" events","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13178,"update":{"content":{"text":" |\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13203,"update":{"content":{"text":"|","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13203,"update":{"content":{"text":" stderr","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13238,"update":{"content":{"text":" |","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13253,"update":{"content":{"text":" Agent","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13277,"update":{"content":{"text":" →","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13322,"update":{"content":{"text":" diagnostics","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13324,"update":{"content":{"text":" |","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13324,"update":{"content":{"text":" Logs","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13345,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13368,"update":{"content":{"text":" errors","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13391,"update":{"content":{"text":" |\n\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13415,"update":{"content":{"text":"Both","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13438,"update":{"content":{"text":" ends","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13463,"update":{"content":{"text":" need","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13463,"update":{"content":{"text":" agreed","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13486,"update":{"content":{"text":" message","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13508,"update":{"content":{"text":" framing","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13532,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13557,"update":{"content":{"text":" such","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13580,"update":{"content":{"text":" as","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13607,"update":{"content":{"text":" newline","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13607,"update":{"content":{"text":"-del","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13630,"update":{"content":{"text":"imited","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13653,"update":{"content":{"text":" JSON","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13678,"update":{"content":{"text":".","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13705,"update":{"content":{"text":" Keep","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13705,"update":{"content":{"text":" diagnostics","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13729,"update":{"content":{"text":" off","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13752,"update":{"content":{"text":" stdout","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13777,"update":{"content":{"text":" so","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13800,"update":{"content":{"text":" they","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13826,"update":{"content":{"text":" cannot","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13827,"update":{"content":{"text":" corrupt","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13851,"update":{"content":{"text":" that","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13879,"update":{"content":{"text":" stream","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13900,"update":{"content":{"text":".","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13925,"update":{"content":{"text":" Also","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13925,"update":{"content":{"text":" handle","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13947,"update":{"content":{"text":" process","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13972,"update":{"content":{"text":" exits","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":13997,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14021,"update":{"content":{"text":" broken","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14052,"update":{"content":{"text":" pipes","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14053,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14070,"update":{"content":{"text":" and","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14095,"update":{"content":{"text":" cancellation","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14115,"update":{"content":{"text":" explicitly","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14141,"update":{"content":{"text":":","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14173,"update":{"content":{"text":" a","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14179,"update":{"content":{"text":" pipe","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14193,"update":{"content":{"text":" transports","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14218,"update":{"content":{"text":" bytes","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14270,"update":{"content":{"text":",","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14272,"update":{"content":{"text":" but","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14275,"update":{"content":{"text":" the","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14294,"update":{"content":{"text":" protocol","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14318,"update":{"content":{"text":" gives","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14344,"update":{"content":{"text":" those","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14345,"update":{"content":{"text":" bytes","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14366,"update":{"content":{"text":" meaning","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14393,"update":{"content":{"text":".","type":"text"},"sessionUpdate":"agent_message_chunk"}}
+{"ms":14678,"update":{"sessionUpdate":"usage_update","size":150000,"used":14586}}
