@@ -769,9 +769,14 @@ fn sent_in_time(file: &Path, wanted: impl Fn(&Value) -> bool) -> Vec<Value> {
 
 /// A desk whose pane to start with keeps what it's sent in `file`.
 fn desk_with_draft(file: &Path) -> (Desk, Entity<Pane>) {
-    // It keeps every line, and lists no saved conversations when asked.
+    desk_with_saved(file, "[]")
+}
+
+/// The same, where the saved conversations are `sessions`, as JSON.
+fn desk_with_saved(file: &Path, sessions: &str) -> (Desk, Entity<Pane>) {
+    // It keeps every line, and lists `sessions` when asked.
     let script = format!(
-        r#"while read -r line; do printf '%s\n' "$line" >> {}; case "$line" in *session/list*) printf '%s\n' '{{"id":2,"result":{{"sessions":[]}}}}';; esac; done"#,
+        r#"while read -r line; do printf '%s\n' "$line" >> {}; case "$line" in *session/list*) printf '%s\n' '{{"id":2,"result":{{"sessions":{sessions}}}}}';; esac; done"#,
         file.display()
     );
     let mut desk = desk_serving(vec!["sh".to_owned(), "-c".to_owned(), script]);

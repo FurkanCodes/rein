@@ -16,6 +16,8 @@ use crate::parts::{Press, set_width};
 
 /// As many rows as a list shows before it scrolls.
 const LIST_MOST: f32 = 300.;
+/// The fewest it shows, however little room there is.
+const LIST_LEAST: f32 = 96.;
 
 /// Who's asking, and so who hears the answer.
 enum Asker {
@@ -99,6 +101,8 @@ impl Pane {
         .detach();
         let at = if let Asking::Choose(menu) = &asking { menu.first() } else { 0 };
         let yes = matches!(asking, Asking::Yes { .. });
+        // What was up from the bar gives way to it.
+        self.picker = None;
         self.asking = Some(Open { asker, asking, input: input.clone(), at, since: Instant::now() });
         cx.defer_in(window, move |pane, window, cx| {
             if pane.half_written_beside(window, cx) {
@@ -202,16 +206,18 @@ impl Pane {
         cx.stop_propagation();
     }
 
-    /// What's up, above the box.
-    pub(super) fn asking_card(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// What's up: above the box, or under it on the first run, in `room`
+    /// when there's a limit to it. Its list gives up what the rest needs.
+    pub(super) fn asking_card(&self, room: Option<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let open = self.asking.as_ref()?;
         let look = Look::of(cx);
         let card = div()
+            .debug_selector(|| "asking".to_owned())
             .relative()
             .flex_none()
-            .ml(px(44.))
-            .mr(px(28.))
-            .mb(px(12.))
+            // In from the rail in a conversation; on the first run, as wide as the box.
+            .when(!self.draft, |card| card.ml(px(44.)).mr(px(28.)).mb(px(12.)))
+            .when_some(room, |card, room| card.max_h(room).overflow_hidden())
             .flex()
             .flex_col()
             .rounded(px(10.))
@@ -298,7 +304,7 @@ impl Pane {
     fn menu_rows(&self, menu: &Menu, open: &Open, cx: &mut Context<Self>) -> Stateful<Div> {
         let look = Look::of(cx);
         let fits = open.fits(cx);
-        let list = div().id("menu").flex().flex_col().max_h(px(LIST_MOST)).overflow_y_scroll().px(px(4.)).py(px(4.));
+        let list = div().id("menu").flex().flex_col().flex_shrink(1.).min_h(px(LIST_LEAST)).max_h(px(LIST_MOST)).overflow_y_scroll().px(px(4.)).py(px(4.));
         if fits.is_empty() {
             return list.child(div().px(px(8.)).py(px(12.)).text_color(look.ink_3).child("Nothing matches every word."));
         }

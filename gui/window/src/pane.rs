@@ -8,6 +8,9 @@ mod for_tests;
 mod heard;
 mod panel;
 mod pickers;
+/// The room each side of an effort level's word, for a test to hold it to.
+#[cfg(test)]
+pub(crate) const LEVEL_ROOM_FOR_TEST: f32 = pickers::LEVEL_ROOM;
 mod review;
 mod rows;
 mod settings_page;
@@ -51,16 +54,16 @@ const BEAT: Duration = Duration::from_millis(125);
 const RAIL: f32 = 31.;
 /// The longest a box grows, in lines, before it scrolls.
 const BOX_LINES: usize = 12;
-/// How far down the first run its box ends, and how much of a pane isn't
-/// above its foot (its header, the foot, the desk's edges): what's left is
-/// the room a list by the box has.
-const DRAFT_BOX_FOOT: f32 = 330.;
-const ABOVE_THE_FOOT: f32 = 190.;
 /// What the box says when there's nothing in it.
 const WRITE: &str = "Write to rein";
 /// What it says while a command waits for your answer, which isn't a turn
 /// to steer.
 const ASKED_ABOVE: &str = "Answer above first";
+/// The same on the first run, whose question is under the box.
+const ASKED_BELOW: &str = "Answer below first";
+/// What's between the first run's box and the window's foot besides a
+/// list's own margin: the gap to a question under it, and the sheet's foot.
+const UNDER_THE_BOX: f32 = 24.;
 
 /// A row's text view, and what it holds now.
 struct Kept {
@@ -250,6 +253,10 @@ pub(crate) struct Pane {
     /// The list a press outside it shut, and where that press went down:
     /// if it was on the list's own cell, that cell mustn't open it again.
     picker_shut: Option<(Picking, Point<Pixels>)>,
+    /// Where what the lists hang from was drawn last: under the first run's
+    /// box, or the part of a conversation above its foot. Their room comes
+    /// from it, never from a guess at the layout, which went stale.
+    hangs_from: pickers::Measured,
     /// It's the pane to start with: see [`About::draft`].
     draft: bool,
     /// Signed in to nothing that runs the model: the ways there are.
@@ -340,6 +347,7 @@ impl Pane {
             undoing: None,
             picker: None,
             picker_shut: None,
+            hangs_from: pickers::Measured::default(),
             page: None,
         }
     }
@@ -773,7 +781,7 @@ impl Render for Pane {
         if self.signing.is_some() && !self.draft {
             let look = Look::of(cx);
             let ways = self.welcome(window, cx);
-            let asking = self.asking_card(window, cx);
+            let asking = self.asking_card(None, window, cx);
             return div()
                 .size_full()
                 .flex()
@@ -789,12 +797,19 @@ impl Render for Pane {
         }
         if self.draft {
             let welcome = self.welcome(window, cx);
-            // Under the box, which sits this far down the first run.
-            let room = window.viewport_size().height - px(DRAFT_BOX_FOOT);
-            let picker = self.picker_card(pickers::Opens::Below, room, cx);
-            let asking = self.asking_card(window, cx);
-            let listing = self.listing(pickers::Opens::Below, cx);
-            return div().relative().w_full().flex().flex_col().gap(px(16.)).child(welcome).children(asking).children(picker).children(listing).into_any_element();
+            // Under the box, in what's left of the window below it, and over
+            // what comes after it (the saved conversations), drawn last: in
+            // turn, those were drawn over the list and took its presses.
+            // They hang from the box alone: hung from all of this, a list
+            // opened under a question that was up, over everything else.
+            let room = self.hangs_from.room(pickers::Opens::Below, window);
+            let picker = self.picker_card(pickers::Opens::Below, room, cx).map(deferred);
+            let listing = self.listing(pickers::Opens::Below, room, cx).map(deferred);
+            let the_box = div().relative().child(self.hangs_from.measure()).child(welcome).children(picker).children(listing);
+            // A question takes the saved conversations' place, in the room
+            // under the box: past it, the first run scrolled the box away.
+            let asking = self.asking_card(Some(room - px(UNDER_THE_BOX)), window, cx);
+            return div().w_full().flex().flex_col().gap(px(16.)).child(the_box).children(asking).into_any_element();
         }
         let look = Look::of(cx);
         let pane = cx.weak_entity();
@@ -817,15 +832,15 @@ impl Render for Pane {
             div().absolute().left(px(RAIL)).bottom_0().w(px(1.5)).h(px(72.)).bg(fade)
         });
         let question = self.question(window, cx);
-        let asking = self.asking_card(window, cx);
-        let listing = self.listing(pickers::Opens::Above, cx);
+        let room = self.hangs_from.room(pickers::Opens::Above, window);
+        let asking = self.asking_card(Some(room), window, cx);
+        let listing = self.listing(pickers::Opens::Above, room, cx);
         let waiting = self.waiting(cx);
         let foot = self.foot(window, cx);
         let header = self.header(cx);
         let beside = self.beside(cx);
         let sheet = self.undo_sheet(cx);
         // Over the foot, in what's left above it.
-        let room = window.viewport_size().height - px(ABOVE_THE_FOOT);
         let picker = self.picker_card(pickers::Opens::Above, room, cx);
         let sheet_of_the_conversation = div()
             .relative()
@@ -878,6 +893,7 @@ impl Render for Pane {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
+                    .child(self.hangs_from.measure())
                     .child(div().absolute().left(px(RAIL)).top_0().bottom_0().w(px(1.)).bg(look.line_2))
                     .child(
                         div()
@@ -924,6 +940,8 @@ impl Pane {
             "This agent has ended"
         } else if self.draft && self.asking.is_none() {
             welcome::DESCRIBE
+        } else if self.asking.is_some() && self.draft {
+            ASKED_BELOW
         } else if self.asking.is_some() {
             ASKED_ABOVE
         } else if self.running {

@@ -485,7 +485,7 @@ impl Pane {
 impl Pane {
     /// What's listed for the word being typed, by the box as `opens` says:
     /// on the first run, under it, where it was once never drawn at all.
-    pub(super) fn listing(&self, opens: super::pickers::Opens, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+    pub(super) fn listing(&self, opens: super::pickers::Opens, room: Pixels, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let over = self.writing.over.as_ref()?;
         let look = Look::of(cx);
         let mono = cx.global::<crate::parts::Monospace>().0.clone();
@@ -516,7 +516,18 @@ impl Pane {
                     .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(if picked { look.ink_2 } else { look.ink_3 }).child(about))
             })
             .collect();
-        let card = div().debug_selector(|| "listing".to_owned()).flex_none().p(px(4.)).rounded(px(10.)).bg(look.float).border_1().border_color(look.line_2).children(rows);
+        let card = div()
+            .id("listing")
+            .debug_selector(|| "listing".to_owned())
+            .flex_none()
+            .max_h(room)
+            .overflow_y_scroll()
+            .p(px(4.))
+            .rounded(px(10.))
+            .bg(look.float)
+            .border_1()
+            .border_color(look.line_2)
+            .children(rows);
         Some(match opens {
             super::pickers::Opens::Above => card.ml(px(44.)).mr(px(28.)).mb(px(8.)),
             super::pickers::Opens::Below => card.occlude().absolute().left_0().right_0().top(relative(1.)).mt(px(8.)),

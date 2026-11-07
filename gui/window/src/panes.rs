@@ -620,9 +620,9 @@ impl Panes {
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let top = div().flex().flex_none().items_center().gap(px(4.)).h(px(TOP)).pl(px(14.)).pr(px(8.)).child(drag_area("drag-list").flex_1().h_full());
-        let bar = div().flex().flex_col().flex_none().w(px(SIDEBAR)).h_full();
+        let bar = div().debug_selector(|| "sidebar".to_owned()).flex().flex_col().flex_none().w(px(SIDEBAR)).h_full();
         if self.choosing.is_some() {
-            let back = Press::new("back").ghost().small().label("Back").on_click(cx.listener(|view, _, _, cx| {
+            let back = Press::new("back").debug_selector(|| "back".to_owned()).ghost().small().label("Back").on_click(cx.listener(|view, _, _, cx| {
                 view.choosing = None;
                 cx.notify();
             }));
@@ -690,8 +690,9 @@ impl Panes {
     fn nothing_open(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let look = Look::of(cx);
         let draft = self.draft.clone();
-        let signing = draft.as_ref().is_some_and(|draft| draft.read(cx).is_signing());
-        let recent = self.recent.as_deref().filter(|recent| !recent.is_empty() && !signing).map(|recent| self.go_on_with(recent, cx));
+        // Signing in, or answering a question, is what's under the box then.
+        let busy = draft.as_ref().is_some_and(|draft| draft.read(cx).is_signing() || draft.read(cx).is_asking());
+        let recent = self.recent.as_deref().filter(|recent| !recent.is_empty() && !busy).map(|recent| self.go_on_with(recent, cx));
         let column = div().flex().flex_col().gap(px(24.)).w_full().max_w(px(620.));
         div()
             .id("first-run")
@@ -717,6 +718,7 @@ impl Panes {
             let picked = one.clone();
             div()
                 .id(("recent", index))
+                .debug_selector(move || format!("recent-{index}"))
                 .flex()
                 .items_center()
                 .gap(px(10.))
@@ -738,7 +740,18 @@ impl Panes {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(look.ink_2)
             .child("Go on with one")
-            .child(div().font_weight(FontWeight::NORMAL).text_color(look.ink_3).child(format!("{} saved", recent.len())));
+            // There's no list beside it here: the count is the way to them all.
+            .child(
+                div()
+                    .id("all-saved")
+                    .debug_selector(|| "all-saved".to_owned())
+                    .font_weight(FontWeight::NORMAL)
+                    .text_color(look.ink_3)
+                    .hover(|style| style.text_color(look.ink))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, window, cx| view.choose_saved(window, cx)))
+                    .child(format!("{} saved", recent.len())),
+            );
         div().flex().flex_col().gap(px(2.)).child(heading).children(rows.collect::<Vec<_>>())
     }
 }
@@ -757,8 +770,24 @@ impl Render for Panes {
         let shown = self.held.iter().filter(|held| held.shown).map(|held| AnyView::from(held.pane.clone()).cached(StyleRefinement::default().flex_1().min_w_0().h_full()));
         let panes: Vec<_> = shown.collect();
         let empty = panes.is_empty().then(|| self.nothing_open(cx));
-        let sidebar = self.sidebar(cx);
+        // With nothing on the desk there's nothing to list beside it: the
+        // first screen is the window, as the design has it, unless you've
+        // asked for the saved conversations, which the list shows.
+        let bare = panes.is_empty() && self.choosing.is_none();
+        let sidebar = (!bare).then(|| self.sidebar(cx));
         let palette = self.palette_card(cx);
+        let desk = if bare {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(drag_area("drag-first-run").flex_none().h(px(TOP)))
+                .child(div().flex().flex_1().min_h_0().px(px(6.)).pb(px(6.)).children(empty))
+        } else {
+            div().flex().flex_1().min_w_0().h_full().gap(px(6.)).py(px(6.)).pr(px(6.)).children(panes).children(empty)
+        };
         div()
             .track_focus(&self.focus)
             // Once the press has done what it will: a window can be moved
@@ -777,8 +806,8 @@ impl Render for Panes {
             .text_size(px(13.))
             .line_height(px(18.))
             .on_mouse_move(move |_, _, _| pointer.pointer_moved())
-            .child(sidebar)
-            .child(div().flex().flex_1().min_w_0().h_full().gap(px(6.)).py(px(6.)).pr(px(6.)).children(panes).children(empty))
+            .children(sidebar)
+            .child(desk)
             .child(frames)
             .children(palette)
             .into_any_element()

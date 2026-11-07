@@ -17,7 +17,7 @@ All your agents side by side, each one to read and steer. It's a workspace of it
 cargo run -p rein-window --release
 ```
 
-It opens on the first run's box: "What should this agent work on?", with the folder, model, effort and mode it would start with, and the four newest saved conversations to go on with. What you send from it starts the agent, which then joins the list. Signed in to nothing that runs the model, it shows the ways to sign in instead, and what each asks comes up as a command's questions do. `⌘N` starts another agent in a folder, and Saved conversations opens one you had. Each `--agent 'rein serve --mode ask'` starts one with it. The command is split on spaces, so a path with spaces in it won't work, and `rein` takes the folder you run this from as its project.
+It opens on the first run's box, with nothing beside it: "What should this agent work on?", with the folder, model, effort and mode it would start with, and the four newest saved conversations to go on with, whose count opens all of them. What you send from it starts the agent, and the list of agents comes in beside it. Signed in to nothing that runs the model, it shows the ways to sign in instead, and what each asks comes up as a command's questions do. `⌘N` starts another agent in a folder, and Saved conversations opens one you had. Each `--agent 'rein serve --mode ask'` starts one with it. The command is split on spaces, so a path with spaces in it won't work, and `rein` takes the folder you run this from as its project.
 
 It wears the look your settings keep (`look`: light, dark, or following your Mac, the default), and `--look light` or `--look dark` pins one for a run.
 

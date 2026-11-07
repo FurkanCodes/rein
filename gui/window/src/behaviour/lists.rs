@@ -21,9 +21,28 @@ fn modes() -> Said {
 
 /// The pane to start with, told what a conversation would be.
 fn first_run(file: &Path) -> (Desk, Entity<Pane>) {
-    let (mut desk, draft) = desk_with_draft(file);
+    first_run_saved(file, "[]")
+}
+
+/// The same, with `sessions` saved to go on with under its box.
+fn first_run_saved(file: &Path, sessions: &str) -> (Desk, Entity<Pane>) {
+    let (mut desk, draft) = desk_with_saved(file, sessions);
     desk.said(&draft, vec![Said::Started("session".to_owned()), model_setting(), modes(), commands()]);
     (desk, draft)
+}
+
+/// Four saved conversations, as many as the first run shows.
+const FOUR_SAVED: &str = r#"[{"sessionId":"one","cwd":"/work","title":"a"},{"sessionId":"two","cwd":"/work","title":"b"},{"sessionId":"three","cwd":"/work","title":"c"},{"sessionId":"four","cwd":"/work","title":"d"}]"#;
+
+/// The list `opening` opens on the first run: a cell's, or what `/` lists.
+fn open_on_first_run(desk: &mut Desk, draft: &Entity<Pane>, opening: &'static str) -> &'static str {
+    if opening == "/" {
+        typed(desk, draft, "/");
+        "listing"
+    } else {
+        press_on(desk, opening);
+        "picker"
+    }
 }
 
 /// A conversation that can set its model and mode.
@@ -156,4 +175,99 @@ fn command_k_on_the_first_run_lists_what_it_can_run() {
     desk.key("cmd-k");
     let runs = desk.cx.update(|_, cx| desk.panes.read(cx).palette_runs_for_test(cx));
     assert!(runs.contains(&"/model".to_owned()), "the pane to start with is the one you're at: {runs:?}");
+}
+
+#[test]
+fn the_first_screen_has_no_list_beside_it_and_its_count_opens_the_saved_ones() {
+    let file = scratch("bare-first-run");
+    let (mut desk, _draft) = desk_with_saved(&file, r#"[{"sessionId":"one","cwd":"/work","title":"fix the flaky test"}]"#);
+    assert!(drawn(&mut desk, "sidebar").is_none(), "nothing's on the desk, so nothing's listed beside it");
+    press_on(&mut desk, "all-saved");
+    assert!(drawn(&mut desk, "sidebar").is_some(), "the count opens every saved conversation beside the box");
+    press_on(&mut desk, "back");
+    assert!(drawn(&mut desk, "sidebar").is_none(), "and Back is the first screen again");
+}
+
+#[test]
+fn the_first_runs_lists_are_over_the_saved_conversations_and_take_the_press() {
+    for (n, opening) in ["model-cell", "mode-cell", "/"].into_iter().enumerate() {
+        let file = scratch(&format!("over-saved-{n}"));
+        let (mut desk, draft) = first_run_saved(&file, FOUR_SAVED);
+        let card = open_on_first_run(&mut desk, &draft, opening);
+        let list = drawn(&mut desk, card).unwrap_or_else(|| panic!("{opening} opens its list"));
+        let row = drawn(&mut desk, "recent-0").expect("a saved conversation is under the box");
+        assert!(list.contains(&row.center()), "{opening}: the list lies over a saved conversation here, {list:?} over {row:?}");
+        press(&mut desk, row.center());
+        let opened: Vec<String> = desk.cx.update(|_, cx| desk.panes.read(cx).panes().iter().filter_map(|pane| pane.read(cx).session().map(str::to_owned)).collect());
+        assert!(!opened.contains(&"one".to_owned()), "{opening}: the press was the list's, not the saved conversation's drawn under it: {opened:?}");
+    }
+}
+
+#[test]
+fn the_first_runs_lists_stay_inside_a_short_window() {
+    for (n, opening) in ["model-cell", "mode-cell", "/"].into_iter().enumerate() {
+        let file = scratch(&format!("short-{n}"));
+        let (mut desk, draft) = first_run_saved(&file, FOUR_SAVED);
+        desk.cx.simulate_resize(gpui_kit::size(px(900.), px(560.)));
+        let card = open_on_first_run(&mut desk, &draft, opening);
+        let list = drawn(&mut desk, card).unwrap_or_else(|| panic!("{opening} opens its list"));
+        let height = desk.cx.update(|window, _| window.viewport_size().height);
+        assert!(list.bottom() <= height, "{opening}: its list ends inside the window, {list:?}, {height:?} tall");
+    }
+}
+
+#[test]
+fn every_effort_level_has_room_around_its_word_inside_the_card() {
+    const LEVELS: [&str; 8] = ["default", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const PILLS: [&str; 8] = ["effort-0", "effort-1", "effort-2", "effort-3", "effort-4", "effort-5", "effort-6", "effort-7"];
+    let mut desk = desk();
+    let file = scratch("effort-room");
+    let pane = desk.pane(&file);
+    let levels: Vec<Value> = LEVELS.iter().map(|level| json!({ "value": level, "name": level })).collect();
+    let settings = Setting::listed(&json!([
+        { "id": "model", "currentValue": "openai/gpt-5", "options": [{ "group": "openai", "name": "OpenAI", "options": [{ "value": "openai/gpt-5", "name": "gpt-5" }] }] },
+        { "id": "effort", "currentValue": "medium", "options": levels },
+    ]));
+    desk.said(&pane, vec![Said::Settings(settings), commands()]);
+    press_on(&mut desk, "model-cell");
+    let card = drawn(&mut desk, "picker").expect("the model's list is open");
+    for (word, selector) in LEVELS.into_iter().zip(PILLS) {
+        let pill = drawn(&mut desk, selector).unwrap_or_else(|| panic!("{word} is drawn"));
+        let text = desk.cx.update(|window, _| {
+            let mut style = window.text_style();
+            style.font_weight = gpui_kit::FontWeight::MEDIUM;
+            window.text_system().shape_line(word.into(), px(12.), &[style.to_run(word.len())], None).width
+        });
+        let room = px(2. * crate::pane::LEVEL_ROOM_FOR_TEST);
+        assert!(pill.size.width >= text + room, "{word}: its pill has room around the word, {pill:?} for a word {text:?} wide");
+        assert!(pill.left() >= card.left() && pill.right() <= card.right(), "{word}: inside the card, {pill:?} in {card:?}");
+    }
+    let_go(&mut desk, &pane);
+}
+
+/// A question as "Sign in to more" asks it: a long list to choose from.
+fn add_a_key_for() -> Said {
+    let items = (0..13).map(|n| rein_transcript::Item { name: format!("Provider {n}"), about: "no key yet".to_owned() }).collect();
+    let menu = rein_transcript::Menu { title: "add a key for".to_owned(), items, current: None, at: None };
+    Said::Asking { id: json!(9), asking: Asking::Choose(menu) }
+}
+
+#[test]
+fn a_question_on_the_first_run_is_under_the_box_in_the_window_and_no_list_opens_over_it() {
+    let file = scratch("first-run-question");
+    let (mut desk, draft) = first_run_saved(&file, FOUR_SAVED);
+    desk.cx.simulate_resize(gpui_kit::size(px(900.), px(640.)));
+    press_on(&mut desk, "model-cell");
+    assert_eq!(picking(&mut desk, &draft), Some(Picking::Model));
+    desk.said(&draft, vec![add_a_key_for()]);
+    assert_eq!(picking(&mut desk, &draft), None, "the list from the bar gives way to the question");
+    let bar = drawn(&mut desk, "model-cell").expect("the box's bar is drawn");
+    let asking = drawn(&mut desk, "asking").expect("the question is drawn");
+    let height = desk.cx.update(|window, _| window.viewport_size().height);
+    assert!(bar.top() >= px(0.) && asking.top() >= bar.bottom(), "under the box, with the box in view: {asking:?} under {bar:?}");
+    // The sheet's foot is 26 high: past it, the first run scrolls.
+    assert!(asking.bottom() <= height - px(26.), "inside the window, and nothing scrolls: {asking:?}, {height:?} tall");
+    assert!(drawn(&mut desk, "recent-0").is_none(), "it takes the saved conversations' place");
+    press_on(&mut desk, "model-cell");
+    assert_eq!(picking(&mut desk, &draft), None, "no list opens while the question waits for its answer");
 }

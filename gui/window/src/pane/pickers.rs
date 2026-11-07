@@ -16,12 +16,49 @@ use crate::parts::hairline;
 const MODEL_WIDE: f32 = 420.;
 const MODE_WIDE: f32 = 380.;
 const FROM_BOX: f32 = 8.;
-/// As many rows as show before the list scrolls, and the fewest: what's
-/// around them, in each card, takes the rest of the room there is.
+/// As many rows as show before the list scrolls, and the fewest: the card
+/// is held to the room there is, and its list gives up what the rest
+/// needs, whatever that is.
 const LIST_MOST: f32 = 360.;
 const LIST_LEAST: f32 = 96.;
-const MODEL_AROUND: f32 = 250.;
-const MODE_AROUND: f32 = 150.;
+/// The room each side of an effort level's word, inside its pill.
+pub(super) const LEVEL_ROOM: f32 = 6.;
+/// What's kept clear between a card and the window's edge, or the top of
+/// a conversation.
+const EDGE: f32 = 12.;
+/// Before anything's drawn: until the first frame says where it is.
+const FIRST_GUESS: f32 = 360.;
+
+/// Where something was drawn last, kept as it's drawn.
+#[derive(Debug, Default, Clone)]
+pub(super) struct Measured(std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>);
+
+impl Measured {
+    /// Over the whole of the element it's a child of, which is `relative`:
+    /// it notes where that was drawn, and asks for another frame when it
+    /// moved, since what was drawn with the old place is out of date.
+    pub(super) fn measure(&self) -> impl IntoElement + use<> {
+        let at = self.0.clone();
+        let note = move |bounds: Bounds<Pixels>, window: &mut Window, _: &mut App| {
+            if at.get() != Some(bounds) {
+                at.set(Some(bounds));
+                window.request_animation_frame();
+            }
+        };
+        canvas(note, |_, (), _, _| ()).absolute().top_0().left_0().size_full()
+    }
+
+    /// How tall a card that `opens` from it may be: under it, down to the
+    /// window's foot; over it, up to its top.
+    pub(super) fn room(&self, opens: Opens, window: &Window) -> Pixels {
+        let Some(at) = self.0.get() else { return px(FIRST_GUESS) };
+        let room = match opens {
+            Opens::Below => window.viewport_size().height - at.bottom(),
+            Opens::Above => at.size.height,
+        };
+        (room - px(FROM_BOX + EDGE)).max(px(LIST_LEAST))
+    }
+}
 
 /// Where a list opens from the box it's for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +151,11 @@ impl Pane {
     /// on its way down, from its own cell, has done all it was for.
     pub(super) fn open_picker_by(&mut self, picking: Picking, at: Option<Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
         let shut = self.picker_shut.take();
+        // The question is what's waiting for you: a list opened over it, and
+        // a pick then went in ahead of your answer.
+        if self.asking.is_some() {
+            return;
+        }
         if at.is_some() && shut == at.map(|at| (picking, at)) {
             return;
         }
@@ -236,8 +278,6 @@ impl Pane {
     /// it, which its rows fit in.
     pub(super) fn picker_card(&self, opens: Opens, room: Pixels, cx: &mut Context<Self>) -> Option<AnyElement> {
         let picker = self.picker.as_ref()?;
-        let around = if picker.picking == Picking::Model { MODEL_AROUND } else { MODE_AROUND };
-        let list_most = (f32::from(room) - around).clamp(LIST_LEAST, LIST_MOST);
         let look = Look::of(cx);
         let mono = cx.global::<crate::parts::Monospace>().0.clone();
         let choices = self.choices(picker.picking);
@@ -305,7 +345,18 @@ impl Pane {
         if fits.is_empty() {
             rows.push(div().px(px(8.)).py(px(16.)).text_color(look.ink_3).child("Nothing matches every word.").into_any_element());
         }
-        let list = div().id("picker-list").flex().flex_col().max_h(px(list_most)).overflow_y_scroll().px(px(6.)).pt(px(4.)).pb(px(8.)).children(rows);
+        let list = div()
+            .id("picker-list")
+            .flex()
+            .flex_col()
+            .flex_shrink(1.)
+            .min_h(px(LIST_LEAST))
+            .max_h(px(LIST_MOST))
+            .overflow_y_scroll()
+            .px(px(6.))
+            .pt(px(4.))
+            .pb(px(8.))
+            .children(rows);
         let keys = cx.listener(Self::picker_key);
         let card = div()
             .id("picker")
@@ -331,6 +382,7 @@ impl Pane {
             .flex()
             .flex_col()
             .max_w(relative(0.94))
+            .max_h(room)
             .rounded(px(12.))
             .overflow_hidden()
             .bg(look.float)
@@ -471,9 +523,13 @@ fn effort_levels(effort: &Setting, cx: &mut Context<Pane>) -> impl IntoElement +
             div()
                 .id(("effort-level", at))
                 .debug_selector(move || format!("effort-{at}"))
+                // As wide as its word and some room each side, never less:
+                // given equal slots, a long word filled its pill to the edge.
+                // What's left over is shared out.
                 .flex()
-                .flex_1()
-                .min_w_0()
+                .flex_auto()
+                .flex_shrink_0()
+                .px(px(LEVEL_ROOM))
                 .items_center()
                 .justify_center()
                 .h(px(24.))
@@ -508,7 +564,8 @@ fn effort_levels(effort: &Setting, cx: &mut Context<Pane>) -> impl IntoElement +
                 .child("Effort")
                 .child(div().font_weight(FontWeight::NORMAL).child("the levels this model takes")),
         )
-        .child(div().flex().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(look.lit).children(levels))
+        // More levels than fit go on a row of their own, not past the card.
+        .child(div().flex().flex_wrap().gap(px(2.)).p(px(2.)).rounded(px(8.)).bg(look.lit).children(levels))
 }
 
 /// A switch: a knob in a track, teal when it's on.
