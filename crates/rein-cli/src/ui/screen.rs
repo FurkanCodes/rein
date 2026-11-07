@@ -102,13 +102,46 @@ pub fn viewing() -> bool {
     state().viewing
 }
 
+/// Where what's said goes while it isn't going to the screen.
+type Taker = Box<dyn Fn(&str) + Send>;
+
+static TAKER: Mutex<Option<Taker>> = Mutex::new(None);
+
+/// What's said goes to a taker for as long as this is held.
+pub struct Taken;
+
+impl Drop for Taken {
+    fn drop(&mut self) {
+        *TAKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// From now until what this gives back is dropped, what `say!` writes goes
+/// to `taker`: `rein serve` has no screen, and a command it runs has things
+/// to say to whoever asked for it.
+#[must_use]
+pub fn take_said(taker: Taker) -> Taken {
+    *TAKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(taker);
+    Taken
+}
+
 /// Writes `text` to stderr in one piece, under the lock.
 pub fn write(text: &str) {
+    if let Some(taker) = TAKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+        taker(text);
+        return;
+    }
     print(text, &mut std::io::stderr());
 }
 
-/// Writes `text` to stdout in one piece, under the lock.
+/// Writes `text` to stdout in one piece, under the lock. Taken, it goes to
+/// the client like the rest: in `rein serve`, stdout is the protocol, and a
+/// compaction's summary printed there stopped every client reading.
 pub fn write_out(text: &str) {
+    if let Some(taker) = TAKER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+        taker(text);
+        return;
+    }
     print(text, &mut std::io::stdout());
 }
 

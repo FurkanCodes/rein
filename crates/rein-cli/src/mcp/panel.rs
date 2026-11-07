@@ -245,10 +245,10 @@ fn actions(row: Row) -> Vec<Action> {
 pub(super) async fn panel(mcp: &mut Mcp, agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
     let rows = rows(mcp);
     // The list to pick from says all the table would: it isn't said twice.
-    if !terminal.input.pinned() || rows.is_empty() {
+    if !terminal.input.can_ask() || rows.is_empty() {
         show(mcp, terminal);
     }
-    if !terminal.input.pinned() {
+    if !terminal.input.can_ask() {
         return Ok(());
     }
     // After the servers, a new one: looked up, or brought from other apps.

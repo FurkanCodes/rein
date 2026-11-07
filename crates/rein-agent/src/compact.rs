@@ -105,6 +105,64 @@ fn rein_note(text: &str) -> bool {
         || crate::agent::is_undo_note(text)
 }
 
+/// What a conversation is made of, in characters.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Made {
+    pub tool_output: usize,
+    /// What's said on the model's behalf: its words, its calls, its thinking.
+    pub reins_words: usize,
+    pub your_messages: usize,
+    /// rein's first message, what the project says, and its notes.
+    pub project: usize,
+}
+
+/// One tool's output, which compaction would look at first.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Biggest {
+    /// The file it read, the command it ran, or what it looked for.
+    pub what: String,
+    pub size: usize,
+    /// It's out of date, so compaction retires it first.
+    pub stale: bool,
+}
+
+/// What `history` is made of.
+pub fn made_of(history: &[Item]) -> Made {
+    let mut made = Made::default();
+    for item in history {
+        let size = size(item);
+        match item {
+            Item::ToolResult { .. } | Item::Image { .. } => made.tool_output += size,
+            Item::User(_) if typed(item).is_some() => made.your_messages += size,
+            Item::User(_) => made.project += size,
+            Item::Assistant(_) | Item::ToolCall(_) | Item::Found { .. } | Item::Opaque(_) => made.reins_words += size,
+        }
+    }
+    made
+}
+
+/// The `most` biggest tool outputs in `history`, the biggest first.
+pub fn biggest(history: &[Item], most: usize) -> Vec<Biggest> {
+    let calls = calls(history);
+    let stale: std::collections::HashSet<String> = stale(history).into_iter().map(|(id, _)| id).collect();
+    let mut found: Vec<Biggest> = history
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult { call_id, output } => {
+                let call = calls.get(call_id.as_str()).map(|(_, call)| call);
+                let what = call.and_then(|call| {
+                    call.path.clone().or_else(|| call.command.clone()).or_else(|| call.pattern.clone()).or_else(|| call.tool.map(|tool| tool.as_str().to_owned()))
+                });
+                Some(Biggest { what: what.unwrap_or_else(|| "a tool's output".to_owned()), size: output.len(), stale: stale.contains(call_id) })
+            }
+            _ => None,
+        })
+        .collect();
+    found.sort_by_key(|one| std::cmp::Reverse(one.size));
+    found.truncate(most);
+    found
+}
+
 /// A message the user actually typed: not rein's first message, not a summary.
 pub fn typed(item: &Item) -> Option<&str> {
     match item {

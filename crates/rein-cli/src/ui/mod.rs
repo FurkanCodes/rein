@@ -2,6 +2,7 @@
 //! from Markdown and wrapped, and under it all, the input box and its
 //! status bar (see `crate::input`).
 
+pub mod asked;
 pub mod editor;
 pub mod fuzzy;
 pub mod history;

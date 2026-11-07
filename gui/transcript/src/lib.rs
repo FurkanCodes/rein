@@ -1,16 +1,31 @@
 //! A conversation as a window holds it: what `session/update`s come to,
 //! with no toolkit in sight, so it outlives the choice of one.
 
+mod asking;
 mod blocks;
+pub mod boards;
+pub mod composing;
+// One rule for finding a path, wherever it's typed.
+#[path = "../../../crates/rein-cli/src/ui/fuzzy.rs"]
+pub mod fuzzy;
+// One rule for narrowing a list, wherever it's drawn.
+#[allow(dead_code)]
+#[path = "../../../crates/rein-cli/src/ui/narrow.rs"]
+mod narrow;
+mod question;
 mod saved;
+mod settings;
 mod watch;
 
 use std::collections::HashMap;
 use std::ops::Range;
 
+pub use asking::{Asking, Command, Item, Menu, Offered, OwnCommand, Sets, says_back};
 pub use blocks::Blocks;
+pub use question::{Answering, ChangedLine, Choice, FileChange, Question, Words};
 pub use saved::{Saved, folder_name};
 use serde_json::Value;
+pub use settings::{Choosable, Meter, Setting};
 pub use watch::{Standing, Watch};
 
 /// Who a message is from.
@@ -24,7 +39,24 @@ pub enum Role {
     Peer,
     /// The window's own word, which nobody in the conversation said.
     Note,
+    /// What a command you ran said, laid out as it was: not the model's.
+    Said,
+    /// The line that ends a turn: what it came to.
+    Turn,
 }
+
+/// Starts what a command said: it's laid out for a terminal, in columns and
+/// lines, so it's kept as code. Longer than any fence in what it holds.
+const SAID_OPENS: &str = "`````\n";
+/// Marks text as a command's, not the model's.
+const SAID: &str = "io.github.furkancodes/said";
+/// Marks a message of yours as whole: chunks of one role run together
+/// otherwise, and two commands in a row read `/model/effort`.
+const WHOLE: &str = "io.github.furkancodes/whole";
+/// Marks a thought as rein's own note: a check, a hook, a command ending.
+const NOTE: &str = "io.github.furkancodes/note";
+/// Marks a note as the line that ends a turn, and the turn to undo from it.
+const TURN: &str = "io.github.furkancodes/turn";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -131,6 +163,8 @@ pub struct Mode {
     pub id: String,
     /// As it's shown, and any mark comes with it: `⚠ trust`.
     pub name: String,
+    /// What it lets through, in a line.
+    pub about: String,
 }
 
 /// The modes an agent offers, and the one it's in.
@@ -146,7 +180,11 @@ impl Modes {
     pub fn of(modes: &Value) -> Option<Modes> {
         let current = modes["currentModeId"].as_str()?.to_owned();
         let listed = modes["availableModes"].as_array()?.iter();
-        let available = listed.filter_map(|mode| Some(Mode { id: mode["id"].as_str()?.to_owned(), name: mode["name"].as_str()?.to_owned() })).collect();
+        let available = listed
+            .filter_map(|mode| {
+                Some(Mode { id: mode["id"].as_str()?.to_owned(), name: mode["name"].as_str()?.to_owned(), about: mode["description"].as_str().unwrap_or_default().to_owned() })
+            })
+            .collect();
         Some(Modes { current, available })
     }
 
@@ -190,84 +228,6 @@ pub struct Update {
     pub added: usize,
     /// Rows that were there already and aren't what they were.
     pub touched: Range<usize>,
-}
-
-/// What a step would do, put to you as a question.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Question {
-    pub title: String,
-    /// All of what it would run or write, where the title shows less: a
-    /// title has one line of a command, and a yes goes to the whole of it.
-    pub detail: Option<String>,
-}
-
-impl Question {
-    /// Read from a `tool_call`. One with no title doesn't say what it is.
-    fn of(update: &Value) -> Option<Question> {
-        let title = update["title"].as_str()?.to_owned();
-        let input = &update["rawInput"];
-        // Only a command step is all in its command: any other tool's
-        // arguments are what you'd be saying yes to, each of them.
-        let command = if update["kind"] == "execute" { input["command"].as_str() } else { None };
-        let whole = (!input.is_null()).then(|| command.or(input.as_str()).map_or_else(|| pretty(input), str::to_owned));
-        let detail = whole.filter(|whole| !title.contains(whole.as_str()));
-        Some(Question { title, detail })
-    }
-}
-
-/// An answer an agent offers to a question.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Choice {
-    /// What's sent back if it's picked.
-    pub id: String,
-    pub name: String,
-    pub kind: Answering,
-}
-
-/// What a choice says to a question: ACP's four.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Answering {
-    AllowOnce,
-    AllowAlways,
-    RejectOnce,
-    RejectAlways,
-}
-
-impl Answering {
-    fn of(word: &str) -> Option<Answering> {
-        match word {
-            "allow_once" => Some(Answering::AllowOnce),
-            "allow_always" => Some(Answering::AllowAlways),
-            "reject_once" => Some(Answering::RejectOnce),
-            "reject_always" => Some(Answering::RejectAlways),
-            _ => None,
-        }
-    }
-}
-
-impl Choice {
-    pub const fn allows(&self) -> bool {
-        matches!(self.kind, Answering::AllowOnce | Answering::AllowAlways)
-    }
-
-    /// The answers to give to a question whose `options` the agent listed.
-    /// A step nobody can describe can't be allowed, however it's offered, a
-    /// way of answering nobody knows isn't offered, whatever it would do, and
-    /// an agent that offers no way out still gets a no.
-    pub fn offered(options: &Value, known: bool) -> Vec<Choice> {
-        let listed = options.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|option| {
-            Some(Choice { id: option["optionId"].as_str()?.to_owned(), name: option["name"].as_str()?.to_owned(), kind: Answering::of(option["kind"].as_str()?)? })
-        });
-        let mut choices: Vec<Choice> = listed.filter(|choice| known || !choice.allows()).collect();
-        if !choices.iter().any(|choice| !choice.allows()) {
-            choices.push(Choice { id: "reject".to_owned(), name: "Reject".to_owned(), kind: Answering::RejectOnce });
-        }
-        choices
-    }
-}
-
-fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 /// Where a step is, and what it would be asked as.
@@ -321,9 +281,31 @@ pub struct Transcript {
     /// The steps of this turn, in order: their messages, and how far each reaches.
     turn: Vec<(usize, Reach)>,
     context: Option<ContextUse>,
+    commands: Vec<Command>,
+    /// The model's plan, as it last said.
+    plan: Vec<boards::Planned>,
+    /// The turn each turn line can undo back to, by message.
+    undo_points: HashMap<usize, usize>,
 }
 
 impl Transcript {
+    /// The model's plan, as it last said.
+    pub fn plan(&self) -> &[boards::Planned] {
+        &self.plan
+    }
+
+    /// The turn message `index` can undo back to, if it's a turn's line and
+    /// that turn changed files.
+    pub fn undo_point(&self, index: usize) -> Option<usize> {
+        self.undo_points.get(&index).copied()
+    }
+
+    /// What the check after edits last said, if it's run.
+    pub fn last_check(&self) -> Option<(&str, StepState)> {
+        let check = self.messages.iter().rev().find(|message| message.role == Role::Step && message.step_line().0 == "Check")?;
+        Some((check.step_line().1, check.state()))
+    }
+
     pub fn len(&self) -> usize {
         self.messages.len()
     }
@@ -345,7 +327,17 @@ impl Transcript {
     /// The first line of the first thing you said, which a conversation with
     /// no name goes by.
     pub fn first_said(&self) -> Option<&str> {
-        self.messages.iter().find(|message| message.role == Role::You)?.text.lines().next()
+        self.messages.iter().find(|message| message.role == Role::You && !says_back(&message.text))?.text.lines().next()
+    }
+
+    /// What can be run from the box, as the agent last said.
+    pub fn commands(&self) -> &[Command] {
+        &self.commands
+    }
+
+    /// The last thing the model said.
+    pub fn last_answer(&self) -> Option<&str> {
+        self.messages.iter().rev().find(|message| message.role == Role::Agent).map(|message| message.text.trim())
     }
 
     /// The last `most` steps of this turn, oldest first.
@@ -503,9 +495,20 @@ impl Transcript {
     fn change(&mut self, update: &Value) -> Change {
         let text = || update["content"]["text"].as_str().unwrap_or_default();
         match update["sessionUpdate"].as_str() {
+            Some("user_message_chunk") if update["_meta"][WHOLE] == true => self.add_said(Role::You, text()),
             Some("user_message_chunk") => self.say(Role::You, text()),
+            Some("agent_message_chunk") if update["_meta"][SAID] == true => self.command_said(text()),
             Some("agent_message_chunk") => self.say(Role::Agent, text()),
+            Some("agent_thought_chunk") if update["_meta"][NOTE] == true => self.noted(update, text()),
             Some("agent_thought_chunk") => self.say(Role::Thought, text()),
+            Some("plan") => {
+                self.plan = boards::Planned::listed(update);
+                Change::Nothing
+            }
+            Some("available_commands_update") => {
+                self.commands = Command::listed(update);
+                Change::Nothing
+            }
             Some("tool_call") => self.step(update),
             Some("tool_call_update") => self.step_update(update),
             Some("usage_update") => {
@@ -516,6 +519,23 @@ impl Transcript {
             }
             _ => Change::Nothing,
         }
+    }
+
+    fn command_said(&mut self, text: &str) -> Change {
+        if self.messages.last().is_some_and(|last| last.role == Role::Said) {
+            return self.say(Role::Said, text);
+        }
+        self.say(Role::Said, &format!("{SAID_OPENS}{text}"))
+    }
+
+    /// A note of rein's own, whole; the line that ends a turn is one.
+    fn noted(&mut self, update: &Value, text: &str) -> Change {
+        let Some(turn) = update["_meta"].get(TURN) else { return self.add_said(Role::Note, text) };
+        let change = self.add_said(Role::Turn, text);
+        if let (Change::Added(index), Some(turn)) = (&change, turn.as_u64().and_then(|turn| usize::try_from(turn).ok())) {
+            self.undo_points.insert(*index, turn);
+        }
+        change
     }
 
     fn add_said(&mut self, role: Role, text: &str) -> Change {
@@ -574,6 +594,39 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn what_a_command_says_is_a_block_of_its_own_and_isnt_the_models() {
+        let mut transcript = Transcript::default();
+        let said = |text: &str| json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text }, "_meta": { SAID: true } });
+        transcript.apply(&said("model   gpt-5\n"));
+        transcript.apply(&said("mode    ask\n"));
+        assert_eq!(transcript.messages.len(), 1, "one command, one block");
+        assert_eq!(transcript.get(0).unwrap().role, Role::Said);
+        assert!(transcript.row_text(0).unwrap().contains("model   gpt-5\nmode    ask"), "as it was laid out: {:?}", transcript.row_text(0));
+        assert_eq!(transcript.last_answer(), None, "/copy is for what the model said");
+        transcript.apply(&chunk("agent_message_chunk", "words"));
+        assert_eq!(transcript.get(1).unwrap().role, Role::Agent);
+    }
+
+    #[test]
+    fn two_commands_in_a_row_are_two_messages() {
+        let whole = |text: &str| json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": text }, "_meta": { WHOLE: true } });
+        let mut transcript = Transcript::default();
+        transcript.apply(&whole("/model"));
+        transcript.apply(&whole("/effort"));
+        assert_eq!(transcript.messages.len(), 2, "{:?}", transcript.messages);
+        assert_eq!(transcript.rows(), 2);
+    }
+
+    #[test]
+    fn a_conversation_isnt_named_after_a_command() {
+        let mut transcript = Transcript::default();
+        transcript.apply(&chunk("user_message_chunk", "/status"));
+        assert_eq!(transcript.first_said(), None);
+        transcript.you("fix the tests");
+        assert_eq!(transcript.first_said(), Some("fix the tests"));
+    }
 
     #[test]
     fn a_way_of_answering_nobody_knows_isnt_offered() {
@@ -708,7 +761,7 @@ mod tests {
         let step = |id: &str, title: &str, input: Value| json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": title, "kind": "execute", "status": "pending", "rawInput": input });
         let command = "echo hi\nrm -rf ~/work";
         transcript.apply(&step("long", "Run echo hi …", json!({ "command": command })));
-        let asked = Question { title: "Run echo hi …".to_owned(), detail: Some(command.to_owned()) };
+        let asked = Question { title: "Run echo hi …".to_owned(), detail: Some(command.to_owned()), change: None };
         assert_eq!(transcript.question("long"), Some(&asked), "a title has only the first line: the rest is what you'd be saying yes to");
 
         let printed = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "long", "status": "in_progress", "content": [{ "type": "content", "content": { "type": "text", "text": "hi" } }] });
@@ -786,6 +839,47 @@ mod tests {
         assert_eq!(transcript.get(2).unwrap().role, Role::Note);
         transcript.apply(&chunk("agent_message_chunk", "hello"));
         assert_eq!(transcript.get(3).unwrap().role, Role::Agent, "and what comes next starts anew");
+    }
+
+    #[test]
+    fn the_plan_is_what_was_last_said_of_it() {
+        use boards::{PlanState, Planned};
+        let mut transcript = Transcript::default();
+        assert!(transcript.plan().is_empty());
+        let entries = json!([{ "content": "Find it", "status": "completed" }, { "content": "Fix it", "status": "in_progress" }, { "content": "Test it", "status": "pending" }]);
+        transcript.apply(&json!({ "sessionUpdate": "plan", "entries": entries }));
+        let planned = |text: &str, state| Planned { text: text.to_owned(), state };
+        assert_eq!(transcript.plan(), [planned("Find it", PlanState::Done), planned("Fix it", PlanState::Running), planned("Test it", PlanState::Waiting)]);
+        transcript.apply(&json!({ "sessionUpdate": "plan", "entries": [{ "content": "Test it", "status": "completed" }] }));
+        assert_eq!(transcript.plan(), [planned("Test it", PlanState::Done)], "a plan is said whole, so it replaces the last");
+    }
+
+    #[test]
+    fn a_note_is_rein_s_own_and_a_turn_s_line_can_say_what_it_undoes() {
+        let mut transcript = Transcript::default();
+        let note = |text: &str, meta: Value| json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": text }, "_meta": meta });
+        transcript.apply(&note("compacted", json!({ NOTE: true })));
+        transcript.apply(&note("1 step", json!({ NOTE: true })));
+        transcript.apply(&note("2 steps · changed a.rs", json!({ NOTE: true, TURN: 7 })));
+        assert_eq!(transcript.get(0).map(|message| message.role), Some(Role::Note));
+        assert_eq!(transcript.len(), 3, "each is whole, not a chunk of the one before");
+        assert_eq!(transcript.get(2).map(|message| message.role), Some(Role::Turn));
+        assert_eq!(transcript.undo_point(2), Some(7));
+        assert_eq!(transcript.undo_point(1), None);
+        assert_eq!(transcript.undo_point(0), None, "a note undoes nothing");
+    }
+
+    #[test]
+    fn the_last_check_is_the_latest_as_it_stands() {
+        let mut transcript = Transcript::default();
+        assert_eq!(transcript.last_check(), None);
+        let check = |id: &str, title: &str| json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": title, "kind": "execute", "status": "in_progress" });
+        transcript.apply(&check("a", "Run cargo test"));
+        assert_eq!(transcript.last_check(), None, "a command isn't the check");
+        transcript.apply(&check("b", "Check cargo check"));
+        assert_eq!(transcript.last_check(), Some(("cargo check", StepState::Running)));
+        transcript.apply(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": "b", "status": "failed" }));
+        assert_eq!(transcript.last_check(), Some(("cargo check", StepState::Failed)));
     }
 
     #[test]

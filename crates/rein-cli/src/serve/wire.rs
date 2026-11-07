@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 
 use rein_agent::permissions::Mode;
 use serde::Deserialize;
+
+use crate::input::{Menu, Question};
+use crate::ui::asked::Asked;
+use crate::ui::steps::Whole;
 use serde_json::{Value, json};
 
 /// The protocol's major version: the only one rein speaks.
@@ -26,6 +30,46 @@ pub(super) const STEERS: &str = "io.github.furkancodes/steer";
 pub(super) const PANES: &str = "io.github.furkancodes/panes";
 /// Asks a client that said [`PANES`] to start a `rein serve` for a sub-agent.
 const OPEN_PANE: &str = "_io.github.furkancodes/open_pane";
+/// A client that can show what a command asks says so as it starts, and
+/// gets these: the list to choose from, the line to type, the question to
+/// answer. ACP has a slash command run as a prompt and has no word for any
+/// of them, so a client without them gets a command's answer but no menu.
+pub(super) const ASKS: &str = "io.github.furkancodes/asks";
+const CHOOSE: &str = "_io.github.furkancodes/choose";
+const READ: &str = "_io.github.furkancodes/read";
+const YES: &str = "_io.github.furkancodes/yes";
+/// What you sent from this folder before, for ↑ and for finding it again.
+const SENT: &str = "_io.github.furkancodes/sent";
+/// What `@` can point at in this project.
+const PATHS: &str = "_io.github.furkancodes/paths";
+/// Sends the command that's running to the background, as Ctrl-B does.
+const BACKGROUND: &str = "_io.github.furkancodes/background";
+/// The commands in the background, and stopping one.
+const TASKS: &str = "_io.github.furkancodes/tasks";
+const STOP_TASK: &str = "_io.github.furkancodes/stop_task";
+/// Looks up the other providers' models, which a list of them needs.
+const MODELS: &str = "_io.github.furkancodes/models";
+/// What's taking room in the conversation.
+const ROOM: &str = "_io.github.furkancodes/room";
+/// The turns there are to undo, what undoing one does, and doing it.
+const UNDO_TURNS: &str = "_io.github.furkancodes/undo_turns";
+const UNDO_PLAN: &str = "_io.github.furkancodes/undo_plan";
+const UNDO: &str = "_io.github.furkancodes/undo";
+/// Marks a thought as rein's own note, a whole one: a check, a hook, a
+/// command in the background.
+const NOTE: &str = "io.github.furkancodes/note";
+/// Marks a note as the line that ends a turn, and the turn to undo from it.
+const TURN: &str = "io.github.furkancodes/turn";
+/// Marks a command as a skill.
+const SKILL: &str = "io.github.furkancodes/skill";
+/// What an image is called in the message it goes with: `[Image #1]`.
+const LABEL: &str = "io.github.furkancodes/label";
+/// Marks text as what a command said, which is rein's own word and nothing
+/// the model wrote. A client that doesn't know it shows it as any answer.
+const SAID: &str = "io.github.furkancodes/said";
+/// A `user_message_chunk` that's a whole message. ACP's chunks of one role
+/// run together, and two commands in a row read `/model/effort`.
+const WHOLE: &str = "io.github.furkancodes/whole";
 /// Another rein's words went into the conversation. They're never the
 /// user's, so they aren't a `user_message_chunk`.
 const HEARD: &str = "_io.github.furkancodes/heard";
@@ -33,8 +77,11 @@ const HEARD: &str = "_io.github.furkancodes/heard";
 /// are all `session/prompt`s, with an answer to say they ended.
 const TURN_STARTED: &str = "_io.github.furkancodes/turn_started";
 const TURN_ENDED: &str = "_io.github.furkancodes/turn_ended";
+/// What ACP has no word for and a client shows: the branch, and how much of
+/// your limits is used.
+const STATE: &str = "_io.github.furkancodes/state";
 
-const INVALID_PARAMS: i64 = -32602;
+pub(super) const INVALID_PARAMS: i64 = -32602;
 const METHOD_NOT_FOUND: i64 = -32601;
 pub(super) const INTERNAL: i64 = -32603;
 const PARSE_ERROR: i64 = -32700;
@@ -54,7 +101,7 @@ impl Refused {
         Refused { code: INTERNAL, message: message.into() }
     }
 
-    fn params(message: impl Into<String>) -> Refused {
+    pub(super) fn params(message: impl Into<String>) -> Refused {
         Refused { code: INVALID_PARAMS, message: message.into() }
     }
 
@@ -68,6 +115,7 @@ impl Refused {
 pub(super) enum Request {
     Initialize {
         panes: bool,
+        asks: bool,
     },
     NewSession {
         cwd: PathBuf,
@@ -84,6 +132,42 @@ pub(super) enum Request {
     Prompt {
         session: String,
         text: String,
+        images: Vec<Pasted>,
+    },
+    /// These are answered while a turn runs: they need none of what it holds.
+    Sent {
+        session: String,
+    },
+    Paths {
+        session: String,
+    },
+    Background {
+        session: String,
+    },
+    Tasks {
+        session: String,
+    },
+    StopTask {
+        session: String,
+        id: String,
+    },
+    Room {
+        session: String,
+    },
+    /// These wait for the turn: they change what it's working on.
+    Models {
+        session: String,
+    },
+    UndoTurns {
+        session: String,
+    },
+    UndoPlan {
+        session: String,
+        turn: usize,
+    },
+    Undo {
+        session: String,
+        turn: usize,
     },
     SetMode {
         session: String,
@@ -93,6 +177,27 @@ pub(super) enum Request {
         session: String,
         text: String,
     },
+    /// `session/set_config_option`.
+    SetOption {
+        session: String,
+        option: String,
+        value: String,
+    },
+}
+
+impl Request {
+    /// It's answered as a turn runs, and between them.
+    pub(super) const fn beside_a_turn(&self) -> bool {
+        matches!(self, Request::Sent { .. } | Request::Paths { .. } | Request::Background { .. } | Request::Tasks { .. } | Request::StopTask { .. } | Request::Room { .. })
+    }
+}
+
+/// An image that came with a prompt.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Pasted {
+    pub(super) bytes: Vec<u8>,
+    /// What the message calls it, if it does.
+    pub(super) label: Option<String>,
 }
 
 /// One line that came in.
@@ -152,9 +257,37 @@ struct Prompt {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct InSession {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfTurn {
+    session_id: String,
+    turn: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfTask {
+    session_id: String,
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetMode {
     session_id: String,
     mode_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetOption {
+    session_id: String,
+    config_id: String,
+    value: String,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +305,11 @@ enum Block {
     },
     ResourceLink {
         uri: String,
+    },
+    Image {
+        data: String,
+        #[serde(default, rename = "_meta")]
+        meta: Value,
     },
     #[serde(other)]
     Other,
@@ -199,7 +337,10 @@ fn request(method: &str, params: Value) -> Result<Request, Refused> {
         serde_json::from_value(params).map_err(|e| Refused::params(e.to_string()))
     }
     match method {
-        "initialize" => Ok(Request::Initialize { panes: params["clientCapabilities"]["_meta"][PANES] == true }),
+        "initialize" => {
+            let meta = &params["clientCapabilities"]["_meta"];
+            Ok(Request::Initialize { panes: meta[PANES] == true, asks: meta[ASKS] == true })
+        }
         "session/new" => parse::<NewSession>(params).map(|new| Request::NewSession { cwd: new.cwd }),
         "session/list" => {
             // Nothing's required of it, so a client may send no params.
@@ -210,30 +351,49 @@ fn request(method: &str, params: Value) -> Result<Request, Refused> {
         "session/load" => parse::<LoadSession>(params).map(|load| Request::LoadSession { session: load.session_id, cwd: load.cwd }),
         "session/prompt" => {
             let prompt: Prompt = parse(params)?;
-            Ok(Request::Prompt { session: prompt.session_id, text: text_of(prompt.prompt)? })
+            let (text, images) = read_prompt(prompt.prompt)?;
+            Ok(Request::Prompt { session: prompt.session_id, text, images })
         }
+        SENT => parse::<InSession>(params).map(|asked| Request::Sent { session: asked.session_id }),
+        PATHS => parse::<InSession>(params).map(|asked| Request::Paths { session: asked.session_id }),
+        BACKGROUND => parse::<InSession>(params).map(|asked| Request::Background { session: asked.session_id }),
+        TASKS => parse::<InSession>(params).map(|asked| Request::Tasks { session: asked.session_id }),
+        STOP_TASK => parse::<OfTask>(params).map(|asked| Request::StopTask { session: asked.session_id, id: asked.id }),
+        ROOM => parse::<InSession>(params).map(|asked| Request::Room { session: asked.session_id }),
+        MODELS => parse::<InSession>(params).map(|asked| Request::Models { session: asked.session_id }),
+        UNDO_TURNS => parse::<InSession>(params).map(|asked| Request::UndoTurns { session: asked.session_id }),
+        UNDO_PLAN => parse::<OfTurn>(params).map(|asked| Request::UndoPlan { session: asked.session_id, turn: asked.turn }),
+        UNDO => parse::<OfTurn>(params).map(|asked| Request::Undo { session: asked.session_id, turn: asked.turn }),
         "session/set_mode" => {
             let set: SetMode = parse(params)?;
             let mode = set.mode_id.parse().map_err(Refused::params)?;
             Ok(Request::SetMode { session: set.session_id, mode })
         }
+        "session/set_config_option" => parse::<SetOption>(params).map(|set| Request::SetOption { session: set.session_id, option: set.config_id, value: set.value }),
         STEER => parse::<Steer>(params).map(|steer| Request::Steer { session: steer.session_id, text: steer.message }),
         _ => Err(Refused { code: METHOD_NOT_FOUND, message: format!("rein has no method {method}") }),
     }
 }
 
-/// A prompt as one message: a file it links to named with `@`, which reads
-/// it in, as you'd type it.
-fn text_of(blocks: Vec<Block>) -> Result<String, Refused> {
+/// A prompt as one message, and the images that go with it: a file it links
+/// to is named with `@`, which reads it in, as you'd type it.
+fn read_prompt(blocks: Vec<Block>) -> Result<(String, Vec<Pasted>), Refused> {
+    use base64::Engine as _;
     let mut pieces = Vec::with_capacity(blocks.len());
+    let mut images = Vec::new();
     for block in blocks {
         pieces.push(match block {
             Block::Text { text } => text,
             Block::ResourceLink { uri } => uri.strip_prefix("file://").map_or_else(|| uri.clone(), |path| format!("@{path}")),
-            Block::Other => return Err(Refused::params("rein takes text and links to files in a prompt so far")),
+            Block::Image { data, meta } => {
+                let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| Refused::params(format!("that image isn't base64: {e}")))?;
+                images.push(Pasted { bytes, label: meta[LABEL].as_str().map(str::to_owned) });
+                continue;
+            }
+            Block::Other => return Err(Refused::params("rein takes text, images and links to files in a prompt")),
         });
     }
-    Ok(pieces.join("\n"))
+    Ok((pieces.join("\n"), images))
 }
 
 /// The answer to `id`.
@@ -251,10 +411,90 @@ pub(super) fn update(session: &str, update: &Value) -> String {
     json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": session, "update": update } }).to_string()
 }
 
+/// Marks the answer that says no and hands the conversation back to you.
+pub(super) const INSTEAD: &str = "io.github.furkancodes/instead";
+/// What rein asks, in its own words, which ACP has no place for.
+const QUESTION: &str = "io.github.furkancodes/question";
+/// Why it's asked.
+const WHY: &str = "io.github.furkancodes/why";
+/// The line an edit starts on, which a `diff` has no place for.
+const LINE: &str = "io.github.furkancodes/line";
+
 /// Asks whether a tool call may run, under the number `id`.
-pub(super) fn ask_permission(id: u64, session: &str, call: &str, options: &Value) -> String {
-    let params = json!({ "sessionId": session, "toolCall": { "toolCallId": call }, "options": options });
+pub(super) fn ask_permission(id: u64, session: &str, call: &str, options: &Value, asked: &Asked) -> String {
+    let meta = json!({ QUESTION: asked.question, WHY: asked.reason });
+    let params = json!({ "sessionId": session, "toolCall": { "toolCallId": call }, "options": options, "_meta": meta });
     json!({ "jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": params }).to_string()
+}
+
+/// A change to a file, as ACP's `diff`.
+pub(super) fn diff(change: &Whole) -> Value {
+    json!({ "type": "diff", "path": change.path, "oldText": change.old, "newText": change.new, "_meta": { LINE: change.line } })
+}
+
+/// All that can be set, as it stands now.
+pub(super) fn options(session: &str, options: &Value) -> String {
+    update(session, &json!({ "sessionUpdate": "config_option_update", "configOptions": options }))
+}
+
+/// Says what a client shows that ACP has no word for.
+pub(super) fn state(session: &str, branch: Option<&str>, meters: &[crate::meters::Cell], background: usize) -> String {
+    let meters: Vec<Value> = meters
+        .iter()
+        .map(|cell| json!({ "label": cell.label, "used": cell.used, "said": cell.said, "resets": cell.resets, "warn": cell.tone != rein_llm::Standing::Fine }))
+        .collect();
+    notification(STATE, &json!({ "sessionId": session, "branch": branch, "meters": meters, "background": background }))
+}
+
+/// A note of rein's own, whole.
+pub(super) fn noted(session: &str, text: &str) -> String {
+    update(session, &json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": text }, "_meta": { NOTE: true } }))
+}
+
+/// The line that ends a turn, and the turn it can be undone back to.
+pub(super) fn turn_line(session: &str, text: &str, turn: Option<usize>) -> String {
+    update(session, &json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": text }, "_meta": { NOTE: true, TURN: turn } }))
+}
+
+/// A skill, as a command: only these load from later in a message.
+pub(super) fn skill(name: &str, about: &str) -> Value {
+    json!({ "name": name, "description": about, "_meta": { SKILL: true } })
+}
+
+/// A message of yours, whole.
+pub(super) fn yours(session: &str, text: &str) -> String {
+    update(session, &json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": text }, "_meta": { WHOLE: true } }))
+}
+
+/// Text a command said.
+pub(super) fn said(session: &str, text: &str) -> String {
+    update(session, &json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text }, "_meta": { SAID: true } }))
+}
+
+/// Says what can be run in `session`: `commands` are ACP's `availableCommands`.
+pub(super) fn commands(session: &str, commands: &[Value]) -> String {
+    update(session, &json!({ "sessionUpdate": "available_commands_update", "availableCommands": commands }))
+}
+
+fn asking(id: u64, method: &str, params: &Value) -> String {
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
+}
+
+/// Asks which of `menu`, under the number `id`.
+pub(super) fn choose(id: u64, session: &str, menu: &Menu) -> String {
+    let items: Vec<Value> = menu.items.iter().map(|(name, about)| json!({ "name": name, "about": about })).collect();
+    asking(id, CHOOSE, &json!({ "sessionId": session, "title": menu.title, "items": items, "current": menu.current, "at": menu.at }))
+}
+
+/// Asks for a line, under the number `id`. One that's `secret` is never shown.
+pub(super) fn read(id: u64, session: &str, prompt: &str, secret: bool) -> String {
+    asking(id, READ, &json!({ "sessionId": session, "prompt": prompt, "secret": secret }))
+}
+
+/// Asks `question`, under the number `id`.
+pub(super) fn yes(id: u64, session: &str, question: &Question) -> String {
+    let answers: Vec<Value> = question.answers.iter().map(|(key, says)| json!({ "key": key, "says": says })).collect();
+    asking(id, YES, &json!({ "sessionId": session, "title": question.title, "detail": question.detail, "command": question.command, "answers": answers }))
 }
 
 /// What a client starts for a sub-agent, with no shell in between: it
@@ -311,19 +551,46 @@ mod tests {
     }
 
     #[test]
+    fn a_client_says_it_can_show_what_a_command_asks() {
+        let said = json!({ "id": 1, "method": "initialize", "params": { "clientCapabilities": { "_meta": { ASKS: true } } } });
+        assert_eq!(asked(said), Ok(Request::Initialize { panes: false, asks: true }));
+    }
+
+    #[test]
+    fn a_choice_comes_in_as_acp_says() {
+        let set = json!({ "id": 1, "method": "session/set_config_option", "params": { "sessionId": "a", "configId": "model", "value": "groq/llama" } });
+        assert_eq!(asked(set), Ok(Request::SetOption { session: "a".to_owned(), option: "model".to_owned(), value: "groq/llama".to_owned() }));
+        let unset = json!({ "id": 1, "method": "session/set_config_option", "params": { "sessionId": "a", "configId": "model" } });
+        assert_eq!(asked(unset).unwrap_err().code, INVALID_PARAMS);
+    }
+
+    #[test]
     fn a_prompts_text_and_links_become_one_message() {
         let prompt = json!({ "id": 1, "method": "session/prompt", "params": { "sessionId": "s", "prompt": [
             { "type": "text", "text": "look at this" },
             { "type": "resource_link", "uri": "file:///p/a.rs", "name": "a.rs" },
             { "type": "resource_link", "uri": "https://a.example/b", "name": "b" },
         ] } });
-        assert_eq!(asked(prompt), Ok(Request::Prompt { session: "s".into(), text: "look at this\n@/p/a.rs\nhttps://a.example/b".into() }));
+        assert_eq!(asked(prompt), Ok(Request::Prompt { session: "s".into(), text: "look at this\n@/p/a.rs\nhttps://a.example/b".into(), images: Vec::new() }));
+    }
+
+    #[test]
+    fn an_image_comes_with_its_message_under_the_name_it_goes_by() {
+        let prompt = json!({ "id": 1, "method": "session/prompt", "params": { "sessionId": "s", "prompt": [
+            { "type": "text", "text": "what's [Image #1]?" },
+            { "type": "image", "data": "aGk=", "mimeType": "image/png", "_meta": { LABEL: "[Image #1]" } },
+            { "type": "image", "data": "aGk=", "mimeType": "image/png" },
+        ] } });
+        let one = |label: Option<&str>| Pasted { bytes: b"hi".to_vec(), label: label.map(str::to_owned) };
+        assert_eq!(asked(prompt), Ok(Request::Prompt { session: "s".into(), text: "what's [Image #1]?".into(), images: vec![one(Some("[Image #1]")), one(None)] }));
     }
 
     #[test]
     fn what_rein_cant_take_says_so_and_isnt_guessed_at() {
-        let image = json!({ "id": 1, "method": "session/prompt", "params": { "sessionId": "s", "prompt": [{ "type": "image", "data": "x" }] } });
+        let image = json!({ "id": 1, "method": "session/prompt", "params": { "sessionId": "s", "prompt": [{ "type": "image", "data": "not base64!" }] } });
         assert_eq!(asked(image).unwrap_err().code, INVALID_PARAMS);
+        let audio = json!({ "id": 1, "method": "session/prompt", "params": { "sessionId": "s", "prompt": [{ "type": "audio", "data": "aGk=" }] } });
+        assert_eq!(asked(audio).unwrap_err().code, INVALID_PARAMS);
         let mode = json!({ "id": 1, "method": "session/set_mode", "params": { "sessionId": "s", "modeId": "yolo" } });
         assert_eq!(asked(mode).unwrap_err().code, INVALID_PARAMS);
         let cursor = json!({ "id": 1, "method": "session/list", "params": { "cursor": "anywhere" } });
@@ -343,10 +610,10 @@ mod tests {
     #[test]
     fn only_a_client_that_says_so_opens_panes() {
         let starts = |capabilities: Value| asked(json!({ "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": capabilities } }));
-        assert_eq!(starts(json!({ "_meta": { PANES: true } })), Ok(Request::Initialize { panes: true }));
-        assert_eq!(starts(json!({ "_meta": { PANES: "yes" } })), Ok(Request::Initialize { panes: false }), "not a clear yes");
-        assert_eq!(starts(json!({ "fs": { "readTextFile": true } })), Ok(Request::Initialize { panes: false }));
-        assert_eq!(asked(json!({ "id": 1, "method": "initialize" })), Ok(Request::Initialize { panes: false }));
+        assert_eq!(starts(json!({ "_meta": { PANES: true } })), Ok(Request::Initialize { panes: true, asks: false }));
+        assert_eq!(starts(json!({ "_meta": { PANES: "yes" } })), Ok(Request::Initialize { panes: false, asks: false }), "not a clear yes");
+        assert_eq!(starts(json!({ "fs": { "readTextFile": true } })), Ok(Request::Initialize { panes: false, asks: false }));
+        assert_eq!(asked(json!({ "id": 1, "method": "initialize" })), Ok(Request::Initialize { panes: false, asks: false }));
     }
 
     #[test]

@@ -16,6 +16,18 @@ const EVERY: Duration = Duration::from_secs(60);
 /// How long an answer may take before it's given up on.
 const PATIENCE: Duration = Duration::from_secs(10);
 
+/// A meter as a client draws it.
+pub(crate) struct Cell {
+    /// What it measures: `5h`, or the whole of what's not a share.
+    pub(crate) label: String,
+    /// How much of it is used, in percent, where there's a limit.
+    pub(crate) used: Option<u8>,
+    pub(crate) said: String,
+    /// When it starts over, once that matters.
+    pub(crate) resets: Option<String>,
+    pub(crate) tone: Standing,
+}
+
 /// What rein knows of how much of your limits is used.
 #[derive(Default)]
 pub(crate) struct Meters {
@@ -82,6 +94,23 @@ impl Meters {
     /// and what isn't a window, a budget or what's spent. What's past its
     /// reset isn't shown: it said what it did before it started over.
     pub(crate) fn bar(&self, s: Style, now: SystemTime) -> Vec<String> {
+        self.shown(now).into_iter().map(|meter| shown_in_bar(meter, s, now)).collect()
+    }
+
+    /// What's shown, for a client to draw: what the bar has, as data.
+    pub(crate) fn cells(&self, now: SystemTime) -> Vec<Cell> {
+        let cell = |meter: &Meter| {
+            let (label, said) = match meter.reading {
+                Reading::Used(percent) => (meter.label(), format!("{percent}%")),
+                _ => (figure(meter), String::new()),
+            };
+            let tone = tone(meter);
+            Cell { label, used: meter.reading.used(), said, resets: (tone != Standing::Fine).then(|| meter.resets.map(|at| when(at, now))).flatten(), tone }
+        };
+        self.shown(now).into_iter().map(cell).collect()
+    }
+
+    fn shown(&self, now: SystemTime) -> Vec<&Meter> {
         let live: Vec<&Meter> = self.known.iter().filter(|meter| meter.resets.is_none_or(|at| at > now)).collect();
         let windows: Vec<&Meter> = live.iter().copied().filter(|meter| matches!(meter.reading, Reading::Used(_)) && meter.only.is_none()).collect();
         let mut shown: Vec<&Meter> = Vec::new();
@@ -96,7 +125,7 @@ impl Meters {
                 shown.push(meter);
             }
         }
-        shown.into_iter().map(|meter| shown_in_bar(meter, s, now)).collect()
+        shown
     }
 
     /// Every meter in full, for `/status`.

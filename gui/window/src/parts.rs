@@ -6,6 +6,7 @@ use std::f32::consts::TAU;
 use gpui_kit::base::Button;
 use gpui_kit::component::Selectable;
 use gpui_kit::component::menu::DropdownMenu;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use rein_transcript::{Reach, StepState, Tick};
@@ -47,6 +48,7 @@ pub(crate) struct Press {
     shape: Shape,
     small: bool,
     on: bool,
+    yields: bool,
     label: Option<SharedString>,
     key: Option<SharedString>,
     width: Option<Pixels>,
@@ -127,7 +129,18 @@ fn sheen(color: Hsla) -> BoxShadow {
 
 impl Press {
     pub(crate) fn new(id: impl Into<ElementId>) -> Press {
-        Press { base: Button::new(id), variant: Variant::Plain, shape: Shape::Natural, small: false, on: false, label: None, key: None, width: None, children: Vec::new() }
+        Press {
+            base: Button::new(id),
+            variant: Variant::Plain,
+            shape: Shape::Natural,
+            small: false,
+            on: false,
+            yields: false,
+            label: None,
+            key: None,
+            width: None,
+            children: Vec::new(),
+        }
     }
 
     pub(crate) const fn primary(mut self) -> Press {
@@ -161,6 +174,13 @@ impl Press {
         self
     }
 
+    /// It gives up room when there's too little, for what must stay in
+    /// reach: what's in it is cut with `…`, and a press still shows it all.
+    pub(crate) const fn yields(mut self) -> Press {
+        self.yields = true;
+        self
+    }
+
     pub(crate) const fn cell_at_end(mut self) -> Press {
         self.variant = Variant::Ghost;
         self.shape = Shape::CellAtEnd;
@@ -186,6 +206,13 @@ impl Press {
 
     pub(crate) fn on_click(mut self, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Press {
         self.base = self.base.on_click(on_click);
+        self
+    }
+
+    /// Says more of what it does, when the pointer rests on it.
+    pub(crate) fn tip(mut self, tip: impl Into<SharedString>) -> Press {
+        let tip = tip.into();
+        self.base = self.base.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
         self
     }
 
@@ -229,6 +256,9 @@ impl ParentElement for Press {
 
 /// How tall a cell of the bar is, which is the bar, less the rule above it.
 pub(crate) const CELL: f32 = 33.;
+
+/// The least a cell that gives up room keeps.
+const SMALLEST_CELL: f32 = 52.;
 
 /// How wide a key's cell is, so that a set can allow for it.
 const fn key_cell(small: bool) -> f32 {
@@ -280,9 +310,11 @@ impl RenderOnce for Press {
                 .child(shown)
         });
         let label = self.label.map(|label| div().when(self.width.is_some(), |it| it.flex_1().text_center()).child(label));
+        let yields = self.yields;
         self.base
             .relative()
-            .flex_none()
+            .when(yields, |it| it.min_w(px(SMALLEST_CELL)))
+            .when(!yields, |it| it.flex_none())
             .gap(px(6.))
             .overflow_hidden()
             .whitespace_nowrap()
@@ -341,6 +373,12 @@ pub(crate) fn gauge(share: f32, width: Option<f32>, fill: Hsla, look: &Look) -> 
         None => track.flex_1().min_w_0(),
     };
     track.child(div().h_full().w(relative(share)).bg(fill))
+}
+
+/// How far up the levels an effort is: `level` of `levels` lit.
+pub(crate) fn pips(level: usize, levels: usize, look: &Look) -> Div {
+    let pip = |index: usize| div().size(px(4.)).rounded_full().bg(if index < level { look.ink_2 } else { look.line_2 });
+    div().flex().items_center().gap(px(3.)).children((0..levels).map(pip))
 }
 
 /// How many steps the strip shows.

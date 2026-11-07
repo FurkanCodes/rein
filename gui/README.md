@@ -23,9 +23,21 @@ It wears your Mac's light or dark look, and `--look light` or `--look dark` pins
 
 ## What the bar shows
 
-Only what the agent has said: a cell with nothing behind it isn't drawn. `rein serve` says the mode and how full the context is. The model and the effort wait for it to say those too, so they aren't in the bar yet, and nor is the `+`.
+Only what the agent has said: a cell with nothing behind it isn't drawn, and a change in rein, however it was made, shows here. A cell runs the command for what it shows, so the model, the effort and the mode each open their list, and `⇧⇥` goes on to the next mode. The `+` waits for a way to attach files.
 
-A question takes the keys only if the box is empty and the pane is yours, and `y`, `a` and `n` show only while they work. It ignores keys and clicks for its first 400 ms: what lands as it appears was meant for something else, and the second press of a double click on Allow would otherwise answer the next question unread. A press also counts only for the question it was drawn for. Any other key goes to the box, and the keys with it, so a word that happens to contain a `y` can't say yes.
+## Commands
+
+Everything the terminal's `/` does works here: `rein serve` runs the command, says what it says into the conversation, and asks what it would ask, so a list to pick from, a line to type and a question all come up over the box. Type `/` for the list: `⏎` runs the one picked, `⇥` puts it in the box to add to, and a command waits for a turn to end. `/new`, `/resume`, `/exit` and `/copy` are the window's own: a pane is a conversation. So are `/undo`, a sheet, and `/tasks`, a panel.
+
+The box goes by the terminal's rules, and what you type goes in it wherever you last pressed, unless a list or a sheet that's up has the keys. The conversation's text keeps them for `⌘C` until you type. `↑` and `↓` bring back what you sent from this folder, the same list a terminal there has, and `^R` finds one by its words. `@` lists the project's files: `⇥` puts one in, and `⏎` does unless it's typed out. While a turn runs, `⏎` steers it and `⇥` sends after it, which a command and a message with an image always do, as does what a running command can't take in; what's waiting shows over the box, a press brings it back, and stopping the turn brings it all back. `^B` sends the running command to the background, `^O` opens every step's output, and a line ending in `\` goes on to the next.
+
+`+` adds files: an image goes with your message wherever it is, and anything else is named with `@`. So does pasting or dropping one. A TIFF, all that some copied images are, goes as a PNG.
+
+The bar's model and mode open lists over the box, the model's with its effort, the mode's with the sandbox. What you pick shows in the bar, and nothing's written in the conversation unless it fails. A pick during a turn waits for its end. In a narrow pane they give up room, and what acts stays in reach. The context gauge opens a panel of what's taking room, a cell shows up with what's running in the background and opens Tasks, and a turn that changed files ends in a line that can undo it. `⌘K` goes to an agent or runs a command.
+
+A question asks in the terminal's words. A file change shows all of its lines, and a command why it's asked: the model's reason, and the rule that asks. Always says what it covers when the pointer rests on it, and in a note once pressed. `esc` is no, and tell rein what to do instead, which stops the turn.
+
+A question takes the keys only if the box is empty and the pane is yours, and `y`, `a`, `n` and `esc` show only while they work. It ignores keys and clicks for its first 400 ms: what lands as it appears was meant for something else, and the second press of a double click on Allow would otherwise answer the next question unread. A press also counts only for the question it was drawn for. Any other key goes to the box, and the keys with it, so a word that happens to contain a `y` can't say yes.
 
 The mode in the bar is the one the agent says it's in: a change it turns down leaves the bar as it was, and says why in the conversation.
 
@@ -35,7 +47,7 @@ The mode in the bar is the one the agent says it's in: a change it turns down le
 cargo test
 ```
 
-`window/src/behaviour.rs` runs real panes in a real window with no GPU behind it: what comes of what an agent says, and of your keys and clicks. The gates below measure speed and these don't.
+`window/src/behaviour.rs` and the files under it run real panes in a real window with no GPU behind it: what comes of what an agent says, and of your keys and clicks. The gates below measure speed and these don't.
 
 ## The gates
 

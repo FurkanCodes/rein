@@ -4862,6 +4862,11 @@ const OPEN_PANE: &str = "_io.github.furkancodes/open_pane";
 const HEARD: &str = "_io.github.furkancodes/heard";
 const TURN_STARTED: &str = "_io.github.furkancodes/turn_started";
 const TURN_ENDED: &str = "_io.github.furkancodes/turn_ended";
+const ASKS: &str = "io.github.furkancodes/asks";
+const SAID: &str = "io.github.furkancodes/said";
+const CHOOSE: &str = "_io.github.furkancodes/choose";
+const READ: &str = "_io.github.furkancodes/read";
+const YES: &str = "_io.github.furkancodes/yes";
 
 impl Client {
     fn start(model: &Model, name: &str) -> Client {
@@ -4869,6 +4874,9 @@ impl Client {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("project")).unwrap();
         std::fs::create_dir_all(dir.join("home")).unwrap();
+        for (file, text) in &model.home {
+            std::fs::write(dir.join("home").join(file), text).unwrap();
+        }
         Client::run(model, env!("CARGO_BIN_EXE_rein"), &["serve".to_owned()], dir, false)
     }
 
@@ -4953,6 +4961,17 @@ impl Client {
     /// Up to a conversation in the project: its id.
     fn open(&mut self) -> String {
         self.open_saying(&json!({}))
+    }
+
+    /// The same, for a client that can show what a command asks.
+    fn open_asking(&mut self) -> String {
+        self.open_saying(&json!({ "_meta": { ASKS: true } }))
+    }
+
+    /// Everything commands said so far, as one text.
+    fn commands_said(&self) -> String {
+        let said = self.seen.iter().map(|message| &message["params"]["update"]).filter(|update| update["_meta"][SAID] == true);
+        said.map(|update| update["content"]["text"].as_str().unwrap_or_default()).collect()
     }
 
     /// The same, for a client that can open panes.
@@ -5081,7 +5100,7 @@ fn a_program_says_yes_or_no_to_what_rein_asks() {
     assert!(call["title"].as_str().unwrap().contains("touch yes.txt"), "{call}");
     assert_eq!(asked["params"]["toolCall"]["toolCallId"], call["toolCallId"]);
     let kinds: Vec<&str> = asked["params"]["options"].as_array().unwrap().iter().filter_map(|option| option["kind"].as_str()).collect();
-    assert_eq!(kinds, ["allow_once", "allow_always", "reject_once"]);
+    assert_eq!(kinds, ["allow_once", "allow_always", "reject_once", "reject_once"], "the terminal's four: the last is a no that stops the turn");
     assert!(!rein.project().join("yes.txt").exists(), "it waits");
     rein.write(&json!({ "jsonrpc": "2.0", "id": asked["id"], "result": { "outcome": { "outcome": "selected", "optionId": "allow" } } }));
     let done = rein.update("tool_call_update", |update| update["status"] == "completed");
@@ -5096,6 +5115,767 @@ fn a_program_says_yes_or_no_to_what_rein_asks() {
     assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
     assert!(!rein.project().join("no.txt").exists(), "what isn't a yes is a no");
     assert!(results(&model).iter().any(|result| result.contains("declined")), "{:?}", results(&model));
+}
+
+#[test]
+fn a_program_runs_a_command_as_a_prompt_with_no_model_involved() {
+    let model = Model::start(vec![says("Never asked.")]);
+    let mut rein = Client::start(&model, "command");
+    let session = rein.open();
+    let listed = rein.update("available_commands_update", |_| true);
+    let names: Vec<&str> = listed["availableCommands"].as_array().unwrap().iter().map(|command| command["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"status") && names.contains(&"compact"), "{names:?}");
+    let turn = rein.prompt(&session, "/status");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    let said = rein.commands_said();
+    assert!(said.contains("model") && said.contains("context"), "{said}");
+    assert!(!said.contains("\x1b"), "a client isn't a terminal: {said:?}");
+    assert_eq!(model.requests().len(), 0, "a command isn't a turn");
+}
+
+#[test]
+fn a_program_is_told_of_a_command_that_fails_and_the_conversation_goes_on() {
+    let model = Model::start(vec![says("Still here.")]);
+    let mut rein = Client::start(&model, "command-fails");
+    let session = rein.open();
+    let turn = rein.prompt(&session, "/new");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.commands_said().contains("✗"), "{}", rein.commands_said());
+    let turn = rein.prompt(&session, "hello");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert_eq!(model.requests().len(), 1);
+}
+
+#[test]
+fn a_program_that_can_ask_gets_a_commands_menu_and_its_choice_counts() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "menu");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "/mode");
+    let asked = rein.asked(CHOOSE);
+    assert_eq!(asked["params"]["sessionId"], session.as_str());
+    let items = asked["params"]["items"].as_array().unwrap();
+    let edits = items.iter().position(|item| item["name"] == "edits").unwrap();
+    assert!(items[edits]["about"].as_str().unwrap().contains("file changes") || !items[edits]["about"].as_str().unwrap().is_empty());
+    assert_eq!(asked["params"]["current"], 1, "it says which is in use: this one runs in ask");
+    rein.reply(&asked, &json!({ "picked": edits }));
+    let question = rein.asked(YES);
+    assert!(question["params"]["title"].as_str().unwrap().contains("Start in edits"), "{question}");
+    rein.reply(&question, &json!({ "key": "n" }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.commands_said().contains("edits"), "{}", rein.commands_said());
+    let turn = rein.prompt(&session, "/status");
+    rein.answer(turn);
+    assert!(rein.commands_said().contains("edits"));
+}
+
+#[test]
+fn every_command_ends_for_a_program_that_leaves_what_it_asks() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "every-command");
+    let session = rein.open_asking();
+    let names: Vec<String> = {
+        let listed = rein.seen.iter().map(|message| &message["params"]["update"]).find(|update| update["sessionUpdate"] == "available_commands_update").cloned();
+        let listed = listed.unwrap_or_else(|| rein.update("available_commands_update", |_| true));
+        listed["availableCommands"].as_array().unwrap().iter().map(|command| command["name"].as_str().unwrap().to_owned()).collect()
+    };
+    assert!(names.len() > 25, "{names:?}");
+    for name in &names {
+        let turn = rein.prompt(&session, &format!("/{name}"));
+        loop {
+            let message = rein.until(&format!("/{name} to end"), |message| {
+                message["id"] == turn
+                    || message["method"].as_str().is_some_and(|method| message.get("id").is_some() && [CHOOSE, READ, YES, "session/request_permission"].contains(&method))
+            });
+            match message["method"].as_str() {
+                None => {
+                    assert_eq!(message["result"]["stopReason"], "end_turn", "/{name}: {message}");
+                    break;
+                }
+                Some(CHOOSE) => rein.reply(&message, &json!({ "picked": null })),
+                Some(READ) => rein.reply(&message, &json!({ "text": null })),
+                Some(YES) => rein.reply(&message, &json!({ "key": null })),
+                Some(_) => rein.reply(&message, &json!({ "outcome": { "outcome": "cancelled" } })),
+            }
+        }
+    }
+    let turn = rein.prompt(&session, "/status");
+    rein.answer(turn);
+    assert!(rein.commands_said().contains("context"), "and it's still there to ask");
+    assert_eq!(model.requests().len(), 1, "and only /compact went to the model");
+}
+
+#[test]
+fn a_commands_line_comes_back_as_a_whole_message() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "whole");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "/status");
+    let update = rein.update("user_message_chunk", |_| true);
+    assert_eq!(update["_meta"]["io.github.furkancodes/whole"], true, "chunks of one role run together otherwise: {update}");
+    rein.answer(turn);
+}
+
+const SENT: &str = "_io.github.furkancodes/sent";
+const PATHS: &str = "_io.github.furkancodes/paths";
+const BACKGROUND: &str = "_io.github.furkancodes/background";
+
+#[test]
+fn what_a_program_sends_is_kept_for_up_as_a_terminals_is() {
+    let model = Model::start(vec![says("First."), says("Second.")]);
+    let mut rein = Client::start(&model, "sent");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "first thing");
+    rein.answer(turn);
+    let turn = rein.prompt(&session, "/login groq a-secret-key");
+    rein.answer(turn);
+    let turn = rein.prompt(&session, "second thing");
+    rein.answer(turn);
+    let asked = rein.call(SENT, json!({ "sessionId": session }));
+    let sent = rein.answer(asked)["result"]["sent"].clone();
+    assert_eq!(sent, json!(["first thing", "second thing"]), "and a line with a key in it isn't");
+    let history = rein.dir.join("home/history");
+    let file = std::fs::read_dir(&history).unwrap().flatten().next().unwrap().path();
+    assert!(std::fs::read_to_string(file).unwrap().contains("second thing"), "a terminal in this folder finds it");
+}
+
+#[test]
+fn what_was_sent_comes_back_in_the_next_rein_started_there() {
+    let model = Model::start(vec![says("Noted.")]);
+    let mut rein = Client::start(&model, "sent-before");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "from before");
+    rein.answer(turn);
+    let (old, mut again) = rein.start_again(&model);
+    let id = again.call("session/new", json!({ "cwd": old.project(), "mcpServers": [] }));
+    let session = again.answer(id)["result"]["sessionId"].as_str().unwrap().to_owned();
+    let asked = again.call(SENT, json!({ "sessionId": session }));
+    assert_eq!(again.answer(asked)["result"]["sent"], json!(["from before"]));
+}
+
+#[test]
+fn a_program_is_told_what_at_can_point_at_even_as_a_turn_runs() {
+    let model = Model::start(vec![runs("sleep 48.42"), says("Done.")]).with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "paths");
+    std::fs::create_dir_all(rein.project().join("src")).unwrap();
+    std::fs::write(rein.project().join("src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(rein.project().join(".gitignore"), "left-out\n").unwrap();
+    std::fs::write(rein.project().join("left-out"), "no").unwrap();
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "wait");
+    rein.update("tool_call", |update| update["status"] == "in_progress");
+    let asked = rein.call(PATHS, json!({ "sessionId": session }));
+    let answer = rein.answer(asked);
+    let paths: Vec<&str> = answer["result"]["paths"].as_array().unwrap_or_else(|| panic!("{answer}")).iter().filter_map(Value::as_str).collect();
+    assert!(paths.contains(&"src/main.rs") && paths.contains(&"src/"), "{paths:?}");
+    assert!(!paths.contains(&"left-out"), "{paths:?}");
+    let asked = rein.call(SENT, json!({ "sessionId": session }));
+    assert_eq!(rein.answer(asked)["result"]["sent"], json!(["wait"]));
+    let elsewhere = rein.call(PATHS, json!({ "sessionId": "not-this-one" }));
+    assert!(rein.answer(elsewhere)["error"]["message"].as_str().unwrap().contains("no conversation"));
+    rein.write(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session } }));
+    rein.answer(turn);
+}
+
+#[test]
+fn a_program_sends_a_running_command_to_the_background_as_ctrl_b_does() {
+    let model = Model::start(vec![runs("sleep 48.43"), says("It goes on without me.")]).with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "background");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "start it");
+    rein.update("tool_call", |update| update["status"] == "in_progress");
+    let start = Instant::now();
+    while !alive("sleep 48.43") {
+        assert!(start.elapsed() < Duration::from_secs(10), "the command never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let asked = rein.call(BACKGROUND, json!({ "sessionId": session }));
+    assert!(rein.answer(asked)["error"].is_null());
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn", "the turn goes on past it");
+    assert!(rein.said().contains("It goes on without me."), "{}", rein.said());
+    assert!(alive("sleep 48.43"), "and it's still running");
+}
+
+#[test]
+fn an_image_a_program_sends_reaches_the_model_with_the_words() {
+    use base64::Engine as _;
+    let model = Model::start(vec![says("A dot.")]);
+    let mut rein = Client::start(&model, "image");
+    let session = rein.open_asking();
+    let data = base64::engine::general_purpose::STANDARD.encode(DOT);
+    let prompt = json!([{ "type": "text", "text": "what's [Image #1]?" }, { "type": "image", "data": data, "mimeType": "image/png", "_meta": { "io.github.furkancodes/label": "[Image #1]" } }]);
+    let turn = rein.call("session/prompt", json!({ "sessionId": session, "prompt": prompt }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    let requests = model.requests();
+    let input = requests[0]["input"].to_string();
+    assert!(input.contains("the image you pasted as [Image #1], 1×1"), "{input}");
+    assert!(input.contains("data:image/png;base64,iVBOR"), "{input}");
+    let conversations = rein.dir.join("home/sessions");
+    let saved: String = std::fs::read_dir(&conversations)
+        .unwrap()
+        .flatten()
+        .flat_map(|folder| std::fs::read_dir(folder.path()).unwrap().flatten())
+        .filter(|file| file.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .map(|file| std::fs::read_to_string(file.path()).unwrap())
+        .collect();
+    assert!(!saved.contains("iVBOR"), "an image's bytes never go in a conversation's file");
+}
+
+#[test]
+fn what_isnt_an_image_stops_the_message_and_says_why() {
+    use base64::Engine as _;
+    let model = Model::start(vec![says("Never said.")]);
+    let mut rein = Client::start(&model, "not-image");
+    let session = rein.open_asking();
+    let data = base64::engine::general_purpose::STANDARD.encode(b"only words");
+    let prompt = json!([{ "type": "text", "text": "look" }, { "type": "image", "data": data, "mimeType": "image/png" }]);
+    let turn = rein.call("session/prompt", json!({ "sessionId": session, "prompt": prompt }));
+    let refused = rein.answer(turn);
+    assert!(refused["error"]["message"].as_str().unwrap().contains("isn't an image"), "{refused}");
+    assert_eq!(model.requests().len(), 0, "your words aren't sent without what they're about");
+}
+
+const NOTE: &str = "io.github.furkancodes/note";
+const TURN: &str = "io.github.furkancodes/turn";
+
+#[test]
+fn a_turn_that_changed_files_ends_in_a_line_that_can_undo_it() {
+    let model = Model::start(vec![calls("write", json!({ "path": "new.txt", "content": "made\n" })), says("Made it.")]).with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "turn-line");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "make a file");
+    rein.answer(turn);
+    let notes: Vec<&Value> = rein.seen.iter().map(|message| &message["params"]["update"]).filter(|update| update["_meta"][NOTE] == true).collect();
+    let line = notes.iter().find(|note| note["content"]["text"].as_str().is_some_and(|text| text.contains("changed new.txt"))).unwrap_or_else(|| panic!("{notes:?}"));
+    assert!(line["content"]["text"].as_str().unwrap().starts_with("1 step · changed new.txt"), "{line}");
+    let at = line["_meta"][TURN].as_u64().unwrap_or_else(|| panic!("{line}"));
+    let id = rein.call("_io.github.furkancodes/undo_turns", json!({ "sessionId": session }));
+    let turns = rein.answer(id)["result"]["turns"].clone();
+    assert_eq!(turns[0]["said"], "make a file");
+    assert_eq!(turns[0]["made"], 1);
+    assert_eq!(turns[0]["turn"], at, "the same turn the line can undo");
+    let id = rein.call("_io.github.furkancodes/undo_plan", json!({ "sessionId": session, "turn": at }));
+    let plan = rein.answer(id)["result"]["plan"].clone();
+    assert_eq!(plan["takeAway"], json!(["new.txt"]), "{plan}");
+    assert!(rein.project().join("new.txt").exists(), "asking what it would do does nothing");
+    let id = rein.call("_io.github.furkancodes/undo", json!({ "sessionId": session, "turn": at }));
+    assert!(rein.answer(id)["error"].is_null());
+    assert!(!rein.project().join("new.txt").exists(), "doing it does");
+    assert!(rein.commands_said().contains("took away new.txt"), "{}", rein.commands_said());
+}
+
+#[test]
+fn a_turn_that_changed_nothing_has_no_turn_to_undo() {
+    // After one that did: there's a turn to point back at, and this isn't it.
+    let model = Model::start(vec![calls("write", json!({ "path": "new.txt", "content": "made\n" })), says("Made it."), runs("true"), says("Nothing changed.")])
+        .with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "turn-line-none");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "make a file");
+    rein.answer(turn);
+    let turn = rein.prompt(&session, "look around");
+    rein.answer(turn);
+    let lines: Vec<&Value> = rein.seen.iter().map(|message| &message["params"]["update"]).filter(|update| update["_meta"][NOTE] == true).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(!lines[0]["_meta"][TURN].is_null(), "{}", lines[0]);
+    assert!(lines[1]["_meta"][TURN].is_null(), "{}", lines[1]);
+}
+
+/// `/mcp` with a server to pick, for a program as for the box.
+#[test]
+fn a_program_picks_a_server_from_mcp_and_what_to_do_with_it() {
+    let mut model = Model::start(vec![]);
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] } } }).to_string()));
+    let mut rein = Client::start(&model, "mcp-picks");
+    std::fs::write(rein.project().join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "/mcp");
+    let list = rein.asked(CHOOSE);
+    let names: Vec<&str> = list["params"]["items"].as_array().unwrap().iter().map(|item| item["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["fake", "+ add", "+ import"], "{list}");
+    rein.reply(&list, &json!({ "picked": 0 }));
+    let what = rein.asked(CHOOSE);
+    assert_eq!(what["params"]["title"], "fake: do what", "{what}");
+    rein.reply(&what, &json!({ "picked": null }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+}
+
+#[test]
+fn a_program_is_shown_a_file_change_and_asked_in_the_terminals_words() {
+    let edit = json!({ "path": "a.txt", "old_text": "two\nthree\n", "new_text": "two\n3\n", "replace_all": false });
+    let again = json!({ "path": "a.txt", "old_text": "one\n", "new_text": "1\n", "replace_all": false });
+    let model = Model::start(vec![calls("edit", edit), calls("edit", again), says("Done.")]).with_env("REIN_MODE", "ask");
+    let mut rein = Client::start(&model, "file-change");
+    std::fs::write(rein.project().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "change it");
+    let step = rein.update("tool_call", |_| true);
+    let asked = rein.asked("session/request_permission");
+    assert_eq!(step["content"][0]["type"], "diff", "{step}");
+    let whole = std::fs::canonicalize(rein.project().join("a.txt")).unwrap();
+    assert_eq!(step["content"][0]["path"], whole.to_string_lossy().as_ref(), "ACP's paths are whole");
+    assert_eq!((&step["content"][0]["oldText"], &step["content"][0]["newText"]), (&json!("two\nthree\n"), &json!("two\n3\n")));
+    assert_eq!(step["content"][0]["_meta"]["io.github.furkancodes/line"], 2, "{step}");
+    assert_eq!(asked["params"]["_meta"]["io.github.furkancodes/question"], "Allow this edit?");
+    let names: Vec<&str> = asked["params"]["options"].as_array().unwrap().iter().map(|option| option["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Yes", "Yes, and don't ask again for file changes", "No", "No, and tell rein what to do instead"]);
+    rein.reply(&asked, &json!({ "outcome": { "outcome": "selected", "optionId": "always" } }));
+    rein.answer(turn);
+    let notes: Vec<&str> = rein
+        .seen
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .filter(|update| update["_meta"][NOTE] == true)
+        .filter_map(|update| update["content"]["text"].as_str())
+        .collect();
+    assert!(notes.contains(&"won't ask again for file changes in this conversation"), "{notes:?}");
+    assert_eq!(rein.seen.iter().filter(|message| message["method"] == "session/request_permission").count(), 1, "and it didn't");
+    assert_eq!(std::fs::read_to_string(rein.project().join("a.txt")).unwrap(), "1\ntwo\n3\n");
+}
+
+#[test]
+fn a_change_nobody_is_asked_about_goes_without_its_diff() {
+    let model = Model::start(vec![calls("write", json!({ "path": "new.txt", "content": "made\n" })), says("Made it.")]).with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "no-diff");
+    let session = rein.open_asking();
+    let step = {
+        let turn = rein.prompt(&session, "make it");
+        let step = rein.update("tool_call", |_| true);
+        rein.answer(turn);
+        step
+    };
+    assert!(step["content"].is_null(), "a whole file on every step is for nothing: {step}");
+}
+
+#[test]
+fn a_program_is_told_why_it_is_asked_by_the_model_and_by_your_rule() {
+    let command = json!({ "command": "touch made.txt", "access": "write", "reason": "the test needs it", "timeout_seconds": null, "background": false });
+    let mut model = Model::start(vec![calls("bash", command), says("Asked.")]).with_env("REIN_MODE", "trust");
+    model.home.push(("permissions".into(), "ask touch\n".to_owned()));
+    let mut rein = Client::start(&model, "asked-why");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "make it");
+    let asked = rein.asked("session/request_permission");
+    assert_eq!(asked["params"]["_meta"]["io.github.furkancodes/why"], "Why: the test needs it · Your rule `ask touch` asks first · /permissions changes your rules", "{asked}");
+    rein.reply(&asked, &json!({ "outcome": { "outcome": "selected", "optionId": "reject" } }));
+    rein.answer(turn);
+}
+
+#[test]
+fn the_fourth_answer_stops_the_turn_and_leaves_the_conversation_to_you() {
+    let model = Model::start(vec![runs("touch made.txt"), says("Never said.")]).with_env("REIN_MODE", "ask");
+    let mut rein = Client::start(&model, "asked-stop");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "make it");
+    let asked = rein.asked("session/request_permission");
+    let option =
+        asked["params"]["options"].as_array().unwrap().iter().find(|option| option["_meta"]["io.github.furkancodes/instead"] == true).cloned().unwrap_or_else(|| panic!("{asked}"));
+    assert_eq!(option["kind"], "reject_once", "a client that doesn't know the mark reads a no");
+    rein.reply(&asked, &json!({ "outcome": { "outcome": "selected", "optionId": option["optionId"] } }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "cancelled", "you stopped it");
+    assert_eq!(model.requests().len(), 1, "the model isn't asked again");
+    assert!(!rein.project().join("made.txt").exists());
+}
+
+#[test]
+fn a_skill_added_as_a_conversation_goes_on_reaches_a_programs_list_once() {
+    let model = Model::start(vec![says("One."), says("Two."), says("Three.")]);
+    let mut rein = Client::start(&model, "skill-comes");
+    let session = rein.open_asking();
+    let lists = |rein: &Client| rein.seen.iter().filter(|message| message["params"]["update"]["sessionUpdate"] == "available_commands_update").count();
+    let turn = rein.prompt(&session, "first");
+    rein.answer(turn);
+    assert_eq!(lists(&rein), 1, "nothing changed, so nothing's said again");
+    let folder = rein.dir.join("home/.agents/skills/graphs");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("SKILL.md"), "---\nname: graphs\ndescription: Draw graphs.\n---\nUse boxes.\n").unwrap();
+    let turn = rein.prompt(&session, "second");
+    rein.answer(turn);
+    assert_eq!(lists(&rein), 2);
+    let list = rein.seen.iter().rfind(|message| message["params"]["update"]["sessionUpdate"] == "available_commands_update").unwrap();
+    let listed = list["params"]["update"]["availableCommands"].as_array().unwrap();
+    assert!(listed.iter().any(|command| command["name"] == "graphs"), "{list}");
+    let turn = rein.prompt(&session, "third");
+    rein.answer(turn);
+    assert_eq!(lists(&rein), 2, "and once");
+}
+
+#[test]
+fn a_program_hears_how_many_commands_run_in_the_background() {
+    let command = json!({ "command": "sleep 30", "access": "write", "reason": null, "timeout_seconds": null, "background": true });
+    let model = Model::start(vec![calls("bash", command), says("Started."), says("It stopped.")]).with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "background-count");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "start it");
+    rein.answer(turn);
+    let said: Vec<&Value> = rein.seen.iter().filter(|message| message["method"] == "_io.github.furkancodes/state").map(|message| &message["params"]["background"]).collect();
+    assert_eq!(said.first(), Some(&&json!(0)), "{said:?}");
+    assert_eq!(said.last(), Some(&&json!(1)), "{said:?}");
+    let at = |wanted: &dyn Fn(&Value) -> bool| rein.seen.iter().position(wanted).unwrap();
+    let counted = at(&|message| message["method"] == "_io.github.furkancodes/state" && message["params"]["background"] == 1);
+    let answered = at(&|message| message["params"]["update"]["sessionUpdate"] == "agent_message_chunk");
+    assert!(counted < answered, "it shows while the turn goes on, which may be long");
+    let stop = rein.call("_io.github.furkancodes/stop_task", json!({ "sessionId": session, "id": "b1" }));
+    assert!(rein.answer(stop)["error"].is_null());
+    let turn = rein.prompt(&session, "is it still going?");
+    rein.answer(turn);
+    let last = rein.seen.iter().rfind(|message| message["method"] == "_io.github.furkancodes/state").unwrap();
+    assert_eq!(last["params"]["background"], 0, "one that's stopped isn't running: {last}");
+}
+
+#[test]
+fn what_a_rein_in_trust_mode_holds_a_program_lets_in_as_a_turn_of_its_own() {
+    let model = Model::start(vec![runs("true"), says("Hello, web.")]).with_env("REIN_MODE", "trust");
+    let dir = std::env::temp_dir().join(format!("rs-{}-inbox", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("project")).unwrap();
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    let args = ["serve", "--name", "api"].map(str::to_owned);
+    let mut api = Client::run(&model, env!("CARGO_BIN_EXE_rein"), &args, dir.clone(), false);
+    let session = api.open_saying(&json!({ "_meta": { ASKS: true, PANES: true } }));
+    let idle = Model::start(vec![]);
+    let mut web = Term::spawn_in(&idle, dir.clone(), &dir.join("project"), &dir.join("home"), 30, 100, &["--name", "web"]);
+    web.wait_for(IDLE);
+    web.keys("/send api hello there\r");
+    web.wait_for("api keeps it for its user to let in");
+    let turn = api.prompt(&session, "/inbox");
+    let list = api.asked(CHOOSE);
+    assert_eq!(list["params"]["items"][0]["name"], "web", "{list}");
+    api.reply(&list, &json!({ "picked": 0 }));
+    let step = api.update("tool_call", |_| true);
+    assert!(step["title"].as_str().unwrap().contains("true"), "its steps are steps: {step}");
+    assert_eq!(api.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(api.said().contains("Hello, web."), "{:?}", api.seen.last());
+    assert!(api.seen.iter().any(|message| message["method"] == "_io.github.furkancodes/heard"), "whose words they are is said");
+    assert!(model.requests()[0].to_string().contains("hello there"));
+}
+
+#[test]
+fn a_program_that_cant_be_asked_is_shown_the_servers_mcp_has() {
+    let mut model = Model::start(vec![]);
+    model.home.push(("mcp.json".into(), json!({ "mcpServers": { "fake": { "command": "sh", "args": ["server.sh"] } } }).to_string()));
+    let mut rein = Client::start(&model, "mcp-table");
+    std::fs::write(rein.project().join("server.sh"), rein_mcp::FAKE_SERVER).unwrap();
+    let session = rein.open();
+    let turn = rein.prompt(&session, "/mcp");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.commands_said().contains("fake"), "{}", rein.commands_said());
+}
+
+#[test]
+fn a_pick_that_isnt_on_the_list_picks_nothing() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "picked-past");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "/mode");
+    let list = rein.asked(CHOOSE);
+    rein.reply(&list, &json!({ "picked": 99 }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn", "and rein is still there");
+    let turn = rein.prompt(&session, "/status");
+    rein.answer(turn);
+}
+
+#[test]
+fn the_model_s_plan_reaches_a_program_as_acps_own() {
+    let plan = json!({ "steps": [{ "step": "Reproduce it", "status": "done" }, { "step": "Fix it", "status": "in_progress" }, { "step": "Test it", "status": "pending" }] });
+    let model = Model::start(vec![calls("plan", plan), says("Planned.")]);
+    let mut rein = Client::start(&model, "plan");
+    let session = rein.open();
+    let turn = rein.prompt(&session, "plan it");
+    let update = rein.update("plan", |_| true);
+    let entries = update["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!((&entries[0]["content"], &entries[0]["status"]), (&json!("Reproduce it"), &json!("completed")));
+    assert_eq!(entries[1]["status"], "in_progress");
+    assert_eq!(entries[2]["status"], "pending");
+    rein.answer(turn);
+}
+
+#[test]
+fn a_program_sees_the_commands_in_the_background_and_stops_one() {
+    let model = Model::start(vec![starts("sleep 48.44"), says("Started it.")]).with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "tasks");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "start it");
+    rein.answer(turn);
+    let asked = rein.call("_io.github.furkancodes/tasks", json!({ "sessionId": session }));
+    let tasks = rein.answer(asked)["result"]["tasks"].clone();
+    assert_eq!(tasks[0]["command"], "sleep 48.44", "{tasks}");
+    assert!(tasks[0]["ended"].is_null());
+    let id = tasks[0]["id"].as_str().unwrap().to_owned();
+    let asked = rein.call("_io.github.furkancodes/stop_task", json!({ "sessionId": session, "id": id }));
+    assert!(rein.answer(asked)["error"].is_null());
+    let start = Instant::now();
+    while alive("sleep 48.44") {
+        assert!(start.elapsed() < Duration::from_secs(10), "it was never stopped");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let asked = rein.call("_io.github.furkancodes/tasks", json!({ "sessionId": session }));
+    assert!(!rein.answer(asked)["result"]["tasks"][0]["ended"].is_null(), "and it says so");
+}
+
+#[test]
+fn a_program_can_see_whats_taking_room_even_as_a_turn_runs() {
+    let model = Model::start(vec![runs("sleep 48.45"), says("Done.")]).with_env("REIN_MODE", "trust");
+    let mut rein = Client::start(&model, "room");
+    let session = rein.open_asking();
+    let asked = rein.call("_io.github.furkancodes/room", json!({ "sessionId": session }));
+    let room = rein.answer(asked)["result"].clone();
+    let parts = room["parts"].as_array().unwrap_or_else(|| panic!("{room}"));
+    assert!(parts.iter().any(|part| part["name"] == "Tools" && part["tokens"].as_u64() > Some(0)), "{room}");
+    assert!(room["limit"].as_u64() > Some(0), "{room}");
+    let turn = rein.prompt(&session, "wait");
+    rein.update("tool_call", |update| update["status"] == "in_progress");
+    let asked = rein.call("_io.github.furkancodes/room", json!({ "sessionId": session }));
+    assert!(rein.answer(asked)["error"].is_null(), "a panel can stay open through a turn");
+    rein.write(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session } }));
+    rein.answer(turn);
+}
+
+#[test]
+fn a_plans_limits_said_with_an_answer_reach_a_program() {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = std::env::temp_dir().join(format!("rein-screen-tools-{}-limits", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("claude"),
+        r#"#!/bin/sh
+/bin/cat > /dev/null
+now=$(/bin/date +%s)
+printf '%s\n' '{"type":"system","subtype":"init"}'
+printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","unifiedWindows":{"five_hour":{"utilization":0.28,"resetsAt":'$((now + 3600))',"status":"allowed"},"seven_day":{"utilization":0.75,"resetsAt":'$((now + 7200))',"status":"allowed_warning"}}}}'
+printf '%s\n' '{"type":"result","structured_output":{"text":"Hello.","tool_calls":[]}}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let model =
+        Model::start(Vec::new()).with_env("PATH", bin.to_str().unwrap()).with_env("REIN_MODEL", "claude-code/sonnet").with_env("CLAUDE_CODE_OAUTH_TOKEN", "subscription-test");
+    let mut rein = Client::start(&model, "limits");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "hello");
+    let state =
+        rein.until("the limits", |message| message["method"] == "_io.github.furkancodes/state" && message["params"]["meters"].as_array().is_some_and(|meters| !meters.is_empty()));
+    let meters = state["params"]["meters"].as_array().unwrap();
+    assert!(meters.iter().any(|meter| meter["label"] == "5h" && meter["used"] == 28), "{meters:?}");
+    assert!(meters.iter().any(|meter| meter["label"] == "7d" && meter["used"] == 75 && meter["warn"] == true), "{meters:?}");
+    rein.answer(turn);
+    let noted = rein
+        .seen
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .filter(|update| update["_meta"][NOTE] == true)
+        .filter_map(|update| update["content"]["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(noted.contains("7d"), "said once, as a terminal does: {noted}");
+}
+
+#[test]
+fn a_program_sees_the_check_as_a_step_with_what_it_printed() {
+    let tools = std::env::temp_dir().join(format!("rein-screen-tools-{}-check-serve", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tools);
+    let path = fake_cargo(&tools);
+    let model = Model::start(vec![edits("src/lib.rs", "    64", "    BROKEN"), says("Broke it.")]).with_env("REIN_MODE", "trust").with_env("PATH", &path);
+    let mut rein = Client::start(&model, "check-serve");
+    std::fs::create_dir_all(rein.project().join("src")).unwrap();
+    std::fs::write(rein.project().join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+    std::fs::write(rein.project().join("src/lib.rs"), "pub fn size() -> usize {\n    64\n}\n").unwrap();
+    let session = rein.open_asking();
+    let id = rein.prompt(&session, "/check cargo check");
+    rein.answer(id);
+    let turn = rein.prompt(&session, "change it");
+    rein.answer(turn);
+    let step = rein
+        .seen
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .find(|update| update["toolCallId"].as_str().is_some_and(|id| id.starts_with("check-")) && update["sessionUpdate"] == "tool_call")
+        .cloned();
+    let step = step.unwrap_or_else(|| panic!("no check: {:#?}", rein.updates()));
+    assert!(step["title"].as_str().unwrap().starts_with("Check cargo check · 1 new error"), "{step}");
+    assert_eq!(step["status"], "failed");
+    let printed = rein
+        .seen
+        .iter()
+        .map(|message| &message["params"]["update"])
+        .find(|update| update["toolCallId"] == step["toolCallId"] && update["sessionUpdate"] == "tool_call_update")
+        .cloned()
+        .expect("what it printed");
+    assert!(printed.to_string().contains("BROKEN"), "{printed}");
+}
+
+#[test]
+fn a_program_that_turns_a_menu_down_changes_nothing() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "menu-no");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "/mode");
+    let asked = rein.asked(CHOOSE);
+    rein.reply(&asked, &json!({ "picked": null }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.commands_said().is_empty(), "{}", rein.commands_said());
+}
+
+#[test]
+fn stopping_a_command_that_waits_for_you_ends_it() {
+    let model = Model::start(vec![says("Fine.")]);
+    let mut rein = Client::start(&model, "menu-stop");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "/mode");
+    rein.asked(CHOOSE);
+    rein.write(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session } }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "cancelled");
+    let turn = rein.prompt(&session, "hello");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn", "the conversation goes on");
+}
+
+#[test]
+fn a_program_that_cant_ask_is_told_so_and_rein_keeps_reading_it() {
+    let model = Model::start(vec![says("Fine.")]);
+    let mut rein = Client::start(&model, "menu-cant");
+    let session = rein.open();
+    let turn = rein.prompt(&session, "/mode");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.commands_said().contains("on the line"), "{}", rein.commands_said());
+    // The terminal's way of asking reads standard input: here that's the
+    // protocol, and a thread reading it would swallow this.
+    let turn = rein.prompt(&session, "hello");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+}
+
+#[test]
+fn a_key_asked_for_goes_to_rein_and_nowhere_else() {
+    let mut model = Model::start(vec![]);
+    model.home.push(("providers".into(), format!("[groq]\nurl = {}\n", model.base)));
+    let mut rein = Client::start(&model, "secret");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "/login groq");
+    let asked = rein.asked(READ);
+    assert_eq!(asked["params"]["secret"], true, "or it would show as you type it");
+    rein.reply(&asked, &json!({ "text": "good-key" }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    let keys = std::fs::read_to_string(rein.dir.join("home/keys.json")).unwrap();
+    assert!(keys.contains("good-key"), "{keys}");
+    let told: String = rein.seen.iter().map(ToString::to_string).collect();
+    assert!(!told.contains("good-key"), "nothing says it back");
+}
+
+#[test]
+fn a_key_on_a_commands_line_isnt_shown_back() {
+    let mut model = Model::start(vec![]);
+    model.home.push(("providers".into(), format!("[groq]\nurl = {}\n", model.base)));
+    let mut rein = Client::start(&model, "secret-line");
+    let session = rein.open_asking();
+    let turn = rein.prompt(&session, "/login groq good-key");
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    let told: String = rein.seen.iter().map(ToString::to_string).collect();
+    assert!(told.contains("key hidden") && !told.contains("good-key"), "{told}");
+}
+
+#[test]
+fn a_program_is_told_what_can_be_set_and_can_set_it() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "options");
+    let id = rein.call("initialize", json!({ "protocolVersion": 1, "clientCapabilities": { "_meta": { ASKS: true } } }));
+    rein.answer(id);
+    let cwd = rein.project();
+    let id = rein.call("session/new", json!({ "cwd": cwd, "mcpServers": [] }));
+    let opened = rein.answer(id);
+    let session = opened["result"]["sessionId"].as_str().unwrap().to_owned();
+    let options = &opened["result"]["configOptions"];
+    let option = |options: &Value, id: &str| options.as_array().unwrap().iter().find(|option| option["id"] == id).unwrap_or_else(|| panic!("no {id}: {options}")).clone();
+    assert_eq!(option(options, "mode")["category"], "mode");
+    assert_eq!(option(options, "mode")["currentValue"], "ask");
+    assert_eq!(option(options, "model")["category"], "model");
+    assert!(option(options, "model")["options"][0]["options"].is_array(), "by provider: {options}");
+    assert_eq!(option(options, "sandbox")["currentValue"], "off");
+
+    let set = rein.call("session/set_config_option", json!({ "sessionId": session, "configId": "sandbox", "value": "on" }));
+    let question = rein.asked(YES);
+    rein.reply(&question, &json!({ "key": "n" }));
+    assert_eq!(option(&rein.answer(set)["result"]["configOptions"], "sandbox")["currentValue"], "on", "ACP has the answer say all of them");
+
+    // A command you typed changes what a client shows too.
+    let turn = rein.prompt(&session, "/mode edits");
+    let question = rein.asked(YES);
+    rein.reply(&question, &json!({ "key": "n" }));
+    let update = rein.update("config_option_update", |_| true);
+    assert_eq!(option(&update["configOptions"], "mode")["currentValue"], "edits");
+    rein.answer(turn);
+}
+
+#[test]
+fn a_program_that_opens_panes_gets_a_pane_for_a_sub_agent_you_ask_for() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "spawn");
+    let session = rein.open_saying(&json!({ "_meta": { PANES: true, ASKS: true } }));
+    let turn = rein.prompt(&session, "/spawn tests run them");
+    let asked = rein.asked(OPEN_PANE);
+    assert_eq!(asked["params"]["name"], "tests", "a pane, never a terminal's tab, and nothing asks: you asked");
+    rein.write(&json!({ "jsonrpc": "2.0", "id": asked["id"], "error": { "code": -32603, "message": "not here" } }));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+    assert!(rein.commands_said().contains("✗"), "{}", rein.commands_said());
+}
+
+#[test]
+fn an_option_rein_doesnt_have_runs_nothing() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "option-no");
+    let session = rein.open();
+    let set = rein.call("session/set_config_option", json!({ "sessionId": session, "configId": "logout", "value": "openai" }));
+    assert_eq!(rein.answer(set)["error"]["code"], -32602, "only what's offered can be set this way");
+}
+
+#[test]
+fn a_choice_made_in_a_control_says_nothing_and_what_stops_it_comes_back() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "option-quiet");
+    let session = rein.open_asking();
+    let set = rein.call("session/set_config_option", json!({ "sessionId": session, "configId": "effort", "value": "high" }));
+    let answered = rein.answer(set);
+    let options = answered["result"]["configOptions"].as_array().unwrap_or_else(|| panic!("no options: {answered}"));
+    let current = options.iter().find(|option| option["id"] == "model").expect("a model")["currentValue"].as_str().expect("its name").to_owned();
+
+    let set = rein.call("session/set_config_option", json!({ "sessionId": session, "configId": "model", "value": current }));
+    assert!(rein.answer(set)["result"]["configOptions"].is_array(), "{:#?}", rein.seen);
+    assert_eq!(rein.commands_said(), "", "the control shows it, and nobody wrote anything");
+    assert!(!rein.updates().iter().any(|kind| kind.ends_with("_message_chunk")), "{:?}", rein.updates());
+
+    let set = rein.call("session/set_config_option", json!({ "sessionId": session, "configId": "model", "value": "no-such-provider/nothing" }));
+    let refused = rein.answer(set);
+    assert!(refused["error"]["message"].as_str().is_some_and(|why| !why.is_empty()), "why it didn't, for the client to show: {refused}");
+    assert_eq!(rein.commands_said(), "", "said as the answer, not as well");
+}
+
+#[test]
+fn a_mode_chosen_in_a_control_shows_before_rein_asks_whether_to_keep_it() {
+    let model = Model::start(vec![]);
+    let mut rein = Client::start(&model, "option-first");
+    let session = rein.open_asking();
+    let set = rein.call("session/set_config_option", json!({ "sessionId": session, "configId": "mode", "value": "edits" }));
+    let mode_is_edits =
+        |update: &Value| update["configOptions"].as_array().is_some_and(|options| options.iter().any(|option| option["id"] == "mode" && option["currentValue"] == "edits"));
+    rein.update("config_option_update", mode_is_edits);
+    let question = rein.asked(YES);
+    rein.reply(&question, &json!({ "key": "y" }));
+    assert!(rein.answer(set)["result"]["configOptions"].is_array());
+    assert_eq!(rein.commands_said(), "", "the answer you just gave needs no saying back");
+}
+
+#[test]
+fn a_program_is_told_the_branch_and_only_when_it_changes() {
+    let model = Model::start(vec![says("Done.")]);
+    let mut rein = Client::start(&model, "state");
+    std::fs::create_dir_all(rein.project().join(".git")).unwrap();
+    std::fs::write(rein.project().join(".git/HEAD"), "ref: refs/heads/release-0.2\n").unwrap();
+    let session = rein.open();
+    let state = rein.asked("_io.github.furkancodes/state");
+    assert_eq!(state["params"]["branch"], "release-0.2");
+    let turn = rein.prompt(&session, "hello");
+    rein.answer(turn);
+    assert_eq!(rein.seen.iter().filter(|message| message["method"] == "_io.github.furkancodes/state").count(), 1, "nothing changed");
 }
 
 #[test]
@@ -5151,7 +5931,11 @@ fn asks_for_a_pane(name: &str, then: Vec<Turn>) -> (Model, Client, String, u64, 
     let mut rein = Client::start(&model, name);
     let session = rein.open_panes();
     let turn = rein.prompt(&session, "get the tests run");
-    rein.allow();
+    let question = rein.asked("session/request_permission");
+    let offered = question["params"]["options"].as_array().unwrap();
+    assert_eq!(offered.len(), 3, "a sub-agent's no is words for the model, and stops no turn: {offered:?}");
+    assert!(offered.iter().all(|option| option["optionId"] != "stop"), "{offered:?}");
+    rein.reply(&question, &json!({ "outcome": { "outcome": "selected", "optionId": "allow" } }));
     let asked = rein.asked(OPEN_PANE);
     (model, rein, session, turn, asked)
 }

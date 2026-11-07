@@ -5,6 +5,7 @@ use crate::format::thousands;
 use crate::input::{Input, Question, Read};
 use crate::peers::node::Incoming;
 use crate::peers::{Node, State};
+use crate::ui::asked::{Asked, INSTEAD};
 use crate::ui::history::History;
 use crate::ui::markdown::Markdown;
 use crate::ui::screen::Progress;
@@ -15,9 +16,9 @@ use crate::ui::tint::Tint;
 use crate::ui::wrap::Wrap;
 use rein_agent::agent::{Approval, Compacted, Heard, Ui};
 use rein_agent::compact;
-use rein_agent::permissions::{Mode, Rule, Sandboxing, Whose};
-use rein_agent::sandbox::{Access, Sandbox};
-use rein_agent::tools::{BashCall, ToolName};
+use rein_agent::permissions::{Mode, Rule, Sandboxing};
+use rein_agent::sandbox::Sandbox;
+use rein_agent::tools::ToolName;
 use rein_agent::undo::{Changed, Watched};
 use rein_llm::{Effort, ToolCall, Usage};
 use std::io::{IsTerminal, Write};
@@ -222,9 +223,19 @@ pub(crate) struct TurnStats {
 }
 
 impl TurnStats {
+    /// A step ran.
+    pub(crate) const fn stepped(&mut self) {
+        self.steps += 1;
+    }
+
+    /// It changed a file.
+    pub(crate) const fn changed_files(&self) -> bool {
+        !self.changed.is_empty()
+    }
+
     /// What a turn that ran steps came to: `4 steps · changed slug.py ·
     /// 24s`. A turn that only talked has none.
-    fn summary(&self) -> Option<String> {
+    pub(crate) fn summary(&self) -> Option<String> {
         let steps = match self.steps {
             0 => return None,
             1 => "1 step".to_owned(),
@@ -240,6 +251,18 @@ impl TurnStats {
     }
 }
 
+/// What a check came to, in a line.
+pub(crate) fn check_said(checked: &rein_agent::check::Checked) -> String {
+    use rein_agent::check::Verdict;
+    let took = format!("{:.1}s", checked.took.as_secs_f32());
+    match checked.verdict {
+        Verdict::Clean => format!("{} · no new errors · {took}", checked.name),
+        Verdict::New(count) => format!("{} · {count} new error{} · {took}", checked.name, if count == 1 { "" } else { "s" }),
+        Verdict::Fixed => format!("{} · the errors these changes brought in are fixed · {took}", checked.name),
+        Verdict::Busy => format!("{} · not run: another command had the build", checked.name),
+    }
+}
+
 /// The most lines of your message the conversation shows again; the rest
 /// is counted.
 pub(crate) const ECHO_LINES: usize = 12;
@@ -248,7 +271,7 @@ impl Terminal {
     /// Asks `question`, whose answers are `y` and `n`: in the box, or on a
     /// line of its own without one. Only yes is yes.
     pub(crate) async fn yes(&mut self, question: Question) -> bool {
-        if !self.input.pinned() {
+        if !self.input.pinned() && !self.input.has_stand_in() {
             let pad = " ".repeat(GUTTER);
             say!("{}", question.title);
             if let Some(command) = &question.command {
@@ -648,18 +671,6 @@ impl Terminal {
 
     /// Prints a step's line before its question, with the change it would
     /// make, unless it's on screen already.
-    /// What to ask about a command: with a sandbox, what it wants past it;
-    /// without one, all of it.
-    fn command_question(&self, bash: Option<&BashCall>) -> &'static str {
-        match bash.map(BashCall::access) {
-            _ if self.sandboxing != Sandboxing::On => "Allow this command?",
-            Some(Access::Write) => "Allow this command to change files?",
-            Some(Access::Network) => "Allow this command to use the network?",
-            Some(Access::Outside) => "Allow this command to run outside the sandbox?",
-            Some(Access::Look) | None => "Allow this command?",
-        }
-    }
-
     fn show_header(&mut self, call: &ToolCall) {
         let shown = self.step.as_ref().is_some_and(|step| step.call_id == call.call_id && step.header_shown);
         if !shown {
@@ -848,12 +859,11 @@ impl Ui for Terminal {
         self.end_line();
         let s = self.err;
         let pad = " ".repeat(steps::INDENT);
-        let took = format!("{:.1}s", checked.took.as_secs_f32());
+        let said = check_said(checked);
         let line = match checked.verdict {
-            Verdict::Clean => s.dim(&format!("↳ {} · no new errors · {took}", checked.name)),
-            Verdict::New(count) => s.red(&format!("✗ {} · {count} new error{} · {took}", checked.name, if count == 1 { "" } else { "s" })),
-            Verdict::Fixed => format!("{} {}", s.green("✓"), s.dim(&format!("{} · the errors these changes brought in are fixed · {took}", checked.name))),
-            Verdict::Busy => s.dim(&format!("↳ {} · not run: another command had the build", checked.name)),
+            Verdict::Clean | Verdict::Busy => s.dim(&format!("↳ {said}")),
+            Verdict::New(_) => s.red(&format!("✗ {said}")),
+            Verdict::Fixed => format!("{} {}", s.green("✓"), s.dim(&said)),
         };
         say!("{pad}{line}");
         let width = self.wrap_width().unwrap_or(80).saturating_sub(steps::INDENT + 2).max(20);
@@ -888,27 +898,10 @@ impl Ui for Terminal {
         self.input.busy(None, std::time::Instant::now());
         self.step = None;
         crate::ui::screen::progress(Progress::Waiting);
-        let bash = BashCall::of(call);
         // An MCP server's tool, by its server's name and its own.
         let server_tool = rein_mcp::parts(&call.name).filter(|_| ToolName::of(call).is_none());
-        let (question, always) = match (ToolName::of(call), server_tool) {
-            (Some(ToolName::Bash), _) => (self.command_question(bash.as_ref()).to_owned(), "Yes, and don't ask again for this command"),
-            (Some(ToolName::Edit), _) => ("Allow this edit?".to_owned(), "Yes, and don't ask again for file changes"),
-            (Some(ToolName::Write), _) => ("Allow writing this file?".to_owned(), "Yes, and don't ask again for file changes"),
-            (None, Some((server, tool))) => (format!("Let {server}'s {tool} run?"), "Yes, and don't ask again for this tool"),
-            _ => ("Allow this?".to_owned(), "Yes, and don't ask again"),
-        };
-        // Why it needs to go past the sandbox, as the model put it, and the
-        // rule that asks, which is yours to change.
-        let why = bash.as_ref().and_then(BashCall::reason).map(|reason| format!("Why: {reason}"));
-        let asks = rule.map(|rule| match rule.whose() {
-            Whose::Yours => format!("Your rule `{rule}` asks first · /permissions changes your rules"),
-            Whose::Project => format!("This project's rule `{rule}` asks first"),
-        });
-        let reason = match (why, asks) {
-            (Some(why), Some(asks)) => Some(format!("{why} · {asks}")),
-            (why, asks) => why.or(asks),
-        };
+        let asking = Asked::of(call, rule, self.sandboxing);
+        let Asked { question, always, reason, .. } = asking.clone();
         if !self.input.pinned() {
             self.show_header(call);
             let pad = " ".repeat(steps::INDENT);
@@ -948,7 +941,7 @@ impl Ui for Terminal {
                 crate::input::command_lines(&command, s, width.saturating_sub(steps::INDENT)).into_iter().map(|line| format!("{pad}{line}")).collect()
             });
         }
-        let answers = vec![("y", "Yes".to_owned()), ("a", always.to_owned()), ("n", "No".to_owned()), ("esc", "No, and tell rein what to do instead".to_owned())];
+        let answers = vec![("y", "Yes".to_owned()), ("a", always.to_owned()), ("n", "No".to_owned()), ("esc", INSTEAD.to_owned())];
         // The other reins see it's waiting, and you can answer from another tab.
         let asked = format!("{question} {}", command.clone().unwrap_or_else(|| command_line(call)));
         let elsewhere = self.peers.as_mut().map(|peers| peers.question(&shorten_line(&asked)));
@@ -979,12 +972,7 @@ impl Ui for Terminal {
         };
         let answer = self.answered(answer);
         if answer == Approval::Always {
-            let what = match ToolName::of(call) {
-                Some(ToolName::Bash) => "this command",
-                None if server_tool.is_some() => "this tool",
-                _ => "file changes",
-            };
-            self.noted = Some(format!("won't ask again for {what} in this conversation"));
+            self.noted = Some(asking.wont_ask_again());
         }
         answer
     }

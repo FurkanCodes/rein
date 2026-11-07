@@ -426,8 +426,18 @@ impl Setup {
     }
 
     /// The model in use, as saved.
-    fn current(&self, agent: &Agent<Llm>) -> String {
+    pub(crate) fn current(&self, agent: &Agent<Llm>) -> String {
         provider::spec(&self.provider, &agent.model_name)
+    }
+
+    /// The models to choose from as far as they've been looked up, by
+    /// provider, the one in use among them.
+    pub(crate) fn models_known(&self, agent: &Agent<Llm>) -> Vec<(Provider, Vec<ModelInfo>)> {
+        let mut own = self.models.clone();
+        if !own.iter().any(|model| model.id == agent.model_name) {
+            own.insert(0, ModelInfo::named(&agent.model_name));
+        }
+        std::iter::once((self.provider.clone(), own)).chain(self.others.iter().flatten().cloned()).collect()
     }
 }
 
@@ -528,6 +538,22 @@ pub(crate) enum Start {
 /// given to do on its own.
 pub(crate) fn step_limit(mode: Mode, one_shot: bool, max_steps: Option<usize>) -> Option<usize> {
     if mode == Mode::Auto || one_shot { max_steps } else { None }
+}
+
+/// Puts the conversation in `mode`, however that was chosen.
+pub(crate) fn set_mode(mode: Mode, agent: &mut Agent<Llm>, terminal: &mut Terminal, max_steps: Option<usize>) {
+    agent.permissions.mode = mode;
+    agent.step_limit = step_limit(mode, false, max_steps);
+    terminal.mode = mode;
+    if let Some(peers) = &terminal.peers {
+        peers.follow_mode(mode);
+    }
+}
+
+/// Turns the sandbox `on` or off, however that was chosen.
+pub(crate) fn set_sandbox(on: bool, agent: &mut Agent<Llm>, terminal: &mut Terminal) {
+    agent.permissions.set_sandbox(on);
+    terminal.sandboxing = agent.permissions.sandboxing();
 }
 
 /// When to compact: `compact_at` tokens if set (the settings, or
@@ -666,42 +692,14 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
             continue;
         }
         let pad = " ".repeat(GUTTER);
-        // A command is rein's; anything else is a message, and the skills
-        // are looked at again for it: one added or changed since is there.
-        let mut parsed = match crate::commands::parse(line).filter(|_| !crate::skills::starts_with_skill(line, agent.skills())) {
-            Some(Ok(command)) => Some(Ok(command)),
-            // Not one of rein's: maybe a skill added since.
-            other => {
-                crate::skills::refresh(agent, terminal, &setup.root, setup.skill_room(&agent.model_name), crate::skills::Look::Message).await;
-                other.filter(|_| !crate::skills::starts_with_skill(line, agent.skills()))
+        match routed(line, agent, terminal, setup).await {
+            // What you typed is back in the box.
+            Routed::Neither => {
+                terminal.input.insert(line);
+                continue;
             }
-        };
-        // A skill of yours that can't be called as it is: turned on if you
-        // say so, or why not; what you typed is back in the box otherwise.
-        if !matches!(parsed, Some(Ok(_)))
-            && let Some(skill) = crate::skills::not_callable(line, agent.skills()).cloned()
-        {
-            match crate::skills::call_anyway(agent, terminal, &setup.root, setup.skill_room(&agent.model_name), &skill).await {
-                Ok(true) => parsed = None,
-                Ok(false) => {
-                    terminal.input.insert(line);
-                    continue;
-                }
-                Err(e) => {
-                    say!("{pad}{}", terminal.err.red(&format!("✗ {e}")));
-                    terminal.input.insert(line);
-                    continue;
-                }
-            }
-        }
-        if parsed.is_none() {
-            for (skill, given) in crate::skills::called(line, agent.skills()) {
-                agent.call_skill(&skill, given);
-            }
-        }
-        match parsed {
-            Some(Ok(Slash::Exit)) => break,
-            Some(parsed) => {
+            Routed::Command(Ok(Slash::Exit)) => break,
+            Routed::Command(parsed) => {
                 // A line that may hold a key is shown again without it.
                 if terminal.input.pinned() {
                     show_you_said(&crate::commands::shown(line), terminal.err);
@@ -715,7 +713,7 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
                 }
                 terminal.input.set_bar(terminal.bar());
             }
-            None => {
+            Routed::Message => {
                 // A plain terminal already shows what was typed; the box doesn't.
                 let echo = terminal.input.pinned().then_some(line);
                 terminal.start_turn(echo);
@@ -740,6 +738,52 @@ pub(crate) async fn conversation(agent: &mut Agent<Llm>, terminal: &mut Terminal
         say!("\n{}", terminal.err.dim("rein -c continues this conversation"));
     }
     Ok(())
+}
+
+/// What a line you sent comes to.
+pub(crate) enum Routed {
+    Command(Result<Slash, crate::commands::Refused>),
+    /// A message, and the skills it calls are ready.
+    Message,
+    /// A skill that can't be called, which is neither for now.
+    Neither,
+}
+
+/// Works out what `line` is. A command is rein's; anything else is a message,
+/// and the skills are looked at again for it: one added or changed since is
+/// there.
+pub(crate) async fn routed(line: &str, agent: &mut Agent<Llm>, terminal: &mut Terminal, setup: &mut Setup) -> Routed {
+    let mut parsed = match crate::commands::parse(line).filter(|_| !crate::skills::starts_with_skill(line, agent.skills())) {
+        Some(Ok(command)) => Some(Ok(command)),
+        // Not one of rein's: maybe a skill added since.
+        other => {
+            crate::skills::refresh(agent, terminal, &setup.root, setup.skill_room(&agent.model_name), crate::skills::Look::Message).await;
+            other.filter(|_| !crate::skills::starts_with_skill(line, agent.skills()))
+        }
+    };
+    // A skill of yours that can't be called as it is: turned on if you say
+    // so, or why not.
+    if !matches!(parsed, Some(Ok(_)))
+        && let Some(skill) = crate::skills::not_callable(line, agent.skills()).cloned()
+    {
+        match crate::skills::call_anyway(agent, terminal, &setup.root, setup.skill_room(&agent.model_name), &skill).await {
+            Ok(true) => parsed = None,
+            Ok(false) => return Routed::Neither,
+            Err(e) => {
+                say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&format!("✗ {e}")));
+                return Routed::Neither;
+            }
+        }
+    }
+    match parsed {
+        Some(parsed) => Routed::Command(parsed),
+        None => {
+            for (skill, given) in crate::skills::called(line, agent.skills()) {
+                agent.call_skill(&skill, given);
+            }
+            Routed::Message
+        }
+    }
 }
 
 /// A sub-agent whose parent has gone goes too, its tab with it, unless
@@ -783,20 +827,14 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
         // Chosen above.
         Slash::Mode(None) | Slash::Sandbox(None) | Slash::Model(None) | Slash::Login(None) | Slash::Logout(None) | Slash::Effort(None) => {}
         Slash::Mode(Some(mode)) => {
-            agent.permissions.mode = mode;
-            agent.step_limit = step_limit(mode, false, setup.max_steps);
-            terminal.mode = mode;
-            if let Some(peers) = &terminal.peers {
-                peers.follow_mode(mode);
-            }
+            set_mode(mode, agent, terminal, setup.max_steps);
             say!("{pad}{} {}", s.green("✓"), crate::modes::said(mode, terminal.sandboxing));
             // The bar says so while it asks whether to keep it.
             terminal.input.set_bar(terminal.bar());
             crate::modes::keep_mode(mode, terminal).await?;
         }
         Slash::Sandbox(Some(on)) => {
-            agent.permissions.set_sandbox(on);
-            terminal.sandboxing = agent.permissions.sandboxing();
+            set_sandbox(on, agent, terminal);
             say!("{pad}{} {}", s.green("✓"), crate::modes::sandbox_now(terminal.sandboxing, agent.permissions.sandbox()));
             // What the mode does now, as it depends on it.
             say!("{pad}{}", s.dim(&crate::modes::said(agent.permissions.mode, terminal.sandboxing)));

@@ -13,14 +13,19 @@ use rein_llm::{Item, ToolCall, Usage};
 use serde_json::{Value, json};
 
 use super::{Link, wire};
+use crate::input::{Menu, Pending, Question, StandIn};
 use crate::peers::Node;
 use crate::peers::talk::{self, Child};
 use crate::terminal::Terminal;
+use crate::ui::asked::{Asked, INSTEAD};
+use crate::ui::screen::{self, Taken};
 use crate::ui::steps;
+use crate::ui::style::{self, GUTTER};
 
 const ALLOW: &str = "allow";
 const ALWAYS: &str = "always";
 const REJECT: &str = "reject";
+const STOP: &str = "stop";
 
 /// The client, as the agent sees it.
 pub(super) struct Served {
@@ -39,6 +44,14 @@ pub(super) struct Served {
     /// The call just turned down: all of it's been said, and what it came
     /// to comes round again as any step's does.
     blocked: Option<String>,
+    /// The folder it works in.
+    root: std::path::PathBuf,
+    /// What the client was last told, so that it's told only what's new.
+    options_said: Option<Value>,
+    state_said: Option<String>,
+    commands_said: Option<Vec<Value>>,
+    /// How many checks have run, which each go as a step of their own.
+    checks: usize,
 }
 
 /// A place kept for a sub-agent that hasn't claimed its task, given up
@@ -55,9 +68,161 @@ impl Drop for Awaited<'_> {
     }
 }
 
+/// What a command says, as a client wants it: it's laid out for a terminal,
+/// under a gutter.
+fn plainly(text: &str) -> String {
+    let pad = " ".repeat(GUTTER);
+    style::strip(text).split_inclusive('\n').map(|line| line.strip_prefix(pad.as_str()).unwrap_or(line)).collect()
+}
+
+/// Asks the client what the box would ask you.
+pub(super) struct Asker {
+    pub(super) session: String,
+    pub(super) link: Link,
+}
+
+impl Asker {
+    /// Sends what `asking` writes under a number, and waits for what comes
+    /// back. A client that can't show it has said so as it started, and it's
+    /// as if you'd changed your mind.
+    fn ask(&self, asking: impl FnOnce(u64) -> String) -> Pending<Option<Value>> {
+        if !self.link.can_ask.get() {
+            say!("This asks something this client can't show. Say it on the line, like /model gpt-5.");
+            return Box::pin(std::future::ready(None));
+        }
+        let (id, answer) = self.link.ask();
+        self.link.send(asking(id));
+        Box::pin(async move { answer.await.ok().flatten() })
+    }
+}
+
+impl StandIn for Asker {
+    fn can_ask(&self) -> bool {
+        self.link.can_ask.get()
+    }
+
+    fn choose(&self, menu: &Menu) -> Pending<Option<usize>> {
+        let answer = self.ask(|id| wire::choose(id, &self.session, menu));
+        Box::pin(async move { usize::try_from(answer.await?["picked"].as_u64()?).ok() })
+    }
+
+    fn read(&self, prompt: &str, secret: bool) -> Pending<Option<String>> {
+        let answer = self.ask(|id| wire::read(id, &self.session, prompt, secret));
+        Box::pin(async move { answer.await?["text"].as_str().map(str::to_owned) })
+    }
+
+    fn ask(&self, question: &Question) -> Pending<Option<String>> {
+        let answer = self.ask(|id| wire::yes(id, &self.session, question));
+        Box::pin(async move { answer.await?["key"].as_str().map(str::to_owned) })
+    }
+}
+
 impl Served {
     pub(super) fn new(session: String, link: Link, terminal: Terminal) -> Served {
-        Served { session, link, announced: HashSet::new(), terminal, answering: false, compacting: false, blocked: None }
+        let root = std::env::current_dir().unwrap_or_default();
+        Served {
+            session,
+            link,
+            announced: HashSet::new(),
+            terminal,
+            answering: false,
+            compacting: false,
+            blocked: None,
+            root,
+            options_said: None,
+            state_said: None,
+            commands_said: None,
+            checks: 0,
+        }
+    }
+
+    /// Says what's changed of what can be set, if anything has.
+    pub(super) fn options(&mut self, options: Value) {
+        if self.options_said.as_ref() != Some(&options) {
+            self.link.send(wire::options(&self.session, &options));
+            self.options_said = Some(options);
+        }
+    }
+
+    /// Says what's changed of the branch, your limits and what's running
+    /// in the background, if anything has.
+    pub(super) fn state(&mut self) {
+        let line =
+            wire::state(&self.session, crate::peers::git_branch(&self.root).as_deref(), &self.terminal.meters.cells(std::time::SystemTime::now()), self.link.in_the_background());
+        if self.state_said.as_ref() != Some(&line) {
+            self.link.send(line.clone());
+            self.state_said = Some(line);
+        }
+    }
+
+    /// Your limits as they stand: what it has to say of them goes to the
+    /// client, with or without a turn.
+    pub(super) fn meters(&mut self, meters: &[rein_llm::Meter]) {
+        {
+            let _noted = self.take_noted();
+            self.terminal.take_meters(meters.to_vec());
+        }
+        self.state();
+    }
+
+    /// While this is held, what commands say goes to the client.
+    pub(super) fn take_said(&self) -> Taken {
+        let (out, session) = (self.link.out.clone(), self.session.clone());
+        screen::take_said(Box::new(move |text| {
+            // Gone only once the client has stopped reading.
+            let _ = out.send(wire::said(&session, &plainly(text)));
+        }))
+    }
+
+    /// While this is held, what commands say goes nowhere: a client's own
+    /// control shows what it came to.
+    pub(super) fn leave_unsaid(&self) -> Taken {
+        screen::take_said(Box::new(|_| {}))
+    }
+
+    /// While this is held, what commands say goes to the client as notes.
+    fn take_noted(&self) -> Taken {
+        let (out, session) = (self.link.out.clone(), self.session.clone());
+        screen::take_said(Box::new(move |text| {
+            // Gone only once the client has stopped reading.
+            let _ = out.send(wire::noted(&session, plainly(text).trim_end()));
+        }))
+    }
+
+    /// The line that ends a turn that did something, if this one did.
+    pub(super) fn turn_ended(&mut self, undo: Option<usize>) {
+        self.terminal.end_turn();
+        if let Some(summary) = self.terminal.turn.summary() {
+            self.link.send(wire::turn_line(&self.session, &summary, undo));
+        }
+    }
+
+    /// Says what the plan is, as ACP has it, if `call` is the model's plan.
+    fn plan(&self, call: &ToolCall) {
+        if let Some(plan) = plan_of(call) {
+            self.update(&plan);
+        }
+    }
+
+    /// Shows a client that shows its own what you ran, as rein has it: it
+    /// may have had a key in it.
+    pub(super) fn ran(&self, line: &str) {
+        if self.link.can_ask.get() {
+            self.link.send(wire::yours(&self.session, &crate::commands::shown(line)));
+        }
+    }
+
+    /// Says what can be run here, if that's changed: rein's commands, and
+    /// the skills you can call the same way, which come and go as files do.
+    pub(super) fn commands(&mut self, skills: &[crate::ui::slash::Offer]) {
+        let hint = |takes: &str| (!takes.is_empty()).then(|| json!({ "hint": takes }));
+        let ours = crate::commands::COMMANDS.iter().map(|(name, takes, does)| json!({ "name": name.trim_start_matches('/'), "description": does, "input": hint(takes) }));
+        let theirs = skills.iter().map(|skill| wire::skill(skill.name.trim_start_matches('/'), &skill.about));
+        let commands: Vec<Value> = ours.chain(theirs).collect();
+        if self.commands_said.as_ref() != Some(&commands) {
+            self.link.send(wire::commands(&self.session, &commands));
+            self.commands_said = Some(commands);
+        }
     }
 
     /// A turn starts.
@@ -75,10 +240,15 @@ impl Served {
         self.update(&json!({ "sessionUpdate": kind, "content": { "type": "text", "text": text } }));
     }
 
-    /// Tells the client of `call`, or that it's now `status`.
-    fn announce(&mut self, call: &ToolCall, status: &str) {
+    /// Tells the client of `call`, with what it would change, or that it's
+    /// now `status`.
+    fn announce(&mut self, call: &ToolCall, status: &str, change: Option<&steps::Whole>) {
         if self.announced.insert(call.call_id.clone()) {
-            self.update(&tool_call(call, status));
+            let mut step = tool_call(call, status);
+            if let Some(change) = change {
+                step["content"] = json!([wire::diff(change)]);
+            }
+            self.update(&step);
         } else {
             self.update(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": call.call_id, "status": status }));
         }
@@ -105,30 +275,39 @@ impl Served {
                     if let Some(said) = compact::typed(item) {
                         match rein_agent::peers::unheard(said) {
                             Some((from, text)) => self.link.send(wire::heard(&self.session, from, text)),
-                            None => self.chunk("user_message_chunk", said),
+                            None => self.link.send(wire::yours(&self.session, said)),
                         }
                     }
                 }
                 Item::Assistant(text) => self.chunk("agent_message_chunk", text),
                 // Failed, until its result says otherwise: a turn cut off
                 // may have left it with none.
-                Item::ToolCall(call) => self.update(&tool_call(call, "failed")),
+                Item::ToolCall(call) => {
+                    self.update(&tool_call(call, "failed"));
+                    self.plan(call);
+                }
                 Item::ToolResult { call_id, output } => self.update(&result_of(call_id, finished(output), output)),
                 Item::Found { .. } | Item::Image { .. } | Item::Opaque(_) => {}
             }
         }
     }
 
-    /// Asks whether `call` may go ahead.
-    async fn asked(&mut self, call: &ToolCall) -> Approval {
-        self.announce(call, "pending");
-        let options = json!([
-            { "optionId": ALLOW, "name": "Allow", "kind": "allow_once" },
-            { "optionId": ALWAYS, "name": "Allow for this conversation", "kind": "allow_always" },
-            { "optionId": REJECT, "name": "Reject", "kind": "reject_once" },
-        ]);
+    /// Asks whether `call` may go ahead, in the terminal's words. Only what's
+    /// asked about shows its change: a whole file on every step, and a look
+    /// at it for each one a saved conversation has, would be for nothing.
+    async fn asked(&mut self, call: &ToolCall, asked: &Asked) -> Approval {
+        self.announce(call, "pending", steps::whole_change(call, &self.root).as_ref());
+        let mut options = vec![
+            json!({ "optionId": ALLOW, "name": "Yes", "kind": "allow_once" }),
+            json!({ "optionId": ALWAYS, "name": asked.always, "kind": "allow_always" }),
+            json!({ "optionId": REJECT, "name": "No", "kind": "reject_once" }),
+        ];
+        // What comes of a sub-agent is words for the model, which stop nothing.
+        if ToolName::of(call) != Some(ToolName::Spawn) {
+            options.push(json!({ "optionId": STOP, "name": INSTEAD, "kind": "reject_once", "_meta": { wire::INSTEAD: true } }));
+        }
         let (id, answer) = self.link.ask();
-        self.link.send(wire::ask_permission(id, &self.session, &call.call_id, &options));
+        self.link.send(wire::ask_permission(id, &self.session, &call.call_id, &Value::Array(options), asked));
         // Never answered, as the client left: not a yes.
         answer.await.map_or(Approval::Stop, |result| approval(result.as_ref()))
     }
@@ -137,17 +316,28 @@ impl Served {
     /// starts a `rein serve` for it, which claims the task. What the model
     /// is told of how that went.
     async fn spawn(&mut self, call: &ToolCall) -> String {
-        let args: SpawnArgs = match serde_json::from_str(&call.arguments) {
-            Ok(args) => args,
-            Err(e) => return format!("{ERROR}bad arguments: {e}"),
-        };
+        match serde_json::from_str(&call.arguments) {
+            Ok(args) => self.start_sub_agent(args, Some(call)).await,
+            Err(e) => format!("{ERROR}bad arguments: {e}"),
+        }
+    }
+
+    /// `/spawn`: you asked for it, so nothing asks. What came of it.
+    pub(super) async fn spawn_yours(&mut self, args: SpawnArgs) -> String {
+        self.start_sub_agent(args, None).await
+    }
+
+    /// Has the client start a sub-agent, asking you first about what `call`
+    /// asked for.
+    async fn start_sub_agent(&mut self, args: SpawnArgs, call: Option<&ToolCall>) -> String {
         let Some(node) = &self.terminal.peers else { return format!("{ERROR}this rein isn't among the others, so it can't start sub-agents") };
         let child = match Child::wanted(&args, &self.terminal.spec, node).await {
             Ok(child) => child,
             Err(e) => return format!("{ERROR}{e}"),
         };
-        if !self.terminal.spawn_always {
-            match self.asked(call).await {
+        if let Some(call) = call.filter(|_| !self.terminal.spawn_always) {
+            let asked = Asked::of(call, None, self.terminal.sandboxing);
+            match self.asked(call, &asked).await {
                 Approval::Yes => {}
                 Approval::Always => self.terminal.spawn_always = true,
                 _ => return "The user declined to start this sub-agent.".to_owned(),
@@ -181,6 +371,27 @@ impl Served {
 /// The word for how a step went, from what it gave.
 fn finished(output: &str) -> &'static str {
     if rein_agent::agent::failed(output) { "failed" } else { "completed" }
+}
+
+/// ACP's plan, from the model's own: each step, and how far it's got.
+fn plan_of(call: &ToolCall) -> Option<Value> {
+    if ToolName::of(call) != Some(ToolName::Plan) {
+        return None;
+    }
+    let args: Value = serde_json::from_str(&call.arguments).ok()?;
+    let entries: Vec<Value> = args["steps"]
+        .as_array()?
+        .iter()
+        .map(|step| {
+            let status = match step["status"].as_str() {
+                Some("done") => "completed",
+                Some("in_progress") => "in_progress",
+                _ => "pending",
+            };
+            json!({ "content": step["step"], "priority": "medium", "status": status })
+        })
+        .collect();
+    Some(json!({ "sessionUpdate": "plan", "entries": entries }))
 }
 
 /// The update saying what the call `id` came to.
@@ -224,6 +435,7 @@ fn approval(result: Option<&Value>) -> Approval {
         Some("selected") => match outcome.and_then(|outcome| outcome["optionId"].as_str()) {
             Some(ALLOW) => Approval::Yes,
             Some(ALWAYS) => Approval::Always,
+            Some(STOP) => Approval::Stop,
             _ => Approval::No,
         },
         Some("cancelled") => Approval::Stop,
@@ -252,8 +464,36 @@ impl Ui for Served {
         self.chunk("agent_thought_chunk", note);
     }
 
-    async fn approve(&mut self, call: &ToolCall, _rule: Option<&Rule>) -> Approval {
-        self.asked(call).await
+    fn meters(&mut self, meters: &[rein_llm::Meter]) {
+        Served::meters(self, meters);
+    }
+
+    fn hooked(&mut self, _call: &ToolCall, what: &str) {
+        self.link.send(wire::noted(&self.session, what));
+    }
+
+    fn background_ended(&mut self, ended: &rein_agent::background::Ended) {
+        let command = rein_agent::background::plain(ended.command.lines().next().unwrap_or_default());
+        self.link.send(wire::noted(&self.session, &format!("↳ {} {command} ended: {}", ended.id, ended.exit.said())));
+        self.state();
+    }
+
+    fn checked(&mut self, checked: &rein_agent::check::Checked, printed: &str) {
+        self.checks += 1;
+        let id = format!("check-{}", self.checks);
+        let status = if matches!(checked.verdict, rein_agent::check::Verdict::New(_)) { "failed" } else { "completed" };
+        let title = format!("Check {}", crate::terminal::check_said(checked));
+        self.update(&json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": title, "kind": "other", "status": status }));
+        self.update(&result_of(&id, status, printed));
+    }
+
+    async fn approve(&mut self, call: &ToolCall, rule: Option<&Rule>) -> Approval {
+        let asked = Asked::of(call, rule, self.terminal.sandboxing);
+        let answer = self.asked(call, &asked).await;
+        if answer == Approval::Always {
+            self.link.send(wire::noted(&self.session, &asked.wont_ask_again()));
+        }
+        answer
     }
 
     async fn peer(&mut self, call: &ToolCall) -> String {
@@ -269,7 +509,7 @@ impl Ui for Served {
     fn tool_started(&mut self, call: &ToolCall) {
         self.answering = false;
         self.terminal.step_started(call);
-        self.announce(call, "in_progress");
+        self.announce(call, "in_progress", None);
     }
 
     fn tool_blocked(&mut self, call: &ToolCall, reason: &str) {
@@ -290,7 +530,11 @@ impl Ui for Served {
         }
         let outcome = steps::outcome(call, output, self.terminal.err);
         self.terminal.step_finished(call, &outcome);
+        self.terminal.turn.stepped();
         self.finish(call, finished(output), output);
+        self.plan(call);
+        // It may have left something running, or stopped it.
+        self.state();
     }
 
     fn usage(&mut self, usage: &Usage) {
@@ -324,7 +568,7 @@ impl Ui for Served {
 
     fn steered(&mut self, heard: &Heard) {
         match heard {
-            Heard::You(text) => self.chunk("user_message_chunk", text),
+            Heard::You(text) => self.link.send(wire::yours(&self.session, text)),
             Heard::Peer { from, text } | Heard::Reported { from, text } | Heard::Told { from, text } => self.link.send(wire::heard(&self.session, from, text)),
             Heard::Changed { by, path } => self.chunk("agent_thought_chunk", &format!("{by} changed {path}, which this conversation has seen")),
         }
@@ -341,6 +585,7 @@ mod tests {
         assert_eq!(approval(Some(&picked(ALLOW))), Approval::Yes);
         assert_eq!(approval(Some(&picked(ALWAYS))), Approval::Always);
         assert_eq!(approval(Some(&picked(REJECT))), Approval::No);
+        assert_eq!(approval(Some(&picked(STOP))), Approval::Stop);
         assert_eq!(approval(Some(&picked("yes please"))), Approval::No);
         assert_eq!(approval(Some(&json!({ "outcome": { "outcome": "cancelled" } }))), Approval::Stop);
         assert_eq!(approval(Some(&json!({ "outcome": { "outcome": "maybe", "optionId": ALLOW } }))), Approval::No);

@@ -878,6 +878,7 @@ dependencies = [
 name = "rein-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "flate2",
  "libc",
  "rein-agent",

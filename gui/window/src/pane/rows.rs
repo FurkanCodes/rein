@@ -8,7 +8,7 @@ use rein_transcript::{Role, StepState};
 
 use super::Pane;
 use crate::look::{Look, THREAD_FROM, THREAD_TO};
-use crate::parts::working;
+use crate::parts::{Press, working};
 
 /// Where what's said starts.
 const TEXT: f32 = 56.;
@@ -66,6 +66,8 @@ impl Pane {
         let pane = self.sheet(&look);
         let body = if role == Role::Step {
             self.step(index, row.message, top, cx)
+        } else if role == Role::Turn {
+            self.turn_line(row.message, top, cx)
         } else {
             let Some(view) = self.view(index, cx) else { return div().into_any_element() };
             let text = TextView::new(&view).selectable(true);
@@ -91,7 +93,7 @@ impl Pane {
                     .pl(px(CARD))
                     .pr(px(RIGHT))
                     .child(div().px(px(14.)).pt(px(8.)).pb(px(9.)).rounded(px(10.)).border_1().border_color(look.line).text_size(px(14.)).line_height(px(22.)).child(text)),
-                Role::Thought | Role::Note | Role::Step => {
+                Role::Thought | Role::Note | Role::Said | Role::Step | Role::Turn => {
                     let dash = (role == Role::Note).then(|| div().absolute().left(px(26.)).top(px(top + 10.)).w(px(11.)).h(px(1.)).bg(look.ink_3));
                     div().relative().pt(px(top)).pl(px(TEXT)).pr(px(RIGHT)).text_size(px(13.)).line_height(px(19.)).text_color(look.ink_3).children(dash).child(text)
                 }
@@ -100,6 +102,31 @@ impl Pane {
         // Above the first thing said there's no rail yet.
         let cover = (index == 0).then(|| div().absolute().left(px(24.)).top_0().w(px(15.)).h(px(top + 13.)).bg(pane));
         div().relative().when(last, |it| it.pb(px(12.))).children(cover).child(body).into_any_element()
+    }
+
+    /// What a turn came to, on the rail, and a way back to before it.
+    fn turn_line(&self, message: usize, top: f32, cx: &mut Context<Self>) -> Div {
+        let look = Look::of(cx);
+        let Some(said) = self.transcript.get(message) else { return div() };
+        let undo = self.transcript.undo_point(message).filter(|_| !self.running).map(|turn| {
+            let pressed = cx.listener(move |pane, _, _, cx| pane.open_undo(Some(turn), cx));
+            Press::new(("undo-to", message)).ghost().small().label("Undo to here").on_click(pressed)
+        });
+        let dash = div().absolute().left(px(26.)).top(px(top + 12.)).w(px(11.)).h(px(1.)).bg(look.ink_3);
+        div()
+            .relative()
+            .pt(px(top))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .min_h(px(24.))
+            .pl(px(TEXT))
+            .pr(px(RIGHT))
+            .text_size(px(12.))
+            .text_color(look.ink_3)
+            .child(dash)
+            .child(div().min_w_0().truncate().child(said.text.clone()))
+            .children(undo)
     }
 
     /// A step: its mark on the rail, its verb, what it's about. Pressing it
@@ -120,7 +147,7 @@ impl Pane {
             StepState::Stopped => tick("–", look.ink_3).into_any_element(),
         };
         let output = said.step_output();
-        let open = self.open_steps.contains(&message) && !output.is_empty();
+        let open = self.open_steps.contains(&message) != self.all_open && !output.is_empty();
         let shown = open.then(|| {
             let lines: Vec<&str> = output.lines().rev().take(OUTPUT_LINES).collect();
             let tail = lines.into_iter().rev().collect::<Vec<_>>().join("\n");

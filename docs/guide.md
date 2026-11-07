@@ -1207,9 +1207,10 @@ Protocol](https://agentclientprotocol.com) (version 1) on standard input and
 output, one JSON-RPC message a line. What it has to say to people goes to
 standard error. It stops when the program closes its standard input.
 
-Sign in first, with `rein login`: there's no signing in over the protocol. One
-`rein serve` holds one conversation, in the folder `session/new` names, so a
-program that wants another conversation starts another `rein serve`.
+Sign in first, with `rein login`, or with `/login` from a program that shows
+what a command asks. One `rein serve` holds one conversation, in the folder
+`session/new` names, so a program that wants another conversation starts
+another `rein serve`.
 
 - **Mode.** It starts in the mode your settings say, which is `trust` unless
   you've changed that, so check it before you hand it to anything automatic.
@@ -1218,8 +1219,57 @@ program that wants another conversation starts another `rein serve`.
 - **What a project brings.** Nobody's at a terminal to say yes, so a project's
   hooks, MCP servers, skills and check stay off until you've said yes to them
   in `rein`, as in a task run on its own.
-- **Questions.** `session/request_permission` offers allow, allow for this
-  conversation, and reject. Any other answer is a no.
+- **Model, effort, mode and sandbox.** `session/new` and `session/load` say
+  them as ACP's `configOptions`, with the models by provider as far as they've
+  been looked up. `session/set_config_option` changes one between turns, and
+  `config_option_update` says when they change, however that happened. Nothing
+  is said in the conversation: your control shows the change, and what stopped
+  it comes back as the error. A mode or a sandbox is set, and said to be, before
+  rein asks whether to keep it. A sandbox turned on where there's none is said
+  as a note, since a switch that shows it on can't.
+- **Commands.** Any slash command runs as a `session/prompt`, as ACP has it, and
+  takes no model. `available_commands_update` lists them, and the skills you
+  can call, once a conversation has opened, and again if the skills change.
+  What a command says comes as
+  `agent_message_chunk` with `"io.github.furkancodes/said": true` under
+  `_meta`, one that fails says so there, and the conversation goes on. `/new`,
+  `/resume` and `/exit` are for the program: a process holds one conversation.
+- **What a command asks.** A program that can show it says so in `initialize`,
+  with `"io.github.furkancodes/asks": true` under `clientCapabilities._meta`,
+  and gets these requests, each with `sessionId`:
+  `_io.github.furkancodes/choose` has `title`, `items` (`name` and `about`),
+  `current` and `at`, answered with `picked`, a place in the list;
+  `_io.github.furkancodes/read` has `prompt` and `secret`, answered with `text`:
+  never show a `secret` one or keep it; and `_io.github.furkancodes/yes` has
+  `title`, `detail`, `command` and `answers` (`key` and `says`), answered with
+  `key`. `null` means you left it. Any other program is told to give what's
+  needed on the line, like `/model gpt-5`.
+- **What comes back.** A message of yours that comes back, a command's line or
+  a steer, is a `user_message_chunk` with `"io.github.furkancodes/whole": true`
+  under `_meta`: ACP's chunks of one role run together otherwise. rein's own
+  notes, what a hook did or a background command ending, are
+  `agent_thought_chunk`s with `"io.github.furkancodes/note": true`. The line
+  that ends a turn that ran steps is one too, and has
+  `"io.github.furkancodes/turn"`, the turn to undo back to if it changed files.
+  The model's plan comes as ACP's `plan`. The check after edits comes as a step,
+  a `tool_call` titled `Check …`, failed if it found new errors, with what it
+  printed.
+- **Images.** A `session/prompt` can hold ACP's `image` blocks, which go with
+  the message as an image you pasted does. `"io.github.furkancodes/label"` under
+  a block's `_meta` says what the message calls it, like `[Image #1]`. One rein
+  can't show turns the message down and says why: your words aren't sent
+  without what they're about. A steer takes words only.
+- **Questions.** `session/request_permission` offers what the terminal does,
+  in its words: yes; yes and don't ask again, saying for what; no; and no, and
+  tell rein what to do instead, which stops the turn. That last is a
+  `reject_once` with `"io.github.furkancodes/instead": true` under its `_meta`,
+  so a client that doesn't know it still reads a no. Any other answer is a no.
+  The request's `_meta` has `"io.github.furkancodes/question"`, what rein asks,
+  and `"io.github.furkancodes/why"`, the reason the model gave and the rule
+  that asks, if there's either. The step of a file change you're asked about
+  has ACP's `diff` in its `content`, with `"io.github.furkancodes/line"` under
+  its `_meta`, the line it starts on. Saying don't ask again comes back as a
+  note of what it covers.
 - **Stopping.** `session/cancel` stops the turn, and whatever it was running.
   The conversation goes on.
 - **Steering.** ACP has no way to add to a running turn, so rein has a method
@@ -1227,6 +1277,38 @@ program that wants another conversation starts another `rein serve`.
   It goes in before the next step, and `initialize` says rein takes it under
   `agentCapabilities._meta`. Sent as a turn is ending, it goes in with your
   next message.
+- **While a turn runs.** What can't be done until it ends is turned down with
+  the code `-32001`, so a program can tell that from a turn that failed.
+- **Branch, limits and the background.** `_io.github.furkancodes/state` says
+  the `branch`, your `meters` (`label`, `used`, `said`, `resets` and `warn`) and
+  `background`, how many commands are running there, when any of them changes:
+  how much is used is the provider's word, and one that says nothing shows
+  nothing. A command you stop with `_io.github.furkancodes/stop_task` isn't
+  said here: `tasks` shows it stopped.
+- **What a box needs.** Each of these takes `sessionId`, and is answered even
+  as a turn runs. `_io.github.furkancodes/sent` gives `sent`, what you sent from
+  this folder, oldest first, which is what `↑` brings back in a terminal there,
+  and what you send here goes in it too, but a line that may hold a key.
+  `_io.github.furkancodes/paths` gives `paths`, what `@` can point at, folders
+  ending in `/`. `_io.github.furkancodes/background` sends the running command
+  to the background, as Ctrl-B does.
+- **What's behind a conversation.** These are answered as a turn runs too.
+  `_io.github.furkancodes/tasks` gives `tasks`, the commands in the background
+  (`id`, `command`, `seconds`, `ended`, `failed` and `last`), and
+  `_io.github.furkancodes/stop_task` stops the one you name by `id`.
+  `_io.github.furkancodes/room` gives what's taking room as of the last turn:
+  `used` and `limit`, `parts` (`name`, `about` and `tokens`), the `biggest`
+  outputs (`what`, `tokens` and `stale`), `cache`, and `retiring`, what retiring
+  stale output would free.
+- **Undo.** These wait for the turn. `_io.github.furkancodes/undo_turns` gives
+  `turns`, the latest first (`turn`, `said`, `at`, `changed`, `made` and
+  `removed`). `_io.github.furkancodes/undo_plan` takes a `turn` and gives `plan`:
+  `putBack`, `takeAway`, `left` and `lost`, the files in each, and how many
+  `turns` it undoes. Nothing changes until `_io.github.furkancodes/undo`, which
+  takes the same `turn`, and says what it did as a command does.
+- **The list of models.** `configOptions` holds the providers looked up so far.
+  `_io.github.furkancodes/models` looks up the others, a few seconds at most,
+  and `config_option_update` brings them.
 - **Flags.** `rein serve` takes what a conversation takes, such as `--mode`,
   `--sandbox`, `-m` and `--name`, but no message: its client sends those.
 - **Saved conversations.** `session/list` gives them 100 at a time, the most
@@ -1273,9 +1355,8 @@ ACP's own draft for sub-agents lets a client stop one, but not prompt or steer
 it, which is why each one is a `rein serve` here.
 
 Not there yet: MCP servers a client passes in `session/new`, which are
-ignored, images in a prompt, and rein's slash commands. What another rein
-sends in `trust` mode waits in `/inbox`, which only a terminal has so far.
-Past 12 turns in a row that other reins started, what they send starts no
+ignored. What another rein sends in `trust` mode waits in `/inbox`, which lets
+one in as a turn, as anything from another rein is. Past 12 turns in a row that other reins started, what they send starts no
 turn: rein says so as a thought, and it goes in with your next message.
 
 ## What's left of your limits

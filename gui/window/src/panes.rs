@@ -14,11 +14,26 @@ use serde_json::Value;
 
 use crate::agent::{Agent, Opening, Start, SubAgent};
 use crate::look::{Look, Wearing, wear};
+use crate::palette::Palette;
 use crate::pane::{About, Pane, Told};
-use crate::parts::{Press, halo, strip, wordmark};
+use crate::parts::{Press, gauge, halo, strip, wordmark};
 use crate::probe::Probe;
 
-gpui_kit::actions!(rein, [NewAgent]);
+gpui_kit::actions!(rein, [NewAgent, NextMode, Complete, FindSent, AllOutput, ToBackground, OpenPalette]);
+
+/// The window's keys. Those over a box go over the toolkit's own, which indent
+/// text: not what `⇥` is for in a message.
+pub(crate) fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-n" } else { "ctrl-n" }, NewAgent, None),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-k" } else { "ctrl-k" }, OpenPalette, None),
+        KeyBinding::new("shift-tab", NextMode, Some("Input")),
+        KeyBinding::new("tab", Complete, Some("Input")),
+        KeyBinding::new("ctrl-r", FindSent, Some("Input")),
+        KeyBinding::new("ctrl-o", AllOutput, Some("Input")),
+        KeyBinding::new("ctrl-b", ToBackground, Some("Input")),
+    ]);
+}
 
 /// How wide the list of agents is.
 pub(crate) const SIDEBAR: f32 = 256.;
@@ -48,7 +63,9 @@ pub(crate) struct Panes {
     serve: Vec<String>,
     choosing: Option<Choosing>,
     /// Holds the keys with no box open, so that shortcuts still reach this.
-    focus: FocusHandle,
+    pub(crate) focus: FocusHandle,
+    /// `⌘K`, while it's up.
+    pub(crate) palette: Option<Palette>,
 }
 
 /// Somewhere to take hold of the window by.
@@ -119,11 +136,16 @@ impl Panes {
         .detach();
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        Panes { held: Vec::new(), probe, serve, choosing: None, focus }
+        Panes { held: Vec::new(), probe, serve, choosing: None, focus, palette: None }
     }
 
     pub(crate) fn panes(&self) -> Vec<Entity<Pane>> {
         self.held.iter().map(|held| held.pane.clone()).collect()
+    }
+
+    /// The pane you're at.
+    pub(crate) fn looking_at(&self, cx: &App) -> Option<Entity<Pane>> {
+        self.held.iter().find(|held| held.pane.read(cx).is_looked_at()).map(|held| held.pane.clone())
     }
 
     fn hold(&mut self, pane: Entity<Pane>, window: &mut Window, cx: &mut Context<Self>) {
@@ -232,6 +254,28 @@ impl Panes {
         self.open(&Start { command: &asked.command, cwd: &asked.cwd, env: &asked.env, opening: Opening::New }, about, window, cx);
     }
 
+    /// A press on what doesn't take keys leaves them here, where nothing
+    /// types: what you write next goes to the agent you're at, as in a
+    /// terminal, wherever you pressed.
+    pub(crate) fn keys_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus.is_focused(window)
+            && let Some(pane) = self.looking_at(cx)
+        {
+            pane.update(cx, |pane, cx| pane.take_keys(window, cx));
+        }
+    }
+
+    /// `key` came all this way, so what has the keys didn't want it.
+    fn typed_elsewhere(&mut self, key: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        let in_a_box = window.context_stack().iter().any(|context| context.contains("Input"));
+        if !in_a_box
+            && self.palette.is_none()
+            && let Some(pane) = self.looking_at(cx)
+        {
+            pane.update(cx, |pane, cx| pane.typed_elsewhere(key, window, cx));
+        }
+    }
+
     fn heard(&mut self, pane: &Entity<Pane>, told: &Told, window: &mut Window, cx: &mut Context<Self>) {
         match told {
             Told::Changed => cx.notify(),
@@ -250,12 +294,20 @@ impl Panes {
                 self.look_past(pane, window, cx);
             }
             // Dropping it closes its agent's input, which ends it.
-            Told::Close => {
-                pane.update(cx, |pane, cx| pane.closing(cx));
-                self.held.retain(|held| held.pane != *pane);
-                self.look_past(pane, window, cx);
+            Told::Close => self.close(pane, window, cx),
+            Told::New => {
+                let cwd = pane.read(cx).cwd().to_owned();
+                self.close(pane, window, cx);
+                self.start_in(std::path::Path::new(&cwd), window, cx);
             }
+            Told::Resume => self.choose_saved(window, cx),
         }
+    }
+
+    fn close(&mut self, pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Self>) {
+        pane.update(cx, |pane, cx| pane.closing(cx));
+        self.held.retain(|held| held.pane != *pane);
+        self.look_past(pane, window, cx);
     }
 
     /// `left` has gone from the desk. If you were at it, you go to the last
@@ -429,7 +481,40 @@ impl Panes {
             .named("New agent")
             .child(Icon::new(IconName::Plus).size_4())
             .on_click(cx.listener(|view, _, window, cx| view.choose_folder(window, cx)));
-        bar.child(top.child(start)).child(div().id("agents").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).child(self.agents(cx)))
+        let meters = self.meters(cx);
+        let find = Press::new("palette").ghost().small().label("⌘K").named("Go to, or run").on_click(cx.listener(|view, _, window, cx| view.toggle_palette(window, cx)));
+        bar.child(top.child(find).child(start)).child(div().id("agents").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).child(self.agents(cx))).children(meters)
+    }
+
+    /// How much of your limits is used, by the agent you're at, as a note at
+    /// the foot of the list: a provider that says nothing shows nothing.
+    fn meters(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let look = Look::of(cx);
+        let at = self.held.iter().find(|held| held.pane.read(cx).is_looking())?;
+        let meters = at.pane.read(cx).meters();
+        if meters.is_empty() {
+            return None;
+        }
+        let rows: Vec<Div> = meters
+            .iter()
+            .map(|meter| {
+                let fill = if meter.warn { look.amber } else { look.ink_3 };
+                let said = meter.resets.as_ref().map_or_else(|| meter.said.clone(), |resets| format!("{} →{resets}", meter.said));
+                let row = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .h(px(18.))
+                    .text_size(px(11.5))
+                    .text_color(if meter.warn { look.amber_text } else { look.ink_3 })
+                    .child(div().flex_none().child(meter.label.clone()));
+                match meter.used {
+                    Some(used) => row.child(gauge(f32::from(used) / 100., None, fill, &look)).child(div().flex_none().child(said)),
+                    None => row,
+                }
+            })
+            .collect();
+        Some(div().flex_none().px(px(17.)).py(px(8.)).border_t_1().border_color(look.line).children(rows))
     }
 
     /// What's on the desk with nothing on it.
@@ -465,9 +550,16 @@ impl Render for Panes {
         let panes: Vec<_> = shown.collect();
         let empty = panes.is_empty().then(|| self.nothing_open(cx));
         let sidebar = self.sidebar(cx);
+        let palette = self.palette_card(cx);
         div()
             .track_focus(&self.focus)
+            // Once the press has done what it will: a window can be moved
+            // from here, and its release is never heard.
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, window, cx| cx.defer_in(window, |view, window, cx| view.keys_home(window, cx))))
+            .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| view.typed_elsewhere(&event.keystroke, window, cx)))
             .on_action(cx.listener(|view, _: &NewAgent, window, cx| view.choose_folder(window, cx)))
+            .on_action(cx.listener(|view, _: &OpenPalette, window, cx| view.toggle_palette(window, cx)))
+            .relative()
             .size_full()
             .flex()
             .flex_row()
@@ -479,6 +571,7 @@ impl Render for Panes {
             .child(sidebar)
             .child(div().flex().flex_1().min_w_0().h_full().gap(px(6.)).py(px(6.)).pr(px(6.)).children(panes).children(empty))
             .child(frames)
+            .children(palette)
     }
 }
 

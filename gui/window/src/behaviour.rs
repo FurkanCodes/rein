@@ -5,13 +5,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::Root;
-use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Focusable as _, TestAppContext, VisualTestContext};
-use rein_transcript::{Modes, Saved, Standing};
+use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, Focusable as _, Keystroke, TestAppContext, VisualTestContext};
+use rein_transcript::{Asking, Modes, Saved, Setting, Standing, Words};
 use serde_json::{Value, json};
 
 use crate::agent::{CameTo, Opening, Said, Start};
 use crate::look::{Wearing, wear};
-use crate::pane::{About, Pane, Told};
+use crate::pane::{About, Pane, Picking, Tab, Told};
 use crate::panes::Panes;
 use crate::probe::Probe;
 
@@ -25,6 +25,7 @@ fn desk() -> Desk {
     let app = TestAppContext::single();
     app.update(|cx| {
         gpui_kit::init(cx);
+        crate::panes::bind_keys(cx);
         wear(false, cx);
     });
     let mut view = None;
@@ -46,9 +47,12 @@ fn scratch(name: &str) -> PathBuf {
     dir.join("got")
 }
 
-/// What an agent was sent, in order.
+/// What an agent was sent, in order, as far as it's whole: this looks while
+/// the agent is writing, and a line with no end yet is half a message.
 fn sent_to(file: &Path) -> Vec<Value> {
-    fs::read_to_string(file).unwrap_or_default().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+    let got = fs::read_to_string(file).unwrap_or_default();
+    let whole = got.rfind('\n').map_or("", |end| &got[..end]);
+    whole.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
 }
 
 impl Desk {
@@ -77,7 +81,7 @@ impl Desk {
     fn asked(&mut self, pane: &Entity<Pane>, id: u64, command: &str) {
         let tool = json!({ "sessionUpdate": "tool_call", "toolCallId": format!("call-{id}"), "title": format!("Run {command}"), "kind": "execute", "status": "pending", "rawInput": { "command": command } });
         let options = json!([{ "optionId": "yes", "name": "Allow", "kind": "allow_once" }, { "optionId": "no", "name": "Reject", "kind": "reject_once" }]);
-        self.said(pane, vec![Said::Update(tool), Said::Asked { id: json!(id), call: format!("call-{id}"), options }]);
+        self.said(pane, vec![Said::Update(tool), Said::Asked { id: json!(id), call: format!("call-{id}"), options, words: Words::default() }]);
     }
 
     /// Writes `text` as if you'd pressed Send.
@@ -95,10 +99,157 @@ impl Desk {
         self.cx.update(|_, cx| look(pane.read(cx)))
     }
 
+    /// Puts your keys where nothing types.
+    fn keys_elsewhere(&mut self) {
+        let focus = self.cx.update(|_, cx| self.panes.read(cx).focus.clone());
+        self.cx.update(|window, cx| focus.focus(window, cx));
+    }
+
     /// Whether your keys are in `pane`'s box.
     fn keys_in(&mut self, pane: &Entity<Pane>) -> bool {
         self.cx.update(|window, cx| pane.read(cx).input.read(cx).focus_handle(cx).is_focused(window))
     }
+}
+
+fn menu_asked() -> Said {
+    let params = json!({ "title": "choose a model", "items": [{ "name": "gpt-5", "about": "OpenAI" }, { "name": "opus", "about": "Anthropic" }, { "name": "sonnet", "about": "Anthropic" }], "current": 0 });
+    Said::Asking { id: json!(40), asking: Asking::of("_io.github.furkancodes/choose", &params).expect("it reads") }
+}
+
+fn answer_to(file: &Path, id: u64) -> Option<Value> {
+    sent_to(file).into_iter().find(|line| line["id"] == id && line.get("method").is_none()).map(|line| line["result"].clone())
+}
+
+impl Desk {
+    /// Lets go of `pane`'s agent, and reads what it was told under `id`.
+    fn answered(&mut self, pane: &Entity<Pane>, file: &Path, id: u64) -> Option<Value> {
+        self.cx.update(|_, cx| pane.update(cx, |pane, _| pane.finish_agent_for_test()));
+        answer_to(file, id)
+    }
+
+    /// Writes `text` in the box and presses Send.
+    fn box_says(&mut self, pane: &Entity<Pane>, text: &'static str) {
+        self.cx.update(|window, cx| {
+            pane.update(cx, |pane, cx| {
+                pane.input.update(cx, |input, cx| input.set_value(text, window, cx));
+                pane.send_box_for_test(window, cx);
+            });
+        });
+        self.cx.run_until_parked();
+    }
+
+    fn key(&mut self, stroke: &'static str) {
+        self.cx.update(|window, cx| {
+            let key = Keystroke::parse(stroke).expect("a key");
+            window.dispatch_keystroke(key, cx);
+        });
+        self.cx.run_until_parked();
+    }
+}
+
+/// Puts `text` in the box, with the keys there, as you'd type it.
+fn typed(desk: &mut Desk, pane: &Entity<Pane>, text: &'static str) {
+    desk.cx.update(|window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.input.update(cx, |input, cx| input.focus(window, cx));
+            pane.set_box_for_test("", window, cx);
+        });
+    });
+    for letter in text.chars() {
+        let key = match letter {
+            ' ' => "space".to_owned(),
+            '\n' => "shift-enter".to_owned(),
+            letter => letter.to_string(),
+        };
+        desk.key(key.leak());
+    }
+    desk.cx.run_until_parked();
+}
+
+fn in_box(desk: &mut Desk, pane: &Entity<Pane>) -> String {
+    desk.cx.update(|_, cx| pane.read(cx).input.read(cx).value().to_string())
+}
+
+/// It answered what it was asked under `id`.
+fn answers(desk: &mut Desk, pane: &Entity<Pane>, id: u64, came_to: CameTo) {
+    desk.said(pane, vec![Said::Answer { id, came_to }]);
+}
+
+/// What the pane asked of its agent under `method`, by number.
+fn asked_for(file: &Path, method: &str) -> Vec<u64> {
+    sent_to(file).into_iter().filter(|line| line["method"] == method).filter_map(|line| line["id"].as_u64()).collect()
+}
+
+/// How many times it's been asked `method`, looking until that's `expected`:
+/// it's a process of its own, and hears in its own time.
+fn asks_of(file: &Path, method: &str, expected: usize) -> usize {
+    for _ in 0..200 {
+        let count = asked_for(file, method).len();
+        if count >= expected {
+            return count;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    asked_for(file, method).len()
+}
+
+/// Lets go of `pane`'s agent, so what it was sent can be read.
+fn let_go(desk: &mut Desk, pane: &Entity<Pane>) {
+    desk.cx.update(|_, cx| pane.update(cx, |pane, _| pane.finish_agent_for_test()));
+}
+
+const SENT: &str = "_io.github.furkancodes/sent";
+const PATHS: &str = "_io.github.furkancodes/paths";
+const STEER: &str = "_io.github.furkancodes/steer";
+
+/// A pane that's been told what you sent before, and has finished asking.
+fn with_sent(desk: &mut Desk, file: &Path, sent: &[&str]) -> Entity<Pane> {
+    let pane = desk.pane(file);
+    let id = wait_for_ask(file, SENT);
+    told(desk, &pane, id, json!({ "sent": sent }));
+    pane
+}
+
+/// The agent writes what it's sent to a file as it comes, so this looks
+/// until it's there.
+fn wait_for_ask(file: &Path, method: &str) -> u64 {
+    for _ in 0..200 {
+        if let Some(id) = asked_for(file, method).last() {
+            return *id;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("nothing asked {method}: {:?}", sent_to(file));
+}
+
+/// It answered what it was asked under `id`, saying `said`.
+fn told(desk: &mut Desk, pane: &Entity<Pane>, id: u64, said: Value) {
+    answers(desk, pane, id, CameTo::Told(said));
+}
+
+/// A pane that's been told what `@` can point at, with `word` in the box.
+fn with_paths(desk: &mut Desk, file: &Path, word: &'static str) -> Entity<Pane> {
+    let pane = desk.pane(file);
+    typed(desk, &pane, word);
+    let id = wait_for_ask(file, PATHS);
+    told(desk, &pane, id, json!({ "paths": ["src/", "src/main.rs", "README.md"] }));
+    pane
+}
+
+const UNDO_TURNS: &str = "_io.github.furkancodes/undo_turns";
+const UNDO_PLAN: &str = "_io.github.furkancodes/undo_plan";
+
+fn turn_line(desk: &mut Desk, pane: &Entity<Pane>, text: &str, turn: Option<u64>) {
+    let line = json!({ "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": text }, "_meta": { "io.github.furkancodes/note": true, "io.github.furkancodes/turn": turn } });
+    desk.said(pane, vec![Said::Update(line)]);
+}
+
+fn model_setting() -> Said {
+    let options = json!([
+        { "id": "model", "currentValue": "openai/gpt-5", "options": [{ "group": "openai", "name": "OpenAI", "options": [{ "value": "openai/gpt-5", "name": "gpt-5", "description": "500000 tokens" }] }, { "group": "groq", "name": "Groq", "options": [{ "value": "groq/llama", "name": "groq/llama" }] }] },
+        { "id": "effort", "currentValue": "low", "options": [{ "value": "low", "name": "low" }, { "value": "high", "name": "high" }] },
+    ]);
+    Said::Settings(Setting::listed(&options))
 }
 
 #[test]
@@ -115,7 +266,6 @@ fn a_refused_mode_leaves_the_turn_its_question_and_the_bar_as_they_were() {
     assert_eq!(desk.read(&pane, Pane::standing), Standing::Asking);
     assert_eq!(desk.read(&pane, Pane::mode_for_test), Some("trust".to_owned()), "the bar says what it's in, not what you asked for");
 }
-
 #[test]
 fn a_mode_counts_once_the_agent_has_said_so() {
     let mut desk = desk();
@@ -126,7 +276,6 @@ fn a_mode_counts_once_the_agent_has_said_so() {
     desk.said(&pane, vec![Said::Answer { id: mode, came_to: CameTo::Done }]);
     assert_eq!(desk.read(&pane, Pane::mode_for_test), Some("ask".to_owned()));
 }
-
 #[test]
 fn a_prompt_that_meets_a_turn_already_running_goes_into_it() {
     let mut desk = desk();
@@ -141,7 +290,6 @@ fn a_prompt_that_meets_a_turn_already_running_goes_into_it() {
     let steer = sent.last().unwrap();
     assert_eq!((steer["method"].as_str(), steer["params"]["message"].as_str()), (Some("_io.github.furkancodes/steer"), Some("hello")), "{sent:?}");
 }
-
 #[test]
 fn a_prompt_turned_down_for_any_other_reason_is_a_failed_turn() {
     let mut desk = desk();
@@ -154,7 +302,6 @@ fn a_prompt_turned_down_for_any_other_reason_is_a_failed_turn() {
     assert_eq!(desk.read(&pane, Pane::standing), Standing::Failed);
     assert_eq!(desk.read(&pane, |pane| pane.failure().map(str::to_owned)), Some("the key was refused".to_owned()));
 }
-
 #[test]
 fn a_second_press_of_a_double_click_answers_nothing() {
     let mut desk = desk();
@@ -177,7 +324,6 @@ fn a_second_press_of_a_double_click_answers_nothing() {
     let answers = sent_to(&file).into_iter().filter(|line| line["result"]["outcome"].is_object()).count();
     assert_eq!(answers, 1, "only one yes went to the agent");
 }
-
 #[test]
 fn a_question_nothing_has_drawn_yet_cant_be_answered() {
     let mut desk = desk();
@@ -197,7 +343,6 @@ fn a_question_nothing_has_drawn_yet_cant_be_answered() {
     });
     assert_eq!(left, 1, "a key can arrive before the frame that shows what it would answer");
 }
-
 #[test]
 fn closing_a_sub_agent_before_it_starts_tells_the_pane_that_asked() {
     let mut desk = desk();
@@ -215,7 +360,6 @@ fn closing_a_sub_agent_before_it_starts_tells_the_pane_that_asked() {
     let refused = sent_to(&file).into_iter().find(|line| line["id"] == 9).expect("it was told");
     assert_eq!(refused["error"]["message"], "its pane was closed", "it waits on this with no timeout");
 }
-
 #[test]
 fn hiding_or_closing_the_pane_youre_at_takes_you_to_another() {
     let mut desk = desk();
@@ -230,7 +374,6 @@ fn hiding_or_closing_the_pane_youre_at_takes_you_to_another() {
     let on_desk = desk.cx.update(|window, cx| desk.panes.read(cx).holds_keys_for_test(window));
     assert!(on_desk, "with no pane left the window has them, or ⌘N reaches nothing");
 }
-
 #[test]
 fn a_press_on_another_pane_brings_the_keys_there() {
     let mut desk = desk();
@@ -242,7 +385,6 @@ fn a_press_on_another_pane_brings_the_keys_there() {
     desk.told(&b, Told::Looked);
     assert!(desk.keys_in(&b), "the pane with the ring has the keys: what you type next goes where it looks like it will");
 }
-
 #[test]
 fn what_you_write_stays_in_the_box_of_an_agent_thats_gone() {
     let mut desk = desk();
@@ -258,7 +400,6 @@ fn what_you_write_stays_in_the_box_of_an_agent_thats_gone() {
     });
     assert_eq!(typed.to_string(), "a long message");
 }
-
 #[test]
 fn a_saved_conversation_thats_open_is_gone_to_not_opened_again() {
     let mut desk = desk();
@@ -268,7 +409,6 @@ fn a_saved_conversation_thats_open_is_gone_to_not_opened_again() {
     desk.cx.update(|window, cx| desk.panes.update(cx, |panes, cx| panes.open_saved_for_test(&saved[0], window, cx)));
     assert_eq!(desk.cx.update(|_, cx| desk.panes.read(cx).panes().len()), 1, "two agents on one file would each write their own history into it");
 }
-
 #[test]
 fn a_saved_conversations_old_steps_arent_this_turns() {
     let mut desk = desk();
@@ -277,6 +417,92 @@ fn a_saved_conversations_old_steps_arent_this_turns() {
     let step = json!({ "sessionUpdate": "tool_call", "toolCallId": "old", "title": "Read a", "kind": "read", "status": "completed" });
     desk.said(&pane, vec![Said::Update(step), Said::Started("session".to_owned())]);
     assert!(desk.read(&pane, Pane::ticks).is_empty());
+}
+#[test]
+fn esc_at_a_question_is_rein_s_own_no_and_the_turn_ends_with_it() {
+    let mut desk = desk();
+    let file = scratch("instead");
+    let pane = desk.pane(&file);
+    desk.send(&pane, "go");
+    let step = json!({ "sessionUpdate": "tool_call", "toolCallId": "c", "title": "Edit a.rs", "kind": "edit", "status": "pending", "content": [{ "type": "diff", "path": "/p/a.rs", "oldText": "a", "newText": "b" }] });
+    let options = json!([
+        { "optionId": "allow", "name": "Yes", "kind": "allow_once" },
+        { "optionId": "reject", "name": "No", "kind": "reject_once" },
+        { "optionId": "stop", "name": "No, and tell rein what to do instead", "kind": "reject_once", "_meta": { "io.github.furkancodes/instead": true } },
+    ]);
+    desk.said(&pane, vec![Said::Update(step), Said::Asked { id: json!(7), call: "c".to_owned(), options, words: Words::default() }]);
+    desk.cx.update(|_, cx| pane.update(cx, |pane, _| pane.pretend_waited_for_test()));
+    desk.key("escape");
+    assert_eq!(desk.read(&pane, Pane::question_count_for_test), 0);
+    assert_eq!(desk.answered(&pane, &file, 7), Some(json!({ "outcome": { "outcome": "selected", "optionId": "stop" } })));
+    assert!(!sent_to(&file).iter().any(|line| line["method"] == "session/cancel"), "the answer stops the turn, as the terminal's does");
+}
+
+#[test]
+fn a_press_on_what_takes_no_keys_leaves_them_with_the_agent_you_are_at() {
+    let mut desk = desk();
+    let file = scratch("press-keys");
+    let pane = desk.pane(&file);
+    let panes = desk.panes.clone();
+    let press = |desk: &mut Desk| {
+        desk.keys_elsewhere();
+        desk.cx.update(|window, cx| panes.update(cx, |panes, cx| panes.keys_home(window, cx)));
+        desk.cx.run_until_parked();
+    };
+    press(&mut desk);
+    assert!(desk.keys_in(&pane), "what you type next goes in its box");
+    desk.key("h");
+    assert_eq!(in_box(&mut desk, &pane), "h");
+    typed(&mut desk, &pane, "");
+    desk.said(&pane, vec![menu_asked()]);
+    desk.cx.run_until_parked();
+    press(&mut desk);
+    desk.key("s");
+    desk.cx.run_until_parked();
+    assert_eq!(in_box(&mut desk, &pane), "", "a list that's up keeps them");
+    assert_eq!(desk.cx.update(|_, cx| pane.read(cx).asking_typed_for_test(cx)), Some("s".to_owned()));
+}
+
+#[test]
+fn what_you_type_where_nothing_types_goes_in_the_box_with_the_keys() {
+    let mut desk = desk();
+    let file = scratch("typed-elsewhere");
+    let pane = desk.pane(&file);
+    desk.keys_elsewhere();
+    desk.key("h");
+    desk.key("i");
+    assert_eq!(in_box(&mut desk, &pane), "hi", "the second too: the keys went with the first");
+    assert!(desk.keys_in(&pane));
+    desk.keys_elsewhere();
+    desk.key("cmd-c");
+    desk.key("enter");
+    assert_eq!(in_box(&mut desk, &pane), "hi", "a shortcut isn't typing, and Enter would send what you can't see it send");
+    desk.send(&pane, "go");
+    desk.asked(&pane, 7, "git push");
+    desk.cx.update(|_, cx| pane.update(cx, |pane, _| pane.pretend_waited_for_test()));
+    desk.keys_elsewhere();
+    desk.key("y");
+    assert_eq!(desk.read(&pane, Pane::question_count_for_test), 1, "typing elsewhere never answers a question");
+}
+
+#[test]
+fn a_list_or_a_sheet_thats_up_keeps_what_you_type() {
+    let mut desk = desk();
+    let file = scratch("typed-held");
+    let pane = desk.pane(&file);
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.open_picker_for_test(Picking::Mode, window, cx)));
+    desk.cx.run_until_parked();
+    desk.keys_elsewhere();
+    desk.key("h");
+    assert_eq!(in_box(&mut desk, &pane), "", "a list that's up");
+    let mut desk = self::desk();
+    let file = scratch("typed-held-palette");
+    let pane = desk.pane(&file);
+    desk.key("cmd-k");
+    desk.cx.run_until_parked();
+    desk.keys_elsewhere();
+    desk.key("h");
+    assert_eq!(in_box(&mut desk, &pane), "", "or the palette");
 }
 
 #[test]
@@ -289,3 +515,192 @@ fn the_beat_rests_while_a_question_waits_for_you() {
     desk.asked(&pane, 7, "git push");
     assert!(!desk.read(&pane, Pane::is_beating_for_test), "eight frames a second, for as long as you're away");
 }
+/// A question from a command, with no answer for Esc.
+fn yes_asked(id: u64) -> Said {
+    let params = json!({ "title": "Keep it?", "answers": [{ "key": "y", "says": "Yes" }, { "key": "n", "says": "No" }] });
+    Said::Asking { id: json!(id), asking: Asking::of("_io.github.furkancodes/yes", &params).expect("a question") }
+}
+
+#[test]
+fn a_press_as_a_commands_question_appears_answers_nothing() {
+    let mut desk = desk();
+    let file = scratch("yes-press");
+    let pane = desk.pane(&file);
+    desk.said(&pane, vec![yes_asked(41)]);
+    desk.cx.run_until_parked();
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.press_asking_for_test("y", window, cx)));
+    assert!(desk.read(&pane, |pane| pane.asking_for_test().is_some()), "of a double click, the second press was meant for the list");
+    desk.cx.update(|_, cx| pane.update(cx, |pane, _| pane.since_for_test()));
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.press_asking_for_test("y", window, cx)));
+    assert!(desk.read(&pane, |pane| pane.asking_for_test().is_none()));
+    assert_eq!(desk.answered(&pane, &file, 41), Some(json!({ "key": "y" })));
+}
+
+#[test]
+fn esc_leaves_a_commands_question_that_has_no_answer_for_it() {
+    let mut desk = desk();
+    let file = scratch("yes-esc");
+    let pane = desk.pane(&file);
+    desk.said(&pane, vec![yes_asked(42)]);
+    desk.cx.run_until_parked();
+    desk.key("escape");
+    assert!(desk.read(&pane, |pane| pane.asking_for_test().is_none()));
+    assert_eq!(desk.answered(&pane, &file, 42), Some(json!({ "key": null })));
+}
+
+#[test]
+fn typing_narrows_a_commands_menu_and_enter_tells_rein_which() {
+    let mut desk = desk();
+    let file = scratch("menu");
+    let pane = desk.pane(&file);
+    desk.said(&pane, vec![menu_asked()]);
+    assert_eq!(desk.read(&pane, Pane::standing), Standing::Asking, "the list of agents says it needs you");
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.type_in_asking_for_test("sonnet", window, cx)));
+    desk.cx.run_until_parked();
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.take_asking_for_test(window, cx)));
+    assert!(desk.read(&pane, |pane| pane.asking_for_test().is_none()));
+    assert_eq!(desk.answered(&pane, &file, 40), Some(json!({ "picked": 2 })), "its place in the whole list, not what's left of it");
+}
+#[test]
+fn the_arrows_move_through_a_menu_and_esc_leaves_it() {
+    let mut desk = desk();
+    let file = scratch("menu-keys");
+    let pane = desk.pane(&file);
+    desk.said(&pane, vec![menu_asked()]);
+    desk.key("down");
+    desk.key("down");
+    desk.key("down");
+    desk.key("enter");
+    assert_eq!(desk.answered(&pane, &file, 40), Some(json!({ "picked": 0 })), "round past the end, to the top");
+
+    let file = scratch("menu-esc");
+    let pane = desk.pane(&file);
+    desk.said(&pane, vec![menu_asked()]);
+    desk.key("escape");
+    assert_eq!(desk.answered(&pane, &file, 40), Some(json!({ "picked": null })));
+}
+#[test]
+fn what_a_command_asks_for_goes_to_rein_and_the_box_is_left_alone() {
+    let mut desk = desk();
+    let file = scratch("read");
+    let pane = desk.pane(&file);
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.input.update(cx, |input, cx| input.set_value("half a thought", window, cx))));
+    let asked = Asking::of("_io.github.furkancodes/read", &json!({ "prompt": "Paste your key", "secret": true })).expect("it reads");
+    desk.said(&pane, vec![Said::Asking { id: json!(41), asking: asked }]);
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.type_in_asking_for_test("sk-secret", window, cx)));
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.take_asking_for_test(window, cx)));
+    let in_box = desk.cx.update(|_, cx| pane.read(cx).input.read(cx).value().to_string());
+    assert_eq!(in_box, "half a thought", "what you were writing isn't your key");
+    assert_eq!(desk.answered(&pane, &file, 41), Some(json!({ "text": "sk-secret" })));
+}
+#[test]
+fn a_question_from_a_command_takes_its_keys_once_it_can_have_been_read() {
+    let mut desk = desk();
+    let file = scratch("yes");
+    let pane = desk.pane(&file);
+    let asked =
+        Asking::of("_io.github.furkancodes/yes", &json!({ "title": "Start in edits from now on?", "answers": [{ "key": "n", "says": "No" }, { "key": "y", "says": "Yes" }] }))
+            .expect("it reads");
+    desk.said(&pane, vec![Said::Asking { id: json!(42), asking: asked }]);
+    desk.key("y");
+    assert!(desk.read(&pane, |pane| pane.asking_for_test().is_some()), "a key as it appears was meant for something else");
+    desk.cx.update(|_, cx| pane.update(cx, |pane, _| pane.since_for_test()));
+    desk.key("y");
+    assert_eq!(desk.answered(&pane, &file, 42), Some(json!({ "key": "y" })));
+}
+#[test]
+fn what_a_command_asks_goes_when_the_command_does() {
+    let mut desk = desk();
+    let file = scratch("stopped");
+    let pane = desk.pane(&file);
+    desk.send(&pane, "/model");
+    desk.said(&pane, vec![menu_asked()]);
+    let prompt = desk.read(&pane, Pane::last_request_for_test);
+    desk.said(&pane, vec![Said::Answer { id: prompt, came_to: CameTo::TurnOver }]);
+    assert!(desk.read(&pane, |pane| pane.asking_for_test().is_none()), "nothing's left to take your answer");
+    assert!(!desk.read(&pane, Pane::is_asking));
+}
+#[test]
+fn a_commands_line_is_left_for_rein_to_say_back() {
+    let mut desk = desk();
+    let file = scratch("no-echo");
+    let pane = desk.pane(&file);
+    desk.send(&pane, "/login groq sk-on-the-line");
+    assert_eq!(desk.read(&pane, Pane::rows_for_test), 0, "it may have a key in it, and only rein knows");
+    desk.send(&pane, "and this?");
+}
+#[test]
+fn the_windows_own_commands_are_the_windows() {
+    let mut desk = desk();
+    let (first, second) = (scratch("own-1"), scratch("own-2"));
+    let (a, b) = (desk.pane(&first), desk.pane(&second));
+    desk.box_says(&b, "/exit");
+    assert_eq!(desk.cx.update(|_, cx| desk.panes.read(cx).panes().len()), 1, "it closes the pane, and nothing asks rein");
+    desk.box_says(&a, "/new");
+    let panes = desk.cx.update(|_, cx| desk.panes.read(cx).panes());
+    assert_eq!(panes.len(), 1, "another in its place");
+    assert!(panes[0] != a);
+}
+#[test]
+fn copy_takes_the_last_answer_as_it_was_written() {
+    let mut desk = desk();
+    let file = scratch("copy");
+    let pane = desk.pane(&file);
+    desk.said(&pane, vec![Said::Update(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "**done**\n" } }))]);
+    desk.box_says(&pane, "/copy");
+    let copied = desk.cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+    assert_eq!(copied.as_deref(), Some("**done**"));
+}
+#[test]
+fn what_a_command_changes_the_bar_follows() {
+    let mut desk = desk();
+    let file = scratch("settings");
+    let pane = desk.pane(&file);
+    let settings = Setting::listed(&json!([{ "id": "mode", "currentValue": "ask", "options": [{ "value": "trust", "name": "⚠ trust" }, { "value": "ask", "name": "ask" }] }]));
+    desk.said(&pane, vec![Said::Settings(settings)]);
+    assert_eq!(desk.read(&pane, Pane::mode_for_test), Some("ask".to_owned()), "a /mode typed in the box, as much as one picked");
+}
+#[test]
+fn shift_tab_goes_on_to_the_next_mode_and_back_round() {
+    let mut desk = desk();
+    let file = scratch("next-mode");
+    let pane = desk.pane(&file);
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.input.update(cx, |input, cx| input.focus(window, cx))));
+    desk.key("shift-tab");
+    let asked = desk.read(&pane, Pane::last_request_for_test);
+    desk.said(&pane, vec![Said::Answer { id: asked, came_to: CameTo::Done }]);
+    assert_eq!(desk.read(&pane, Pane::mode_for_test), Some("ask".to_owned()));
+    desk.key("shift-tab");
+    let asked = desk.read(&pane, Pane::last_request_for_test);
+    desk.said(&pane, vec![Said::Answer { id: asked, came_to: CameTo::Done }]);
+    assert_eq!(desk.read(&pane, Pane::mode_for_test), Some("trust".to_owned()));
+}
+#[test]
+fn a_cell_waits_for_the_turn_to_end_as_any_command_does() {
+    let mut desk = desk();
+    let file = scratch("cell");
+    let pane = desk.pane(&file);
+    desk.send(&pane, "go");
+    desk.cx.update(|_, cx| pane.update(cx, |pane, cx| pane.run_for_test("/model", cx)));
+    desk.cx.update(|_, cx| pane.update(cx, |pane, _| pane.finish_agent_for_test()));
+    let sent = sent_to(&file);
+    assert_eq!(sent.iter().filter(|line| line["method"] == "session/prompt").count(), 1, "{sent:?}");
+    assert!(!sent.iter().any(|line| line["method"] == "_io.github.furkancodes/steer"), "a command isn't words for the turn: {sent:?}");
+}
+#[test]
+fn what_a_command_asks_isnt_a_turn_to_steer() {
+    let mut desk = desk();
+    let file = scratch("asked");
+    let pane = desk.pane(&file);
+    desk.send(&pane, "/mode");
+    let menu = rein_transcript::Menu { title: "choose a mode".to_owned(), items: Vec::new(), current: None, at: None };
+    desk.said(&pane, vec![Said::Asking { id: json!(7), asking: Asking::Choose(menu) }]);
+    desk.box_says(&pane, "words");
+    desk.cx.update(|_, cx| pane.update(cx, |pane, _| pane.finish_agent_for_test()));
+    let sent = sent_to(&file);
+    assert!(!sent.iter().any(|line| line["method"] == "_io.github.furkancodes/steer"), "{sent:?}");
+    assert_eq!(desk.cx.update(|_, cx| pane.read(cx).input.read(cx).value().to_string()), "words", "and it's kept for after");
+}
+
+mod boards;
+mod writing;

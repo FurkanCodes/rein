@@ -9,6 +9,7 @@ mod agent;
 #[cfg(test)]
 mod behaviour;
 mod look;
+mod palette;
 mod pane;
 mod panes;
 mod parts;
@@ -24,7 +25,7 @@ use serde_json::json;
 use crate::agent::{Opening, Start};
 use crate::look::{Wearing, wear};
 use crate::pane::{About, Pane};
-use crate::panes::{NewAgent, Panes, SIDEBAR, here};
+use crate::panes::{Panes, SIDEBAR, here};
 use crate::probe::Probe;
 
 #[derive(Default)]
@@ -99,7 +100,7 @@ fn flags() -> Result<Flags, String> {
             }
             "--key" => {
                 let said = value()?;
-                let (key, at) = said.split_once('@').ok_or("--key takes a key and when: y@2.5")?;
+                let (key, at) = said.rsplit_once('@').ok_or("--key takes a key and when: y@2.5")?;
                 flags.keys.push((key.to_owned(), at.parse().map_err(|_| "--key takes a key and when: y@2.5")?));
             }
             "--look" => {
@@ -419,7 +420,7 @@ fn main() {
         gpui_kit::init(cx);
         // Nobody's looking by then, and past it nothing would end what won't.
         cx.on_app_quit(|_| async { crate::agent::wait_for_those_ending() }).detach();
-        cx.bind_keys([KeyBinding::new(if cfg!(target_os = "macos") { "cmd-n" } else { "ctrl-n" }, NewAgent, None)]);
+        crate::panes::bind_keys(cx);
         let wearing = flags.wearing;
         wear(wearing.dark(cx.window_appearance()), cx);
         let probe = Probe::new();

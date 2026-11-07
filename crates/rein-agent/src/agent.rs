@@ -292,6 +292,24 @@ pub struct Compacted {
     pub summarized: bool,
 }
 
+/// What's taking room in the conversation, in about how many tokens.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Room {
+    pub tool_output: u64,
+    pub reins_words: u64,
+    pub your_messages: u64,
+    pub project: u64,
+    pub tools: u64,
+    /// How many tools the model is shown, and how many it found.
+    pub tools_shown: usize,
+    pub tools_found: usize,
+    pub instructions: u64,
+    /// The biggest outputs, by what they were, and whether they're stale.
+    pub biggest: Vec<(String, u64, bool)>,
+    /// What retiring what's out of date would free.
+    pub retiring: u64,
+}
+
 /// How full the conversation is, and what compaction needs to know.
 struct Window {
     /// Compact once a request would carry more than this many tokens.
@@ -1460,33 +1478,60 @@ impl<M: Model> Agent<M> {
         match self.window.measured {
             Some((tokens, sent)) if sent <= self.history.len() => tokens + added(&self.history[sent..]),
             _ => {
-                let held = self.model.holds_back(&self.request(&[], None));
-                let found: std::collections::HashSet<&str> = self
-                    .history
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Found { names, .. } => Some(names.iter().map(String::as_str)),
-                        _ => None,
-                    })
-                    .flatten()
-                    .collect();
-                let sent = |tool: &&Tool| match tool.loading {
-                    Loading::UpFront => true,
-                    Loading::Found => !held || found.contains(tool.name.as_str()),
-                    Loading::Search => held,
-                };
-                let tools: usize = self.specs().iter().filter(sent).map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len()).sum();
+                let tools: usize = self.tools_sent(&self.tools_found()).iter().map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len()).sum();
                 let instructions = self.system().map_or(0, |system| system.len());
                 compact::estimate(tools + instructions) + added(&self.history)
             }
         }
     }
 
-    async fn compact_now(&mut self, focus: Option<&str>, summarize: bool, ui: &mut impl Ui) -> Result<Compacted> {
-        ui.compacting();
-        let before = self.estimated();
-        let retired = compact::stale(&self.history);
-        let freed: u64 = retired
+    /// The tools held back that have been found so far.
+    fn tools_found(&self) -> std::collections::HashSet<&str> {
+        self.history
+            .iter()
+            .filter_map(|item| match item {
+                Item::Found { names, .. } => Some(names.iter().map(String::as_str)),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The tools a request carries: those held back only once `found`, and
+    /// only where the format holds them back.
+    fn tools_sent(&self, found: &std::collections::HashSet<&str>) -> Vec<&Tool> {
+        let held = self.model.holds_back(&self.request(&[], None));
+        let sent = |tool: &&Tool| match tool.loading {
+            Loading::UpFront => true,
+            Loading::Found => !held || found.contains(tool.name.as_str()),
+            Loading::Search => held,
+        };
+        self.specs().iter().filter(sent).collect()
+    }
+
+    /// What's taking room in the conversation, as [`Agent::estimated`] counts it.
+    pub fn room(&self) -> Room {
+        let found = self.tools_found();
+        let shown = self.tools_sent(&found);
+        let tools: usize = shown.iter().map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len()).sum();
+        let made = compact::made_of(&self.history);
+        Room {
+            tool_output: compact::estimate(made.tool_output),
+            reins_words: compact::estimate(made.reins_words),
+            your_messages: compact::estimate(made.your_messages),
+            project: compact::estimate(made.project),
+            tools: compact::estimate(tools),
+            tools_shown: shown.len(),
+            tools_found: found.len(),
+            instructions: compact::estimate(self.system().map_or(0, |system| system.len())),
+            biggest: compact::biggest(&self.history, 4).into_iter().map(|one| (one.what, compact::estimate(one.size), one.stale)).collect(),
+            retiring: self.retiring(),
+        }
+    }
+
+    /// What retiring what's out of date would free.
+    fn retiring(&self) -> u64 {
+        compact::stale(&self.history)
             .iter()
             .map(|(id, text)| {
                 let old = self.history.iter().find_map(|item| match item {
@@ -1495,7 +1540,14 @@ impl<M: Model> Agent<M> {
                 });
                 compact::estimate(old.unwrap_or(0).saturating_sub(text.len()))
             })
-            .sum();
+            .sum()
+    }
+
+    async fn compact_now(&mut self, focus: Option<&str>, summarize: bool, ui: &mut impl Ui) -> Result<Compacted> {
+        ui.compacting();
+        let before = self.estimated();
+        let retired = compact::stale(&self.history);
+        let freed = self.retiring();
         if !summarize && before.saturating_sub(freed) <= self.window.limit * 6 / 10 {
             if let Some(session) = &mut self.session {
                 session.append_retired(&retired)?;

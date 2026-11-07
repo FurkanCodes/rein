@@ -367,12 +367,27 @@ finding. Each says why in a line.
   protocol: they can't approve anything, and a client mustn't show them as
   yours.
 - What a limit holds back and what your rules hold back aren't one queue
-  to empty: `rein serve` has no `/inbox`, so what's past the turns in a row
-  goes in with your next message, and emptying `/inbox` that way would let
-  in what `trust` mode keeps out.
+  to empty: what's past the turns in a row goes in with your next message,
+  and emptying `/inbox` that way would let in what `trust` mode keeps out.
+  What's in `/inbox` waits for you to pick it, and runs as a turn of
+  `rein serve`'s own: run behind it, as the terminal's, a Stop left a tool
+  call unanswered and every step reached the client as words.
+- In the window, what you type goes in the box wherever you last pressed: a
+  press on what takes no keys leaves them on the desk, where nothing types,
+  and the conversation's text keeps them for `⌘C`. After a click, or moving
+  the window by its title, every key went nowhere, `/undo` included, and
+  only the look of the box said so.
 - An id a client sends is never made into a path: a saved conversation is
   found by reading what's in the folder (`session::find`), so `../../keys`
   finds nothing.
+- A choice in a control isn't a message: a client's own control shows it,
+  so `set_config_option` puts nothing in the conversation, and what stopped
+  it is the answer. The window ran a pick as a typed `/model …`, which showed
+  a line you never wrote, a box of terminal text, and Stop with no turn
+  running. What a control can't show still gets said: a sandbox that's on
+  with nothing to run in. And while a setting changes rein takes nothing
+  else, so the window holds what you send until it's done: steered at a
+  turn that wasn't there, a message left the pane running for good.
 - What a turn leaves for the others (a task's result, the steps it ran) is
   noted in `Terminal`'s `step_*` methods, which any `Ui` calls: written into
   the terminal's drawing, a sub-agent in `rein serve` would report nothing.

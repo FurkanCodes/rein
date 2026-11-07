@@ -59,6 +59,12 @@ pub(crate) fn description(mode: Mode, sandboxing: Sandboxing) -> &'static str {
     }
 }
 
+/// What's said even where a switch shows the sandbox: on, with nothing to
+/// run in, the switch alone would have you think commands have walls.
+pub(crate) fn walls_missing(sandboxing: Sandboxing, sandbox: &Sandbox) -> Option<String> {
+    (sandboxing == Sandboxing::Missing).then(|| sandbox_now(sandboxing, sandbox))
+}
+
 /// The sandbox now, in words, as `/sandbox` sets it.
 pub(crate) fn sandbox_now(sandboxing: Sandboxing, sandbox: &Sandbox) -> String {
     match sandboxing {
@@ -159,6 +165,16 @@ async fn keep_setting(keep: Keep, kept: impl Fn(&crate::settings::Settings) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sandbox_that_isnt_here_is_said_though_its_switch_shows_on() {
+        use rein_agent::sandbox::{Missing, Places};
+        let sandbox = Sandbox::missing(Places::new(std::path::Path::new("/tmp"), None, None), Missing::NotHere);
+        let said = walls_missing(Sandboxing::Missing, &sandbox).expect("a switch alone would say you have walls");
+        assert!(said.contains("commands ask before they run"), "{said}");
+        assert_eq!(walls_missing(Sandboxing::On, &sandbox), None);
+        assert_eq!(walls_missing(Sandboxing::Off, &sandbox), None);
+    }
 
     #[test]
     fn only_a_mode_with_nothing_to_hold_a_command_back_is_marked() {

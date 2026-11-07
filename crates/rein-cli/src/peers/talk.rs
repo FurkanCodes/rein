@@ -467,24 +467,29 @@ fn step_lines(report: &Report) -> Vec<String> {
     earlier.into_iter().chain(report.steps.iter().map(|step| format!("· {step}"))).chain(on).collect()
 }
 
-/// `/spawn`: a sub-agent you start yourself, so nothing asks. What isn't
-/// given, its name and task, is asked for.
-async fn spawn_here(spawn: crate::commands::Spawn, terminal: &mut Terminal) -> CliResult {
+/// What `/spawn` asks for: what isn't given, its name and task, is asked
+/// for. `None` if you leave it.
+pub(crate) async fn spawn_args(spawn: crate::commands::Spawn, terminal: &mut Terminal) -> Option<rein_agent::peers::SpawnArgs> {
     let role = match spawn.role {
         Some(role) => role,
         None => match terminal.input.read("its name (tests, docs, review)  ", false).await {
             crate::input::Read::Line(line) if !line.trim().is_empty() => line.trim().to_owned(),
-            _ => return Ok(()),
+            _ => return None,
         },
     };
     let task = match spawn.task {
         Some(task) => task,
         None => match terminal.input.read("its task  ", false).await {
             crate::input::Read::Line(line) if !line.trim().is_empty() => line,
-            _ => return Ok(()),
+            _ => return None,
         },
     };
-    let args = rein_agent::peers::SpawnArgs { role, task, model: spawn.model, edits: spawn.edits };
+    Some(rein_agent::peers::SpawnArgs { role, task, model: spawn.model, edits: spawn.edits })
+}
+
+/// `/spawn`: a sub-agent you start yourself, so nothing asks.
+async fn spawn_here(spawn: crate::commands::Spawn, terminal: &mut Terminal) -> CliResult {
+    let Some(args) = spawn_args(spawn, terminal).await else { return Ok(()) };
     let said = start_child(args, false, terminal).await;
     match said.strip_prefix(rein_agent::tools::ERROR) {
         Some(why) => Err(why.to_owned()),
@@ -630,15 +635,22 @@ async fn write_to(to: Option<String>, text: Option<String>, task: bool, terminal
 
 /// `/inbox`: what's waiting to be let in; the one picked goes in now.
 async fn inbox(agent: &mut Agent<Llm>, terminal: &mut Terminal) -> CliResult {
+    match pick_held(terminal).await? {
+        Some(incoming) => work_on(incoming, agent, terminal).await,
+        None => Ok(()),
+    }
+}
+
+/// What you let in of what's held back, if there's anything to.
+pub(crate) async fn pick_held(terminal: &mut Terminal) -> CliResult<Option<Incoming>> {
     let held = node(terminal)?.held();
     if held.is_empty() {
         say!("{}nothing is waiting", " ".repeat(GUTTER));
-        return Ok(());
+        return Ok(None);
     }
     let items = held.iter().map(|incoming| (incoming.from().to_owned(), preview(&incoming.text()))).collect();
-    let Some(i) = terminal.input.choose(Menu { title: "let which in".into(), items, current: None, at: None }).await else { return Ok(()) };
-    let Some(incoming) = node(terminal)?.take_held(i) else { return Ok(()) };
-    work_on(incoming, agent, terminal).await
+    let Some(i) = terminal.input.choose(Menu { title: "let which in".into(), items, current: None, at: None }).await else { return Ok(None) };
+    Ok(node(terminal)?.take_held(i))
 }
 
 #[cfg(test)]

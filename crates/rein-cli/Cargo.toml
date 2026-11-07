@@ -10,6 +10,7 @@ description = "rein: a tiny, fast agent harness. You hold the reins."
 rein-agent = { version = "0.1.0", path = "../rein-agent" }
 rein-llm = { version = "0.1.0", path = "../rein-llm" }
 rein-mcp = { version = "0.1.0", path = "../rein-mcp" }
+base64 = "0.23.1"
 libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

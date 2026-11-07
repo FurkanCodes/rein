@@ -5701,15 +5701,18 @@ name = "rein-transcript"
 version = "0.0.0"
 dependencies = [
  "serde_json",
+ "unicode-width",
 ]
 
 [[package]]
 name = "rein-window"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "futures",
  "gpui-kit",
  "gpui-pre",
+ "image",
  "rein-transcript",
  "serde_json",
 ]

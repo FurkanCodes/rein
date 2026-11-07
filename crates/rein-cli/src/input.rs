@@ -74,6 +74,22 @@ pub struct Question {
     pub answers: Vec<(&'static str, String)>,
 }
 
+/// An answer on its way. It lives on rein's one thread, as `Terminal` does.
+pub type Pending<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T>>>;
+
+/// Shows what the box would, where there's no box: a client of `rein serve`
+/// does, so a command asks the same way wherever you are. `None`: you
+/// changed your mind.
+pub trait StandIn {
+    /// Whether it can put a list or a question to you at all.
+    fn can_ask(&self) -> bool;
+    fn choose(&self, menu: &Menu) -> Pending<Option<usize>>;
+    /// A line typed in answer to `prompt`, shown as dots if it's `secret`.
+    fn read(&self, prompt: &str, secret: bool) -> Pending<Option<String>>;
+    /// The key of the answer you gave.
+    fn ask(&self, question: &Question) -> Pending<Option<String>>;
+}
+
 /// A list to choose one from: ↑↓ move, typing narrows it, Enter picks,
 /// Esc cancels. Every command that shows choices shows them this way.
 pub struct Menu {
@@ -171,6 +187,8 @@ pub struct Input {
     root: PathBuf,
     /// What it hides, `@` doesn't offer either.
     sandbox: Arc<Sandbox>,
+    /// What asks in the box's place, if anything does.
+    stand_in: Option<std::rc::Rc<dyn StandIn>>,
 }
 
 /// The box, shared by the keyboard's thread, the clock's and the rest of rein.
@@ -1290,7 +1308,7 @@ impl Input {
                     }
                 }
             });
-            return Input { requests, replies, pending: false, boxed: Some(boxed), _raw: Some(raw), root, sandbox };
+            return Input { requests, replies, pending: false, boxed: Some(boxed), _raw: Some(raw), root, sandbox, stand_in: None };
         }
         std::thread::spawn(move || {
             for prompt in asked {
@@ -1305,7 +1323,22 @@ impl Input {
                 }
             }
         });
-        Input { requests, replies, pending: false, boxed: None, _raw: None, root, sandbox }
+        Input { requests, replies, pending: false, boxed: None, _raw: None, root, sandbox, stand_in: None }
+    }
+
+    /// From here on `stand_in` asks what the box would have.
+    pub fn stand_in(&mut self, stand_in: std::rc::Rc<dyn StandIn>) {
+        self.stand_in = Some(stand_in);
+    }
+
+    pub fn has_stand_in(&self) -> bool {
+        self.stand_in.is_some()
+    }
+
+    /// Whether a list or a question reaches you, in the box or through what
+    /// stands in for it. Without either, there's only a line to type on.
+    pub fn can_ask(&self) -> bool {
+        self.pinned() || self.stand_in.as_ref().is_some_and(|stand_in| stand_in.can_ask())
     }
 
     /// Looks again at what `@` can point at: a turn may have made or
@@ -1343,6 +1376,9 @@ impl Input {
     /// to `prompt`. Plain lines show `prompt` first. A message queued while
     /// rein worked comes back at once.
     pub async fn read(&mut self, prompt: &str, message: bool) -> Read {
+        if let Some(stand_in) = &self.stand_in {
+            return stand_in.read(prompt, false).await.map_or(Read::Interrupted, Read::Line);
+        }
         if !self.pending {
             match &self.boxed {
                 Some(boxed) => {
@@ -1422,6 +1458,9 @@ impl Input {
     /// isn't kept, and Esc cancels. `None` without a box, where it would
     /// show as it's typed.
     pub async fn read_secret(&mut self, prompt: &str) -> Option<Read> {
+        if let Some(stand_in) = &self.stand_in {
+            return Some(stand_in.read(prompt, true).await.map_or(Read::Interrupted, Read::Line));
+        }
         self.boxed.as_ref()?;
         // It starts empty: what's in the box is what you were typing, and
         // Enter would send it to a provider as your key. It comes back after.
@@ -1446,6 +1485,10 @@ impl Input {
     pub async fn choose(&mut self, menu: Menu) -> Option<usize> {
         if menu.items.is_empty() {
             return None;
+        }
+        if let Some(stand_in) = &self.stand_in {
+            // Whoever stands in says what it likes.
+            return stand_in.choose(&menu).await.filter(|picked| *picked < menu.items.len());
         }
         if self.boxed.is_none() {
             let pad = " ".repeat(GUTTER);
@@ -1480,6 +1523,9 @@ impl Input {
 
     /// Asks `question` in the box and waits for the key of the answer.
     pub async fn ask(&mut self, question: Question) -> Read {
+        if let Some(stand_in) = &self.stand_in {
+            return stand_in.ask(&question).await.map_or(Read::Interrupted, Read::Line);
+        }
         if !self.pending {
             self.with(|boxed| {
                 boxed.waiting = Waiting::Answer;

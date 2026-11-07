@@ -106,7 +106,7 @@ fn why_nothing(plan: &Plan) -> String {
     }
 }
 
-fn say_done(done: &Plan, terminal: &Terminal) {
+pub(crate) fn say_done(done: &Plan, terminal: &Terminal) {
     let (pad, s) = (" ".repeat(GUTTER), terminal.err);
     let mut did = Vec::new();
     if !done.put_back.is_empty() {

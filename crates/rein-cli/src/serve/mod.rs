@@ -11,6 +11,8 @@
 //! the terms a tab does. Each sub-agent is a `rein serve` of its own, which
 //! the client starts when it's asked to, and drives like any other.
 
+mod beside;
+mod options;
 mod ui;
 mod wire;
 
@@ -28,15 +30,18 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, Stdin};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::args::{AskArgs, Resume};
-use crate::conversation::{self, Opened, Start, step_limit};
+use crate::commands::Slash;
+use crate::conversation::{self, Opened, Routed, Start, step_limit};
 use crate::format::{shorten, utc_stamp};
 use crate::peers::node::Incoming as Sent;
 use crate::peers::talk::Taken;
 use crate::peers::{self, State, talk};
 use crate::settings::{self, Settings};
+use crate::ui::history::{self, History};
 use crate::{CliResult, config_dir, describe};
-use ui::Served;
-use wire::{Incoming, Refused, Request};
+use beside::{Beside, room, undo_plan, undo_turn};
+use ui::{Asker, Served};
+use wire::{Incoming, Pasted, Refused, Request};
 
 type Input = Lines<BufReader<Stdin>>;
 
@@ -55,6 +60,10 @@ struct Link {
     heard: Rc<RefCell<Vec<Heard>>>,
     /// The client can open a pane for a sub-agent.
     panes: Rc<Cell<bool>>,
+    /// The client can show what a command asks.
+    can_ask: Rc<Cell<bool>>,
+    /// What's asked of the conversation beside a turn.
+    beside: Rc<RefCell<Option<Beside>>>,
 }
 
 impl Link {
@@ -90,8 +99,8 @@ struct Session {
     sandboxing: Sandboxing,
     /// Turns other reins started since the client last said something.
     in_a_row: usize,
-    /// Kept for as long as the conversation: it holds its MCP servers.
-    _setup: conversation::Setup,
+    /// What commands need, and it holds the conversation's MCP servers.
+    setup: conversation::Setup,
 }
 
 /// Runs until the client closes standard input. `flags` are what a
@@ -117,7 +126,7 @@ pub(crate) async fn run(http: &rein_llm::reqwest::Client, flags: Vec<String>) ->
             }
         }
     });
-    let link = Link { out, asked: Rc::default(), asks: Rc::new(Cell::new(0)), heard: Rc::default(), panes: Rc::default() };
+    let link = Link { out, asked: Rc::default(), asks: Rc::new(Cell::new(0)), heard: Rc::default(), panes: Rc::default(), can_ask: Rc::default(), beside: Rc::default() };
     let mut input: Input = BufReader::new(tokio::io::stdin()).lines();
     let mut session: Option<Session> = None;
     loop {
@@ -127,19 +136,32 @@ pub(crate) async fn run(http: &rein_llm::reqwest::Client, flags: Vec<String>) ->
             line = input.next_line() => {
                 let Ok(Some(line)) = line else { break };
                 match Incoming::read(&line) {
+                    Incoming::Request { id, request: Ok(request) } if request.beside_a_turn() => link.answer_beside(&id, &request),
                     Incoming::Request { id, request } => {
+                        let opens = matches!(request, Ok(Request::NewSession { .. } | Request::LoadSession { .. }));
                         let Some(goes_on) = handle(request, http, &flags, &mut session, &link, &mut input).await else { break };
                         goes_on.send(&link, &id);
+                        // After the answer: only that says what it's about.
+                        if let Some(session) = session.as_mut().filter(|_| opens) {
+                            session.served.commands(&crate::skills::offers(session.agent.skills()));
+                            session.served.state();
+                            session.served.terminal.meters.ask(&session.agent.model.client, &session.agent.model_name);
+                        }
                     }
                     Incoming::Unreadable(refused) => link.send(wire::refuse(&Value::Null, &refused)),
                     // Nothing's running to stop, and nothing was asked.
                     Incoming::Cancel | Incoming::Reply { .. } | Incoming::Ignored => {}
                 }
             }
-            sent = from_the_others(&mut session) => {
+            outside = from_outside(&mut session) => {
                 let Some(session) = &mut session else { continue };
-                if !take_in(session, sent, &link, &mut input).await {
-                    break;
+                match outside {
+                    Outside::Sent(sent) => {
+                        if !take_in(session, sent, &link, &mut input).await {
+                            break;
+                        }
+                    }
+                    Outside::Meters(meters) => session.served.meters(&meters),
                 }
             }
             () = job_ended(jobs.as_deref()) => {
@@ -190,8 +212,9 @@ async fn handle(
         Err(refused) => return Some(Answer::Refused(refused)),
     };
     Some(match request {
-        Request::Initialize { panes } => {
+        Request::Initialize { panes, asks } => {
             link.panes.set(panes);
+            link.can_ask.set(asks);
             Answer::Result(initialized())
         }
         Request::NewSession { .. } | Request::LoadSession { .. } if session.is_some() => {
@@ -199,7 +222,7 @@ async fn handle(
         }
         Request::NewSession { cwd } => match open(&cwd, Resume::New, flags, http, link).await {
             Ok(opened) => {
-                let result = json!({ "sessionId": opened.id, "modes": modes(opened.agent.permissions.mode, opened.sandboxing) });
+                let result = json!({ "sessionId": opened.id, "modes": modes(opened.agent.permissions.mode, opened.sandboxing), "configOptions": options::all(&opened.agent, &opened.setup) });
                 *session = Some(opened);
                 Answer::Result(result)
             }
@@ -207,7 +230,7 @@ async fn handle(
         },
         Request::LoadSession { session: id, cwd } => match load(&id, &cwd, flags, http, link).await {
             Ok(opened) => {
-                let result = json!({ "modes": modes(opened.agent.permissions.mode, opened.sandboxing) });
+                let result = json!({ "modes": modes(opened.agent.permissions.mode, opened.sandboxing), "configOptions": options::all(&opened.agent, &opened.setup) });
                 *session = Some(opened);
                 Answer::Result(result)
             }
@@ -217,26 +240,65 @@ async fn handle(
             Ok(result) => Answer::Result(result),
             Err(said) => Answer::Refused(Refused::new(said)),
         },
-        Request::Prompt { session: id, text } => match mine(session, &id) {
-            Ok(session) => return turn(session, text, link, input).await,
+        Request::Prompt { session: id, text, images } => match mine(session, &id) {
+            Ok(session) => return turn(session, text, images, link, input).await,
+            Err(refused) => Answer::Refused(refused),
+        },
+        // `run` answers these, as `alongside` does.
+        Request::Sent { .. } | Request::Paths { .. } | Request::Background { .. } | Request::Tasks { .. } | Request::StopTask { .. } | Request::Room { .. } => {
+            Answer::Result(Value::Null)
+        }
+        // The list goes out with the options, as the others' are looked up.
+        Request::Models { session: id } => match mine(session, &id) {
+            Ok(session) => {
+                conversation::other_models(&mut session.setup, &mut session.served.terminal).await;
+                session.served.options(options::all(&session.agent, &session.setup));
+                Answer::Result(json!({}))
+            }
+            Err(refused) => Answer::Refused(refused),
+        },
+        Request::UndoTurns { session: id } => match mine(session, &id) {
+            Ok(session) => Answer::Result(json!({ "turns": session.agent.undo_list().await.iter().map(undo_turn).collect::<Vec<Value>>() })),
+            Err(refused) => Answer::Refused(refused),
+        },
+        Request::UndoPlan { session: id, turn } => match mine(session, &id) {
+            Ok(session) => Answer::Result(json!({ "plan": undo_plan(&session.agent.undo_plan(turn).await) })),
+            Err(refused) => Answer::Refused(refused),
+        },
+        Request::Undo { session: id, turn } => match mine(session, &id) {
+            Ok(session) => match session.agent.undo(turn).await {
+                Ok(done) => {
+                    let _said = session.served.take_said();
+                    crate::undo::say_done(&done, &session.served.terminal);
+                    Answer::Result(json!({ "plan": undo_plan(&done) }))
+                }
+                Err(e) => Answer::Refused(Refused::new(describe(e))),
+            },
             Err(refused) => Answer::Refused(refused),
         },
         Request::SetMode { session: id, mode } => match mine(session, &id) {
             Ok(session) => {
-                session.agent.permissions.mode = mode;
-                session.agent.step_limit = step_limit(mode, false, session.max_steps);
-                session.served.terminal.mode = mode;
-                if let Some(peers) = &session.served.terminal.peers {
-                    peers.follow_mode(mode);
-                }
+                conversation::set_mode(mode, &mut session.agent, &mut session.served.terminal, session.max_steps);
+                session.served.options(options::all(&session.agent, &session.setup));
                 Answer::Result(json!({}))
             }
+            Err(refused) => Answer::Refused(refused),
+        },
+        Request::SetOption { session: id, option, value } => match mine(session, &id) {
+            Ok(session) => match options::command(&option, &value) {
+                Ok(chosen) => match setting(session, chosen, link, input).await {
+                    Alongside::ClientGone => return None,
+                    Alongside::Done(Err(why)) => Answer::Refused(Refused::new(why)),
+                    Alongside::Done(Ok(())) | Alongside::Cancelled => Answer::Result(json!({ "configOptions": options::all(&session.agent, &session.setup) })),
+                },
+                Err(refused) => Answer::Refused(refused),
+            },
             Err(refused) => Answer::Refused(refused),
         },
         // With no turn running, it goes in as the next one starts.
         Request::Steer { session: id, text } => match mine(session, &id) {
             Ok(_) => {
-                link.heard.borrow_mut().push(Heard::You(text));
+                link.steer(text);
                 Answer::Result(json!({}))
             }
             Err(refused) => Answer::Refused(refused),
@@ -254,9 +316,9 @@ fn initialized() -> Value {
         "agentCapabilities": {
             "loadSession": true,
             "sessionCapabilities": { "list": {} },
-            "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
+            "promptCapabilities": { "image": true, "audio": false, "embeddedContext": false },
             "mcpCapabilities": { "http": false, "sse": false },
-            "_meta": { (wire::STEERS): true, (wire::PANES): true },
+            "_meta": { (wire::STEERS): true, (wire::PANES): true, (wire::ASKS): true },
         },
         "agentInfo": { "name": "rein", "title": "rein", "version": env!("CARGO_PKG_VERSION") },
         "authMethods": [],
@@ -316,8 +378,14 @@ async fn open(cwd: &Path, resume: Resume, flags: &[String], http: &rein_llm::req
     // The saved conversation's own, for `session/load` to find it by.
     let id = agent.session().map(|session| session.header().id.clone()).ok_or("the conversation has no file")?;
     let sandboxing = agent.permissions.sandboxing();
+    // Its standard input is this protocol: nothing else may read it.
+    terminal.input.stand_in(Rc::new(Asker { session: id.clone(), link: link.clone() }));
+    let (root, sandbox, jobs) = (agent.tools.root().to_owned(), agent.tools.sandbox().clone(), agent.tools.jobs().clone());
+    let sent = History::load(history::file(&dir, &root));
+    let room = room(&agent, &terminal);
+    *link.beside.borrow_mut() = Some(Beside { session: id.clone(), root, sandbox, jobs, sent, room });
     let served = Served::new(id.clone(), link.clone(), terminal);
-    Ok(Session { id, agent, served, max_steps, sandboxing, in_a_row: 0, _setup: setup })
+    Ok(Session { id, agent, served, max_steps, sandboxing, in_a_row: 0, setup })
 }
 
 /// Where the conversations held in `cwd` are saved.
@@ -358,12 +426,21 @@ fn listed(cwd: Option<&Path>, skip: usize) -> CliResult<Value> {
     Ok(listed)
 }
 
-/// The next thing another rein sends; never, before there's a conversation
-/// or for one not among them.
-async fn from_the_others(session: &mut Option<Session>) -> Sent {
-    match session {
-        Some(session) => conversation::from_peers(&mut session.served.terminal.peers).await,
-        None => std::future::pending().await,
+/// What came from outside the client.
+enum Outside {
+    /// Another rein sent this.
+    Sent(Sent),
+    /// The provider says this of your limits.
+    Meters(Vec<rein_llm::Meter>),
+}
+
+/// The next thing from outside; never, before there's a conversation.
+async fn from_outside(session: &mut Option<Session>) -> Outside {
+    let Some(session) = session else { return std::future::pending().await };
+    let terminal = &mut session.served.terminal;
+    tokio::select! {
+        sent = conversation::from_peers(&mut terminal.peers) => Outside::Sent(sent),
+        meters = terminal.meters.answered() => Outside::Meters(meters),
     }
 }
 
@@ -381,8 +458,7 @@ async fn take_in(session: &mut Session, sent: Sent, link: &Link, input: &mut Inp
     let sent = match talk::starts_a_turn(sent, &mut session.in_a_row, &mut session.served.terminal) {
         Taken::Turn(sent) => sent,
         Taken::Noted => return true,
-        // There's no `/inbox` here. Not what your rules hold back: that
-        // stays there, and only a terminal can let it in.
+        // Not what your rules hold back: that stays in `/inbox`, for you.
         Taken::TooMany(sent) => {
             let terminal = &mut session.served.terminal;
             let note = terminal.heard_of(sent);
@@ -419,18 +495,215 @@ enum Ended {
     ClientGone,
 }
 
-/// What a client's prompt comes to. `None`: it went away.
-async fn turn(session: &mut Session, prompt: String, link: &Link, input: &mut Input) -> Option<Answer> {
-    session.in_a_row = 0;
-    for (skill, given) in crate::skills::called(&prompt, session.agent.skills()) {
-        session.agent.call_skill(&skill, given);
+/// How something run alongside what comes in came out.
+enum Alongside<T> {
+    Done(T),
+    Cancelled,
+    /// Standard input closed.
+    ClientGone,
+}
+
+/// Runs `work`, reading what comes in as it goes: the answers it's waiting
+/// for, a stop, and only if it `steers`, what you say to a turn. Anything else
+/// has to wait for it.
+async fn alongside<T>(work: impl Future<Output = T>, steers: bool, link: &Link, input: &mut Input) -> Alongside<T> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            done = &mut work => return Alongside::Done(done),
+            line = input.next_line() => {
+                let Ok(Some(line)) = line else { return Alongside::ClientGone };
+                match Incoming::read(&line) {
+                    Incoming::Cancel => return Alongside::Cancelled,
+                    Incoming::Reply { id, result } => link.answered(id, result),
+                    Incoming::Request { id, request: Ok(Request::Steer { text, .. }) } if steers => {
+                        link.steer(text);
+                        link.send(wire::answer(&id, &json!({})));
+                    }
+                    Incoming::Request { id, request: Ok(request) } if request.beside_a_turn() => link.answer_beside(&id, &request),
+                    Incoming::Request { id, .. } => link.send(wire::refuse(&id, &Refused::busy("a turn is running: stop it, or wait for it to end"))),
+                    Incoming::Unreadable(refused) => link.send(wire::refuse(&Value::Null, &refused)),
+                    Incoming::Ignored => {}
+                }
+            }
+        }
     }
-    Some(match work(session, Start::You(prompt), link, input).await {
-        Ended::Finished(Ok(outcome)) => Answer::Result(json!({ "stopReason": stop_reason(&outcome) })),
-        Ended::Finished(Err(e)) => Answer::Refused(Refused::new(describe(e))),
-        Ended::Cancelled => Answer::Result(json!({ "stopReason": "cancelled" })),
-        Ended::ClientGone => return None,
+}
+
+/// What a client's prompt comes to: a command, as ACP has them, or a message.
+/// `None`: it went away.
+async fn turn(session: &mut Session, prompt: String, images: Vec<Pasted>, link: &Link, input: &mut Input) -> Option<Answer> {
+    session.in_a_row = 0;
+    link.remember(&prompt);
+    // What starts with a `/` may have a key in it, and only rein knows.
+    if prompt.trim_start().starts_with('/') {
+        session.served.ran(prompt.trim());
+    }
+    let routed = {
+        let Session { agent, served, setup, .. } = &mut *session;
+        let _said = served.take_said();
+        alongside(conversation::routed(prompt.trim(), agent, &mut served.terminal, setup), false, link, input).await
+    };
+    // Looking at the skills for this message may have found others.
+    session.served.commands(&crate::skills::offers(session.agent.skills()));
+    let done = || Answer::Result(json!({ "stopReason": "end_turn" }));
+    let cancelled = || Answer::Result(json!({ "stopReason": "cancelled" }));
+    Some(match routed {
+        Alongside::Done(Routed::Message) => {
+            if let Err(why) = take_images(session, images).await {
+                return Some(Answer::Refused(Refused::new(why)));
+            }
+            match work(session, Start::You(prompt), link, input).await {
+                Ended::Finished(Ok(outcome)) => Answer::Result(json!({ "stopReason": stop_reason(&outcome) })),
+                Ended::Finished(Err(e)) => Answer::Refused(Refused::new(describe(e))),
+                Ended::Cancelled => cancelled(),
+                Ended::ClientGone => return None,
+            }
+        }
+        Alongside::Done(Routed::Command(parsed)) => match command(session, parsed, link, input).await {
+            Alongside::Done(()) => done(),
+            Alongside::Cancelled => cancelled(),
+            Alongside::ClientGone => return None,
+        },
+        Alongside::Done(Routed::Neither) => done(),
+        Alongside::Cancelled => cancelled(),
+        Alongside::ClientGone => return None,
     })
+}
+
+/// Checks and keeps what came with a message, as Ctrl-V does, for it to go
+/// with it: all of them, or none, and why. Your words aren't sent without
+/// what they're about.
+async fn take_images(session: &mut Session, images: Vec<Pasted>) -> Result<(), String> {
+    let mut taken = Vec::with_capacity(images.len());
+    for pasted in images {
+        let folder = session.setup.images();
+        let what = pasted.label.map_or_else(|| "the image you pasted".to_owned(), |label| format!("the image you pasted as {label}"));
+        let prepared = tokio::task::spawn_blocking(move || rein_agent::image::prepare(&pasted.bytes, &what, &folder));
+        taken.push(prepared.await.unwrap_or_else(|e| Err(e.to_string()))?);
+    }
+    for image in taken {
+        session.agent.paste(image);
+    }
+    Ok(())
+}
+
+/// `/inbox`: what you let in is a turn here like any another rein starts,
+/// so its steps reach the client, which is asked what it asks. The
+/// terminal's would run behind it, where Stop leaves a call unanswered.
+async fn inbox(session: &mut Session, link: &Link, input: &mut Input) -> Alongside<()> {
+    let picked = {
+        let _said = session.served.take_said();
+        match alongside(talk::pick_held(&mut session.served.terminal), false, link, input).await {
+            Alongside::Done(Ok(picked)) => picked,
+            Alongside::Done(Err(e)) => {
+                say!("✗ {e}");
+                None
+            }
+            Alongside::Cancelled => return Alongside::Cancelled,
+            Alongside::ClientGone => return Alongside::ClientGone,
+        }
+    };
+    let Some(incoming) = picked else { return Alongside::Done(()) };
+    let (Some(Heard::Peer { from, text }) | Some(Heard::Reported { from, text })) = session.served.terminal.heard_of(incoming) else { return Alongside::Done(()) };
+    link.send(wire::heard(&session.id, &from, &text));
+    match work(session, Start::Peer { from, text }, link, input).await {
+        Ended::Finished(outcome) => {
+            if let Err(e) = outcome {
+                let _said = session.served.take_said();
+                say!("✗ {}", describe(e));
+            }
+            Alongside::Done(())
+        }
+        Ended::Cancelled => Alongside::Cancelled,
+        Ended::ClientGone => Alongside::ClientGone,
+    }
+}
+
+/// Runs a command. What it says goes to the client, and a command that
+/// fails says so there too, as it does in a terminal: it isn't a turn, and
+/// the conversation goes on.
+async fn command(session: &mut Session, parsed: Result<Slash, crate::commands::Refused>, link: &Link, input: &mut Input) -> Alongside<()> {
+    if matches!(parsed, Ok(Slash::Inbox)) {
+        return inbox(session, link, input).await;
+    }
+    let Session { agent, served, setup, .. } = &mut *session;
+    let _said = served.take_said();
+    let done = match parsed {
+        // A process holds one conversation, and what starts or ends one is
+        // the client.
+        Ok(Slash::New | Slash::Resume | Slash::Exit) => Err("that's for your client: close this conversation, or start or open another".to_owned()),
+        // A sub-agent here is a pane, never a terminal's tab.
+        Ok(Slash::Spawn(spawn)) => {
+            let work = async {
+                let Some(args) = talk::spawn_args(spawn, &mut served.terminal).await else { return Ok(()) };
+                let said = served.spawn_yours(args).await;
+                match said.strip_prefix(rein_agent::tools::ERROR) {
+                    Some(why) => Err(why.to_owned()),
+                    None => {
+                        say!("{said}");
+                        Ok(())
+                    }
+                }
+            };
+            match alongside(work, false, link, input).await {
+                Alongside::Done(done) => done,
+                Alongside::Cancelled => return Alongside::Cancelled,
+                Alongside::ClientGone => return Alongside::ClientGone,
+            }
+        }
+        Ok(command) => match alongside(conversation::run_command(command, agent, &mut served.terminal, setup), false, link, input).await {
+            Alongside::Done(done) => done,
+            Alongside::Cancelled => {
+                link.asked.borrow_mut().clear();
+                return Alongside::Cancelled;
+            }
+            Alongside::ClientGone => return Alongside::ClientGone,
+        },
+        Err(refused) => Err(refused.to_string()),
+    };
+    link.asked.borrow_mut().clear();
+    if let Err(e) = done {
+        say!("✗ {e}");
+    }
+    say_changes(agent, served, setup, link);
+    Alongside::Done(())
+}
+
+/// Sets what was chosen in a client's own control, which shows it: nothing's
+/// said of it, as nobody wrote it, and what stopped it is the answer. A mode
+/// or a sandbox shows as set while rein asks whether to keep it.
+async fn setting(session: &mut Session, chosen: Slash, link: &Link, input: &mut Input) -> Alongside<CliResult> {
+    let Session { id, agent, served, setup, max_steps, .. } = &mut *session;
+    let unsaid = served.leave_unsaid();
+    let done = match chosen {
+        Slash::Mode(Some(mode)) => {
+            conversation::set_mode(mode, agent, &mut served.terminal, *max_steps);
+            served.options(options::all(agent, setup));
+            alongside(crate::modes::keep_mode(mode, &mut served.terminal), false, link, input).await
+        }
+        Slash::Sandbox(Some(on)) => {
+            conversation::set_sandbox(on, agent, &mut served.terminal);
+            served.options(options::all(agent, setup));
+            if let Some(missing) = crate::modes::walls_missing(served.terminal.sandboxing, agent.permissions.sandbox()) {
+                link.send(wire::noted(id, &missing));
+            }
+            alongside(crate::modes::keep_sandbox(on, &mut served.terminal), false, link, input).await
+        }
+        chosen => alongside(conversation::run_command(chosen, agent, &mut served.terminal, setup), false, link, input).await,
+    };
+    drop(unsaid);
+    link.asked.borrow_mut().clear();
+    say_changes(agent, served, setup, link);
+    done
+}
+
+/// Tells the client what a command left changed.
+fn say_changes(agent: &Agent<Llm>, served: &mut Served, setup: &conversation::Setup, link: &Link) {
+    served.options(options::all(agent, setup));
+    served.commands(&crate::skills::offers(agent.skills()));
+    served.state();
+    link.room_changed(agent, &served.terminal);
 }
 
 /// Runs a turn, reading what comes in alongside it, then sends each task
@@ -446,25 +719,10 @@ async fn work(session: &mut Session, start: Start, link: &Link, input: &mut Inpu
                 Start::Ended => agent.hear_ended(served).await,
             }
         };
-        tokio::pin!(work);
-        loop {
-            tokio::select! {
-                outcome = &mut work => break Ended::Finished(outcome),
-                line = input.next_line() => {
-                    let Ok(Some(line)) = line else { break Ended::ClientGone };
-                    match Incoming::read(&line) {
-                        Incoming::Cancel => break Ended::Cancelled,
-                        Incoming::Reply { id, result } => link.answered(id, result),
-                        Incoming::Request { id, request: Ok(Request::Steer { text, .. }) } => {
-                            link.heard.borrow_mut().push(Heard::You(text));
-                            link.send(wire::answer(&id, &json!({})));
-                        }
-                        Incoming::Request { id, .. } => link.send(wire::refuse(&id, &Refused::busy("a turn is running: stop it, or wait for it to end"))),
-                        Incoming::Unreadable(refused) => link.send(wire::refuse(&Value::Null, &refused)),
-                        Incoming::Ignored => {}
-                    }
-                }
-            }
+        match alongside(work, true, link, input).await {
+            Alongside::Done(outcome) => Ended::Finished(outcome),
+            Alongside::Cancelled => Ended::Cancelled,
+            Alongside::ClientGone => Ended::ClientGone,
         }
     };
     crate::skills::count(session.agent.take_loaded());
@@ -473,6 +731,16 @@ async fn work(session: &mut Session, start: Start, link: &Link, input: &mut Inpu
     if !matches!(ended, Ended::Finished(Ok(_))) {
         session.agent.repair();
     }
+    // What it comes to, and what it can be undone back to if it changed files.
+    let undo = if session.served.terminal.turn.changed_files() { session.agent.undo_list().await.first().map(|turn| turn.turn) } else { None };
+    if !matches!(ended, Ended::ClientGone) {
+        session.served.turn_ended(undo);
+    }
+    link.room_changed(&session.agent, &session.served.terminal);
+    // A model can turn an effort down, and a turn tells of your limits.
+    session.served.options(options::all(&session.agent, &session.setup));
+    session.served.state();
+    session.served.terminal.meters.ask(&session.agent.model.client, &session.agent.model_name);
     let terminal = &mut session.served.terminal;
     let outcome = if let Ended::Finished(Ok(outcome)) = &ended { Some(outcome) } else { None };
     terminal.state(if outcome == Some(&Outcome::Done) { State::Done } else { State::Idle });
@@ -481,7 +749,7 @@ async fn work(session: &mut Session, start: Start, link: &Link, input: &mut Inpu
         if matches!(start, Start::You(_)) && terminal.tasks.is_empty() {
             talk::follow_up(terminal).await;
         }
-        talk::report(terminal, outcome).await;
+        talk::report(terminal, outcome.as_ref().copied()).await;
     }
     ended
 }

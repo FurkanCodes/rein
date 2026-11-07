@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use rein_transcript::{Modes, Saved};
+use rein_transcript::{Asking, Meter, Modes, Saved, Setting, Words};
 use serde_json::{Value, json};
 
 /// What an agent said.
@@ -29,6 +29,7 @@ pub(crate) enum Said {
         id: Value,
         call: String,
         options: Value,
+        words: Words,
     },
     /// It asks, under this number, for a sub-agent to be started: `None` if
     /// what it asked can't be read.
@@ -36,8 +37,22 @@ pub(crate) enum Said {
         id: Value,
         asked: Option<SubAgent>,
     },
+    /// A command asks you something, under this number.
+    Asking {
+        id: Value,
+        asking: Asking,
+    },
     /// The modes it offers, and the one it's in.
     Modes(Modes),
+    /// All that can be set, as it stands now.
+    Settings(Vec<Setting>),
+    /// What a window shows that ACP has no word for.
+    State {
+        branch: Option<String>,
+        meters: Vec<Meter>,
+        /// How many commands are running in the background.
+        background: u64,
+    },
     /// The conversation has started, under this id.
     Started(String),
     /// A turn nobody here prompted has started.
@@ -64,6 +79,18 @@ pub(crate) enum CameTo {
     /// It can't be done while a turn runs.
     Busy(String),
     Refused(String),
+    /// It answered, and this is what it said.
+    Told(Value),
+}
+
+/// An image to go with a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Attached {
+    /// What the message calls it: `[Image #1]`.
+    pub(crate) label: String,
+    pub(crate) mime: &'static str,
+    /// In base64, as it goes.
+    pub(crate) data: String,
 }
 
 /// A sub-agent to run: `rein serve` says what to start, and it's started
@@ -125,7 +152,7 @@ pub(crate) struct Agent {
     session: Option<String>,
     /// What was written before the conversation had started: the first is
     /// a prompt, and the rest steer it.
-    waiting: Vec<(u64, String)>,
+    waiting: Vec<(u64, String, Vec<Attached>)>,
 }
 
 const NEW: u64 = 2;
@@ -143,9 +170,24 @@ const PANES: &str = "io.github.furkancodes/panes";
 const OPEN_PANE: &str = "_io.github.furkancodes/open_pane";
 const TURN_STARTED: &str = "_io.github.furkancodes/turn_started";
 const TURN_ENDED: &str = "_io.github.furkancodes/turn_ended";
+const STATE: &str = "_io.github.furkancodes/state";
+/// Said in `initialize`: this window shows what a command asks.
+const ASKS: &str = "io.github.furkancodes/asks";
+/// What you sent from this folder, and what `@` can point at.
+const SENT: &str = "_io.github.furkancodes/sent";
+const PATHS: &str = "_io.github.furkancodes/paths";
+const BACKGROUND: &str = "_io.github.furkancodes/background";
+const TASKS: &str = "_io.github.furkancodes/tasks";
+const STOP_TASK: &str = "_io.github.furkancodes/stop_task";
+const ROOM: &str = "_io.github.furkancodes/room";
+const MODELS: &str = "_io.github.furkancodes/models";
+const UNDO_TURNS: &str = "_io.github.furkancodes/undo_turns";
+const UNDO_PLAN: &str = "_io.github.furkancodes/undo_plan";
+const UNDO: &str = "_io.github.furkancodes/undo";
+const LABEL: &str = "io.github.furkancodes/label";
 
 fn initialize() -> Value {
-    json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": { "_meta": { PANES: true } } } })
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": { "_meta": { PANES: true, ASKS: true } } } })
 }
 
 fn send(input: &mut impl Write, message: &Value) {
@@ -175,6 +217,8 @@ fn answered(message: &Value, opening: &Opening) -> Option<Said> {
         CameTo::Refused(why())
     } else if message["result"]["stopReason"].is_string() {
         CameTo::TurnOver
+    } else if message["result"].as_object().is_some_and(|said| !said.is_empty()) {
+        CameTo::Told(message["result"].clone())
     } else {
         CameTo::Done
     };
@@ -198,25 +242,33 @@ fn read(output: impl BufRead, said: &UnboundedSender<Said>, opening: &Opening) {
         // With no conversation there's nothing more it can do: left open,
         // what you write would wait for one for good.
         let no_conversation = message["id"] == NEW && message["error"].is_object();
-        if message["id"] == NEW
-            && let Some(modes) = Modes::of(&message["result"]["modes"])
-            && said.unbounded_send(Said::Modes(modes)).is_err()
-        {
-            return;
+        if message["id"] == NEW {
+            let settings = Some(Setting::listed(&message["result"]["configOptions"])).filter(|settings| !settings.is_empty()).map(Said::Settings);
+            let modes = Modes::of(&message["result"]["modes"]).map(Said::Modes);
+            if modes.into_iter().chain(settings).any(|one| said.unbounded_send(one).is_err()) {
+                return;
+            }
         }
         let params = &message["params"];
         let one = match message["method"].as_str() {
+            Some("session/update") if params["update"]["sessionUpdate"] == "config_option_update" => Some(Said::Settings(Setting::listed(&params["update"]["configOptions"]))),
             Some("session/update") => Some(Said::Update(params["update"].clone())),
-            Some("session/request_permission") => {
-                Some(Said::Asked { id: message["id"].clone(), call: params["toolCall"]["toolCallId"].as_str().unwrap_or_default().to_owned(), options: params["options"].clone() })
+            Some(STATE) => {
+                Some(Said::State { branch: params["branch"].as_str().map(str::to_owned), meters: Meter::listed(params), background: params["background"].as_u64().unwrap_or(0) })
             }
+            Some("session/request_permission") => Some(Said::Asked {
+                id: message["id"].clone(),
+                call: params["toolCall"]["toolCallId"].as_str().unwrap_or_default().to_owned(),
+                options: params["options"].clone(),
+                words: Words::of(params),
+            }),
             Some(OPEN_PANE) => Some(Said::SubAgent { id: message["id"].clone(), asked: SubAgent::of(params) }),
             Some(TURN_STARTED) => Some(Said::TurnStarted),
             Some(TURN_ENDED) => Some(turn_ended(params)),
             Some("_io.github.furkancodes/heard") => {
                 Some(Said::Heard { from: params["from"].as_str().unwrap_or("?").to_owned(), text: params["text"].as_str().unwrap_or_default().to_owned() })
             }
-            Some(_) => None,
+            Some(method) => Asking::of(method, params).map(|asking| Said::Asking { id: message["id"].clone(), asking }),
             None => answered(&message, opening),
         };
         if let Some(one) = one
@@ -316,28 +368,93 @@ impl Agent {
     pub(crate) fn started(&mut self, session: String) {
         self.session = Some(session);
         let mut waiting = std::mem::take(&mut self.waiting).into_iter();
-        if let Some((id, text)) = waiting.next() {
-            self.prompt(id, &text);
+        if let Some((id, text, images)) = waiting.next() {
+            self.prompt(id, &text, &images);
         }
-        for (id, text) in waiting {
+        for (id, text, _) in waiting {
             self.steer(id, &text);
         }
     }
 
-    /// Sends `text` as a prompt.
-    pub(crate) fn prompt(&mut self, id: u64, text: &str) {
+    /// Sends `text` as a prompt, with `images`.
+    pub(crate) fn prompt(&mut self, id: u64, text: &str, images: &[Attached]) {
         let Some(session) = &self.session else {
-            self.waiting.push((id, text.to_owned()));
+            self.waiting.push((id, text.to_owned(), images.to_vec()));
             return;
         };
-        let params = json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] });
+        let mut prompt = vec![json!({ "type": "text", "text": text })];
+        prompt.extend(images.iter().map(|image| json!({ "type": "image", "data": image.data, "mimeType": image.mime, "_meta": { LABEL: image.label } })));
+        let params = json!({ "sessionId": session, "prompt": prompt });
         self.say(&json!({ "jsonrpc": "2.0", "id": id, "method": "session/prompt", "params": params }));
+    }
+
+    /// Asks `method`, of this conversation, under the number `id`.
+    fn ask_of_it(&mut self, id: u64, method: &str) -> bool {
+        self.ask_with(id, method, json!({}))
+    }
+
+    /// The same, saying more.
+    fn ask_with(&mut self, id: u64, method: &str, mut params: Value) -> bool {
+        let Some(session) = &self.session else { return false };
+        params["sessionId"] = json!(session);
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        true
+    }
+
+    /// Asks what's in the background.
+    pub(crate) fn ask_tasks(&mut self, id: u64) -> bool {
+        self.ask_of_it(id, TASKS)
+    }
+
+    /// Stops the background command `task`.
+    pub(crate) fn stop_task(&mut self, id: u64, task: &str) -> bool {
+        self.ask_with(id, STOP_TASK, json!({ "id": task }))
+    }
+
+    /// Asks what's taking room.
+    pub(crate) fn ask_room(&mut self, id: u64) -> bool {
+        self.ask_of_it(id, ROOM)
+    }
+
+    /// Has the other providers' models looked up: they come with the options.
+    pub(crate) fn ask_models(&mut self, id: u64) -> bool {
+        self.ask_of_it(id, MODELS)
+    }
+
+    /// Asks which turns there are to undo.
+    pub(crate) fn ask_undo_turns(&mut self, id: u64) -> bool {
+        self.ask_of_it(id, UNDO_TURNS)
+    }
+
+    /// Asks what undoing back to `turn` does.
+    pub(crate) fn ask_undo_plan(&mut self, id: u64, turn: usize) -> bool {
+        self.ask_with(id, UNDO_PLAN, json!({ "turn": turn }))
+    }
+
+    /// Undoes back to before `turn`.
+    pub(crate) fn undo(&mut self, id: u64, turn: usize) -> bool {
+        self.ask_with(id, UNDO, json!({ "turn": turn }))
+    }
+
+    /// Asks what you sent from this folder before.
+    pub(crate) fn ask_sent(&mut self, id: u64) -> bool {
+        self.ask_of_it(id, SENT)
+    }
+
+    /// Asks what `@` can point at.
+    pub(crate) fn ask_paths(&mut self, id: u64) -> bool {
+        self.ask_of_it(id, PATHS)
+    }
+
+    /// Sends the command that's running to the background.
+    pub(crate) fn background(&mut self, id: u64) -> bool {
+        self.ask_of_it(id, BACKGROUND)
     }
 
     /// Sends `text` into the turn that's running.
     pub(crate) fn steer(&mut self, id: u64, text: &str) {
         let Some(session) = &self.session else {
-            self.waiting.push((id, text.to_owned()));
+            self.waiting.push((id, text.to_owned(), Vec::new()));
             return;
         };
         let params = json!({ "sessionId": session, "message": text });
@@ -367,6 +484,19 @@ impl Agent {
     /// what's pressed is a yes.
     pub(crate) fn answer(&mut self, id: &Value, chosen: &str) {
         self.say(&json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": { "outcome": "selected", "optionId": chosen } } }));
+    }
+
+    /// Sets `option` to `value`, under the number `id`.
+    pub(crate) fn set_option(&mut self, id: u64, option: &str, value: &str) -> bool {
+        let Some(session) = &self.session else { return false };
+        let params = json!({ "sessionId": session, "configId": option, "value": value });
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "method": "session/set_config_option", "params": params }));
+        true
+    }
+
+    /// Answers what a command asked under `id`.
+    pub(crate) fn reply(&mut self, id: &Value, result: &Value) {
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
     }
 
     /// Says the sub-agent asked for under `id` has started.
@@ -491,8 +621,16 @@ mod tests {
     #[test]
     fn a_question_names_its_step() {
         let options = json!([{ "optionId": "allow", "name": "Allow", "kind": "allow_once" }]);
-        let asked = heard(&[json!({ "id": 7, "method": "session/request_permission", "params": { "toolCall": { "toolCallId": "call_1" }, "options": options } })]);
-        assert_eq!(asked, [Said::Asked { id: json!(7), call: "call_1".to_owned(), options }, Said::Ended]);
+        let asked = heard(&[
+            json!({ "id": 7, "method": "session/request_permission", "params": { "toolCall": { "toolCallId": "call_1" }, "options": options, "_meta": { "io.github.furkancodes/question": "Allow this edit?", "io.github.furkancodes/why": "Why: it must" } } }),
+        ]);
+        assert_eq!(
+            asked,
+            [
+                Said::Asked { id: json!(7), call: "call_1".to_owned(), options, words: Words { asks: Some("Allow this edit?".to_owned()), why: Some("Why: it must".to_owned()) } },
+                Said::Ended
+            ]
+        );
     }
 
     #[test]
@@ -591,7 +729,7 @@ mod tests {
         let dir = scratch("waits");
         let file = dir.join("got");
         let mut agent = sh(&format!("cat > {}", file.display()));
-        agent.prompt(101, "first");
+        agent.prompt(101, "first", &[]);
         agent.steer(102, "second");
         agent.started("abc".to_owned());
         agent.steer(103, "third");
@@ -608,7 +746,7 @@ mod tests {
         let dir = scratch("stopped-early");
         let file = dir.join("got");
         let mut agent = sh(&format!("cat > {}", file.display()));
-        agent.prompt(101, "delete the lot");
+        agent.prompt(101, "delete the lot", &[]);
         agent.steer(102, "and quickly");
         assert_eq!(agent.stop(), Stopping::NeverBegan);
         agent.started("abc".to_owned());

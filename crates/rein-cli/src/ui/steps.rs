@@ -492,14 +492,7 @@ pub enum Changed {
 pub fn change(call: &ToolCall, root: &Path, applied: bool) -> Vec<Changed> {
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     let Some((old, new)) = sides(call, &args) else { return Vec::new() };
-    // Where the change starts in the file, for the line numbers.
-    let first = match ToolName::of(call) {
-        Some(ToolName::Edit) => args["path"]
-            .as_str()
-            .and_then(|path| std::fs::read_to_string(root.join(path)).ok())
-            .and_then(|text| text.find(if applied { new } else { old }).map(|at| text[..at].matches('\n').count() + 1)),
-        _ => Some(1),
-    };
+    let first = line_of(call, &args, root, if applied { new } else { old });
     let (old, new, same_start) = changed_lines(old, new);
     let first = first.map(|first| first + same_start);
     let mut lines = Vec::new();
@@ -515,6 +508,38 @@ pub fn change(call: &ToolCall, root: &Path, applied: bool) -> Vec<Changed> {
         lines.push(Changed::Note("(every occurrence)".to_owned()));
     }
     lines
+}
+
+/// Where the change starts in the file, for the line numbers: where
+/// `found` is, in an edit.
+fn line_of(call: &ToolCall, args: &Value, root: &Path, found: &str) -> Option<usize> {
+    match ToolName::of(call) {
+        Some(ToolName::Edit) => {
+            args["path"].as_str().and_then(|path| std::fs::read_to_string(root.join(path)).ok()).and_then(|text| text.find(found).map(|at| text[..at].matches('\n').count() + 1))
+        }
+        _ => Some(1),
+    }
+}
+
+/// A change to a file, all of it, for a client to show as it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Whole {
+    pub path: String,
+    /// What it replaces, for an edit: a file written whole replaces nothing.
+    pub old: Option<String>,
+    pub new: String,
+    /// The line the old text starts on, as far as can be told.
+    pub line: Option<usize>,
+}
+
+/// What `call` would change, if it changes a file, with nothing left out:
+/// a yes goes to all of it. `root` is where its path starts.
+pub fn whole_change(call: &ToolCall, root: &Path) -> Option<Whole> {
+    let args: Value = serde_json::from_str(&call.arguments).ok()?;
+    let (old, new) = sides(call, &args)?;
+    let path = root.join(args["path"].as_str()?).to_string_lossy().into_owned();
+    let line = line_of(call, &args, root, old);
+    Some(Whole { path, old: (!old.is_empty()).then(|| old.to_owned()), new: new.to_owned(), line })
 }
 
 /// A change's lines at `columns`, under the step: the lines it takes away
