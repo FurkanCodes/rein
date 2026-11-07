@@ -1,8 +1,8 @@
-# The throwaway test window: a workspace of its own, so nothing of GPUI's
+# rein's window: a workspace of its own, so nothing of GPUI's
 # reaches rein's dependencies or its checks.
 [workspace]
 resolver = "3"
-members = ["replay", "transcript", "window"]
+members = ["replay", "stubs/bench-metrics", "transcript", "window"]
 
 [workspace.package]
 edition = "2024"
@@ -11,3 +11,6 @@ publish = false
 
 [profile.release]
 debug = "line-tables-only"
+
+[patch.crates-io]
+gpui-pre-bench-metrics = { path = "stubs/bench-metrics" }

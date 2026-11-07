@@ -4,9 +4,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::channel;
+use std::sync::{Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use rein_transcript::{Modes, Saved};
 use serde_json::{Value, json};
 
 /// What an agent said.
@@ -18,23 +22,102 @@ pub(crate) enum Said {
         from: String,
         text: String,
     },
-    /// It asks, under this number, whether step `call` may run. `rein serve`
-    /// says which step and no more: what it does was said as it was shown.
+    /// It asks, under this number, whether step `call` may run, offering
+    /// `options`. `rein serve` says which step and no more: what it does was
+    /// said as it was shown.
     Asked {
         id: Value,
         call: String,
+        options: Value,
     },
+    /// It asks, under this number, for a sub-agent to be started: `None` if
+    /// what it asked can't be read.
+    SubAgent {
+        id: Value,
+        asked: Option<SubAgent>,
+    },
+    /// The modes it offers, and the one it's in.
+    Modes(Modes),
     /// The conversation has started, under this id.
     Started(String),
+    /// A turn nobody here prompted has started.
+    TurnStarted,
     /// A turn came to an end.
     TurnOver,
-    /// What was asked of it failed, and this is why.
+    /// What it was doing failed, and this is why.
     Failed(String),
+    /// What came of the request sent under this number.
+    Answer {
+        id: u64,
+        came_to: CameTo,
+    },
     Ended,
 }
 
+/// What came of a request. Whoever sent it knows what that means: a mode
+/// that's turned down hasn't failed a turn.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CameTo {
+    Done,
+    /// The turn it started has ended.
+    TurnOver,
+    /// It can't be done while a turn runs.
+    Busy(String),
+    Refused(String),
+}
+
+/// A sub-agent to run: `rein serve` says what to start, and it's started
+/// with no shell in between.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SubAgent {
+    pub(crate) name: String,
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: String,
+    /// Added to what the window has.
+    pub(crate) env: Vec<(String, String)>,
+}
+
+impl SubAgent {
+    fn of(params: &Value) -> Option<SubAgent> {
+        let text = |value: &Value| value.as_str().map(str::to_owned);
+        let mut command = vec![text(&params["command"])?];
+        for arg in params["args"].as_array()? {
+            command.push(text(arg)?);
+        }
+        let env = params["env"].as_array()?.iter().map(|one| Some((text(&one["name"])?, text(&one["value"])?))).collect::<Option<_>>()?;
+        Some(SubAgent { name: text(&params["name"])?, command, cwd: text(&params["cwd"])?, env })
+    }
+}
+
+/// What an agent starts with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Opening {
+    New,
+    /// The saved conversation with this id.
+    Saved(String),
+}
+
+/// What a stop came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stopping {
+    /// The agent's been told, and what ends the turn will say so.
+    Told,
+    /// There's no conversation yet, so no turn: what was waiting for one
+    /// went, and nothing will say it ended.
+    NeverBegan,
+}
+
+/// How to start an agent.
+pub(crate) struct Start<'a> {
+    pub(crate) command: &'a [String],
+    pub(crate) cwd: &'a str,
+    pub(crate) env: &'a [(String, String)],
+    pub(crate) opening: Opening,
+}
+
 pub(crate) struct Agent {
-    child: Child,
+    /// Taken as it's closed.
+    child: Option<Child>,
     /// Closing it is what ends the agent, so a drop takes it first.
     input: Option<ChildStdin>,
     /// Taken by whoever listens, which then wakes only when there's news.
@@ -48,64 +131,179 @@ pub(crate) struct Agent {
 const NEW: u64 = 2;
 /// How long an agent gets to stop what it started, once its input closes.
 const TO_END: Duration = Duration::from_secs(3);
+/// How long a list of saved conversations may take.
+const LIST_WITHIN: Duration = Duration::from_secs(10);
+/// The most pages of saved conversations asked for, so that an agent that
+/// always says there's more can't hold the list open.
+const PAGES_MOST: usize = 1000;
+/// What `rein serve` says of a request it can't take while a turn runs.
+const BUSY: i64 = -32001;
+/// Said in `initialize`: this window starts sub-agents, each in a pane.
+const PANES: &str = "io.github.furkancodes/panes";
+const OPEN_PANE: &str = "_io.github.furkancodes/open_pane";
+const TURN_STARTED: &str = "_io.github.furkancodes/turn_started";
+const TURN_ENDED: &str = "_io.github.furkancodes/turn_ended";
+
+fn initialize() -> Value {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": { "_meta": { PANES: true } } } })
+}
 
 fn send(input: &mut impl Write, message: &Value) {
     // Gone only once the agent has: its output's end says so.
     let _ = writeln!(input, "{message}").and_then(|()| input.flush());
 }
 
-/// What an answer to a request comes to, if it's anything to act on. What
-/// ends a prompt says why it ended, or that it failed: a steer is answered
-/// too, and the turn goes on.
-fn answered(message: &Value) -> Option<Said> {
+/// What an answer to a request comes to: opening the conversation is the
+/// agent's own affair, and whoever sent any other is told by its number.
+fn answered(message: &Value, opening: &Opening) -> Option<Said> {
     let id = message["id"].as_u64()?;
-    if message["error"].is_object() {
-        let why = message["error"]["message"].as_str().unwrap_or("That failed.");
-        return (id >= NEW).then(|| Said::Failed(why.to_owned()));
-    }
+    let error = &message["error"];
+    let why = || error["message"].as_str().unwrap_or("That failed.").to_owned();
     if id == NEW {
-        return message["result"]["sessionId"].as_str().map(|session| Said::Started(session.to_owned()));
+        if error.is_object() {
+            return Some(Said::Failed(why()));
+        }
+        // `session/load` says no id: the conversation already has one.
+        return match opening {
+            Opening::New => message["result"]["sessionId"].as_str().map(|session| Said::Started(session.to_owned())),
+            Opening::Saved(session) => message["result"].is_object().then(|| Said::Started(session.clone())),
+        };
     }
-    (id > NEW && message["result"]["stopReason"].is_string()).then_some(Said::TurnOver)
+    let came_to = if error["code"] == BUSY {
+        CameTo::Busy(why())
+    } else if error.is_object() {
+        CameTo::Refused(why())
+    } else if message["result"]["stopReason"].is_string() {
+        CameTo::TurnOver
+    } else {
+        CameTo::Done
+    };
+    (id > NEW).then_some(Said::Answer { id, came_to })
 }
 
-fn read(output: impl BufRead, said: &UnboundedSender<Said>) {
+/// Asks for the page of saved conversations after `cursor`.
+fn list_after(id: u64, cursor: Option<&str>) -> Value {
+    let params = cursor.map_or_else(|| json!({}), |cursor| json!({ "cursor": cursor }));
+    json!({ "jsonrpc": "2.0", "id": id, "method": "session/list", "params": params })
+}
+
+/// A turn nobody prompted has ended, so no answer says so.
+fn turn_ended(params: &Value) -> Said {
+    params["error"].as_str().map_or(Said::TurnOver, |why| Said::Failed(why.to_owned()))
+}
+
+fn read(output: impl BufRead, said: &UnboundedSender<Said>, opening: &Opening) {
     for line in output.lines().map_while(Result::ok) {
         let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+        // With no conversation there's nothing more it can do: left open,
+        // what you write would wait for one for good.
+        let no_conversation = message["id"] == NEW && message["error"].is_object();
+        if message["id"] == NEW
+            && let Some(modes) = Modes::of(&message["result"]["modes"])
+            && said.unbounded_send(Said::Modes(modes)).is_err()
+        {
+            return;
+        }
         let params = &message["params"];
         let one = match message["method"].as_str() {
             Some("session/update") => Some(Said::Update(params["update"].clone())),
-            Some("session/request_permission") => Some(Said::Asked { id: message["id"].clone(), call: params["toolCall"]["toolCallId"].as_str().unwrap_or_default().to_owned() }),
+            Some("session/request_permission") => {
+                Some(Said::Asked { id: message["id"].clone(), call: params["toolCall"]["toolCallId"].as_str().unwrap_or_default().to_owned(), options: params["options"].clone() })
+            }
+            Some(OPEN_PANE) => Some(Said::SubAgent { id: message["id"].clone(), asked: SubAgent::of(params) }),
+            Some(TURN_STARTED) => Some(Said::TurnStarted),
+            Some(TURN_ENDED) => Some(turn_ended(params)),
             Some("_io.github.furkancodes/heard") => {
                 Some(Said::Heard { from: params["from"].as_str().unwrap_or("?").to_owned(), text: params["text"].as_str().unwrap_or_default().to_owned() })
             }
             Some(_) => None,
-            None => answered(&message),
+            None => answered(&message, opening),
         };
         if let Some(one) = one
             && said.unbounded_send(one).is_err()
         {
             return;
         }
+        if no_conversation {
+            break;
+        }
     }
     let _ = said.unbounded_send(Said::Ended);
 }
 
 impl Agent {
-    /// Starts `command`, with a conversation in `cwd`. It doesn't wait for
-    /// the conversation: an agent's MCP servers can take their time, and
-    /// this is the UI thread. [`Said::Started`] says when it has.
-    pub(crate) fn start(command: &[String], cwd: &str) -> Result<Agent, String> {
+    /// Starts an agent, and opens a conversation in it. It doesn't wait for
+    /// that: an agent's MCP servers can take their time, and this is the UI
+    /// thread. [`Said::Started`] says when it has.
+    pub(crate) fn start(start: &Start<'_>) -> Result<Agent, String> {
+        let Start { command, cwd, env, opening } = start;
+        let (program, args) = command.split_first().ok_or("no agent to run")?;
+        let mut child = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("can't start {program} in {cwd}: {e}"))?;
+        let mut input = child.stdin.take().ok_or("the agent has no input")?;
+        let output = child.stdout.take().ok_or("the agent has no output")?;
+        send(&mut input, &initialize());
+        let open = match opening {
+            Opening::New => json!({ "jsonrpc": "2.0", "id": NEW, "method": "session/new", "params": { "cwd": cwd, "mcpServers": [] } }),
+            Opening::Saved(session) => json!({ "jsonrpc": "2.0", "id": NEW, "method": "session/load", "params": { "sessionId": session, "cwd": cwd, "mcpServers": [] } }),
+        };
+        send(&mut input, &open);
+        let (said_tx, said) = unbounded();
+        let opening = opening.clone();
+        std::thread::spawn(move || read(BufReader::new(output), &said_tx, &opening));
+        Ok(Agent { child: Some(child), input: Some(input), said: Some(said), session: None, waiting: Vec::new() })
+    }
+
+    /// The conversations `command` has saved, every project's, as many pages
+    /// as there are. It runs for this and ends, and it blocks, so never on the
+    /// UI thread.
+    pub(crate) fn saved(command: &[String]) -> Result<Vec<Saved>, String> {
         let (program, args) = command.split_first().ok_or("no agent to run")?;
         let mut child =
             Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| format!("can't start {program}: {e}"))?;
         let mut input = child.stdin.take().ok_or("the agent has no input")?;
         let output = child.stdout.take().ok_or("the agent has no output")?;
-        send(&mut input, &json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": {} } }));
-        send(&mut input, &json!({ "jsonrpc": "2.0", "id": NEW, "method": "session/new", "params": { "cwd": cwd, "mcpServers": [] } }));
-        let (said_tx, said) = unbounded();
-        std::thread::spawn(move || read(BufReader::new(output), &said_tx));
-        Ok(Agent { child, input: Some(input), said: Some(said), session: None, waiting: Vec::new() })
+        send(&mut input, &initialize());
+        send(&mut input, &list_after(NEW, None));
+        let (answer_tx, answer) = channel();
+        std::thread::spawn(move || {
+            let mut lines = BufReader::new(output).lines().map_while(Result::ok);
+            for id in (NEW..).take(PAGES_MOST) {
+                let found = lines.by_ref().filter_map(|line| serde_json::from_str::<Value>(&line).ok()).find(|message| message["id"] == id);
+                let next = found.as_ref().and_then(|message| message["result"]["nextCursor"].as_str().map(str::to_owned));
+                let last = next.is_none();
+                if answer_tx.send(found).is_err() || last {
+                    return;
+                }
+                send(&mut input, &list_after(id + 1, next.as_deref()));
+            }
+        });
+        let mut saved = Vec::new();
+        let came_to = loop {
+            match answer.recv_timeout(LIST_WITHIN) {
+                Ok(Some(message)) if message["error"].is_object() => break Err(message["error"]["message"].as_str().unwrap_or("it can't list them").to_owned()),
+                Ok(Some(message)) => {
+                    saved.extend(Saved::listed(&message["result"]));
+                    if message["result"]["nextCursor"].is_null() {
+                        break Ok(saved);
+                    }
+                }
+                Ok(None) => break Err(format!("{program} ended without listing them")),
+                // It always says there's more: what it listed is still so.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if !saved.is_empty() => break Ok(saved),
+                Err(_) => break Err(format!("{program} didn't list them in time")),
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        came_to
     }
 
     fn say(&mut self, message: &Value) {
@@ -146,28 +344,95 @@ impl Agent {
         self.say(&json!({ "jsonrpc": "2.0", "id": id, "method": "_io.github.furkancodes/steer", "params": params }));
     }
 
-    /// Answers what was asked under `id`. Only what's pressed is a yes.
-    pub(crate) fn answer(&mut self, id: &Value, allow: bool) {
-        let option = if allow { "allow" } else { "reject" };
-        self.say(&json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": { "outcome": "selected", "optionId": option } } }));
+    /// Stops the turn that's running, or what's waiting to become one: a
+    /// stop you pressed while the conversation opened still counts.
+    pub(crate) fn stop(&mut self) -> Stopping {
+        let Some(session) = &self.session else {
+            self.waiting.clear();
+            return Stopping::NeverBegan;
+        };
+        let params = json!({ "sessionId": session });
+        self.say(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": params }));
+        Stopping::Told
+    }
+
+    /// Puts the conversation in the mode `mode`, under the number `id`.
+    pub(crate) fn set_mode(&mut self, id: u64, mode: &str) {
+        let Some(session) = &self.session else { return };
+        let params = json!({ "sessionId": session, "modeId": mode });
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "method": "session/set_mode", "params": params }));
+    }
+
+    /// Answers what was asked under `id`, with the option `chosen`. Only
+    /// what's pressed is a yes.
+    pub(crate) fn answer(&mut self, id: &Value, chosen: &str) {
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": { "outcome": "selected", "optionId": chosen } } }));
+    }
+
+    /// Says the sub-agent asked for under `id` has started.
+    pub(crate) fn opened(&mut self, id: &Value) {
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
+    }
+
+    /// Says what was asked under `id` can't be done, and why.
+    pub(crate) fn refuse(&mut self, id: &Value, why: &str) {
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": why } }));
+    }
+}
+
+#[cfg(test)]
+impl Agent {
+    /// Closes it, and waits for it to end.
+    pub(crate) fn finish(mut self) {
+        if let Some(ending) = self.end() {
+            ending.join().expect("what ends it doesn't panic");
+        }
+    }
+}
+
+/// Agents on their way out, for the window's last moments.
+static ENDING: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+impl Agent {
+    /// Closes its input, and gives it time to end on a thread of its own: it
+    /// runs its hooks and stops what it started as it goes, which can take
+    /// seconds, and this is usually the UI thread. `None` once it's been done.
+    fn end(&mut self) -> Option<JoinHandle<()>> {
+        // Its input closing ends it, and it stops what it started as it goes.
+        // Killed, it couldn't: a command runs in a group of its own, and a
+        // dev server or `cargo test` would run on with nobody to stop it.
+        self.input = None;
+        let mut child = self.child.take()?;
+        Some(std::thread::spawn(move || {
+            let closed = Instant::now();
+            while closed.elapsed() < TO_END {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }))
     }
 }
 
 impl Drop for Agent {
     fn drop(&mut self) {
-        // Its input closing ends it, and it stops what it started as it goes.
-        // Killed, it couldn't: a command runs in a group of its own, and a
-        // dev server or `cargo test` would run on with nobody to stop it.
-        self.input = None;
-        let closed = Instant::now();
-        while closed.elapsed() < TO_END {
-            if !matches!(self.child.try_wait(), Ok(None)) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        if let Some(ending) = self.end() {
+            let mut all = ENDING.lock().unwrap_or_else(PoisonError::into_inner);
+            all.retain(|one| !one.is_finished());
+            all.push(ending);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    }
+}
+
+/// Waits for the agents already closed to end. Only as the app goes: past
+/// this, nothing would be left to end one that won't.
+pub(crate) fn wait_for_those_ending() {
+    let ending = std::mem::take(&mut *ENDING.lock().unwrap_or_else(PoisonError::into_inner));
+    for one in ending {
+        let _ = one.join();
     }
 }
 
@@ -182,11 +447,21 @@ mod tests {
 
     /// What an agent saying `lines` comes to.
     fn heard(lines: &[Value]) -> Vec<Said> {
+        heard_opening(lines, &Opening::New)
+    }
+
+    fn heard_opening(lines: &[Value], opening: &Opening) -> Vec<Said> {
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
         let (said, mut taken) = unbounded();
-        read(text.as_bytes(), &said);
+        read(text.as_bytes(), &said, opening);
         drop(said);
         std::iter::from_fn(|| taken.try_recv().ok()).collect()
+    }
+
+    /// An agent running `script` in a shell.
+    fn sh(script: &str) -> Agent {
+        let command = ["sh".to_owned(), "-c".to_owned(), script.to_owned()];
+        Agent::start(&Start { command: &command, cwd: "/", env: &[], opening: Opening::New }).unwrap()
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -199,32 +474,128 @@ mod tests {
     fn what_a_request_came_to_is_said() {
         let started = heard(&[json!({ "id": NEW, "result": { "sessionId": "abc" } })]);
         assert_eq!(started, [Said::Started("abc".to_owned()), Said::Ended]);
-        let refused = heard(&[json!({ "id": NEW, "error": { "code": -32000, "message": "sign in first" } })]);
-        assert_eq!(refused, [Said::Failed("sign in first".to_owned()), Said::Ended], "a conversation that can't start says why");
-        let failed = heard(&[json!({ "id": 101, "error": { "code": -32000, "message": "the key was refused" } })]);
-        assert_eq!(failed, [Said::Failed("the key was refused".to_owned()), Said::Ended], "and so does a turn");
-        let ended = heard(&[json!({ "id": 101, "result": { "stopReason": "end_turn" } })]);
-        assert_eq!(ended, [Said::TurnOver, Said::Ended]);
-        let steered = heard(&[json!({ "id": 102, "result": {} })]);
-        assert_eq!(steered, [Said::Ended], "a steer is answered too, and the turn goes on");
+        let refused = heard(&[json!({ "id": NEW, "error": { "code": -32000, "message": "sign in first" } }), json!({ "id": 101, "result": { "stopReason": "end_turn" } })]);
+        assert_eq!(refused, [Said::Failed("sign in first".to_owned()), Said::Ended], "a conversation that can't start says why, and that's the end of its agent");
+        let answer = |line: Value| heard(&[line]).remove(0);
+        let refused = answer(json!({ "id": 101, "error": { "code": -32000, "message": "the key was refused" } }));
+        assert_eq!(refused, Said::Answer { id: 101, came_to: CameTo::Refused("the key was refused".to_owned()) });
+        let busy = answer(json!({ "id": 101, "error": { "code": BUSY, "message": "a turn is running" } }));
+        assert_eq!(busy, Said::Answer { id: 101, came_to: CameTo::Busy("a turn is running".to_owned()) });
+        let ended = answer(json!({ "id": 101, "result": { "stopReason": "end_turn" } }));
+        assert_eq!(ended, Said::Answer { id: 101, came_to: CameTo::TurnOver });
+        let steered = answer(json!({ "id": 102, "result": {} }));
+        assert_eq!(steered, Said::Answer { id: 102, came_to: CameTo::Done }, "a steer is answered too, and the turn goes on");
+        assert_eq!(heard(&[json!({ "id": 1, "result": {} })]), [Said::Ended], "what started it isn't anything to act on");
     }
 
     #[test]
     fn a_question_names_its_step() {
-        let asked = heard(&[json!({ "id": 7, "method": "session/request_permission", "params": { "toolCall": { "toolCallId": "call_1" } } })]);
-        assert_eq!(asked, [Said::Asked { id: json!(7), call: "call_1".to_owned() }, Said::Ended]);
+        let options = json!([{ "optionId": "allow", "name": "Allow", "kind": "allow_once" }]);
+        let asked = heard(&[json!({ "id": 7, "method": "session/request_permission", "params": { "toolCall": { "toolCallId": "call_1" }, "options": options } })]);
+        assert_eq!(asked, [Said::Asked { id: json!(7), call: "call_1".to_owned(), options }, Said::Ended]);
+    }
+
+    #[test]
+    fn a_saved_conversation_goes_by_the_id_it_has() {
+        let opening = Opening::Saved("kept".to_owned());
+        assert_eq!(heard_opening(&[json!({ "id": NEW, "result": { "modes": {} } })], &opening), [Said::Started("kept".to_owned()), Said::Ended]);
+        let refused = heard_opening(&[json!({ "id": NEW, "error": { "message": "there's no saved conversation kept" } })], &opening);
+        assert_eq!(refused, [Said::Failed("there's no saved conversation kept".to_owned()), Said::Ended]);
+    }
+
+    #[test]
+    fn a_turn_nobody_prompted_is_said_to_start_and_end() {
+        let lines = [
+            json!({ "method": TURN_STARTED, "params": {} }),
+            json!({ "method": TURN_ENDED, "params": { "stopReason": "end_turn" } }),
+            json!({ "method": TURN_ENDED, "params": { "error": "the key was refused" } }),
+        ];
+        assert_eq!(heard(&lines), [Said::TurnStarted, Said::TurnOver, Said::Failed("the key was refused".to_owned()), Said::Ended]);
+    }
+
+    #[test]
+    fn a_sub_agent_is_what_rein_said_to_run_and_what_cant_be_read_is_no_sub_agent() {
+        let params = json!({ "name": "tests", "command": "rein", "args": ["serve", "--child", "1:abc"], "cwd": "/work", "env": [{ "name": "REIN_HOME", "value": "/home" }] });
+        let asked = heard(&[json!({ "id": 9, "method": OPEN_PANE, "params": params })]);
+        let wanted = SubAgent {
+            name: "tests".to_owned(),
+            command: ["rein", "serve", "--child", "1:abc"].map(str::to_owned).to_vec(),
+            cwd: "/work".to_owned(),
+            env: vec![("REIN_HOME".to_owned(), "/home".to_owned())],
+        };
+        assert_eq!(asked, [Said::SubAgent { id: json!(9), asked: Some(wanted) }, Said::Ended]);
+        for broken in [json!({ "name": "tests" }), json!({ "name": "tests", "command": "rein", "args": [1], "cwd": "/", "env": [] })] {
+            let refused = heard(&[json!({ "id": 9, "method": OPEN_PANE, "params": broken })]);
+            assert_eq!(refused, [Said::SubAgent { id: json!(9), asked: None }, Said::Ended]);
+        }
+    }
+
+    #[test]
+    fn it_says_it_opens_panes_and_opens_what_its_told_where_its_told() {
+        let dir = scratch("opens");
+        let (file, whats_run) = (dir.join("got"), dir.join("ran"));
+        let script = format!("pwd > {}; echo \"$CARRIED\" >> {}; cat > {}", whats_run.display(), whats_run.display(), file.display());
+        let command = ["sh".to_owned(), "-c".to_owned(), script];
+        let env = [("CARRIED".to_owned(), "over".to_owned())];
+        let cwd = dir.canonicalize().unwrap().display().to_string();
+        let agent = Agent::start(&Start { command: &command, cwd: &cwd, env: &env, opening: Opening::Saved("kept".to_owned()) }).unwrap();
+        agent.finish();
+        let got: Vec<Value> = std::fs::read_to_string(&file).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(got[0]["params"]["clientCapabilities"]["_meta"][PANES], true, "or a sub-agent has nowhere to run");
+        assert_eq!((&got[1]["method"], &got[1]["params"]["sessionId"]), (&json!("session/load"), &json!("kept")));
+        assert_eq!(std::fs::read_to_string(&whats_run).unwrap(), format!("{cwd}\nover\n"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stopping_and_answering_go_as_acp_says() {
+        let dir = scratch("stops-a-turn");
+        let file = dir.join("got");
+        let mut agent = sh(&format!("cat > {}", file.display()));
+        assert_eq!(agent.stop(), Stopping::NeverBegan);
+        agent.started("abc".to_owned());
+        assert_eq!(agent.stop(), Stopping::Told);
+        agent.answer(&json!(7), "always");
+        agent.opened(&json!(8));
+        agent.refuse(&json!(9), "can't");
+        agent.finish();
+        let got: Vec<Value> = std::fs::read_to_string(&file).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(got.len(), 6, "a stop before there's a conversation has nothing to stop: {got:?}");
+        assert_eq!((got[2]["method"].as_str(), got[2].get("id")), (Some("session/cancel"), None), "a notification, with no answer to wait for");
+        assert_eq!(got[3]["result"]["outcome"], json!({ "outcome": "selected", "optionId": "always" }));
+        assert_eq!((&got[4]["id"], &got[4]["result"]), (&json!(8), &json!({})));
+        assert_eq!(got[5]["error"]["message"], "can't");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_saved_list_goes_on_for_as_many_pages_as_there_are() {
+        let lists = r#"read a; read b; printf '%s\n' '{"id":1,"result":{}}' '{"id":2,"result":{"sessions":[{"sessionId":"new","cwd":"/a"}],"nextCursor":"100"}}'; read c; case "$c" in *'"cursor":"100"'*) printf '%s\n' '{"id":3,"result":{"sessions":[{"sessionId":"old","cwd":"/b"}]}}';; esac"#;
+        let saved = Agent::saved(&["sh".to_owned(), "-c".to_owned(), lists.to_owned()]).unwrap();
+        assert_eq!(saved.iter().map(|saved| saved.id.as_str()).collect::<Vec<_>>(), ["new", "old"], "past the first 100 is still yours");
+    }
+
+    #[test]
+    fn the_saved_list_comes_from_an_agent_run_for_it() {
+        let lists = r#"read a; read b; printf '%s\n' '{"id":1,"result":{}}' '{"id":2,"result":{"sessions":[{"sessionId":"abc","cwd":"/work"}]}}'"#;
+        let command = ["sh".to_owned(), "-c".to_owned(), lists.to_owned()];
+        let saved = Agent::saved(&command).unwrap();
+        assert_eq!(saved.iter().map(|saved| saved.id.as_str()).collect::<Vec<_>>(), ["abc"]);
+        let refuses = r#"read a; read b; printf '%s\n' '{"id":2,"error":{"message":"no"}}'"#;
+        assert_eq!(Agent::saved(&["sh".to_owned(), "-c".to_owned(), refuses.to_owned()]), Err("no".to_owned()));
+        assert!(Agent::saved(&["true".to_owned()]).is_err(), "one that says nothing lists nothing");
     }
 
     #[test]
     fn what_you_write_before_a_conversation_has_started_waits_for_it() {
         let dir = scratch("waits");
         let file = dir.join("got");
-        let mut agent = Agent::start(&["sh".to_owned(), "-c".to_owned(), format!("cat > {}", file.display())], "/").unwrap();
+        let mut agent = sh(&format!("cat > {}", file.display()));
         agent.prompt(101, "first");
         agent.steer(102, "second");
         agent.started("abc".to_owned());
         agent.steer(103, "third");
-        drop(agent);
+        agent.finish();
         let got = std::fs::read_to_string(&file).unwrap();
         let methods: Vec<Value> = got.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()["method"].clone()).collect();
         assert_eq!(methods, ["initialize", "session/new", "session/prompt", "_io.github.furkancodes/steer", "_io.github.furkancodes/steer"]);
@@ -233,20 +604,38 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_before_a_conversation_has_started_drops_what_was_waiting_for_it() {
+        let dir = scratch("stopped-early");
+        let file = dir.join("got");
+        let mut agent = sh(&format!("cat > {}", file.display()));
+        agent.prompt(101, "delete the lot");
+        agent.steer(102, "and quickly");
+        assert_eq!(agent.stop(), Stopping::NeverBegan);
+        agent.started("abc".to_owned());
+        agent.finish();
+        let got = std::fs::read_to_string(&file).unwrap();
+        let methods: Vec<Value> = got.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()["method"].clone()).collect();
+        assert_eq!(methods, ["initialize", "session/new"], "you pressed Stop, so it never goes");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn an_agent_gets_to_stop_what_it_started_when_its_pane_goes() {
         let dir = scratch("stops");
         let done = dir.join("done");
-        let agent = Agent::start(&["sh".to_owned(), "-c".to_owned(), format!("cat > /dev/null; touch {}", done.display())], "/").unwrap();
-        drop(agent);
+        let agent = sh(&format!("cat > /dev/null; touch {}", done.display()));
+        agent.finish();
         assert!(done.exists(), "killed outright, a command in a group of its own runs on");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn an_agent_that_wont_end_is_ended() {
-        let agent = Agent::start(&["sleep".to_owned(), "60".to_owned()], "/").unwrap();
-        let (pid, started) = (agent.child.id(), Instant::now());
+    fn an_agent_that_wont_end_is_ended_with_the_window_left_alone() {
+        let agent = Agent::start(&Start { command: &["sleep".to_owned(), "60".to_owned()], cwd: "/", env: &[], opening: Opening::New }).unwrap();
+        let (pid, started) = (agent.child.as_ref().unwrap().id(), Instant::now());
         drop(agent);
+        assert!(started.elapsed() < Duration::from_millis(500), "a pane closes on the UI thread: {:?}", started.elapsed());
+        wait_for_those_ending();
         assert!(started.elapsed() < TO_END + Duration::from_secs(2), "{:?}", started.elapsed());
         let alive = Command::new("kill").args(["-0", &pid.to_string()]).stderr(Stdio::null()).status().unwrap().success();
         assert!(!alive, "it's still running");

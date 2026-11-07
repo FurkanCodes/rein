@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runs the gates: the test window against each workload, on screen, while
+"""Runs the gates: the window against each workload, on screen, while
 this samples what it costs from outside. `run.py [gate ...]`, or every gate.
 
 Each gate's pass mark is in the report it came from, and is a judgement, not a
@@ -167,6 +167,8 @@ GATES = {
     "idle": idle,
     # The caret in a box, as it mostly is: "idle" has nothing focused.
     "idle-caret": lambda: idle("--focus"),
+    # A pointer crossing it for 6 seconds in the middle, then still again.
+    "hover": lambda: idle("--sweep", "24,6"),
     "history": lambda: run("history", [*agent("history"), "--settle", "10000", "--scroll", "40", "--stalls"], 25),
     # At these speeds a run reaches a 200 KB answer, and 20,000 lines of code.
     "long-big": lambda: run("long-big", [*agent("long", "--speed", "20"), "--empty", "1", "--type", "--stalls"], 28),

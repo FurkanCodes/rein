@@ -90,7 +90,7 @@ impl Blocks {
                     self.finish_before(line.len());
                     self.open = Open::Fence { opener: body.trim_start().to_owned(), lines: 0 };
                 } else if body.trim().is_empty() {
-                    self.finish();
+                    self.blank(line.len());
                 }
             }
             Open::Fence { opener, lines } => {
@@ -106,6 +106,21 @@ impl Blocks {
                     self.reopened.push((self.finished.len(), opener));
                 }
             }
+        }
+    }
+
+    /// A blank line of `length` bytes ends the row it follows. One with
+    /// nothing before it, as after a code block, is no row of its own, which
+    /// would draw as an empty line: it stays with the row above, so what's
+    /// copied keeps it.
+    fn blank(&mut self, length: usize) {
+        if self.read - length > self.tail {
+            self.finish();
+        } else if let Some(last) = self.finished.last_mut() {
+            last.end = self.read;
+            self.tail = self.read;
+        } else {
+            self.tail = self.read;
         }
     }
 
@@ -209,6 +224,15 @@ mod tests {
         }
         let rows = (0..blocks.rows(text)).map(|row| blocks.row(row, text).unwrap().into_owned()).collect();
         (blocks, rows)
+    }
+
+    #[test]
+    fn a_blank_line_on_its_own_is_no_row() {
+        let text = "```\ncode\n```\n\n\nAfter it.\n";
+        let (blocks, rows) = cut(text, 3);
+        assert_eq!(rows, ["```\ncode\n```\n\n\n", "After it.\n"]);
+        assert_eq!(blocks.source(0, text), Some(0..15), "copied, the blank lines are still there");
+        assert_eq!(cut("\n\nFirst.\n", 2).1, ["First.\n"], "nor is one at the very start");
     }
 
     #[test]

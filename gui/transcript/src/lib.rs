@@ -2,12 +2,16 @@
 //! with no toolkit in sight, so it outlives the choice of one.
 
 mod blocks;
+mod saved;
+mod watch;
 
 use std::collections::HashMap;
 use std::ops::Range;
 
 pub use blocks::Blocks;
+pub use saved::{Saved, folder_name};
 use serde_json::Value;
+pub use watch::{Standing, Watch};
 
 /// Who a message is from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +34,126 @@ pub struct Message {
     /// How a step stands: `in_progress`, `completed`, `failed`.
     pub status: Option<String>,
     blocks: Blocks,
+}
+
+impl Message {
+    /// How a step stands, read once from the wire's word for it.
+    pub fn state(&self) -> StepState {
+        StepState::of(self.status.as_deref())
+    }
+
+    /// A step's verb and what it's about: `Run`, `cargo test`.
+    pub fn step_line(&self) -> (&str, &str) {
+        let title = self.text.lines().next().unwrap_or_default();
+        title.split_once(' ').unwrap_or((title, ""))
+    }
+
+    /// What a step printed.
+    pub fn step_output(&self) -> &str {
+        self.text.split_once('\n').map_or("", |(_, output)| output)
+    }
+}
+
+/// How far a step reaches, which is how tall its tick stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Looked,
+    Ran,
+    Changed,
+}
+
+impl Reach {
+    /// From ACP's word for what a call does.
+    fn of(kind: Option<&str>) -> Reach {
+        match kind {
+            Some("execute") => Reach::Ran,
+            Some("edit") => Reach::Changed,
+            _ => Reach::Looked,
+        }
+    }
+}
+
+/// How a step stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepState {
+    Running,
+    Done,
+    Failed,
+    /// Its turn ended before it did.
+    Stopped,
+}
+
+impl StepState {
+    fn of(status: Option<&str>) -> StepState {
+        match status {
+            Some("completed") => StepState::Done,
+            Some("failed") => StepState::Failed,
+            Some("stopped") => StepState::Stopped,
+            _ => StepState::Running,
+        }
+    }
+}
+
+/// One step of a turn, as the list of agents shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tick {
+    pub reach: Reach,
+    pub state: StepState,
+}
+
+/// How much of what the model can hold the conversation takes up, as the
+/// agent said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUse {
+    pub used: u64,
+    pub size: u64,
+}
+
+impl ContextUse {
+    /// How full it is, from 0 to 1.
+    pub fn share(self) -> f32 {
+        if self.size == 0 { 0.0 } else { (self.used as f32 / self.size as f32).clamp(0.0, 1.0) }
+    }
+
+    /// In the bar's words: `42k/150k`.
+    pub fn shown(self) -> String {
+        format!("{}/{}", thousands(self.used), thousands(self.size))
+    }
+}
+
+fn thousands(count: u64) -> String {
+    if count < 1000 { count.to_string() } else { format!("{}k", count / 1000) }
+}
+
+/// A mode an agent offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mode {
+    pub id: String,
+    /// As it's shown, and any mark comes with it: `⚠ trust`.
+    pub name: String,
+}
+
+/// The modes an agent offers, and the one it's in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Modes {
+    pub current: String,
+    pub available: Vec<Mode>,
+}
+
+impl Modes {
+    /// Read from what `session/new` said of them. An agent with none says
+    /// nothing, and a window shows nothing.
+    pub fn of(modes: &Value) -> Option<Modes> {
+        let current = modes["currentModeId"].as_str()?.to_owned();
+        let listed = modes["availableModes"].as_array()?.iter();
+        let available = listed.filter_map(|mode| Some(Mode { id: mode["id"].as_str()?.to_owned(), name: mode["name"].as_str()?.to_owned() })).collect();
+        Some(Modes { current, available })
+    }
+
+    /// What the mode it's in is called.
+    pub fn current_name(&self) -> &str {
+        self.available.iter().find(|mode| mode.id == self.current).map_or(self.current.as_str(), |mode| mode.name.as_str())
+    }
 }
 
 /// What a window draws: one block of one message. Rows come in order, and
@@ -91,6 +215,57 @@ impl Question {
     }
 }
 
+/// An answer an agent offers to a question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// What's sent back if it's picked.
+    pub id: String,
+    pub name: String,
+    pub kind: Answering,
+}
+
+/// What a choice says to a question: ACP's four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answering {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+impl Answering {
+    fn of(word: &str) -> Option<Answering> {
+        match word {
+            "allow_once" => Some(Answering::AllowOnce),
+            "allow_always" => Some(Answering::AllowAlways),
+            "reject_once" => Some(Answering::RejectOnce),
+            "reject_always" => Some(Answering::RejectAlways),
+            _ => None,
+        }
+    }
+}
+
+impl Choice {
+    pub const fn allows(&self) -> bool {
+        matches!(self.kind, Answering::AllowOnce | Answering::AllowAlways)
+    }
+
+    /// The answers to give to a question whose `options` the agent listed.
+    /// A step nobody can describe can't be allowed, however it's offered, a
+    /// way of answering nobody knows isn't offered, whatever it would do, and
+    /// an agent that offers no way out still gets a no.
+    pub fn offered(options: &Value, known: bool) -> Vec<Choice> {
+        let listed = options.as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|option| {
+            Some(Choice { id: option["optionId"].as_str()?.to_owned(), name: option["name"].as_str()?.to_owned(), kind: Answering::of(option["kind"].as_str()?)? })
+        });
+        let mut choices: Vec<Choice> = listed.filter(|choice| known || !choice.allows()).collect();
+        if !choices.iter().any(|choice| !choice.allows()) {
+            choices.push(Choice { id: "reject".to_owned(), name: "Reject".to_owned(), kind: Answering::RejectOnce });
+        }
+        choices
+    }
+}
+
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
@@ -100,6 +275,18 @@ fn pretty(value: &Value) -> String {
 struct Step {
     index: usize,
     question: Option<Question>,
+}
+
+impl Update {
+    /// What this and `other` did between them.
+    pub fn and(self, other: Update) -> Update {
+        let touched = match (self.touched.is_empty(), other.touched.is_empty()) {
+            (true, _) => other.touched,
+            (_, true) => self.touched,
+            _ => self.touched.start.min(other.touched.start)..self.touched.end.max(other.touched.end),
+        };
+        Update { added: self.added + other.added, touched }
+    }
 }
 
 /// What an update did to the messages.
@@ -131,6 +318,9 @@ pub struct Transcript {
     last_first_row: usize,
     /// Each step's row.
     step_rows: HashMap<usize, usize>,
+    /// The steps of this turn, in order: their messages, and how far each reaches.
+    turn: Vec<(usize, Reach)>,
+    context: Option<ContextUse>,
 }
 
 impl Transcript {
@@ -150,6 +340,28 @@ impl Transcript {
     /// is a question nobody can answer yes to.
     pub fn question(&self, id: &str) -> Option<&Question> {
         self.steps.get(id)?.question.as_ref()
+    }
+
+    /// The first line of the first thing you said, which a conversation with
+    /// no name goes by.
+    pub fn first_said(&self) -> Option<&str> {
+        self.messages.iter().find(|message| message.role == Role::You)?.text.lines().next()
+    }
+
+    /// The last `most` steps of this turn, oldest first.
+    pub fn ticks(&self, most: usize) -> Vec<Tick> {
+        let shown = self.turn.iter().rev().take(most).rev();
+        shown.filter_map(|&(index, reach)| Some(Tick { reach, state: self.messages.get(index)?.state() })).collect()
+    }
+
+    /// How full the context is, once the agent has said.
+    pub const fn context(&self) -> Option<ContextUse> {
+        self.context
+    }
+
+    /// A turn nobody here prompted has started, so its steps start afresh.
+    pub fn turn_started(&mut self) {
+        self.turn.clear();
     }
 
     /// How many rows there are.
@@ -224,9 +436,27 @@ impl Transcript {
         self.rows_for(&change)
     }
 
+    /// A turn is over, so no step of it is still going. An agent says
+    /// nothing of one a stop cut short, and it would read as pending for
+    /// good.
+    pub fn turn_over(&mut self) -> Update {
+        let mut touched = Update::default();
+        for step in self.steps.values() {
+            let Some(message) = self.messages.get_mut(step.index) else { continue };
+            if matches!(message.status.as_deref(), Some("pending" | "in_progress")) {
+                message.status = Some("stopped".to_owned());
+                if let Some(&row) = self.step_rows.get(&step.index) {
+                    touched = touched.and(Update { added: 0, touched: row..row + 1 });
+                }
+            }
+        }
+        touched
+    }
+
     /// You wrote `text`, as a message of its own: an agent says only what
     /// reaches a running turn back.
     pub fn you(&mut self, text: &str) -> Update {
+        self.turn.clear();
         let change = self.add_said(Role::You, text);
         self.rows_for(&change)
     }
@@ -278,6 +508,12 @@ impl Transcript {
             Some("agent_thought_chunk") => self.say(Role::Thought, text()),
             Some("tool_call") => self.step(update),
             Some("tool_call_update") => self.step_update(update),
+            Some("usage_update") => {
+                if let (Some(used), Some(size)) = (update["used"].as_u64(), update["size"].as_u64()) {
+                    self.context = Some(ContextUse { used, size });
+                }
+                Change::Nothing
+            }
             _ => Change::Nothing,
         }
     }
@@ -313,6 +549,7 @@ impl Transcript {
         let change = self.add(Message { role: Role::Step, text: title.to_owned(), status, blocks: Blocks::default() });
         if let Change::Added(index) = change {
             self.steps.insert(id.to_owned(), Step { index, question: Question::of(update) });
+            self.turn.push((index, Reach::of(update["kind"].as_str())));
         }
         change
     }
@@ -337,6 +574,67 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_way_of_answering_nobody_knows_isnt_offered() {
+        let options = json!([{ "optionId": "ok", "name": "Allow", "kind": "allow_once" }, { "optionId": "odd", "name": "Sure", "kind": "allow_forever" }, { "optionId": "odder", "name": "Hm", "kind": "maybe" }]);
+        let offered = Choice::offered(&options, true);
+        let ids: Vec<&str> = offered.iter().map(|choice| choice.id.as_str()).collect();
+        assert_eq!(ids, ["ok", "reject"], "a yes under a name rein can't read would be drawn as anything, and there's always a no");
+    }
+
+    /// A step of `kind`, as an agent announces it.
+    fn step(id: &str, kind: &str, status: &str) -> Value {
+        json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": "Run cargo test", "kind": kind, "status": status })
+    }
+
+    #[test]
+    fn the_strip_holds_this_turns_steps_as_they_stand_and_a_new_turn_starts_it_afresh() {
+        let mut transcript = Transcript::default();
+        transcript.apply(&step("a", "read", "completed"));
+        transcript.apply(&step("b", "execute", "in_progress"));
+        transcript.apply(&step("c", "edit", "completed"));
+        transcript.apply(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": "b", "status": "failed" }));
+        let tick = |reach, state| Tick { reach, state };
+        assert_eq!(transcript.ticks(8), [tick(Reach::Looked, StepState::Done), tick(Reach::Ran, StepState::Failed), tick(Reach::Changed, StepState::Done)]);
+        assert_eq!(transcript.ticks(1), [tick(Reach::Changed, StepState::Done)], "the latest, as the strip ends with them");
+        transcript.you("and now");
+        assert!(transcript.ticks(8).is_empty());
+        transcript.apply(&step("d", "search", "pending"));
+        assert_eq!(transcript.ticks(8), [tick(Reach::Looked, StepState::Running)], "a step that hasn't ended is running");
+    }
+
+    #[test]
+    fn a_step_says_its_verb_and_what_its_about() {
+        let mut transcript = Transcript::default();
+        transcript.apply(&step("a", "execute", "completed"));
+        transcript.apply(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": "a", "content": [{ "content": { "text": "ok\ndone" } }] }));
+        let message = transcript.get(0).unwrap();
+        assert_eq!(message.step_line(), ("Run", "cargo test"));
+        assert_eq!(message.step_output(), "ok\ndone");
+    }
+
+    #[test]
+    fn the_context_is_what_the_agent_last_said_and_stays_in_bounds() {
+        let mut transcript = Transcript::default();
+        assert_eq!(transcript.context(), None, "a window shows nothing until it's said");
+        transcript.apply(&json!({ "sessionUpdate": "usage_update", "used": 42_100, "size": 150_000 }));
+        let context = transcript.context().unwrap();
+        assert_eq!(context.shown(), "42k/150k");
+        assert!((context.share() - 0.28).abs() < 0.01);
+        assert_eq!(ContextUse { used: 900, size: 0 }.share(), 0.0, "a size of nothing is no division by it");
+        assert_eq!(ContextUse { used: 900, size: 800 }.share(), 1.0);
+        assert_eq!(ContextUse { used: 900, size: 800 }.shown(), "900/800");
+    }
+
+    #[test]
+    fn modes_are_read_with_their_marks_and_no_list_is_no_modes() {
+        let said = json!({ "currentModeId": "trust", "availableModes": [{ "id": "ask", "name": "ask" }, { "id": "trust", "name": "⚠ trust" }, { "name": "no id" }] });
+        let modes = Modes::of(&said).unwrap();
+        assert_eq!(modes.available.len(), 2, "one that can't be chosen isn't offered");
+        assert_eq!(modes.current_name(), "⚠ trust");
+        assert_eq!(Modes::of(&json!({})), None);
+    }
 
     fn chunk(kind: &str, text: &str) -> Value {
         json!({ "sessionUpdate": kind, "content": { "type": "text", "text": text } })
@@ -433,6 +731,47 @@ mod tests {
         assert_eq!(transcript.question("nope"), None, "a step never shown can't be put as a question");
         transcript.apply(&json!({ "sessionUpdate": "tool_call", "toolCallId": "untitled", "rawInput": { "command": "ls" } }));
         assert_eq!(transcript.question("untitled"), None, "nor one that doesn't say what it is");
+    }
+
+    #[test]
+    fn the_answers_to_a_question_are_the_agents_own_but_a_step_nobody_can_describe_cant_be_allowed() {
+        let options = json!([
+            { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+            { "optionId": "always", "name": "Allow for this conversation", "kind": "allow_always" },
+            { "optionId": "reject", "name": "Reject", "kind": "reject_once" },
+        ]);
+        let ids = |choices: Vec<Choice>| choices.into_iter().map(|choice| choice.id).collect::<Vec<_>>();
+        assert_eq!(ids(Choice::offered(&options, true)), ["allow", "always", "reject"]);
+        assert_eq!(ids(Choice::offered(&options, false)), ["reject"]);
+        assert_eq!(ids(Choice::offered(&json!([]), false)), ["reject"], "there's always a no");
+        assert_eq!(ids(Choice::offered(&Value::Null, true)), ["reject"]);
+        let no_no = json!([{ "optionId": "ok", "name": "OK", "kind": "allow_once" }]);
+        assert_eq!(ids(Choice::offered(&no_no, true)), ["ok", "reject"]);
+        assert_eq!(ids(Choice::offered(&no_no, false)), ["reject"]);
+    }
+
+    #[test]
+    fn a_step_a_turn_left_unfinished_is_said_to_have_stopped() {
+        let mut transcript = Transcript::default();
+        let step = |id: &str, status: &str| json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": format!("Run {id}"), "status": status });
+        transcript.apply(&step("done", "completed"));
+        transcript.apply(&step("waiting", "pending"));
+        transcript.apply(&chunk("agent_message_chunk", "between"));
+        transcript.apply(&step("going", "in_progress"));
+        let status = |transcript: &Transcript, index: usize| transcript.get(index).unwrap().status.clone();
+        assert_eq!(transcript.turn_over(), Update { added: 0, touched: 1..4 }, "from the first it changed to the last");
+        assert_eq!(status(&transcript, 0).as_deref(), Some("completed"), "what finished stays finished");
+        assert_eq!(status(&transcript, 1).as_deref(), Some("stopped"));
+        assert_eq!(status(&transcript, 3).as_deref(), Some("stopped"));
+        assert_eq!(transcript.turn_over(), Update::default(), "nothing's left to stop");
+    }
+
+    #[test]
+    fn what_two_updates_did_comes_to_one() {
+        let (a, b) = (Update { added: 1, touched: 2..3 }, Update { added: 2, touched: 7..9 });
+        assert_eq!(a.clone().and(b), Update { added: 3, touched: 2..9 });
+        assert_eq!(a.clone().and(Update::default()), a, "an empty range isn't anywhere");
+        assert_eq!(Update::default().and(a.clone()), a);
     }
 
     #[test]
