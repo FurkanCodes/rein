@@ -157,9 +157,10 @@ pub enum OwnCommand {
     Resume,
     Exit,
     Copy,
-    /// Undo has a sheet of its own, and the tasks a panel.
+    /// Undo has a sheet of its own, and the tasks and changes a panel.
     Undo,
     Tasks,
+    Changes,
 }
 
 impl OwnCommand {
@@ -173,6 +174,7 @@ impl OwnCommand {
             "/copy" => Some(OwnCommand::Copy),
             "/undo" => Some(OwnCommand::Undo),
             "/tasks" => Some(OwnCommand::Tasks),
+            "/changes" => Some(OwnCommand::Changes),
             _ => None,
         }
     }

@@ -11,7 +11,7 @@ use rein_llm::{Loading, Tool, ToolCall};
 use crate::background::{self, Foreground, Jobs, Started};
 use crate::redact::{self, Secrets};
 use crate::sandbox::{self, Access, Run};
-use crate::undo::{Listed, Plan, Undo, Watched};
+use crate::undo::{Changes, Listed, Plan, Span, Undo, Watched};
 use crate::{files, search};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -198,6 +198,11 @@ struct EditArgs {
 /// How a tool's output starts when it failed. Compaction's record tells
 /// what worked by it.
 pub const ERROR: &str = "error: ";
+/// What a read of part of a file ends with: `[lines 1-200 of 5000…]`.
+pub const PART: &str = "[lines ";
+/// What a read of an image is called, inside the note that stands for it:
+/// `[image a.png, 40×30]`.
+pub const IMAGE: &str = "image ";
 
 /// How a command ended, as the line `bash` writes after its output says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,6 +498,29 @@ impl Tools {
         self.on_undo(move |undo, hides| undo.undo(turn, hides)).await
     }
 
+    /// What `span` changed, with what a stopped command did in it, and the
+    /// patches if `lines`. A command still running in the background goes
+    /// on being followed: a window asks after every turn, and looking would
+    /// otherwise lose all it writes from then on.
+    pub async fn changes(&self, span: Span, lines: bool) -> Changes {
+        let writing = self.jobs.writing();
+        let comparing = self
+            .on_undo(move |undo, hides| {
+                undo.settle(hides);
+                if writing {
+                    undo.still_changing();
+                }
+                undo.changes(span)
+            })
+            .await;
+        tokio::task::spawn_blocking(move || comparing.run(lines)).await.unwrap_or_default()
+    }
+
+    /// A way to see what's changed from beside a turn.
+    pub fn looking(&self) -> Looking {
+        Looking { undo: self.undo.clone() }
+    }
+
     /// What the last command did to the project's files, once.
     pub fn take_watched(&self) -> Option<Watched> {
         locked(&self.watched).take()
@@ -762,7 +790,7 @@ impl Tools {
         let bytes = spot.read().await.map_err(|e| format!("can't read {}: {e}", args.path))?;
         // An image is shown, not read as text.
         if crate::image::kind_of(&bytes).is_some() {
-            return self.picture(call_id, bytes, format!("image {}", args.path)).await;
+            return self.picture(call_id, bytes, format!("{IMAGE}{}", args.path)).await;
         }
         let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't a UTF-8 text file", args.path))?;
         lines(&text, &args)
@@ -1042,6 +1070,28 @@ fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// What's changed, seen from beside a turn: it holds nothing the turn does.
+#[derive(Clone)]
+pub struct Looking {
+    undo: std::sync::Arc<std::sync::Mutex<Undo>>,
+}
+
+impl Looking {
+    /// What `span` has changed so far, with the patches if `lines`. A
+    /// command that's running is left to finish, so what it's doing shows
+    /// once it has. The lock goes before anything's compared, or the turn's
+    /// next step would wait for this.
+    pub async fn changes(&self, span: Span, lines: bool) -> Changes {
+        let undo = self.undo.clone();
+        tokio::task::spawn_blocking(move || {
+            let comparing = locked(&undo).changes(span);
+            comparing.run(lines)
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
 /// Reads all of `pipe`, keeping the first `MAX_OUTPUT` bytes: a command
 /// that prints gigabytes costs no more memory than one that prints enough.
 /// Returns what was kept, and how much there was.
@@ -1139,7 +1189,7 @@ fn lines(text: &str, args: &ReadArgs) -> Result<String, String> {
         out.push('\n');
     }
     let more = if end < total { format!("; read again with start_line {} for more", end + 1) } else { String::new() };
-    out.push_str(&format!("[lines {start}-{end} of {total}{more}]"));
+    out.push_str(&format!("{PART}{start}-{end} of {total}{more}]"));
     Ok(out)
 }
 

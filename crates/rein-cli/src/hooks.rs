@@ -88,6 +88,21 @@ pub(crate) async fn start(agent: &mut Agent<Llm>, terminal: &mut Terminal, dir: 
     agent.session_started(source, terminal).await;
 }
 
+/// Asks about a project's hooks that wait for a yes, once there's someone
+/// to ask: `rein serve`'s client, once the conversation it asked for is
+/// open. Those you say yes to run from then on.
+pub(crate) async fn ask_waiting(agent: &mut Agent<Llm>, terminal: &mut Terminal, dir: &Path) {
+    let root = agent.tools.root().to_owned();
+    let waiting: Vec<Hook> = agent.hooks().all().iter().filter(|hook| hook.state == State::Waiting).cloned().collect();
+    if waiting.is_empty() || !say_yes(&waiting, &root, terminal).await {
+        return;
+    }
+    match keep(dir, &root, &waiting, true) {
+        Ok(()) => agent.set_hooks(load(dir, &root)),
+        Err(e) => say!("{}{}", " ".repeat(GUTTER), terminal.err.red(&format!("✗ {e}"))),
+    }
+}
+
 /// The hooks there are, in a line: those that run, and those that don't
 /// and why, briefly. `None` with none.
 fn said(hooks: &Hooks) -> Option<String> {
@@ -174,19 +189,91 @@ async fn say_yes(hooks: &[Hook], root: &Path, terminal: &mut Terminal) -> bool {
         say!("{pad}  {} {}: {}{}", hook.name(), when(hook), command_line(hook), scripts(hook, root));
     }
     let count = hooks.len();
-    let (they, one) = if count == 1 { ("It came", "it, or to a script it names, asks again") } else { ("They came", "one, or to a script it names, asks again") };
-    let run = if count == 1 { "it'd run as you'd run it" } else { "they'd run as you'd run them" };
-    let question = Question {
-        title: format!("Run {} this project sets?", if count == 1 { "the hook".to_owned() } else { format!("the {count} hooks") }),
-        detail: Some(format!(
-            "{they} with the project, and may be anyone's: {run}, outside the sandbox, with your keys. A change to {one}; \
-             /hooks turns one off or on."
-        )),
-        command: None,
-        // No first: what's in a cloned repository runs only once you choose.
-        answers: vec![("n", "No, not this time".to_owned()), ("y", if count == 1 { "Yes, run it" } else { "Yes, run them" }.to_owned())],
-    };
-    terminal.yes(question).await
+    let whens: Vec<String> = hooks.iter().map(when).fold(Vec::new(), |mut whens, when| {
+        if !whens.contains(&when) {
+            whens.push(when);
+        }
+        whens
+    });
+    let (it, runs) = if count == 1 { ("it", "It runs") } else { ("one", "They run") };
+    let named: Vec<String> = hooks.iter().map(|hook| format!("{}{}", command_line(hook), lines_of(hook, root))).collect();
+    let mut read = false;
+    loop {
+        let shown = if read { contents(hooks, root) } else { named.join("\n") };
+        // Reading is offered once, and only of what there's a script to read.
+        let readable = !read && hooks.iter().any(|hook| !hook.scripts(root).is_empty());
+        // No first: what's in a cloned repository runs only once you choose,
+        // and Enter picks the first.
+        let mut answers = vec![("n", "Not now".to_owned()), ("y", "Trust it".to_owned())];
+        if readable {
+            answers.insert(1, ("r", "Read it".to_owned()));
+        }
+        let question = Question {
+            title: format!("This project comes with {}", if count == 1 { "a hook".to_owned() } else { format!("{count} hooks") }),
+            detail: Some(format!(
+                "{runs} {}, outside the sandbox, with your keys. Nothing of {it} runs until you say yes to all of what it is, and a later change to it asks again.",
+                whens.join(" and ")
+            )),
+            command: Some(shown),
+            answers,
+        };
+        match terminal.answer(question).await.as_deref() {
+            Some("y") => return true,
+            Some("r") => read = true,
+            _ => return false,
+        }
+    }
+}
+
+/// The most of a script read: a project chooses what its hooks name, and
+/// rein has one thread.
+const SCRIPT_BYTES: u64 = 1024 * 1024;
+
+/// What the script at `path` says, as far as [`SCRIPT_BYTES`]: only a file,
+/// never a pipe or a device, which a read would wait on for good.
+fn script_text(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("it isn't a file".to_owned());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|file| file.take(SCRIPT_BYTES).read_to_end(&mut bytes)).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// How long each script `hook` names is: ` (41 lines)`.
+fn lines_of(hook: &Hook, root: &Path) -> String {
+    let counts: Vec<String> = hook.scripts(root).iter().filter_map(|script| script_text(script).ok()).map(|text| text.lines().count().to_string()).collect();
+    match counts.as_slice() {
+        [] => String::new(),
+        [one] => format!("  ({one} line{})", if one == "1" { "" } else { "s" }),
+        many => format!("  ({} lines)", many.join(", ")),
+    }
+}
+
+/// The most of a script the question shows: it scrolls, but a script can
+/// be any size.
+const SCRIPT_LINES: usize = 400;
+
+/// What each of `hooks` runs, with the whole of each script it names.
+fn contents(hooks: &[Hook], root: &Path) -> String {
+    let mut shown = Vec::new();
+    for hook in hooks {
+        shown.push(format!("$ {}", command_line(hook)));
+        for script in hook.scripts(root) {
+            let path = script.strip_prefix(root).unwrap_or(&script).display().to_string();
+            let text = script_text(&script).unwrap_or_else(|e| format!("(can't read it: {e})"));
+            let lines: Vec<&str> = text.lines().collect();
+            let more = lines.len().saturating_sub(SCRIPT_LINES);
+            shown.push(format!("── {path} ──"));
+            shown.extend(lines.into_iter().take(SCRIPT_LINES).map(str::to_owned));
+            if more > 0 {
+                shown.push(format!("… and {more} more lines"));
+            }
+        }
+    }
+    shown.join("\n")
 }
 
 /// The scripts `hook` names, said after its command: ` · runs a.py`.

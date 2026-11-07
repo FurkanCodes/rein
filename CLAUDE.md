@@ -388,6 +388,20 @@ finding. Each says why in a line.
   with nothing to run in. And while a setting changes rein takes nothing
   else, so the window holds what you send until it's done: steered at a
   turn that wasn't there, a message left the pane running for good.
+- What you review and what Undo puts back are one comparison (`Undo::since`):
+  each file as it was before the turn, against how it is now. Asked for during
+  a turn it reads what's recorded and doesn't `settle`, which would take a
+  running command for a stopped one. Between turns it settles and goes on
+  following what still runs in the background: a window asks after every
+  turn, and what such a command wrote next was lost to `/undo`. It compares
+  with the lock let go (`Comparing`), or the turn's next step would wait.
+- What you're partway through writing keeps the keys when a question comes
+  up, wherever in the window it is: a `y` meant for a comment said yes to a
+  command nobody had read.
+- A `notify` made while a frame draws asks for no frame: GPUI drops it. What
+  measures itself as it paints (the kit's `Diff`) needs whoever shows it to
+  ask for the next (`request_animation_frame`): Changes opened blank until
+  something else drew, and every shot taken after another click hid that.
 - What a turn leaves for the others (a task's result, the steps it ran) is
   noted in `Terminal`'s `step_*` methods, which any `Ui` calls: written into
   the terminal's drawing, a sub-agent in `rein serve` would report nothing.

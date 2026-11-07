@@ -10,7 +10,7 @@ use rein_transcript::{Item, Menu, Setting};
 
 use super::{Pane, Sent};
 use crate::look::Look;
-use crate::parts::{Press, hairline};
+use crate::parts::hairline;
 
 /// How wide each is, and how far above the pane's foot it sits.
 const MODEL_WIDE: f32 = 420.;
@@ -28,7 +28,7 @@ pub(crate) enum Picking {
 
 /// A list on screen.
 pub(super) struct Picker {
-    picking: Picking,
+    pub(super) picking: Picking,
     /// What's typed to narrow the models. The modes are few enough.
     input: Entity<InputState>,
     /// Which of what fits is picked.
@@ -43,6 +43,12 @@ struct Choice {
     about: String,
     group: Option<String>,
     current: bool,
+}
+
+/// How much of your limits is used, in a few words: `5h 28% · 7d 75%`.
+fn meters_said(meters: &[rein_transcript::Meter]) -> Option<String> {
+    let said: Vec<String> = meters.iter().filter_map(|meter| meter.used.map(|used| format!("{} {used}%", meter.label))).collect();
+    (!said.is_empty()).then(|| said.join(" · "))
 }
 
 impl Pane {
@@ -105,6 +111,11 @@ impl Pane {
         let keys = cx.focus_handle();
         if picking == Picking::Model {
             input.update(cx, |input, cx| input.focus(window, cx));
+            self.next_request += 1;
+            if let Some(agent) = &mut self.agent {
+                agent.ask_ways(self.next_request);
+                self.sent.insert(self.next_request, Sent::Ways);
+            }
             // The other providers' are looked up as the list opens.
             if !self.running {
                 self.next_request += 1;
@@ -177,19 +188,29 @@ impl Pane {
         let fits = Self::fitting(picker, &choices, cx);
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut group: Option<&str> = None;
+        // How much of your limits is used is said of the provider in use,
+        // beside its models, as it says it: a provider that says nothing
+        // shows nothing.
+        let in_use = choices.iter().find(|choice| choice.current).and_then(|choice| choice.group.clone());
+        let used = meters_said(&self.meters);
         for (place, &at) in fits.iter().enumerate() {
             let choice = &choices[at];
             if choice.group.as_deref() != group {
                 group = choice.group.as_deref();
+                let used = used.clone().filter(|_| group.is_some() && group == in_use.as_deref());
                 rows.push(
                     div()
+                        .flex()
+                        .justify_between()
+                        .gap(px(8.))
                         .px(px(8.))
                         .pt(px(10.))
                         .pb(px(4.))
                         .text_size(px(11.5))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(look.ink_3)
-                        .children(group.map(str::to_owned))
+                        .child(div().min_w_0().truncate().children(group.map(str::to_owned)))
+                        .children(used.map(|used| div().flex_none().font_weight(FontWeight::NORMAL).child(used)))
                         .into_any_element(),
                 );
             }
@@ -249,10 +270,25 @@ impl Pane {
             Picking::Model => {
                 let typed = !picker.input.read(cx).value().is_empty();
                 let count = typed.then(|| div().flex_none().text_size(px(12.)).text_color(look.ink_3).child(format!("{} of {}", fits.len(), choices.len())));
-                let more = Press::new("sign-in-more").ghost().wide().label("Sign in to more").on_click(cx.listener(|pane, _, window, cx| {
+                let sign_in = cx.listener(|pane, _, window, cx| {
                     pane.close_picker(window, cx);
                     pane.run("/login", Vec::new(), cx);
-                }));
+                });
+                let heading = div().px(px(8.)).pt(px(10.)).pb(px(4.)).text_size(px(11.5)).font_weight(FontWeight::SEMIBOLD).text_color(look.ink_3).child("Sign in to more");
+                let providers = self.more_ways.clone().unwrap_or_else(|| "Another provider".to_owned());
+                let row = div()
+                    .id("sign-in-more")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .min_h(px(30.))
+                    .px(px(8.))
+                    .rounded(px(7.))
+                    .hover(|style| style.bg(look.hover))
+                    .on_click(sign_in)
+                    .child(div().flex_1().min_w_0().truncate().child(providers))
+                    .child(div().flex_none().text_color(look.ink_3).child("›"));
+                let more = div().child(heading).child(row);
                 let effort = self.setting("effort").map(|effort| effort_levels(effort, cx));
                 card.w(px(MODEL_WIDE))
                     .child(
@@ -330,6 +366,22 @@ impl Pane {
                             )
                             .child(switch("sandbox-switch", walled, &look).on_click(flip)),
                     )
+                    .children(self.setting("keep").map(|keep| {
+                        let kept = keep.current == "on";
+                        let flip =
+                            cx.listener(move |pane, _: &ClickEvent, _, cx| pane.set_option(rein_transcript::Sets { option: "keep", value: if kept { "off" } else { "on" } }, cx));
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .min_h(px(36.))
+                            .px(px(14.))
+                            .border_t_1()
+                            .border_color(look.line)
+                            .child(div().flex_1().min_w_0().child("Keep for new conversations"))
+                            .child(switch("keep-switch", kept, &look).on_click(flip))
+                    }))
                     .into_any_element()
             }
         })
@@ -389,7 +441,7 @@ fn effort_levels(effort: &Setting, cx: &mut Context<Pane>) -> impl IntoElement +
 }
 
 /// A switch: a knob in a track, teal when it's on.
-fn switch(id: &'static str, on: bool, look: &Look) -> Stateful<Div> {
+pub(super) fn switch(id: &'static str, on: bool, look: &Look) -> Stateful<Div> {
     let knob = div()
         .absolute()
         .top(px(2.))

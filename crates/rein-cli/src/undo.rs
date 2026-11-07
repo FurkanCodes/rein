@@ -4,7 +4,7 @@
 use std::time::{Duration, SystemTime};
 
 use rein_agent::agent::{Agent, Llm};
-use rein_agent::undo::{Listed, Plan};
+use rein_agent::undo::{Became, Listed, Plan, Span, Unshown};
 
 use crate::format::files;
 use crate::input::{Menu, Question};
@@ -42,6 +42,37 @@ pub(crate) async fn command(agent: &mut Agent<Llm>, terminal: &mut Terminal) -> 
     let done = agent.undo(picked.turn).await.map_err(describe)?;
     say_done(&done, terminal);
     Ok(())
+}
+
+/// `/changes`: what the conversation changed, file by file, as `/undo`
+/// would see it.
+pub(crate) async fn changes(agent: &Agent<Llm>, terminal: &Terminal) {
+    let (pad, s) = (" ".repeat(GUTTER), terminal.err);
+    let changes = agent.changes(Span::Conversation, false).await;
+    if changes.files.is_empty() {
+        say!("{pad}nothing's changed in this conversation");
+        return;
+    }
+    let widest = changes.files.iter().map(|file| file.path.chars().count()).max().unwrap_or(0);
+    for file in &changes.files {
+        let room = " ".repeat(widest.saturating_sub(file.path.chars().count()));
+        let lines = match file.unshown {
+            Some(Unshown::Binary) => s.dim("not text"),
+            Some(Unshown::TooBig) => s.dim("too long to show"),
+            Some(Unshown::NotKept) => s.dim("no copy of how it was"),
+            None => format!("{} {}", s.green(&format!("+{}", file.added)), s.red(&format!("−{}", file.removed))),
+        };
+        let word = match (file.since, file.became) {
+            (true, _) => "changed since",
+            (false, Became::Made) => "made",
+            (false, Became::Removed) => "removed",
+            (false, Became::Changed) => "",
+        };
+        say!("{pad}{}{room}  {lines}  {}", file.path, s.dim(word));
+    }
+    let (files, added, removed) = changes.totals();
+    let total = format!("{}, +{added} −{removed}", if files == 1 { "1 file".to_owned() } else { format!("{files} files") });
+    say!("{pad}{}", s.dim(&total));
 }
 
 /// A turn as the list has it: what started it.

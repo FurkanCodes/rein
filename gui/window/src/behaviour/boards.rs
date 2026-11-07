@@ -306,13 +306,14 @@ fn the_palette_lists_agents_and_commands_and_runs_what_you_pick() {
     assert!(desk.cx.update(|_, cx| panes.read(cx).palette_open_for_test()));
     let names = desk.cx.update(|_, cx| panes.read(cx).palette_names_for_test(cx));
     assert!(names.contains(&"Make room".to_owned()) && names.contains(&"something rein grew".to_owned()), "{names:?}");
-    desk.cx.update(|window, cx| panes.update(cx, |panes, cx| panes.type_in_palette_for_test("make room", window, cx)));
+    // `/compact` alone opens the Context panel: this one goes to rein.
+    desk.cx.update(|window, cx| panes.update(cx, |panes, cx| panes.type_in_palette_for_test("something rein grew", window, cx)));
     desk.cx.run_until_parked();
     desk.cx.update(|window, cx| panes.update(cx, |panes, cx| panes.take_palette_for_test(window, cx)));
     assert!(!desk.cx.update(|_, cx| panes.read(cx).palette_open_for_test()), "it goes as it runs");
     let_go(&mut desk, &b);
     let ran = sent_to(&second).into_iter().find(|line| line["method"] == "session/prompt").expect("it ran");
-    assert_eq!(ran["params"]["prompt"][0]["text"], "/compact", "in the pane you're at");
+    assert_eq!(ran["params"]["prompt"][0]["text"], "/new-one", "in the pane you're at");
     drop(a);
 }
 

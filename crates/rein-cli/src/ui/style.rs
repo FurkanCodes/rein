@@ -23,8 +23,8 @@ impl Style {
         Style { on: std::io::stdout().is_terminal() && color_allowed() }
     }
 
-    #[cfg(test)]
-    pub fn plain() -> Style {
+    /// With no colours: for words that go to a client, which colours them itself.
+    pub const fn plain() -> Style {
         Style { on: false }
     }
 

@@ -20,6 +20,9 @@ pub struct Question {
     pub detail: Option<String>,
     /// What it would change in a file, where that's what it does.
     pub change: Option<FileChange>,
+    /// A sub-agent's task, whole, where it's all the step says: its role
+    /// is in the title. `None` if it says more, which `detail` holds.
+    pub task: Option<String>,
 }
 
 impl Question {
@@ -33,7 +36,9 @@ impl Question {
         let command = if update["kind"] == "execute" { input["command"].as_str() } else { None };
         let whole = (!input.is_null()).then(|| command.or(input.as_str()).map_or_else(|| pretty(input), str::to_owned));
         let detail = whole.filter(|whole| change.is_none() && !title.contains(whole.as_str()));
-        Some(Question { title, detail, change })
+        let only_task = input.as_object().is_some_and(|fields| fields.keys().all(|key| key == "role" || key == "task"));
+        let task = input["task"].as_str().filter(|_| only_task).map(str::to_owned);
+        Some(Question { title, detail, change, task })
     }
 }
 
@@ -216,5 +221,15 @@ mod tests {
         let words = Words::of(&json!({ "_meta": { ASKS: "Allow this edit?", WHY: "Why: it must" } }));
         assert_eq!(words, Words { asks: Some("Allow this edit?".to_owned()), why: Some("Why: it must".to_owned()) });
         assert_eq!(Words::of(&json!({})), Words::default());
+    }
+
+    #[test]
+    fn a_sub_agents_task_is_kept_whole_when_its_all_the_step_says() {
+        let asked = |input: Value| Question::of(&serde_json::json!({ "title": "Sub-agent linux: run them", "kind": "other", "rawInput": input })).unwrap();
+        let task = "Run the whole suite.\nThen report.";
+        assert_eq!(asked(serde_json::json!({ "role": "linux", "task": task })).task.as_deref(), Some(task));
+        let more = asked(serde_json::json!({ "role": "linux", "task": task, "model": "opus" }));
+        assert_eq!(more.task, None, "what else it says would go unseen");
+        assert!(more.detail.is_some_and(|detail| detail.contains("opus")));
     }
 }

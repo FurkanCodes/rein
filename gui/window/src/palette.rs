@@ -31,6 +31,7 @@ const NAMED: [(&str, &[Named]); 4] = [
             ("sandbox", "Sandbox", "on or off, in any mode"),
             ("compact", "Make room", "compact, with a focus if you like"),
             ("undo", "Undo", "put files back, by turn"),
+            ("changes", "Changes", "what's been changed, file by file"),
             ("copy", "Copy the last answer", "as it wrote it"),
             ("status", "Status", "what is in use"),
             ("search", "Web search", "which model searches"),

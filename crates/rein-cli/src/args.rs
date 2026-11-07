@@ -206,32 +206,32 @@ impl AskArgs {
     /// Flags first; what they don't say comes from `settings` (and the
     /// environment), then rein's defaults.
     pub(crate) fn parse(args: Vec<String>, settings: &Settings) -> CliResult<Self> {
-        let mut model = settings.get("model", "REIN_MODEL");
-        let effort = settings.get("effort", "REIN_EFFORT").map(|e| e.parse::<Effort>().map_err(|e| format!("{e} (in the settings)"))).transpose()?;
+        let mut model = settings.get("model");
+        let effort = settings.get("effort").map(|e| e.parse::<Effort>().map_err(|e| format!("{e} (in the settings)"))).transpose()?;
         let (mut effort, mut system, mut record, mut words) = (effort, None, None, Vec::new());
-        let search = settings.get("search", "REIN_SEARCH").map(|with| with.parse().map_err(|e| format!("{e} (in the settings)"))).transpose()?.unwrap_or_default();
-        let mut mode = match settings.get("mode", "REIN_MODE") {
+        let search = settings.get("search").map(|with| with.parse().map_err(|e| format!("{e} (in the settings)"))).transpose()?.unwrap_or_default();
+        let mut mode = match settings.get("mode") {
             Some(name) => name.parse::<Mode>().map_err(|e| format!("{e} (in the settings)"))?,
             None => Mode::default(),
         };
-        let switch = |key: &str, env: &str, default: bool| match settings.get(key, env).as_deref() {
+        let switch = |key: &str, default: bool| match settings.get(key).as_deref() {
             None => Ok(default),
             Some(value) => on_off(key, value),
         };
-        let (bell, compress) = (switch("bell", "REIN_BELL", true)?, switch("compress", "REIN_COMPRESS", true)?);
+        let (bell, compress) = (switch("bell", true)?, switch("compress", true)?);
         // Off unless you turn it on, as in Claude Code.
-        let mut sandbox = switch("sandbox", "REIN_SANDBOX", false)?;
-        let memory = switch("memory", "REIN_MEMORY", true)?;
-        let check = crate::check::Setting::of(settings.get("check", "REIN_CHECK").as_deref());
-        let strip = switch("strip", "REIN_STRIP", true)?;
-        let tab_command = settings.get("tab_command", "REIN_TAB_COMMAND");
+        let mut sandbox = switch("sandbox", false)?;
+        let memory = switch("memory", true)?;
+        let check = crate::check::Setting::of(settings.get("check").as_deref());
+        let strip = switch("strip", true)?;
+        let tab_command = settings.get("tab_command");
         let mut child = None;
-        let joining = match settings.get("peers", "REIN_PEERS") {
+        let joining = match settings.get("peers") {
             Some(value) => value.parse::<Joining>()?,
             None => Joining::On(Policy::Accept),
         };
         let (mut name, mut workspace, mut worktree) = (None, None, false);
-        let mut max_steps = match settings.get("max_steps", "REIN_MAX_STEPS") {
+        let mut max_steps = match settings.get("max_steps") {
             Some(value) => steps(&value)?,
             None => Some(DEFAULT_MAX_STEPS),
         };

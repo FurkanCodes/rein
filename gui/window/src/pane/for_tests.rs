@@ -22,6 +22,15 @@ impl Pane {
         self.next_request
     }
 
+    /// Presses `way`'s button, as the first run offers it.
+    pub(crate) fn sign_in_for_test(&mut self, way: rein_transcript::signing::Way, cx: &mut Context<Self>) {
+        self.sign_in(way, cx);
+    }
+
+    pub(crate) fn panel_shows_for_test(&self, tab: super::Tab) -> bool {
+        self.panel_shows(tab)
+    }
+
     pub(crate) const fn last_request_for_test(&self) -> u64 {
         self.next_request
     }

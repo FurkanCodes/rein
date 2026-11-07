@@ -55,6 +55,9 @@ pub(crate) enum Said {
     },
     /// The conversation has started, under this id.
     Started(String),
+    /// It couldn't start: you're signed in to nothing that runs the model,
+    /// and these are the ways there are.
+    SignedOut(Vec<rein_transcript::signing::Offered>),
     /// A turn nobody here prompted has started.
     TurnStarted,
     /// A turn came to an end.
@@ -153,6 +156,8 @@ pub(crate) struct Agent {
     /// What was written before the conversation had started: the first is
     /// a prompt, and the rest steer it.
     waiting: Vec<(u64, String, Vec<Attached>)>,
+    /// What opens the conversation, to send again once you've signed in.
+    opens: Value,
 }
 
 const NEW: u64 = 2;
@@ -173,6 +178,9 @@ const TURN_ENDED: &str = "_io.github.furkancodes/turn_ended";
 const STATE: &str = "_io.github.furkancodes/state";
 /// Said in `initialize`: this window shows what a command asks.
 const ASKS: &str = "io.github.furkancodes/asks";
+/// Said in `initialize`: this window has a switch for keeping the mode and
+/// sandbox for new conversations, so changing them needn't ask.
+const KEEPS: &str = "io.github.furkancodes/keeps";
 /// What you sent from this folder, and what `@` can point at.
 const SENT: &str = "_io.github.furkancodes/sent";
 const PATHS: &str = "_io.github.furkancodes/paths";
@@ -181,13 +189,21 @@ const TASKS: &str = "_io.github.furkancodes/tasks";
 const STOP_TASK: &str = "_io.github.furkancodes/stop_task";
 const ROOM: &str = "_io.github.furkancodes/room";
 const MODELS: &str = "_io.github.furkancodes/models";
+const CHANGES: &str = "_io.github.furkancodes/changes";
 const UNDO_TURNS: &str = "_io.github.furkancodes/undo_turns";
 const UNDO_PLAN: &str = "_io.github.furkancodes/undo_plan";
 const UNDO: &str = "_io.github.furkancodes/undo";
 const LABEL: &str = "io.github.furkancodes/label";
+const SIGN_IN: &str = "_io.github.furkancodes/sign_in";
+const WAYS: &str = "_io.github.furkancodes/ways";
+/// Your settings, for the settings page; a key of them set; a rule of
+/// yours added or taken out.
+const CONFIG: &str = "_io.github.furkancodes/config";
+const SET_CONFIG: &str = "_io.github.furkancodes/set_config";
+const RULE: &str = "_io.github.furkancodes/rule";
 
 fn initialize() -> Value {
-    json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": { "_meta": { PANES: true, ASKS: true } } } })
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": { "_meta": { PANES: true, ASKS: true, KEEPS: true } } } })
 }
 
 fn send(input: &mut impl Write, message: &Value) {
@@ -202,6 +218,9 @@ fn answered(message: &Value, opening: &Opening) -> Option<Said> {
     let error = &message["error"];
     let why = || error["message"].as_str().unwrap_or("That failed.").to_owned();
     if id == NEW {
+        if error["code"] == rein_transcript::signing::SIGNED_OUT {
+            return Some(Said::SignedOut(rein_transcript::signing::ways(&error["data"])));
+        }
         if error.is_object() {
             return Some(Said::Failed(why()));
         }
@@ -240,8 +259,9 @@ fn read(output: impl BufRead, said: &UnboundedSender<Said>, opening: &Opening) {
     for line in output.lines().map_while(Result::ok) {
         let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
         // With no conversation there's nothing more it can do: left open,
-        // what you write would wait for one for good.
-        let no_conversation = message["id"] == NEW && message["error"].is_object();
+        // what you write would wait for one for good. Signed out, it waits
+        // for you to sign in.
+        let no_conversation = message["id"] == NEW && message["error"].is_object() && message["error"]["code"] != rein_transcript::signing::SIGNED_OUT;
         if message["id"] == NEW {
             let settings = Some(Setting::listed(&message["result"]["configOptions"])).filter(|settings| !settings.is_empty()).map(Said::Settings);
             let modes = Modes::of(&message["result"]["modes"]).map(Said::Modes);
@@ -310,7 +330,7 @@ impl Agent {
         let (said_tx, said) = unbounded();
         let opening = opening.clone();
         std::thread::spawn(move || read(BufReader::new(output), &said_tx, &opening));
-        Ok(Agent { child: Some(child), input: Some(input), said: Some(said), session: None, waiting: Vec::new() })
+        Ok(Agent { child: Some(child), input: Some(input), said: Some(said), session: None, waiting: Vec::new(), opens: open })
     }
 
     /// The conversations `command` has saved, every project's, as many pages
@@ -401,6 +421,23 @@ impl Agent {
         true
     }
 
+    /// Signs in the way `way` says, under the number `id`: there's no
+    /// conversation to ask it of yet.
+    pub(crate) fn sign_in(&mut self, id: u64, way: rein_transcript::signing::Way) {
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "method": SIGN_IN, "params": { "way": way.id() } }));
+    }
+
+    /// Asks the ways there are to sign in to more, under the number `id`.
+    pub(crate) fn ask_ways(&mut self, id: u64) {
+        self.say(&json!({ "jsonrpc": "2.0", "id": id, "method": WAYS, "params": {} }));
+    }
+
+    /// Opens the conversation again, once you've signed in.
+    pub(crate) fn open_again(&mut self) {
+        let open = self.opens.clone();
+        self.say(&open);
+    }
+
     /// Asks what's in the background.
     pub(crate) fn ask_tasks(&mut self, id: u64) -> bool {
         self.ask_of_it(id, TASKS)
@@ -414,6 +451,26 @@ impl Agent {
     /// Asks what's taking room.
     pub(crate) fn ask_room(&mut self, id: u64) -> bool {
         self.ask_of_it(id, ROOM)
+    }
+
+    /// Asks for your settings, as a settings page shows them.
+    pub(crate) fn ask_config(&mut self, id: u64) -> bool {
+        self.ask_of_it(id, CONFIG)
+    }
+
+    /// Sets `key` in your settings to `value`, or takes it out with `None`.
+    pub(crate) fn set_config(&mut self, id: u64, key: &str, value: Option<&str>) -> bool {
+        self.ask_with(id, SET_CONFIG, json!({ "key": key, "value": value }))
+    }
+
+    /// Adds `rule` to yours, or takes it out.
+    pub(crate) fn rule(&mut self, id: u64, rule: &str, add: bool) -> bool {
+        self.ask_with(id, RULE, json!({ "rule": rule, "add": add }))
+    }
+
+    /// Asks what `span` changed, with its `lines`, or only how much.
+    pub(crate) fn ask_changes(&mut self, id: u64, span: rein_transcript::changes::Span, lines: bool) -> bool {
+        self.ask_with(id, CHANGES, json!({ "span": span.id(), "lines": lines }))
     }
 
     /// Has the other providers' models looked up: they come with the options.
@@ -631,6 +688,15 @@ mod tests {
                 Said::Ended
             ]
         );
+    }
+
+    #[test]
+    fn signed_out_it_says_the_ways_and_waits_for_you_to_sign_in() {
+        let refused = json!({ "id": NEW, "error": { "code": rein_transcript::signing::SIGNED_OUT, "message": "signed out", "data": { "ways": [{ "way": "local", "providers": ["Ollama"] }] } } });
+        let heard = heard(&[refused, json!({ "id": NEW, "result": { "sessionId": "abc" } })]);
+        let Said::SignedOut(ways) = &heard[0] else { panic!("{heard:?}") };
+        assert_eq!(ways.iter().map(|way| way.way).collect::<Vec<_>>(), [rein_transcript::signing::Way::Local]);
+        assert_eq!(heard[1..], [Said::Started("abc".to_owned()), Said::Ended], "it goes on reading, for the conversation once you've signed in");
     }
 
     #[test]

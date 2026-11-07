@@ -8,8 +8,11 @@ mod for_tests;
 mod heard;
 mod panel;
 mod pickers;
+mod review;
 mod rows;
+mod settings_page;
 mod undo;
+mod welcome;
 mod write;
 
 #[cfg(test)]
@@ -75,6 +78,9 @@ pub(crate) struct About {
     pub(crate) started_for: Option<(WeakEntity<Pane>, Value)>,
     /// The pane this is a sub-agent of, which it's listed under.
     pub(crate) parent: Option<WeakEntity<Pane>>,
+    /// It's the pane to start with, on a desk with nothing else: drawn as
+    /// the first run's box until something's sent from it.
+    pub(crate) draft: bool,
 }
 
 /// What a pane tells the window.
@@ -94,6 +100,15 @@ pub(crate) enum Told {
     New,
     /// `/resume`: the saved conversations.
     Resume,
+    /// The pane to start with has had something sent from it, and is a
+    /// conversation like any other now.
+    Begun,
+    /// The pane to start with wants another folder.
+    Folder,
+    /// Go to the sub-agent this one started, by the name it gave it.
+    OpenSubAgent(String),
+    /// Your settings now keep this look: `light`, `dark` or `follow`.
+    Look(String),
 }
 
 impl EventEmitter<Told> for Pane {}
@@ -130,10 +145,23 @@ enum Sent {
     UndoTurns(Option<usize>),
     UndoPlan,
     Undoing,
+    /// How much the conversation changed, for the header.
+    Totals,
+    /// What a span changed, with its lines.
+    Changes(rein_transcript::changes::Span),
     /// What can be set, as the list of models comes.
     Models,
     /// A setting changing: rein takes nothing else until it has.
     Setting,
+    /// Signing in, before there's a conversation.
+    SignIn,
+    /// The ways there are to sign in to more, for the list of models.
+    Ways,
+    /// Your settings, for the settings page; a key of them set to this, or
+    /// taken out; a rule of yours added or taken out.
+    Config,
+    SetConfig(rein_transcript::config::Key, Option<String>),
+    Rule,
 }
 
 /// A question waiting for your answer.
@@ -206,11 +234,21 @@ pub(crate) struct Pane {
     /// What's open beside the conversation, and what's to open, which
     /// takes a window.
     panel: Option<panel::Panel>,
+    review: review::Review,
     to_panel: Option<panel::Tab>,
     /// The sheet that puts the project back.
     undoing: Option<undo::Sheet>,
     /// The model or mode list, over the box.
     picker: Option<pickers::Picker>,
+    /// It's the pane to start with: see [`About::draft`].
+    draft: bool,
+    /// Signed in to nothing that runs the model: the ways there are.
+    signing: Option<welcome::Signing>,
+    /// The providers there are still to sign in to, in a few words, as the
+    /// list of models offers them.
+    more_ways: Option<String>,
+    /// The settings page, while it's open over the window.
+    page: Option<settings_page::Page>,
 }
 
 impl Pane {
@@ -248,7 +286,11 @@ impl Pane {
             })
             .detach();
         }
+        let draft = about.draft;
         Pane {
+            draft,
+            signing: None,
+            more_ways: None,
             transcript: Transcript::default(),
             agent,
             scroller,
@@ -283,9 +325,11 @@ impl Pane {
             writing: write::Writing::default(),
             all_open: false,
             panel: None,
+            review: review::Review::default(),
             to_panel: None,
             undoing: None,
             picker: None,
+            page: None,
         }
     }
 
@@ -313,7 +357,9 @@ impl Pane {
     /// an image go after it. While a setting changes everything does: rein
     /// would say it's busy, and no turn would come to end what it was sent.
     fn run(&mut self, text: &str, images: Vec<Attached>, cx: &mut Context<Self>) {
-        if self.setting_changing() || self.running && (says_back(text) || !images.is_empty()) {
+        // A panel only looks: it has no need to wait for anything.
+        let panel = matches!(OwnCommand::of(text), Some(OwnCommand::Tasks | OwnCommand::Changes));
+        if !panel && (self.setting_changing() || self.running && (says_back(text) || !images.is_empty())) {
             self.writing.waits(text.to_owned(), images);
             cx.notify();
             return;
@@ -325,6 +371,7 @@ impl Pane {
             Some(OwnCommand::Copy) => self.copy_last_answer(cx),
             Some(OwnCommand::Undo) => self.open_undo(None, cx),
             Some(OwnCommand::Tasks) => self.open_panel(panel::Tab::Tasks, cx),
+            Some(OwnCommand::Changes) => self.open_panel(panel::Tab::Changes, cx),
             None => match Sets::of(text).filter(|sets| images.is_empty() && self.setting(sets.option).is_some()) {
                 Some(sets) => self.set_option(sets, cx),
                 None => self.send_with(text, images, cx),
@@ -384,6 +431,9 @@ impl Pane {
     /// What's asked, in words for the list: `wants to run git push`.
     pub(crate) fn wanting(&self) -> Option<String> {
         let question = self.asked.front()?.question.as_ref()?;
+        if question.title.starts_with("Sub-agent ") {
+            return Some("wants to start a sub-agent".to_owned());
+        }
         let mut letters = question.title.chars();
         let first = letters.next()?;
         Some(format!("wants to {}{}", first.to_lowercase(), letters.as_str()))
@@ -449,11 +499,19 @@ impl Pane {
     }
 
     /// Runs what you chose or typed. What has a list of its own opens it:
-    /// the effort is with the model, and the sandbox with the mode.
+    /// the effort is with the model, and the sandbox with the mode. What
+    /// says how full the conversation is, or makes room, opens the panel
+    /// that shows it, where Compact asks what to keep in mind.
     pub(crate) fn run_chosen(&mut self, line: &str, window: &mut Window, cx: &mut Context<Self>) {
         match line.trim() {
             "/model" | "/effort" if self.setting("model").is_some() => self.open_picker(Picking::Model, window, cx),
             "/mode" | "/sandbox" if self.modes.is_some() => self.open_picker(Picking::Mode, window, cx),
+            // How full the conversation is, and making room, are the Context panel's.
+            "/status" | "/compact" if self.agent.is_some() => {
+                if !self.panel_shows(panel::Tab::Context) {
+                    self.open_panel(panel::Tab::Context, cx);
+                }
+            }
             _ => self.run(line, Vec::new(), cx),
         }
     }
@@ -556,6 +614,7 @@ impl Pane {
         } else {
             agent.prompt(self.next_request, text, &images);
             self.sent.insert(self.next_request, Sent::Prompt(text.to_owned(), images));
+            self.begun(cx);
             self.watch.started();
             self.failure = None;
             // A command's line may hold a key: rein says it back without it.
@@ -619,6 +678,10 @@ impl Pane {
             for choice in &mode.choices {
                 if let Some(known) = modes.available.iter_mut().find(|known| known.id == choice.value) {
                     known.name.clone_from(&choice.name);
+                    // What each lets through depends on the sandbox too.
+                    if !choice.about.is_empty() {
+                        known.about.clone_from(&choice.about);
+                    }
                 }
             }
         }
@@ -691,6 +754,34 @@ impl Pane {
 impl Render for Pane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.settle(window, cx);
+        if self.page.is_some() {
+            return self.page_view(cx);
+        }
+        // Signed out, any pane shows the ways in, not only the first run's:
+        // a pane started with ⌘N would otherwise wait for good.
+        if self.signing.is_some() && !self.draft {
+            let look = Look::of(cx);
+            let ways = self.welcome(window, cx);
+            let asking = self.asking_card(window, cx);
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(72.))
+                .px(px(20.))
+                .rounded(px(10.))
+                .bg(look.bg)
+                .shadow(vec![halo(look.line, 1.)])
+                .child(div().relative().w_full().max_w(px(620.)).flex().flex_col().gap(px(16.)).child(ways).children(asking))
+                .into_any_element();
+        }
+        if self.draft {
+            let welcome = self.welcome(window, cx);
+            let picker = self.picker_card(cx);
+            let asking = self.asking_card(window, cx);
+            return div().relative().w_full().flex().flex_col().gap(px(16.)).child(welcome).children(asking).children(picker).into_any_element();
+        }
         let look = Look::of(cx);
         let pane = cx.weak_entity();
         let list = MessageScroller::new("transcript", self.scroller.clone(), move |index, _, cx| {
@@ -789,7 +880,7 @@ impl Render for Pane {
             .child(foot)
             .children(picker)
             .children(sheet);
-        div().size_full().min_w_0().flex().gap(px(6.)).child(sheet_of_the_conversation).children(beside)
+        div().size_full().min_w_0().flex().gap(px(6.)).child(sheet_of_the_conversation).children(beside).into_any_element()
     }
 }
 
@@ -802,6 +893,7 @@ impl Pane {
         }
         self.settle_box(window, cx);
         self.settle_panel(window, cx);
+        self.settle_review(window);
         self.settle_undo(window, cx);
         // What held the keys has gone, and took them with it: at a pane
         // you're at, there's always somewhere for what you type to go.
@@ -814,6 +906,8 @@ impl Pane {
         }
         let says = if self.agent.is_none() {
             "This agent has ended"
+        } else if self.draft && self.asking.is_none() {
+            welcome::DESCRIBE
         } else if self.asking.is_some() {
             ASKED_ABOVE
         } else if self.running {
@@ -842,6 +936,9 @@ impl Pane {
     /// You've come here, or a question has: the keys go to what's waiting,
     /// unless you've something half-written, which they stay with.
     pub(crate) fn take_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.half_written_beside(window, cx) {
+            return;
+        }
         if self.asking.is_some() {
             self.focus_asking(window, cx);
         } else if self.is_asking() && self.input.read(cx).value().is_empty() {
@@ -879,6 +976,7 @@ impl Pane {
             }))
         });
         let (weight, title) = if self.looking { (FontWeight::SEMIBOLD, look.ink) } else { (FontWeight::MEDIUM, look.ink_2) };
+        let changes = self.changes_button(cx);
         div()
             .flex()
             .flex_none()
@@ -895,6 +993,7 @@ impl Pane {
                 None => self.folder().to_owned(),
             }))
             .child(crate::panes::drag_area("drag-pane").flex_1().h_full())
+            .children(changes)
             .child(more)
     }
 }

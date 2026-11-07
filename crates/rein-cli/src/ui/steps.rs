@@ -572,16 +572,45 @@ pub fn change_lines(change: &[Changed], style: Style, columns: usize) -> Vec<Str
 /// How a change to a file is said on its step's line: `+5 -1` for an
 /// edit, `+2` for one that only adds, `30 lines` for a file written whole.
 pub fn change_counts(call: &ToolCall, style: Style) -> String {
+    match change_sizes(call) {
+        None => String::new(),
+        Some(Sizes::Written(lines)) => style.dim(&format!("{lines} line{}", if lines == 1 { "" } else { "s" })),
+        Some(Sizes::Edited { added, removed }) => {
+            let added = (added > 0).then(|| style.green(&format!("+{added}")));
+            let removed = (removed > 0).then(|| style.red(&format!("-{removed}")));
+            added.into_iter().chain(removed).collect::<Vec<_>>().join(" ")
+        }
+    }
+}
+
+/// How big a change to a file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sizes {
+    /// A file written whole, this many lines long.
+    Written(usize),
+    /// An edit: the lines it adds and takes away.
+    Edited { added: usize, removed: usize },
+}
+
+/// How big the change `call` makes is, if it makes one.
+pub fn change_sizes(call: &ToolCall) -> Option<Sizes> {
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
-    let Some((old, new)) = sides(call, &args) else { return String::new() };
+    let (old, new) = sides(call, &args)?;
     if ToolName::of(call) == Some(ToolName::Write) {
-        let lines = new.lines().count();
-        return style.dim(&format!("{lines} line{}", if lines == 1 { "" } else { "s" }));
+        return Some(Sizes::Written(new.lines().count()));
     }
     let (old, new, _) = changed_lines(old, new);
-    let added = (!new.is_empty()).then(|| style.green(&format!("+{}", new.len())));
-    let removed = (!old.is_empty()).then(|| style.red(&format!("-{}", old.len())));
-    added.into_iter().chain(removed).collect::<Vec<_>>().join(" ")
+    Some(Sizes::Edited { added: new.len(), removed: old.len() })
+}
+
+/// How many lines a whole read brought in: none for a part of a file, an
+/// image, or one already in the conversation, which say so another way.
+pub fn lines_read(call: &ToolCall, output: &str) -> Option<usize> {
+    use rein_agent::{compact::UNCHANGED, tools};
+    let image = output.strip_prefix('[').is_some_and(|rest| rest.starts_with(tools::IMAGE));
+    let whole = !output.starts_with(UNCHANGED) && !image && !output.starts_with(tools::ERROR);
+    let partial = output.lines().last().is_some_and(|line| line.starts_with(tools::PART));
+    (ToolName::of(call) == Some(ToolName::Read) && whole && !partial).then(|| output.lines().count())
 }
 
 /// The text a change takes away and puts in: an edit's, or none and the

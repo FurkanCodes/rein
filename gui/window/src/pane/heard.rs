@@ -21,6 +21,7 @@ impl Pane {
         self.writing.turn_over();
         self.ask_sent();
         self.ask_room();
+        self.files_may_have_changed();
         self.watch.turn_over(self.looking);
         self.transcript.turn_over()
     }
@@ -62,6 +63,7 @@ impl Pane {
         self.writing.turn_over();
         // It may not go as you meant it to, now: it's yours again.
         self.writing.bring_back();
+        self.files_may_have_changed();
         self.watch.failed();
         self.tell_parent(Err(&why), cx);
         let update = self.transcript.turn_over().and(self.transcript.note(&why));
@@ -119,6 +121,14 @@ impl Pane {
                 self.room_came(&said, cx);
                 Update::default()
             }
+            (Some(Sent::Totals), CameTo::Told(said)) => {
+                self.totals_came(id, &said, cx);
+                Update::default()
+            }
+            (Some(Sent::Changes(span)), CameTo::Told(said)) => {
+                self.changes_came(id, span, &said, cx);
+                Update::default()
+            }
             (Some(Sent::Stopping | Sent::UndoTurns(_) | Sent::UndoPlan | Sent::Undoing | Sent::Setting | Sent::Models), CameTo::Busy(why) | CameTo::Refused(why)) => {
                 self.undoing = None;
                 self.transcript.note(&why)
@@ -131,6 +141,7 @@ impl Pane {
             (Some(Sent::Undoing), _) => {
                 self.undoing = None;
                 self.ask_room();
+                self.files_may_have_changed();
                 cx.notify();
                 Update::default()
             }
@@ -143,6 +154,49 @@ impl Pane {
                 Update::default()
             }
             (Some(Sent::Steer(_)), CameTo::Refused(why)) => self.transcript.note(&format!("That didn't reach it: {why}")),
+            (Some(Sent::Config), CameTo::Told(said)) => {
+                self.config_came(Ok(&said), cx);
+                Update::default()
+            }
+            (Some(Sent::Config), CameTo::Busy(why) | CameTo::Refused(why)) => {
+                self.config_came(Err(why), cx);
+                Update::default()
+            }
+            (Some(Sent::SetConfig(key, value)), CameTo::Done | CameTo::Told(_)) => {
+                self.key_set(key, value, Ok(()), cx);
+                Update::default()
+            }
+            (Some(Sent::SetConfig(key, value)), CameTo::Busy(why) | CameTo::Refused(why)) => {
+                self.key_set(key, value, Err(why), cx);
+                Update::default()
+            }
+            (Some(Sent::Rule), CameTo::Done | CameTo::Told(_)) => {
+                self.rule_changed(Ok(()), cx);
+                Update::default()
+            }
+            (Some(Sent::Rule), CameTo::Busy(_)) => {
+                self.rule_changed(Err("Your rules can change once the turn that's running ends.".to_owned()), cx);
+                Update::default()
+            }
+            (Some(Sent::Rule), CameTo::Refused(why)) => {
+                self.rule_changed(Err(why), cx);
+                Update::default()
+            }
+            (Some(Sent::Ways), CameTo::Told(said)) => {
+                let key = rein_transcript::signing::ways(&said).into_iter().find(|offered| offered.way == rein_transcript::signing::Way::Key);
+                self.more_ways = key.map(|offered| offered.says);
+                cx.notify();
+                Update::default()
+            }
+            (Some(Sent::SignIn), came_to) => {
+                let came_to = match came_to {
+                    CameTo::Told(said) => Ok(said["signedIn"] == true),
+                    CameTo::Busy(why) | CameTo::Refused(why) => Err(why),
+                    CameTo::Done | CameTo::TurnOver => Ok(false),
+                };
+                self.signed_in(came_to, cx);
+                Update::default()
+            }
             _ => Update::default(),
         }
     }
@@ -162,7 +216,12 @@ impl Pane {
                         return Update::default();
                     }
                 }
-                self.transcript.apply(&update)
+                let step_over = update["sessionUpdate"] == "tool_call_update" && matches!(update["status"].as_str(), Some("completed" | "failed"));
+                let shown = self.transcript.apply(&update);
+                if step_over {
+                    self.step_over();
+                }
+                shown
             }
             Said::Heard { from, text } => self.transcript.heard(&from, &text),
             // Said in order, so the step it's about is in by now.
@@ -204,12 +263,20 @@ impl Pane {
                 cx.notify();
                 Update::default()
             }
+            Said::SignedOut(ways) => {
+                self.signing = Some(super::welcome::Signing::new(ways));
+                cx.notify();
+                Update::default()
+            }
             Said::Started(session) => {
+                self.signing = None;
                 self.about.session = Some(session.clone());
                 if let Some(agent) = &mut self.agent {
                     agent.started(session);
                 }
                 self.ask_sent();
+                // A saved conversation has changed things already.
+                self.ask_totals();
                 // What a saved conversation did isn't this turn's.
                 self.transcript.turn_started();
                 self.tell_parent(Ok(()), cx);

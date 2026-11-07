@@ -175,6 +175,15 @@ pub(crate) fn command(given: Option<&str>, agent: &mut Agent<Llm>, terminal: &mu
     Ok(())
 }
 
+/// The project's check as a switch shows it: what it runs, and whether it
+/// runs after edits now. `None` when rein knows of none to run.
+pub(crate) fn switch(agent: &Agent<Llm>) -> Option<(String, bool)> {
+    match agent.checking().check() {
+        Some(check) => Some((check.name(), !agent.checking().paused())),
+        None => detect(agent.tools.root()).map(|found| (found.name(), false)),
+    }
+}
+
 /// How rein reads what a command of yours says.
 fn reads(check: &Check) -> &'static str {
     match check.reads {

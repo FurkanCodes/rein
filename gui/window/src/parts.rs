@@ -216,6 +216,12 @@ impl Press {
         self
     }
 
+    /// Stands lit, for what it opens is open.
+    pub(crate) const fn lit(mut self, on: bool) -> Press {
+        self.on = on;
+        self
+    }
+
     /// What it's called for a screen reader, where its label doesn't say.
     pub(crate) fn named(mut self, name: impl Into<SharedString>) -> Press {
         self.base = self.base.accessibility_label(name);

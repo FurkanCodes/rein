@@ -19,7 +19,7 @@ use crate::pane::{About, Pane, Told};
 use crate::parts::{Press, gauge, halo, strip, wordmark};
 use crate::probe::Probe;
 
-gpui_kit::actions!(rein, [NewAgent, NextMode, Complete, FindSent, AllOutput, ToBackground, OpenPalette]);
+gpui_kit::actions!(rein, [NewAgent, NextMode, Complete, FindSent, AllOutput, ToBackground, OpenPalette, OpenSettings]);
 
 /// The window's keys. Those over a box go over the toolkit's own, which indent
 /// text: not what `⇥` is for in a message.
@@ -27,6 +27,7 @@ pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-n" } else { "ctrl-n" }, NewAgent, None),
         KeyBinding::new(if cfg!(target_os = "macos") { "cmd-k" } else { "ctrl-k" }, OpenPalette, None),
+        KeyBinding::new(if cfg!(target_os = "macos") { "cmd-," } else { "ctrl-," }, OpenSettings, None),
         KeyBinding::new("shift-tab", NextMode, Some("Input")),
         KeyBinding::new("tab", Complete, Some("Input")),
         KeyBinding::new("ctrl-r", FindSent, Some("Input")),
@@ -66,7 +67,17 @@ pub(crate) struct Panes {
     pub(crate) focus: FocusHandle,
     /// `⌘K`, while it's up.
     pub(crate) palette: Option<Palette>,
+    /// The pane to start with, drawn on a desk with nothing else on it.
+    draft: Option<Entity<Pane>>,
+    /// The saved conversations, newest first, once they've been listed.
+    recent: Option<Vec<Saved>>,
+    /// Which look the window wears, as your settings keep it: shared with
+    /// what follows the Mac's.
+    wearing: std::rc::Rc<std::cell::Cell<Wearing>>,
 }
+
+/// How many saved conversations the first run offers to go on with.
+const RECENT: usize = 4;
 
 /// Somewhere to take hold of the window by.
 pub(crate) fn drag_area(id: &'static str) -> Stateful<Div> {
@@ -89,12 +100,31 @@ fn age(stood: Duration) -> String {
     }
 }
 
+/// How long ago `at` (seconds since 1970) was, as the list says it.
+pub(crate) fn age_since(at: u64) -> String {
+    age(Duration::from_secs(now().saturating_sub(at)))
+}
+
 /// `path` with your home folder as `~`.
-fn tilde(path: &str, home: Option<&str>) -> String {
+pub(crate) fn tilde(path: &str, home: Option<&str>) -> String {
     match home.and_then(|home| path.strip_prefix(home)) {
         Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
         _ => path.to_owned(),
     }
+}
+
+/// What the button to the saved conversations says: how many, once known.
+fn saved_label(recent: Option<&[Saved]>) -> String {
+    match recent.map(<[Saved]>::len) {
+        Some(1) => "1 saved conversation".to_owned(),
+        Some(count) if count > 0 => format!("{count} saved conversations"),
+        _ => "Saved conversations".to_owned(),
+    }
+}
+
+/// The seconds since 1970, now.
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs())
 }
 
 /// A list's heading: what it's called, and on the right what's under it.
@@ -115,8 +145,10 @@ fn group(name: impl Into<SharedString>, beside: impl Into<SharedString>, look: &
 
 impl Panes {
     pub(crate) fn new(probe: Probe, serve: Vec<String>, wearing: Wearing, window: &mut Window, cx: &mut Context<Self>) -> Panes {
+        let wearing = std::rc::Rc::new(std::cell::Cell::new(wearing));
+        let following = wearing.clone();
         cx.observe_window_appearance(window, move |_, window, cx| {
-            wear(wearing.dark(window.appearance()), cx);
+            wear(following.get().dark(window.appearance()), cx);
             window.refresh();
         })
         .detach();
@@ -136,7 +168,93 @@ impl Panes {
         .detach();
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        Panes { held: Vec::new(), probe, serve, choosing: None, focus, palette: None }
+        // Once whatever the window opens with is open: with an agent on the
+        // desk, there's no pane to start with.
+        cx.defer_in(window, |view, window, cx| view.ensure_draft(window, cx));
+        Panes { held: Vec::new(), probe, serve, choosing: None, focus, palette: None, draft: None, recent: None, wearing }
+    }
+
+    /// With nothing on the desk, there's a pane to start with, and the
+    /// saved conversations to go on with.
+    fn ensure_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.held.iter().any(|held| held.shown) {
+            return;
+        }
+        self.list_recent(window, cx);
+        match &self.draft {
+            Some(draft) => {
+                let draft = draft.clone();
+                cx.defer_in(window, move |_, window, cx| draft.update(cx, |pane, cx| pane.take_keys(window, cx)));
+            }
+            None => {
+                let home = std::env::var("HOME").ok();
+                // Opened from the Finder, the window starts at `/`.
+                let cwd = match (here(), home) {
+                    (here, Some(home)) if here == std::path::Path::new("/") => home,
+                    (here, _) => here.display().to_string(),
+                };
+                self.make_draft(&cwd, String::new(), window, cx);
+            }
+        }
+    }
+
+    /// A pane to start with in `cwd`, with `text` in its box.
+    fn make_draft(&mut self, cwd: &str, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let about = About { cwd: cwd.to_owned(), draft: true, ..About::default() };
+        let start = Start { command: &self.serve, cwd, env: &[], opening: Opening::New };
+        let agent = Agent::start(&start);
+        let why = agent.as_ref().err().cloned();
+        let pane = cx.new(|cx| Pane::new(agent.ok(), about, window, cx));
+        if let Some(why) = why {
+            pane.update(cx, |pane, cx| pane.couldnt_start(&why, cx));
+        }
+        cx.subscribe_in(&pane, window, Self::heard).detach();
+        pane.update(cx, |pane, cx| {
+            pane.set_looking(true, cx);
+            if !text.is_empty() {
+                pane.input.update(cx, |input, cx| input.set_value(text, window, cx));
+            }
+        });
+        let focus = pane.clone();
+        cx.defer_in(window, move |_, window, cx| focus.update(cx, |pane, cx| pane.take_keys(window, cx)));
+        self.draft = Some(pane);
+        cx.notify();
+    }
+
+    /// The pane to start with, while it shows.
+    fn shown_draft(&self) -> Option<Entity<Pane>> {
+        self.draft.clone().filter(|_| !self.held.iter().any(|held| held.shown))
+    }
+
+    /// Asks which folder the pane to start with should work in, and starts
+    /// it again there, with what you'd written.
+    fn move_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let options = PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Work here".into()) };
+        let chosen = cx.prompt_for_paths(options);
+        cx.spawn_in(window, async move |view, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else { return };
+            let Some(folder) = paths.into_iter().next() else { return };
+            let _ = view.update_in(cx, |view, window, cx| {
+                let text = view.draft.take().map(|old| old.read(cx).input.read(cx).value().to_string()).unwrap_or_default();
+                view.make_draft(&folder.display().to_string(), text, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Lists the saved conversations for the first run, off the UI thread.
+    fn list_recent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let serve = self.serve.clone();
+        let listing = cx.background_executor().spawn(async move { Agent::saved(&serve) });
+        cx.spawn_in(window, async move |view, cx| {
+            let listed = listing.await;
+            let _ = view.update(cx, |view, cx| {
+                // One that can't be listed shows none: there's nothing to do about it here.
+                view.recent = Some(listed.unwrap_or_default());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn panes(&self) -> Vec<Entity<Pane>> {
@@ -259,7 +377,7 @@ impl Panes {
     /// terminal, wherever you pressed.
     pub(crate) fn keys_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.focus.is_focused(window)
-            && let Some(pane) = self.looking_at(cx)
+            && let Some(pane) = self.looking_at(cx).or_else(|| self.shown_draft())
         {
             pane.update(cx, |pane, cx| pane.take_keys(window, cx));
         }
@@ -270,13 +388,18 @@ impl Panes {
         let in_a_box = window.context_stack().iter().any(|context| context.contains("Input"));
         if !in_a_box
             && self.palette.is_none()
-            && let Some(pane) = self.looking_at(cx)
+            && let Some(pane) = self.looking_at(cx).or_else(|| self.shown_draft())
         {
             pane.update(cx, |pane, cx| pane.typed_elsewhere(key, window, cx));
         }
     }
 
     fn heard(&mut self, pane: &Entity<Pane>, told: &Told, window: &mut Window, cx: &mut Context<Self>) {
+        // The pane to start with is no conversation yet: there's nothing to
+        // hide, close, or start again.
+        if self.draft.as_ref() == Some(pane) && matches!(told, Told::Hide | Told::Close | Told::New | Told::Looked) {
+            return;
+        }
         match told {
             Told::Changed => cx.notify(),
             Told::Looked => {
@@ -301,6 +424,30 @@ impl Panes {
                 self.start_in(std::path::Path::new(&cwd), window, cx);
             }
             Told::Resume => self.choose_saved(window, cx),
+            Told::Begun => {
+                if self.draft.as_ref() == Some(pane) {
+                    self.draft = None;
+                    self.held.push(Held { pane: pane.clone(), shown: true });
+                    self.look_at(pane, true, window, cx);
+                }
+            }
+            Told::Folder => self.move_draft(window, cx),
+            Told::Look(kept) => {
+                if let Some(wearing) = Wearing::of(kept) {
+                    self.wearing.set(wearing);
+                    wear(wearing.dark(window.appearance()), cx);
+                    window.refresh();
+                }
+            }
+            Told::OpenSubAgent(name) => {
+                let parent = pane.downgrade();
+                let children: Vec<Entity<Pane>> = self.held.iter().map(|held| held.pane.clone()).filter(|child| child.read(cx).parent() == Some(&parent)).collect();
+                // By its name, or the only one there is.
+                let named = children.iter().find(|child| child.read(cx).title() == *name).cloned();
+                if let Some(child) = named.or_else(|| (children.len() == 1).then(|| children[0].clone())) {
+                    self.look_at(&child, true, window, cx);
+                }
+            }
         }
     }
 
@@ -320,6 +467,7 @@ impl Panes {
                 None => self.focus.focus(window, cx),
             }
         }
+        self.ensure_draft(window, cx);
         cx.notify();
     }
 
@@ -426,11 +574,9 @@ impl Panes {
                 list = list.child(self.agent_row(index, child, cx));
             }
         }
-        list.child(
-            div()
-                .mt(px(10.))
-                .child(Press::new("resume").ghost().small().wide().label("Saved conversations").on_click(cx.listener(|view, _, window, cx| view.choose_saved(window, cx)))),
-        )
+        list.child(div().mt(px(10.)).child(
+            Press::new("resume").ghost().small().wide().label(saved_label(self.recent.as_deref())).on_click(cx.listener(|view, _, window, cx| view.choose_saved(window, cx))),
+        ))
     }
 
     /// The saved conversations to choose from.
@@ -482,8 +628,23 @@ impl Panes {
             .child(Icon::new(IconName::Plus).size_4())
             .on_click(cx.listener(|view, _, window, cx| view.choose_folder(window, cx)));
         let meters = self.meters(cx);
+        let settings = Press::new("settings").ghost().small().wide().label("Settings").key("⌘,").on_click(cx.listener(|view, _, window, cx| view.open_settings(window, cx)));
+        let foot = div().flex_none().flex().flex_col().gap(px(4.)).px(px(8.)).py(px(8.)).border_t_1().border_color(Look::of(cx).line).children(meters).child(settings);
         let find = Press::new("palette").ghost().small().label("⌘K").named("Go to, or run").on_click(cx.listener(|view, _, window, cx| view.toggle_palette(window, cx)));
-        bar.child(top.child(find).child(start)).child(div().id("agents").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).child(self.agents(cx))).children(meters)
+        bar.child(top.child(find).child(start)).child(div().id("agents").flex_1().min_h_0().overflow_y_scroll().px(px(8.)).pb(px(8.)).child(self.agents(cx))).child(foot)
+    }
+
+    /// The settings page, from the rein behind the pane you're at, or the
+    /// pane to start with.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.looking_at(cx).or_else(|| self.shown_draft()) else { return };
+        pane.update(cx, |pane, cx| pane.open_page(window, cx));
+        cx.notify();
+    }
+
+    /// The pane whose settings page is open, if one is.
+    fn page_open(&self, cx: &App) -> Option<Entity<Pane>> {
+        self.held.iter().map(|held| &held.pane).chain(self.draft.iter()).find(|pane| pane.read(cx).shows_page()).cloned()
     }
 
     /// How much of your limits is used, by the agent you're at, as a note at
@@ -514,34 +675,74 @@ impl Panes {
                 }
             })
             .collect();
-        Some(div().flex_none().px(px(17.)).py(px(8.)).border_t_1().border_color(look.line).children(rows))
+        Some(div().px(px(9.)).pb(px(4.)).children(rows))
     }
 
-    /// What's on the desk with nothing on it.
+    /// What's on the desk with nothing on it: the pane to start with, and
+    /// the saved conversations to go on with.
     fn nothing_open(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let look = Look::of(cx);
-        let start = Press::new("start").primary().label("New agent").key("⌘N").on_click(cx.listener(|view, _, window, cx| view.choose_folder(window, cx)));
-        let column = div().flex().flex_col().gap(px(24.)).w_full().max_w(px(620.)).items_start();
-        let heading = div().text_size(px(24.)).line_height(px(30.)).font_weight(FontWeight::SEMIBOLD).child("Start an agent in a folder");
-        let about = div().text_color(look.ink_3).child("Each agent works on its own. Keep several going, and steer whichever needs you.");
+        let draft = self.draft.clone();
+        let signing = draft.as_ref().is_some_and(|draft| draft.read(cx).is_signing());
+        let recent = self.recent.as_deref().filter(|recent| !recent.is_empty() && !signing).map(|recent| self.go_on_with(recent, cx));
+        let column = div().flex().flex_col().gap(px(24.)).w_full().max_w(px(620.));
         div()
+            .id("first-run")
             .flex()
             .flex_col()
             .flex_1()
             .items_center()
+            .overflow_y_scroll()
             .pt(px(72.))
             .px(px(20.))
             .pb(px(20.))
             .rounded(px(10.))
             .bg(look.bg)
             .shadow(vec![halo(look.line, 1.)])
-            .child(column.child(wordmark(5.)).child(div().flex().flex_col().gap(px(8.)).child(heading).child(about)).child(start))
+            .child(column.child(wordmark(5.)).children(draft.map(AnyView::from)).children(recent))
+    }
+
+    /// The newest saved conversations, each a press away.
+    fn go_on_with(&self, recent: &[Saved], cx: &mut Context<Self>) -> Div {
+        let look = Look::of(cx);
+        let now = now();
+        let rows = recent.iter().take(RECENT).enumerate().map(|(index, one)| {
+            let picked = one.clone();
+            div()
+                .id(("recent", index))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .h(px(32.))
+                .px(px(8.))
+                .rounded(px(7.))
+                .hover(|style| style.bg(look.hover))
+                .on_click(cx.listener(move |view, _, window, cx| view.open_saved(&picked, window, cx)))
+                .child(div().flex_1().min_w_0().truncate().child(one.title.clone().unwrap_or_else(|| "A conversation".to_owned())))
+                .child(div().flex_none().text_size(px(12.)).text_color(look.ink_3).child(one.folder().to_owned()))
+                .child(div().flex_none().w(px(36.)).text_right().text_size(px(12.)).text_color(look.ink_3).child(one.age(now).map(age).unwrap_or_default()))
+        });
+        let heading = div()
+            .flex()
+            .justify_between()
+            .px(px(8.))
+            .pb(px(4.))
+            .text_size(px(12.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(look.ink_2)
+            .child("Go on with one")
+            .child(div().font_weight(FontWeight::NORMAL).text_color(look.ink_3).child(format!("{} saved", recent.len())));
+        div().flex().flex_col().gap(px(2.)).child(heading).children(rows.collect::<Vec<_>>())
     }
 }
 
 impl Render for Panes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let look = Look::of(cx);
+        // Over the whole window, with nothing beside it.
+        if let Some(pane) = self.page_open(cx) {
+            return div().size_full().bg(look.desk).text_color(look.ink).text_size(px(13.)).line_height(px(18.)).child(AnyView::from(pane)).into_any_element();
+        }
         let probe = self.probe.clone();
         let frames = canvas(|_, _, _| (), move |_, (), _, _| probe.painted()).absolute().size_0();
         let pointer = self.probe.clone();
@@ -559,6 +760,7 @@ impl Render for Panes {
             .on_key_down(cx.listener(|view, event: &KeyDownEvent, window, cx| view.typed_elsewhere(&event.keystroke, window, cx)))
             .on_action(cx.listener(|view, _: &NewAgent, window, cx| view.choose_folder(window, cx)))
             .on_action(cx.listener(|view, _: &OpenPalette, window, cx| view.toggle_palette(window, cx)))
+            .on_action(cx.listener(|view, _: &OpenSettings, window, cx| view.open_settings(window, cx)))
             .relative()
             .size_full()
             .flex()
@@ -572,6 +774,7 @@ impl Render for Panes {
             .child(div().flex().flex_1().min_w_0().h_full().gap(px(6.)).py(px(6.)).pr(px(6.)).children(panes).children(empty))
             .child(frames)
             .children(palette)
+            .into_any_element()
     }
 }
 
@@ -587,8 +790,8 @@ impl Panes {
         self.hold(pane, window, cx);
     }
 
-    pub(crate) fn holds_keys_for_test(&self, window: &Window) -> bool {
-        self.focus.is_focused(window)
+    pub(crate) fn draft_for_test(&self) -> Option<Entity<Pane>> {
+        self.draft.clone()
     }
 
     pub(crate) fn open_saved_for_test(&mut self, saved: &Saved, window: &mut Window, cx: &mut Context<Self>) {

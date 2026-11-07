@@ -258,7 +258,7 @@ impl Served {
         if !self.announced.remove(&call.call_id) {
             self.update(&tool_call(call, status));
         }
-        self.update(&result_of(&call.call_id, status, said));
+        self.update(&summed(result_of(&call.call_id, status, said), call, said));
     }
 
     fn used(&self, tokens: u64) {
@@ -269,6 +269,7 @@ impl Served {
     /// what other reins said, the model's answers and its steps. What rein
     /// added for the model isn't anything you said, and isn't shown.
     pub(super) fn replay(&self, items: &[Item]) {
+        let mut calls = std::collections::HashMap::new();
         for item in items {
             match item {
                 Item::User(_) => {
@@ -285,8 +286,15 @@ impl Served {
                 Item::ToolCall(call) => {
                     self.update(&tool_call(call, "failed"));
                     self.plan(call);
+                    calls.insert(call.call_id.as_str(), call);
                 }
-                Item::ToolResult { call_id, output } => self.update(&result_of(call_id, finished(output), output)),
+                Item::ToolResult { call_id, output } => {
+                    let result = result_of(call_id, finished(output), output);
+                    self.update(&match calls.get(call_id.as_str()) {
+                        Some(call) => summed(result, call, output),
+                        None => result,
+                    });
+                }
                 Item::Found { .. } | Item::Image { .. } | Item::Opaque(_) => {}
             }
         }
@@ -394,6 +402,34 @@ fn plan_of(call: &ToolCall) -> Option<Value> {
     Some(json!({ "sessionUpdate": "plan", "entries": entries }))
 }
 
+/// What a step came to, short, as the terminal says it on the step's line:
+/// `exit 101`, how big a change is, how many lines a read brought in.
+const SUMMARY: &str = "io.github.furkancodes/summary";
+/// What a check after edits came to, in fields, for a panel to say.
+const CHECKED: &str = "io.github.furkancodes/checked";
+
+/// `result` with what `call` came to, in short, in its `_meta`.
+fn summed(mut result: Value, call: &ToolCall, output: &str) -> Value {
+    let outcome = steps::outcome(call, output, style::Style::plain());
+    let mut summary = json!({ "status": outcome.status, "said": outcome.said.trim_start_matches(" · ") });
+    if outcome.ok == Some(false) {
+        summary["failed"] = json!(true);
+    }
+    match steps::change_sizes(call) {
+        Some(steps::Sizes::Edited { added, removed }) => {
+            summary["added"] = json!(added);
+            summary["removed"] = json!(removed);
+        }
+        Some(steps::Sizes::Written(lines)) => summary["lines"] = json!(lines),
+        None => {}
+    }
+    if let Some(lines) = steps::lines_read(call, output) {
+        summary["lines"] = json!(lines);
+    }
+    result["_meta"] = json!({ SUMMARY: summary });
+    result
+}
+
 /// The update saying what the call `id` came to.
 fn result_of(id: &str, status: &str, said: &str) -> Value {
     let content = [json!({ "type": "content", "content": { "type": "text", "text": said } })];
@@ -484,7 +520,15 @@ impl Ui for Served {
         let status = if matches!(checked.verdict, rein_agent::check::Verdict::New(_)) { "failed" } else { "completed" };
         let title = format!("Check {}", crate::terminal::check_said(checked));
         self.update(&json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": title, "kind": "other", "status": status }));
-        self.update(&result_of(&id, status, printed));
+        let (verdict, count) = match checked.verdict {
+            rein_agent::check::Verdict::Clean => ("clean", 0),
+            rein_agent::check::Verdict::New(count) => ("new", count),
+            rein_agent::check::Verdict::Fixed => ("fixed", 0),
+            rein_agent::check::Verdict::Busy => ("busy", 0),
+        };
+        let mut result = result_of(&id, status, printed);
+        result["_meta"] = json!({ CHECKED: { "name": checked.name, "verdict": verdict, "count": count, "tookMs": checked.took.as_millis(), "before": checked.before } });
+        self.update(&result);
     }
 
     async fn approve(&mut self, call: &ToolCall, rule: Option<&Rule>) -> Approval {

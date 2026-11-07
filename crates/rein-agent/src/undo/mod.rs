@@ -17,6 +17,7 @@
 //! symlinks aren't kept. A file that changed since rein did is left as it
 //! is, as that's someone else's work.
 
+mod changes;
 mod copies;
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,9 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::search::Hides;
+pub(crate) use changes::Comparing;
+pub use changes::{Became, Changes, FileChange, Span, Unshown};
+use changes::{LONGEST, ToCompare, Was};
 use copies::Copies;
 
 /// A file bigger than this isn't kept.
@@ -427,6 +431,52 @@ impl Undo {
         std::fs::symlink_metadata(self.root().join(rel)).ok().and_then(|meta| Seen::of(&meta))
     }
 
+    /// Each file the turns from `from` on changed: as it was before the
+    /// first of them, and as the last left it.
+    fn since(&self, from: usize) -> BTreeMap<&str, (Option<&Seen>, Option<&Seen>)> {
+        let mut changes: BTreeMap<&str, (Option<&Seen>, Option<&Seen>)> = BTreeMap::new();
+        for turn in self.turns.get(from..).unwrap_or_default() {
+            for (path, change) in &turn.changes {
+                changes.entry(path.as_str()).or_insert((change.before.as_ref(), None)).1 = change.after.as_ref();
+            }
+        }
+        changes
+    }
+
+    /// What to compare to say what `span` changed: each file as it was
+    /// before, against how it is now, as undoing it would see them. Reading
+    /// and comparing them is left for [`Comparing::run`], with this let go
+    /// of. A command that's still running is left to finish, so this doesn't
+    /// look for what it did. The conversation is as far back as [`TURNS`]
+    /// turns reach, as undoing it is.
+    pub(crate) fn changes(&mut self, span: Span) -> Comparing {
+        self.load();
+        let turn = self.turns.iter().rposition(|turn| !turn.changes.is_empty());
+        let from = match span {
+            Span::LastTurn => turn.unwrap_or(self.turns.len()),
+            Span::Conversation => 0,
+        };
+        let files = self
+            .since(from)
+            .into_iter()
+            .map(|(path, (before, after))| {
+                let now = self.now(path);
+                let since = !as_left(now.as_ref(), after);
+                ToCompare { path: path.to_owned(), was: before.map_or(Was::Gone, |before| self.copy_of(before)), now, since }
+            })
+            .collect();
+        Comparing { root: self.root(), turn, files }
+    }
+
+    /// What was kept of `before`.
+    fn copy_of(&self, before: &Seen) -> Was {
+        match &before.copy {
+            _ if before.len > LONGEST => Was::TooBig,
+            None => Was::NotKept,
+            Some(name) => Was::Kept(self.copies.find(name)),
+        }
+    }
+
     /// `seen`, the file `rel` as it is now, with its copy, as [`Undo::refresh`].
     fn kept(&mut self, rel: &str, seen: Seen) -> Seen {
         let mut kept = self.refresh([(rel.to_owned(), seen)].into());
@@ -504,22 +554,10 @@ impl Undo {
         self.settle(hides);
         let undone = self.turns.get(from..).unwrap_or_default();
         let mut plan = Plan { said: undone.first().map(|turn| turn.said.clone()).unwrap_or_default(), turns: undone.len(), ..Plan::default() };
-        // Each file as it was before the first of them, and as the last left it.
-        let mut changes: BTreeMap<&str, (Option<&Seen>, Option<&Seen>)> = BTreeMap::new();
-        for turn in undone {
-            for (path, change) in &turn.changes {
-                changes.entry(path.as_str()).or_insert((change.before.as_ref(), None)).1 = change.after.as_ref();
-            }
-        }
-        for (path, (before, after)) in changes {
+        for (path, (before, after)) in self.since(from) {
             let now = self.now(path);
-            let as_left = match (&now, after) {
-                (None, None) => true,
-                (Some(now), Some(after)) => now.same(after),
-                _ => false,
-            };
             match before {
-                _ if !as_left => plan.left.push(path.to_owned()),
+                _ if !as_left(now.as_ref(), after) => plan.left.push(path.to_owned()),
                 None if now.is_some() => plan.take_away.push(path.to_owned()),
                 None => {}
                 Some(before) if before.copy.is_none() => plan.lost.push(path.to_owned()),
@@ -588,6 +626,16 @@ impl Undo {
             file.set_permissions(std::fs::Permissions::from_mode(before.mode & 0o7777)).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+}
+
+/// Whether a file is as rein's last change to it left it: anything else
+/// is someone else's work, which undoing leaves alone.
+fn as_left(now: Option<&Seen>, after: Option<&Seen>) -> bool {
+    match (now, after) {
+        (None, None) => true,
+        (Some(now), Some(after)) => now.same(after),
+        _ => false,
     }
 }
 

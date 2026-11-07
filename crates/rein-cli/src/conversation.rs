@@ -925,6 +925,7 @@ pub(crate) async fn run_command(command: Slash, agent: &mut Agent<Llm>, terminal
             }
         }
         Slash::Undo => crate::undo::command(agent, terminal).await?,
+        Slash::Changes => crate::undo::changes(agent, terminal).await,
         Slash::Skills => crate::skills::command(agent, terminal, &setup.root, setup.skill_room(&agent.model_name)).await?,
         Slash::Hooks => crate::hooks::command(agent, terminal, &config_dir()?).await?,
         Slash::Memory => crate::memory::command(agent, terminal).await?,

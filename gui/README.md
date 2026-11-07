@@ -17,9 +17,13 @@ All your agents side by side, each one to read and steer. It's a workspace of it
 cargo run -p rein-window --release
 ```
 
-It opens with nothing on the desk: `⌘N` starts an agent in a folder, and Saved conversations opens one you had. Each `--agent 'rein serve --mode ask'` starts one with it. The command is split on spaces, so a path with spaces in it won't work, and `rein` takes the folder you run this from as its project.
+It opens on the first run's box: "What should this agent work on?", with the folder, model, effort and mode it would start with, and the four newest saved conversations to go on with. What you send from it starts the agent, which then joins the list. Signed in to nothing that runs the model, it shows the ways to sign in instead, and what each asks comes up as a command's questions do. `⌘N` starts another agent in a folder, and Saved conversations opens one you had. Each `--agent 'rein serve --mode ask'` starts one with it. The command is split on spaces, so a path with spaces in it won't work, and `rein` takes the folder you run this from as its project.
 
-It wears your Mac's light or dark look, and `--look light` or `--look dark` pins one.
+It wears the look your settings keep (`look`: light, dark, or following your Mac, the default), and `--look light` or `--look dark` pins one for a run.
+
+## Settings
+
+`⌘,`, or Settings at the foot of the list, opens your settings file (`~/.config/rein/config`) over the window, read out as sentences: an underlined word opens what it can be, and back to rein's own. It's the rein behind the pane you're at that reads and writes it, as it would read it starting, so a value it wouldn't start with is turned down where you set it, and a variable that wins over the file says so. What you set is for new conversations; your rules, which you add and take out here, count at once, but wait for a turn that's running. The look changes as you pick it. Skills, hooks, memory notes and MCP servers are listed as the conversation found them; turning one off happens in the conversation for now (`/skills`, `/hooks`, `/memory`, `/mcp`). `esc` closes it.
 
 ## What the bar shows
 
@@ -27,7 +31,7 @@ Only what the agent has said: a cell with nothing behind it isn't drawn, and a c
 
 ## Commands
 
-Everything the terminal's `/` does works here: `rein serve` runs the command, says what it says into the conversation, and asks what it would ask, so a list to pick from, a line to type and a question all come up over the box. Type `/` for the list: `⏎` runs the one picked, `⇥` puts it in the box to add to, and a command waits for a turn to end. `/new`, `/resume`, `/exit` and `/copy` are the window's own: a pane is a conversation. So are `/undo`, a sheet, and `/tasks`, a panel.
+Everything the terminal's `/` does works here: `rein serve` runs the command, says what it says into the conversation, and asks what it would ask, so a list to pick from, a line to type and a question all come up over the box. Type `/` for the list: `⏎` runs the one picked, `⇥` puts it in the box to add to, and a command waits for a turn to end, unless all it does is open a panel. `/new`, `/resume`, `/exit` and `/copy` are the window's own: a pane is a conversation. So are `/undo`, a sheet, and `/tasks` and `/changes`, panels.
 
 The box goes by the terminal's rules, and what you type goes in it wherever you last pressed, unless a list or a sheet that's up has the keys. The conversation's text keeps them for `⌘C` until you type. `↑` and `↓` bring back what you sent from this folder, the same list a terminal there has, and `^R` finds one by its words. `@` lists the project's files: `⇥` puts one in, and `⏎` does unless it's typed out. While a turn runs, `⏎` steers it and `⇥` sends after it, which a command and a message with an image always do, as does what a running command can't take in; what's waiting shows over the box, a press brings it back, and stopping the turn brings it all back. `^B` sends the running command to the background, `^O` opens every step's output, and a line ending in `\` goes on to the next.
 
@@ -35,9 +39,11 @@ The box goes by the terminal's rules, and what you type goes in it wherever you 
 
 The bar's model and mode open lists over the box, the model's with its effort, the mode's with the sandbox. What you pick shows in the bar, and nothing's written in the conversation unless it fails. A pick during a turn waits for its end. In a narrow pane they give up room, and what acts stays in reach. The context gauge opens a panel of what's taking room, a cell shows up with what's running in the background and opens Tasks, and a turn that changed files ends in a line that can undo it. `⌘K` goes to an agent or runs a command.
 
+Once a conversation has changed files, its header says how much, and that opens Changes: this turn or the whole conversation, file by file, each with its lines. It's what undoing would put back, and while it's open it follows a turn step by step. Over a line a `+` opens a box for what you have to say: `⏎` keeps it, and Send to rein sends all you kept as one message of yours, which goes into a turn that's running as anything you write does, and `⌘⏎` in the box does both. Comments stay until they're sent, whether the panel's open or not. One whose line has gone from what's listed shows under the lines, to read or take back. Undo this turn opens the sheet at that turn.
+
 A question asks in the terminal's words. A file change shows all of its lines, and a command why it's asked: the model's reason, and the rule that asks. Always says what it covers when the pointer rests on it, and in a note once pressed. `esc` is no, and tell rein what to do instead, which stops the turn.
 
-A question takes the keys only if the box is empty and the pane is yours, and `y`, `a`, `n` and `esc` show only while they work. It ignores keys and clicks for its first 400 ms: what lands as it appears was meant for something else, and the second press of a double click on Allow would otherwise answer the next question unread. A press also counts only for the question it was drawn for. Any other key goes to the box, and the keys with it, so a word that happens to contain a `y` can't say yes.
+A question takes the keys only if the box is empty, you aren't partway through a comment, and the pane is yours, and `y`, `a`, `n` and `esc` show only while they work. It ignores keys and clicks for its first 400 ms: what lands as it appears was meant for something else, and the second press of a double click on Allow would otherwise answer the next question unread. A press also counts only for the question it was drawn for. Any other key goes to the box, and the keys with it, so a word that happens to contain a `y` can't say yes.
 
 The mode in the bar is the one the agent says it's in: a change it turns down leaves the bar as it was, and says why in the conversation.
 

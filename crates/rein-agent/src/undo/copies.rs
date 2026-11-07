@@ -21,6 +21,22 @@ const UNUSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// or once this many have been used since.
 const CONVERSATIONS: usize = 10;
 
+/// A copy, to read once whatever keeps it has been let go of.
+pub(super) enum Kept {
+    /// In memory, as long as it's still there.
+    Held(Option<Vec<u8>>),
+    At(PathBuf),
+}
+
+impl Kept {
+    pub(super) fn bytes(self) -> io::Result<Vec<u8>> {
+        match self {
+            Kept::Held(bytes) => bytes.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "its copy is gone")),
+            Kept::At(path) => std::fs::read(path),
+        }
+    }
+}
+
 pub(super) enum Copies {
     /// For rein's own file changes only, as long as rein runs.
     Memory(HashMap<String, Vec<u8>>),
@@ -75,9 +91,15 @@ impl Copies {
 
     /// What the copy `name` holds.
     pub(super) fn bytes(&self, name: &str) -> io::Result<Vec<u8>> {
+        self.find(name).bytes()
+    }
+
+    /// The copy called `name`, to read later. That's when it's found to be
+    /// gone, if it is.
+    pub(super) fn find(&self, name: &str) -> Kept {
         match self {
-            Copies::Memory(copies) => copies.get(name).cloned().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "its copy is gone")),
-            Copies::Disk { own } => std::fs::read(own.join(name)),
+            Copies::Memory(copies) => Kept::Held(copies.get(name).cloned()),
+            Copies::Disk { own } => Kept::At(own.join(name)),
         }
     }
 
@@ -147,12 +169,31 @@ fn open(root: &Path, rel: &str, seen: &Seen) -> io::Result<File> {
 }
 
 /// What `rel` holds, if it's still the file `seen` says once it's read.
-fn read(root: &Path, rel: &str, seen: &Seen) -> io::Result<Vec<u8>> {
+pub(super) fn read(root: &Path, rel: &str, seen: &Seen) -> io::Result<Vec<u8>> {
     let mut file = open(root, rel, seen)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     unchanged(&file, seen)?;
     Ok(bytes)
+}
+
+/// What `rel` holds now, at most `most` bytes, still read never through a
+/// link: for a file that changed after rein last looked, which is still
+/// what's there now. One that won't hold still for a read isn't read.
+pub(super) fn read_now(root: &Path, rel: &str, most: u64) -> io::Result<Vec<u8>> {
+    for _ in 0..3 {
+        let mut file = files::open(root, Path::new(rel))?;
+        let Some(seen) = Seen::of(&file.metadata()?) else { return Err(io::Error::other("it isn't a plain file")) };
+        if seen.len > most {
+            return Err(io::Error::other("it's too big to show"));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if unchanged(&file, &seen).is_ok() {
+            return Ok(bytes);
+        }
+    }
+    Err(io::Error::other("it kept changing while rein read it"))
 }
 
 fn unchanged(file: &File, seen: &Seen) -> io::Result<()> {

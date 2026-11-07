@@ -6,8 +6,10 @@
 use std::path::{Path, PathBuf};
 
 use rein_agent::permissions::Mode;
+use rein_agent::undo::{Became, Changes, FileChange, Span, Unshown};
 use serde::Deserialize;
 
+use super::signing::Way;
 use crate::input::{Menu, Question};
 use crate::ui::asked::Asked;
 use crate::ui::steps::Whole;
@@ -35,9 +37,16 @@ const OPEN_PANE: &str = "_io.github.furkancodes/open_pane";
 /// answer. ACP has a slash command run as a prompt and has no word for any
 /// of them, so a client without them gets a command's answer but no menu.
 pub(super) const ASKS: &str = "io.github.furkancodes/asks";
+/// A client with a switch of its own for keeping the mode and sandbox for
+/// new conversations says so as it starts, and isn't asked as they change.
+pub(super) const KEEPS: &str = "io.github.furkancodes/keeps";
 const CHOOSE: &str = "_io.github.furkancodes/choose";
 const READ: &str = "_io.github.furkancodes/read";
 const YES: &str = "_io.github.furkancodes/yes";
+/// Signs in before there's a conversation, the way it names.
+const SIGN_IN: &str = "_io.github.furkancodes/sign_in";
+/// The ways there are to sign in, any time.
+const WAYS: &str = "_io.github.furkancodes/ways";
 /// What you sent from this folder before, for ↑ and for finding it again.
 const SENT: &str = "_io.github.furkancodes/sent";
 /// What `@` can point at in this project.
@@ -55,6 +64,13 @@ const ROOM: &str = "_io.github.furkancodes/room";
 const UNDO_TURNS: &str = "_io.github.furkancodes/undo_turns";
 const UNDO_PLAN: &str = "_io.github.furkancodes/undo_plan";
 const UNDO: &str = "_io.github.furkancodes/undo";
+/// What a turn or a conversation changed, file by file.
+const CHANGES: &str = "_io.github.furkancodes/changes";
+/// Your settings as a page shows them, a key of them set, and a rule of
+/// yours added or taken out.
+const CONFIG: &str = "_io.github.furkancodes/config";
+const SET_CONFIG: &str = "_io.github.furkancodes/set_config";
+const RULE: &str = "_io.github.furkancodes/rule";
 /// Marks a thought as rein's own note, a whole one: a check, a hook, a
 /// command in the background.
 const NOTE: &str = "io.github.furkancodes/note";
@@ -88,6 +104,9 @@ const PARSE_ERROR: i64 = -32700;
 /// A request that can't be taken while a turn runs: a number of its own, so
 /// a client needn't read the words to tell it from a turn that failed.
 const BUSY: i64 = -32001;
+/// A new conversation that would find you signed in to nothing that runs
+/// its model: the error's `data` says the ways there are to sign in.
+pub(super) const SIGNED_OUT: i64 = -32002;
 
 /// Why a request isn't answered with what it asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -116,10 +135,17 @@ pub(super) enum Request {
     Initialize {
         panes: bool,
         asks: bool,
+        keeps: bool,
     },
     NewSession {
         cwd: PathBuf,
     },
+    /// Signs in, before there's a conversation.
+    SignIn {
+        way: Way,
+    },
+    /// The ways there are to sign in to more, which a turn needn't wait for.
+    Ways,
     /// Saved conversations: `cwd`'s, or all of them, after the first `skip`.
     ListSessions {
         cwd: Option<PathBuf>,
@@ -154,6 +180,26 @@ pub(super) enum Request {
     Room {
         session: String,
     },
+    /// Your settings, and what the conversation found, as it last stood
+    /// between turns.
+    Config {
+        session: String,
+    },
+    /// Writes only your settings file, which new conversations read.
+    SetConfig {
+        session: String,
+        key: String,
+        /// `None` takes it out, so rein's own holds.
+        value: Option<String>,
+    },
+    /// Between turns this takes in what a stopped command did. During one
+    /// it leaves what's running to finish, and says what's changed so far.
+    Changes {
+        session: String,
+        span: Span,
+        /// The patches too, or only how much changed.
+        lines: bool,
+    },
     /// These wait for the turn: they change what it's working on.
     Models {
         session: String,
@@ -168,6 +214,12 @@ pub(super) enum Request {
     Undo {
         session: String,
         turn: usize,
+    },
+    /// A rule of yours added, or taken out: the turn decides by them.
+    Rule {
+        session: String,
+        rule: String,
+        add: bool,
     },
     SetMode {
         session: String,
@@ -188,7 +240,18 @@ pub(super) enum Request {
 impl Request {
     /// It's answered as a turn runs, and between them.
     pub(super) const fn beside_a_turn(&self) -> bool {
-        matches!(self, Request::Sent { .. } | Request::Paths { .. } | Request::Background { .. } | Request::Tasks { .. } | Request::StopTask { .. } | Request::Room { .. })
+        matches!(
+            self,
+            Request::Ways
+                | Request::Sent { .. }
+                | Request::Paths { .. }
+                | Request::Background { .. }
+                | Request::Tasks { .. }
+                | Request::StopTask { .. }
+                | Request::Room { .. }
+                | Request::Config { .. }
+                | Request::SetConfig { .. }
+        )
     }
 }
 
@@ -235,6 +298,11 @@ struct NewSession {
 }
 
 #[derive(Deserialize)]
+struct SignIn {
+    way: Way,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListSessions {
     cwd: Option<PathBuf>,
@@ -270,6 +338,22 @@ struct OfTurn {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetConfig {
+    session_id: String,
+    key: String,
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfRule {
+    session_id: String,
+    rule: String,
+    add: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OfTask {
     session_id: String,
     id: String,
@@ -288,6 +372,32 @@ struct SetOption {
     session_id: String,
     config_id: String,
     value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AskChanges {
+    session_id: String,
+    span: AskedSpan,
+    #[serde(default)]
+    lines: bool,
+}
+
+/// How far back a client looks: anything else comes back as an error.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AskedSpan {
+    Turn,
+    Conversation,
+}
+
+impl From<AskedSpan> for Span {
+    fn from(span: AskedSpan) -> Span {
+        match span {
+            AskedSpan::Turn => Span::LastTurn,
+            AskedSpan::Conversation => Span::Conversation,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -339,9 +449,11 @@ fn request(method: &str, params: Value) -> Result<Request, Refused> {
     match method {
         "initialize" => {
             let meta = &params["clientCapabilities"]["_meta"];
-            Ok(Request::Initialize { panes: meta[PANES] == true, asks: meta[ASKS] == true })
+            Ok(Request::Initialize { panes: meta[PANES] == true, asks: meta[ASKS] == true, keeps: meta[KEEPS] == true })
         }
         "session/new" => parse::<NewSession>(params).map(|new| Request::NewSession { cwd: new.cwd }),
+        SIGN_IN => parse::<SignIn>(params).map(|asked| Request::SignIn { way: asked.way }),
+        WAYS => Ok(Request::Ways),
         "session/list" => {
             // Nothing's required of it, so a client may send no params.
             let list: ListSessions = parse(if params.is_null() { json!({}) } else { params })?;
@@ -360,7 +472,11 @@ fn request(method: &str, params: Value) -> Result<Request, Refused> {
         TASKS => parse::<InSession>(params).map(|asked| Request::Tasks { session: asked.session_id }),
         STOP_TASK => parse::<OfTask>(params).map(|asked| Request::StopTask { session: asked.session_id, id: asked.id }),
         ROOM => parse::<InSession>(params).map(|asked| Request::Room { session: asked.session_id }),
+        CONFIG => parse::<InSession>(params).map(|asked| Request::Config { session: asked.session_id }),
+        SET_CONFIG => parse::<SetConfig>(params).map(|asked| Request::SetConfig { session: asked.session_id, key: asked.key, value: asked.value }),
+        RULE => parse::<OfRule>(params).map(|asked| Request::Rule { session: asked.session_id, rule: asked.rule, add: asked.add }),
         MODELS => parse::<InSession>(params).map(|asked| Request::Models { session: asked.session_id }),
+        CHANGES => parse::<AskChanges>(params).map(|asked| Request::Changes { session: asked.session_id, span: asked.span.into(), lines: asked.lines }),
         UNDO_TURNS => parse::<InSession>(params).map(|asked| Request::UndoTurns { session: asked.session_id }),
         UNDO_PLAN => parse::<OfTurn>(params).map(|asked| Request::UndoPlan { session: asked.session_id, turn: asked.turn }),
         UNDO => parse::<OfTurn>(params).map(|asked| Request::Undo { session: asked.session_id, turn: asked.turn }),
@@ -406,6 +522,11 @@ pub(super) fn refuse(id: &Value, refused: &Refused) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": refused.code, "message": refused.message } }).to_string()
 }
 
+/// `id` turned down, with `data` saying more.
+pub(super) fn refuse_with(id: &Value, refused: &Refused, data: &Value) -> String {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": refused.code, "message": refused.message, "data": data } }).to_string()
+}
+
 /// A `session/update` for `session`.
 pub(super) fn update(session: &str, update: &Value) -> String {
     json!({ "jsonrpc": "2.0", "method": "session/update", "params": { "sessionId": session, "update": update } }).to_string()
@@ -425,6 +546,29 @@ pub(super) fn ask_permission(id: u64, session: &str, call: &str, options: &Value
     let meta = json!({ QUESTION: asked.question, WHY: asked.reason });
     let params = json!({ "sessionId": session, "toolCall": { "toolCallId": call }, "options": options, "_meta": meta });
     json!({ "jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": params }).to_string()
+}
+
+/// What a span changed, as a client shows it: with `lines`, each file's
+/// patch; without them it's only how much, which is all a count needs.
+pub(super) fn changes(changes: &Changes, lines: bool) -> Value {
+    let file = |file: &FileChange| {
+        let became = match file.became {
+            Became::Changed => "changed",
+            Became::Made => "made",
+            Became::Removed => "removed",
+        };
+        let unshown = file.unshown.map(|why| match why {
+            Unshown::Binary => "binary",
+            Unshown::TooBig => "too_big",
+            Unshown::NotKept => "not_kept",
+        });
+        let mut said = json!({ "path": file.path, "became": became, "added": file.added, "removed": file.removed, "unshown": unshown, "since": file.since });
+        if lines {
+            said["patch"] = json!(file.patch);
+        }
+        said
+    };
+    json!({ "turn": changes.turn, "files": changes.files.iter().map(file).collect::<Vec<Value>>() })
 }
 
 /// A change to a file, as ACP's `diff`.
@@ -553,7 +697,17 @@ mod tests {
     #[test]
     fn a_client_says_it_can_show_what_a_command_asks() {
         let said = json!({ "id": 1, "method": "initialize", "params": { "clientCapabilities": { "_meta": { ASKS: true } } } });
-        assert_eq!(asked(said), Ok(Request::Initialize { panes: false, asks: true }));
+        assert_eq!(asked(said), Ok(Request::Initialize { panes: false, asks: true, keeps: false }));
+    }
+
+    #[test]
+    fn a_setting_comes_in_set_or_taken_out() {
+        let set = json!({ "id": 1, "method": SET_CONFIG, "params": { "sessionId": "a", "key": "mode", "value": "edits" } });
+        assert_eq!(asked(set), Ok(Request::SetConfig { session: "a".to_owned(), key: "mode".to_owned(), value: Some("edits".to_owned()) }));
+        let unset = json!({ "id": 1, "method": SET_CONFIG, "params": { "sessionId": "a", "key": "mode", "value": null } });
+        assert_eq!(asked(unset), Ok(Request::SetConfig { session: "a".to_owned(), key: "mode".to_owned(), value: None }));
+        let rule = json!({ "id": 1, "method": RULE, "params": { "sessionId": "a", "rule": "ask rm" } });
+        assert_eq!(asked(rule).unwrap_err().code, INVALID_PARAMS, "add or take out, said");
     }
 
     #[test]
@@ -610,10 +764,10 @@ mod tests {
     #[test]
     fn only_a_client_that_says_so_opens_panes() {
         let starts = |capabilities: Value| asked(json!({ "id": 1, "method": "initialize", "params": { "protocolVersion": 1, "clientCapabilities": capabilities } }));
-        assert_eq!(starts(json!({ "_meta": { PANES: true } })), Ok(Request::Initialize { panes: true, asks: false }));
-        assert_eq!(starts(json!({ "_meta": { PANES: "yes" } })), Ok(Request::Initialize { panes: false, asks: false }), "not a clear yes");
-        assert_eq!(starts(json!({ "fs": { "readTextFile": true } })), Ok(Request::Initialize { panes: false, asks: false }));
-        assert_eq!(asked(json!({ "id": 1, "method": "initialize" })), Ok(Request::Initialize { panes: false, asks: false }));
+        assert_eq!(starts(json!({ "_meta": { PANES: true } })), Ok(Request::Initialize { panes: true, asks: false, keeps: false }));
+        assert_eq!(starts(json!({ "_meta": { PANES: "yes" } })), Ok(Request::Initialize { panes: false, asks: false, keeps: false }), "not a clear yes");
+        assert_eq!(starts(json!({ "fs": { "readTextFile": true } })), Ok(Request::Initialize { panes: false, asks: false, keeps: false }));
+        assert_eq!(asked(json!({ "id": 1, "method": "initialize" })), Ok(Request::Initialize { panes: false, asks: false, keeps: false }));
     }
 
     #[test]

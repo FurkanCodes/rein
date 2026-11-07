@@ -185,6 +185,9 @@ pub struct Checked {
     pub verdict: Verdict,
     /// The errors it brought in, the first [`SHOWN`].
     pub shown: Vec<String>,
+    /// How many errors there were before the turn's first change, which
+    /// aren't counted against it.
+    pub before: usize,
 }
 
 /// What a check after a step said.
@@ -284,7 +287,7 @@ impl Turn {
                 (Verdict::New(count), Some(format!("{NOTE}`{}` after these changes: {}.\n{}]", check.name(), errors(count), listed(&new))))
             }
         };
-        Some((Checked { name: check.name(), took, verdict, shown }, note))
+        Some((Checked { name: check.name(), took, verdict, shown, before: baseline.len() }, note))
     }
 
     /// What to tell the model as it says it's done, once a turn: the

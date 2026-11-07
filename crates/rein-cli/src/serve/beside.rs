@@ -24,6 +24,12 @@ pub(super) struct Beside {
     pub(super) sent: History,
     /// What's taking room, as it stood when the agent was last free.
     pub(super) room: Value,
+    /// What's changed, as far as a turn has got.
+    pub(super) looking: rein_agent::tools::Looking,
+    /// What a settings page lists of what the conversation found, as it
+    /// stood when the agent was last free, and how it was started.
+    pub(super) found: Value,
+    pub(super) flags: Vec<String>,
 }
 
 impl Link {
@@ -44,12 +50,22 @@ impl Link {
     /// Answers `request`, one of those answered beside a turn. A project's
     /// files take a while to walk, and rein has one thread.
     pub(super) fn answer_beside(&self, id: &Value, request: &Request) {
+        // Asked of no conversation.
+        if matches!(request, Request::Ways) {
+            self.send(match super::signing::ways() {
+                Ok(ways) => wire::answer(id, &ways),
+                Err(said) => wire::refuse(id, &Refused::new(said)),
+            });
+            return;
+        }
         let (Request::Sent { session }
         | Request::Paths { session }
         | Request::Background { session }
         | Request::Tasks { session }
         | Request::StopTask { session, .. }
-        | Request::Room { session }) = request
+        | Request::Room { session }
+        | Request::Config { session }
+        | Request::SetConfig { session, .. }) = request
         else {
             return;
         };
@@ -72,6 +88,14 @@ impl Link {
             }
             Request::Tasks { .. } => self.send(wire::answer(id, &json!({ "tasks": beside.jobs.list().iter().map(task).collect::<Vec<Value>>() }))),
             Request::Room { .. } => self.send(wire::answer(id, &beside.room)),
+            Request::Config { .. } => self.send(match super::config::page(&beside.flags, &beside.found) {
+                Ok(page) => wire::answer(id, &page),
+                Err(why) => wire::refuse(id, &Refused::new(why)),
+            }),
+            Request::SetConfig { key, value, .. } => self.send(match super::config::set(key, value.as_deref()) {
+                Ok(()) => wire::answer(id, &json!({})),
+                Err(why) => wire::refuse(id, &Refused::params(why)),
+            }),
             Request::StopTask { id: task, .. } => {
                 let (jobs, task, out, id) = (beside.jobs.clone(), task.clone(), self.out.clone(), id.clone());
                 // It's given two seconds to stop, and rein has one thread.
@@ -90,6 +114,21 @@ impl Link {
         }
     }
 
+    /// Answers with what `span` has changed so far, while a turn runs:
+    /// comparing files takes a while, and the turn goes on.
+    pub(super) fn changes_beside(&self, id: &Value, session: &str, span: rein_agent::undo::Span, lines: bool) {
+        let beside = self.beside.borrow();
+        let Some(beside) = beside.as_ref().filter(|beside| beside.session == session) else {
+            self.send(wire::refuse(id, &Refused::new(format!("there's no conversation {session} here"))));
+            return;
+        };
+        let (looking, out, id) = (beside.looking.clone(), self.out.clone(), id.clone());
+        tokio::spawn(async move {
+            let changes = looking.changes(span, lines).await;
+            let _ = out.send(wire::answer(&id, &wire::changes(&changes, lines)));
+        });
+    }
+
     /// How many commands are running in the background.
     pub(super) fn in_the_background(&self) -> usize {
         self.beside.borrow().as_ref().map_or(0, |beside| beside.jobs.list().iter().filter(|job| job.ended.is_none()).count())
@@ -99,6 +138,7 @@ impl Link {
     pub(super) fn room_changed(&self, agent: &Agent<Llm>, terminal: &crate::terminal::Terminal) {
         if let Some(beside) = self.beside.borrow_mut().as_mut() {
             beside.room = room(agent, terminal);
+            beside.found = super::config::found(agent);
         }
     }
 }

@@ -268,6 +268,18 @@ pub(crate) fn check_said(checked: &rein_agent::check::Checked) -> String {
 pub(crate) const ECHO_LINES: usize = 12;
 
 impl Terminal {
+    /// The key of the answer you chose to `question`. With nothing to show
+    /// its answers on, it's asked as yes or no, and comes to `y` or `n`.
+    pub(crate) async fn answer(&mut self, question: Question) -> Option<String> {
+        if !self.input.pinned() && !self.input.has_stand_in() {
+            return Some(if self.yes(question).await { "y" } else { "n" }.to_owned());
+        }
+        match self.input.ask(question).await {
+            Read::Line(key) => Some(key),
+            _ => None,
+        }
+    }
+
     /// Asks `question`, whose answers are `y` and `n`: in the box, or on a
     /// line of its own without one. Only yes is yes.
     pub(crate) async fn yes(&mut self, question: Question) -> bool {

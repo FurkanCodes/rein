@@ -628,7 +628,7 @@ impl<M: Model> Agent<M> {
                 }
             }
             crate::check::Ran::Busy => {
-                let checked = crate::check::Checked { name: check.name(), took: crate::check::BUDGET, verdict: crate::check::Verdict::Busy, shown: Vec::new() };
+                let checked = crate::check::Checked { name: check.name(), took: crate::check::BUDGET, verdict: crate::check::Verdict::Busy, shown: Vec::new(), before: 0 };
                 ui.checked(&checked, "");
             }
             ran => self.check_paused(&check, &ran, ui),
@@ -1896,6 +1896,11 @@ impl<M> Agent<M> {
     /// What undoing back to before `turn` would do now.
     pub async fn undo_plan(&self, turn: usize) -> Plan {
         self.tools.undo_plan(turn).await
+    }
+
+    /// What `span` changed in the project's files, with the patches if `lines`.
+    pub async fn changes(&self, span: crate::undo::Span, lines: bool) -> crate::undo::Changes {
+        self.tools.changes(span, lines).await
     }
 
     /// Undoes `turn` and every one after it, and tells the model, so it

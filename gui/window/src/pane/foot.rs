@@ -18,6 +18,8 @@ use crate::parts::{Press, gauge, hairline, halo, lip, pips, set_width};
 
 /// Where a pane's foot starts the box, and how far the rail runs into it.
 const OVER_BOX: f32 = 12.;
+/// The most the folder's cell takes, so the model and mode keep their names.
+const FOLDER_MOST: f32 = 260.;
 /// A question shows this much of what it would do, and scrolls the rest.
 const QUESTION_MOST: f32 = 180.;
 
@@ -90,11 +92,28 @@ impl Pane {
         let look = Look::of(cx);
         let mono = cx.global::<crate::parts::Monospace>().0.clone();
         let (verb, what) = waiting.question.as_ref().map_or(("do", "a step it hasn't shown"), |question| question.title.split_once(' ').unwrap_or((&question.title, "")));
-        let heading = waiting.words.asks.clone().unwrap_or_else(|| format!("rein asks to {}", verb.to_lowercase()));
+        // A sub-agent starts in a pane of its own here, not a tab: said as
+        // the window does it, its task whole under its name.
+        let sub_agent = (verb == "Sub-agent").then(|| what.split_once(": ").unwrap_or((what, "")));
+        let heading = match sub_agent {
+            Some(_) => "rein asks to start a sub-agent".to_owned(),
+            None => waiting.words.asks.clone().unwrap_or_else(|| format!("rein asks to {}", verb.to_lowercase())),
+        };
+        let named = sub_agent.map(|(name, _)| div().child(format!("Named {name}, in a pane of its own. Its result comes back here.")));
         let change = waiting.question.as_ref().and_then(|question| question.change.as_ref());
-        let whole = waiting.question.as_ref().and_then(|question| question.detail.clone()).unwrap_or_else(|| what.to_owned());
+        let whole = match sub_agent {
+            // All it would be told, or all it says, if it says more than a task.
+            Some((_, first_line)) => {
+                waiting.question.as_ref().and_then(|question| question.task.clone().or_else(|| question.detail.clone())).unwrap_or_else(|| first_line.to_owned())
+            }
+            None => waiting.question.as_ref().and_then(|question| question.detail.clone()).unwrap_or_else(|| what.to_owned()),
+        };
         let plain = |choice: &&Choice| choice.kind != Answering::Instead;
-        let width = set_width(waiting.choices.iter().filter(plain).map(|choice| choice_label(choice).0), true, window);
+        let label = |choice: &Choice| match (sub_agent, choice.kind) {
+            (Some(_), Answering::AllowOnce) => ("Start it", "y"),
+            _ => choice_label(choice),
+        };
+        let width = set_width(waiting.choices.iter().filter(plain).map(|choice| label(choice).0), true, window);
         // Shown only while they work: with your keys in the box they'd type.
         let keyed = self.card.is_focused(window);
         let buttons: Vec<Press> = waiting
@@ -103,7 +122,7 @@ impl Pane {
             .enumerate()
             .map(|(index, choice)| {
                 let (chosen, drawn_for) = (choice.id.clone(), waiting.id.clone());
-                let (label, key) = choice_label(choice);
+                let (label, key) = label(choice);
                 let pressed = cx.listener(move |pane, _, _, cx| pane.answer(&drawn_for, &chosen, cx));
                 let button = Press::new(("choice", index)).label(label).named(choice.name.clone()).on_click(pressed);
                 let button = if plain(&choice) { button.width(width) } else { button };
@@ -143,6 +162,7 @@ impl Pane {
                         .child(div().size_full().rounded_full().bg(look.amber)),
                 )
                 .child(div().font_weight(FontWeight::SEMIBOLD).child(heading))
+                .children(named)
                 .child(
                     div()
                         .id("asked")
@@ -181,17 +201,17 @@ impl Pane {
         let paste = move |item: &ClipboardItem, window: &mut Window, cx: &mut App| pane.update(cx, |pane, cx| pane.pasted(item, window, cx)).unwrap_or(false);
         let hint = (self.running && self.asking.is_none())
             .then(|| div().absolute().right(px(12.)).top(px(9.)).text_size(px(12.)).text_color(look.ink_3).child("⏎ now · ⇥ after this turn"));
+        // The pane to start with has no conversation above it to run into.
+        let rail_into = (!self.draft).then(|| div().absolute().left(px(RAIL)).top_0().w(px(rail_width)).h(px(OVER_BOX)).bg(rail));
         div()
             .relative()
             .flex_none()
-            .pt(px(OVER_BOX))
-            .px(px(8.))
-            .pb(px(8.))
+            .when(!self.draft, |foot| foot.pt(px(OVER_BOX)).px(px(8.)).pb(px(8.)))
             .capture_action(cx.listener(|pane, _: &MoveUp, window, cx| pane.arrow(true, window, cx)))
             .capture_action(cx.listener(|pane, _: &MoveDown, window, cx| pane.arrow(false, window, cx)))
             .capture_action(cx.listener(|pane, action: &Enter, window, cx| pane.enter(action, window, cx)))
             .capture_action(cx.listener(Self::escape))
-            .child(div().absolute().left(px(RAIL)).top_0().w(px(rail_width)).h(px(OVER_BOX)).bg(rail))
+            .children(rail_into)
             .child(
                 div()
                     .relative()
@@ -200,7 +220,15 @@ impl Pane {
                     .shadow(if has_keys { vec![hairline(look.focus_line), lip(look.lip), halo(look.focus_halo, 3.)] } else { vec![hairline(look.ring), lip(look.lip)] })
                     .children(thread)
                     .children(hint)
-                    .child(div().min_h(px(62.)).pt(px(6.)).pb(px(4.)).pl(px(36.)).pr(px(6.)).child(Textarea::new(&self.input).appearance(false).text_size(px(15.)).on_paste(paste)))
+                    .child(
+                        div()
+                            .min_h(px(if self.draft { 84. } else { 62. }))
+                            .pt(px(6.))
+                            .pb(px(4.))
+                            .pl(px(if self.draft { 14. } else { 36. }))
+                            .pr(px(6.))
+                            .child(Textarea::new(&self.input).appearance(false).text_size(px(15.)).on_paste(paste)),
+                    )
                     .child(self.bar(cx)),
             )
     }
@@ -216,26 +244,50 @@ impl Pane {
     /// The instrument under the box.
     fn bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let look = Look::of(cx);
+        // A cell whose list or panel is open stands lit.
+        let picking = |picking: Picking| self.picker.as_ref().is_some_and(|picker| picker.picking == picking);
         // With no agent there's nothing to give it.
-        let add = self
-            .agent
-            .is_some()
-            .then(|| Press::new("add").cell().named("Add a file or an image").child("+").on_click(cx.listener(|pane, _, window, cx| pane.pick_files(window, cx))));
+        let add = self.agent.is_some().then(|| {
+            if self.draft {
+                // Where it would work, which you can change before it starts.
+                let home = std::env::var("HOME").ok();
+                let shown = crate::panes::tilde(&self.about.cwd, home.as_deref());
+                return Press::new("folder")
+                    .cell()
+                    .yields()
+                    .max_w(px(FOLDER_MOST))
+                    .named("Folder")
+                    .child(div().truncate().child(shown))
+                    .on_click(cx.listener(|pane, _, _, cx| pane.choose_folder(cx)));
+            }
+            Press::new("add").cell().named("Add a file or an image").child("+").on_click(cx.listener(|pane, _, window, cx| pane.pick_files(window, cx)))
+        });
         // A cell runs the command for what it shows, and shows its list.
-        let model = self
-            .setting("model")
-            .map(|model| Press::new("model").cell().yields().child(div().truncate().child(short_model(model.current_name()).to_owned())).on_click(Self::picks(Picking::Model, cx)));
-        let effort = self
-            .setting("effort")
-            .and_then(Setting::pips)
-            .map(|(level, levels)| Press::new("effort").cell().named("Effort").child(pips(level, levels, &look)).on_click(Self::picks(Picking::Model, cx)));
+        let model = self.setting("model").map(|model| {
+            Press::new("model")
+                .cell()
+                .yields()
+                .lit(picking(Picking::Model))
+                .child(div().truncate().child(short_model(model.current_name()).to_owned()))
+                .on_click(Self::picks(Picking::Model, cx))
+        });
+        let effort = self.setting("effort").and_then(Setting::pips).map(|(level, levels)| {
+            Press::new("effort").cell().lit(picking(Picking::Model)).named("Effort").child(pips(level, levels, &look)).on_click(Self::picks(Picking::Model, cx))
+        });
         let mode = self.modes.as_ref().map(|modes| {
             let name = modes.current_name().to_owned();
             let (warning, name) = name.strip_prefix("⚠ ").map_or((None, name.as_str()), |name| (Some(div().text_color(look.amber).child("⚠")), name));
             let walled = self.setting("sandbox").is_some_and(|sandbox| sandbox.current == "on");
             let shown = if walled { format!("{name} · sandbox") } else { name.to_owned() };
             if !self.transcript.commands().is_empty() {
-                return Press::new("mode").cell().yields().children(warning).child(div().truncate().child(shown)).on_click(Self::picks(Picking::Mode, cx)).into_any_element();
+                return Press::new("mode")
+                    .cell()
+                    .yields()
+                    .lit(picking(Picking::Mode))
+                    .children(warning)
+                    .child(div().truncate().child(shown))
+                    .on_click(Self::picks(Picking::Mode, cx))
+                    .into_any_element();
             }
             let available = modes.available.clone();
             let pane = cx.weak_entity();
@@ -258,6 +310,7 @@ impl Pane {
             let pressed = cx.listener(|pane, _, _, cx| pane.open_panel(Tab::Context, cx));
             Press::new("context")
                 .cell_at_end()
+                .lit(self.panel_shows(Tab::Context))
                 .named(format!("Context: {}", context.shown()))
                 .child(gauge(context.share(), Some(44.), fill, &look))
                 .child(context.shown())
@@ -269,6 +322,7 @@ impl Pane {
             let pressed = cx.listener(|pane, _, _, cx| pane.open_panel(Tab::Tasks, cx));
             Press::new("tasks")
                 .cell_at_end()
+                .lit(self.panel_shows(Tab::Tasks))
                 .named(format!("Background commands: {running}"))
                 .child(div().size(px(6.)).rounded_full().bg(look.teal))
                 .child(running)
@@ -276,7 +330,9 @@ impl Pane {
         });
         // With no agent, there's nothing to send to or stop.
         let act = self.agent.is_some().then(|| {
-            let act = if self.running {
+            let act = if self.draft {
+                Press::new("start").primary().small().label("Start").key("⏎").on_click(cx.listener(|pane, _, window, cx| pane.send_box(window, cx)))
+            } else if self.running {
                 Press::new("stop").small().label("Stop").key("esc").on_click(cx.listener(|pane, _, _, cx| pane.stop(cx)))
             } else {
                 Press::new("send").small().label("Send").key("⏎").on_click(cx.listener(|pane, _, window, cx| pane.send_box(window, cx)))

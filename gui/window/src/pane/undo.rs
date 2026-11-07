@@ -126,6 +126,15 @@ impl Pane {
                     .on_click(cx.listener(move |pane, _, _, cx| pane.pick_undo(at, cx)))
                     .child(div().flex_1().min_w_0().truncate().child(turn.said.clone()))
                     .child(div().flex_none().text_size(px(12.)).text_color(if picked { look.ink_2 } else { look.ink_3 }).child(turn.counts()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(34.))
+                            .text_right()
+                            .text_size(px(12.))
+                            .text_color(if picked { look.ink_2 } else { look.ink_3 })
+                            .child(crate::panes::age_since(turn.at)),
+                    )
             })
             .collect();
         let part = |name: &'static str, files: &[String], why: Option<&'static str>| {
@@ -254,6 +263,10 @@ impl Pane {
 
     pub(crate) fn undo_picked_for_test(&self) -> Option<usize> {
         self.undoing.as_ref().and_then(|sheet| sheet.turns.get(sheet.at)).map(|turn| turn.turn)
+    }
+
+    pub(crate) fn open_undo_for_test(&mut self, wanted: Option<usize>, cx: &mut Context<Self>) {
+        self.open_undo(wanted, cx);
     }
 
     pub(crate) fn undo_now_for_test(&mut self) {

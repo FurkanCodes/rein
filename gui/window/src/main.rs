@@ -30,8 +30,8 @@ use crate::probe::Probe;
 
 #[derive(Default)]
 struct Flags {
-    /// Which look to wear: your Mac's, unless a run pins one.
-    wearing: Wearing,
+    /// Which look to wear, if a run pins one: otherwise your settings say.
+    wearing: Option<Wearing>,
     /// One agent command a pane.
     agents: Vec<Vec<String>>,
     /// How a new agent is started, if not as `rein serve`.
@@ -105,8 +105,8 @@ fn flags() -> Result<Flags, String> {
             }
             "--look" => {
                 flags.wearing = match value()?.as_str() {
-                    "light" => Wearing::Light,
-                    "dark" => Wearing::Dark,
+                    "light" => Some(Wearing::Light),
+                    "dark" => Some(Wearing::Dark),
                     other => return Err(format!("--look takes light or dark, not {other}")),
                 };
             }
@@ -421,7 +421,7 @@ fn main() {
         // Nobody's looking by then, and past it nothing would end what won't.
         cx.on_app_quit(|_| async { crate::agent::wait_for_those_ending() }).detach();
         crate::panes::bind_keys(cx);
-        let wearing = flags.wearing;
+        let wearing = flags.wearing.unwrap_or_else(Wearing::kept);
         wear(wearing.dark(cx.window_appearance()), cx);
         let probe = Probe::new();
         let bounds = Bounds::new(point(px(240.), px(60.)), size(px(WIDTH), px(HEIGHT)));

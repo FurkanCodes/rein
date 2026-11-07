@@ -362,3 +362,186 @@ fn copies_are_clones_that_take_no_room() {
     assert!(taken < 50 << 10, "copies took {taken} KB");
     std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
 }
+
+/// `file` of `changes`.
+fn file<'a>(changes: &'a Changes, path: &str) -> &'a FileChange {
+    changes.files.iter().find(|file| file.path == path).unwrap_or_else(|| panic!("no {path}: {changes:?}"))
+}
+
+/// A file that changes again between the look and the comparison is
+/// compared as it is then: it's still what's there now, and rein still has
+/// its copy of how it was.
+#[test]
+fn a_file_that_changes_as_its_compared_shows_as_it_is_now() {
+    let (project, copies) = place("changes-moving", &[("a.rs", "one\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("tidy", NOTHING);
+    command(&mut undo, || write(&project, "a.rs", "two\n"));
+    let comparing = undo.changes(Span::LastTurn);
+    std::thread::sleep(super::TICK);
+    write(&project, "a.rs", "three\nfour\n");
+    let changes = comparing.run(true);
+    let a = file(&changes, "a.rs");
+    assert_eq!((a.unshown, a.added, a.removed), (None, 2, 1), "{changes:?}");
+    std::fs::remove_dir_all(project.parent().unwrap()).unwrap();
+}
+
+/// Comparing has none of what a turn needs, so it can't hold a turn up.
+#[test]
+fn comparing_goes_on_with_undo_let_go_of() {
+    let (project, copies) = place("comparing", &[("a.rs", "one\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("tidy", NOTHING);
+    command(&mut undo, || write(&project, "a.rs", "two\n"));
+    let comparing = undo.changes(Span::LastTurn);
+    drop(undo);
+    assert_eq!(comparing.run(true).totals(), (1, 1, 1));
+}
+
+#[test]
+fn what_changed_is_shown_as_undoing_would_see_it() {
+    let (project, copies) = place("changes", &[("a.rs", "one\ntwo\nthree\n"), ("gone.txt", "bye\n"), ("same.txt", "still\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("tidy", NOTHING);
+    command(&mut undo, || {
+        write(&project, "a.rs", "one\nTWO\nthree\nfour\n");
+        std::fs::remove_file(project.join("gone.txt")).unwrap();
+        write(&project, "new.rs", "made\n");
+    });
+    let changes = undo.changes(Span::LastTurn).run(true);
+    assert_eq!(changes.turn, Some(0));
+    let paths: Vec<&str> = changes.files.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(paths, ["a.rs", "gone.txt", "new.rs"]);
+    assert_eq!(changes.totals(), (3, 3, 2));
+
+    let a = file(&changes, "a.rs");
+    assert_eq!((a.became, a.added, a.removed, a.unshown, a.since), (Became::Changed, 2, 1, None, false));
+    assert!(a.patch.starts_with("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ "), "{}", a.patch);
+    assert!(a.patch.contains("-two\n") && a.patch.contains("+TWO\n") && a.patch.contains(" one\n"), "{}", a.patch);
+
+    assert_eq!(file(&changes, "gone.txt").became, Became::Removed);
+    assert!(file(&changes, "gone.txt").patch.contains("deleted file mode") && file(&changes, "gone.txt").patch.contains("+++ /dev/null"));
+    assert_eq!(file(&changes, "new.rs").became, Became::Made);
+    assert!(file(&changes, "new.rs").patch.contains("new file mode") && file(&changes, "new.rs").patch.contains("--- /dev/null"));
+
+    let plan = undo.plan(changes.turn.unwrap(), NOTHING);
+    assert_eq!((plan.put_back, plan.take_away), (names(&["a.rs", "gone.txt"]), names(&["new.rs"])), "the same files it would undo");
+}
+
+#[test]
+fn a_turn_is_the_last_that_changed_anything_and_a_conversation_is_all_of_them() {
+    let (project, copies) = place("changes-span", &[("a.txt", "one\n"), ("b.txt", "bee\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("first", NOTHING);
+    command(&mut undo, || write(&project, "a.txt", "two\n"));
+    undo.turn("second", NOTHING);
+    command(&mut undo, || write(&project, "a.txt", "three\n"));
+    command(&mut undo, || write(&project, "b.txt", "BEE\n"));
+    undo.turn("a question, which changes nothing", NOTHING);
+
+    let turn = undo.changes(Span::LastTurn).run(true);
+    assert_eq!(turn.turn, Some(1), "the question has nothing to show");
+    assert!(file(&turn, "a.txt").patch.contains("-two\n+three\n"), "from where that turn started");
+
+    let whole = undo.changes(Span::Conversation).run(true);
+    assert_eq!(whole.files.len(), 2);
+    assert!(file(&whole, "a.txt").patch.contains("-one\n+three\n"), "from where the conversation started");
+    assert_eq!(whole.turn, Some(1), "undoing still starts from the last");
+}
+
+#[test]
+fn a_file_that_came_back_as_it_was_isnt_a_change() {
+    let (project, copies) = place("changes-back", &[("a.txt", "one\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("there and back", NOTHING);
+    command(&mut undo, || write(&project, "a.txt", "two\n"));
+    undo.turn("back", NOTHING);
+    command(&mut undo, || write(&project, "a.txt", "one\n"));
+    assert_eq!(undo.changes(Span::Conversation).run(true).files, []);
+}
+
+#[test]
+fn what_cant_be_shown_as_lines_says_why() {
+    let (project, copies) = place("changes-unshown", &[("small.txt", "s\n")]);
+    std::fs::write(project.join("logo.png"), [0_u8, 159, 146, 150]).unwrap();
+    std::fs::write(project.join("long.txt"), "x\n".repeat(600_000)).unwrap();
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("swap", NOTHING);
+    command(&mut undo, || {
+        std::fs::write(project.join("logo.png"), [1_u8, 2, 3]).unwrap();
+        std::fs::write(project.join("long.txt"), "y\n").unwrap();
+    });
+    let changes = undo.changes(Span::LastTurn).run(true);
+    assert_eq!(file(&changes, "logo.png").unshown, Some(Unshown::Binary));
+    assert_eq!(file(&changes, "long.txt").unshown, Some(Unshown::TooBig));
+    assert!(file(&changes, "logo.png").patch.is_empty() && file(&changes, "long.txt").patch.is_empty());
+}
+
+#[test]
+fn a_file_changed_since_rein_did_is_said_and_shows_how_it_is_now() {
+    let (project, copies) = place("changes-since", &[("a.txt", "one\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("change", NOTHING);
+    command(&mut undo, || write(&project, "a.txt", "two\n"));
+    write(&project, "a.txt", "yours\n");
+    let changes = undo.changes(Span::LastTurn).run(true);
+    let a = file(&changes, "a.txt");
+    assert!(a.since, "undoing leaves it");
+    assert!(a.patch.contains("+yours\n"), "{}", a.patch);
+    assert_eq!(undo.plan(0, NOTHING).left, names(&["a.txt"]));
+}
+
+#[test]
+fn a_file_with_no_copy_left_says_so_rather_than_failing() {
+    let (project, copies) = place("changes-gone", &[("a.txt", "one\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("change", NOTHING);
+    command(&mut undo, || write(&project, "a.txt", "two\n"));
+    std::fs::remove_dir_all(&copies).unwrap();
+    assert_eq!(file(&undo.changes(Span::LastTurn).run(true), "a.txt").unshown, Some(Unshown::NotKept));
+}
+
+#[test]
+fn a_file_grown_past_the_longest_shows_no_lines() {
+    let (project, copies) = place("changes-grown", &[("a.txt", "short\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("grow it", NOTHING);
+    command(&mut undo, || std::fs::write(project.join("a.txt"), "x\n".repeat(600_000)).unwrap());
+    assert_eq!(file(&undo.changes(Span::LastTurn).run(true), "a.txt").unshown, Some(Unshown::TooBig));
+}
+
+#[test]
+#[ignore = "a measurement, not a check: prints how long a big change takes to compare"]
+fn how_long_many_changed_files_take() {
+    for (count, lines) in [(100, 500), (500, 500), (2000, 500), (500, 5000)] {
+        let body: String = (0..lines).map(|line| format!("    let value_{line} = compute_something({line});\n")).collect();
+        let files: Vec<(String, String)> = (0..count).map(|at| (format!("src/f{at}.rs"), body.clone())).collect();
+        let listed: Vec<(&str, &str)> = files.iter().map(|(path, text)| (path.as_str(), text.as_str())).collect();
+        let (project, copies) = place(&format!("changes-measure-{count}-{lines}"), &listed);
+        let mut undo = undo(&project, &copies, "s1");
+        undo.turn("format everything", NOTHING);
+        command(&mut undo, || {
+            for (path, text) in &files {
+                write(&project, path, &text.replace("compute_something(1", "compute_it(1"));
+            }
+        });
+        let start = std::time::Instant::now();
+        let changes = undo.changes(Span::Conversation).run(true);
+        println!(
+            "{count} files of {lines} lines: {:?}, {} changed, {} bytes of patch",
+            start.elapsed(),
+            changes.totals().0,
+            changes.files.iter().map(|file| file.patch.len()).sum::<usize>()
+        );
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+}
+
+#[test]
+fn nothing_changed_is_nothing_to_show() {
+    let (project, copies) = place("changes-none", &[("a.txt", "one\n")]);
+    let mut undo = undo(&project, &copies, "s1");
+    undo.turn("a question", NOTHING);
+    assert_eq!(undo.changes(Span::LastTurn).run(true), Changes::default());
+    assert_eq!(undo.changes(Span::Conversation).run(true), Changes::default());
+}

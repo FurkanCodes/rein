@@ -42,6 +42,8 @@ pub(crate) struct Look {
     pub(crate) amber_tint: Hsla,
     pub(crate) amber_line: Hsla,
     pub(crate) red: Hsla,
+    pub(crate) add: Hsla,
+    pub(crate) del: Hsla,
     pub(crate) add_tint: Hsla,
     pub(crate) del_tint: Hsla,
     pub(crate) band: Hsla,
@@ -65,7 +67,7 @@ fn tint(hex: u32, alpha: f32) -> Hsla {
 }
 
 impl Look {
-    fn light() -> Look {
+    pub(crate) fn light() -> Look {
         const SHADE: u32 = 0x162622;
         const TEAL: u32 = 0x0e8f7e;
         const AMBER: u32 = 0xd97706;
@@ -101,6 +103,8 @@ impl Look {
             amber_tint: tint(AMBER, 0.08),
             amber_line: tint(AMBER, 0.3),
             red: solid(0xc62f2f),
+            add: solid(0x1a7f4b),
+            del: solid(0xb42318),
             add_tint: tint(0x22a05a, 0.11),
             del_tint: tint(0xd23232, 0.09),
             band: solid(0xf4f6f5),
@@ -110,7 +114,7 @@ impl Look {
         }
     }
 
-    fn dark() -> Look {
+    pub(crate) fn dark() -> Look {
         const SHADE: u32 = 0xe2f0ec;
         const TEAL: u32 = 0x4fd1b5;
         const AMBER: u32 = 0xf2a33a;
@@ -146,6 +150,8 @@ impl Look {
             amber_tint: tint(AMBER, 0.1),
             amber_line: tint(AMBER, 0.32),
             red: solid(0xf07a7a),
+            add: solid(0x63d396),
+            del: solid(0xf28b82),
             add_tint: tint(0x63d396, 0.12),
             del_tint: tint(0xf28b82, 0.12),
             band: solid(0x1f2423),
@@ -170,6 +176,30 @@ pub(crate) enum Wearing {
 }
 
 impl Wearing {
+    /// What `look` says in your settings, as rein's settings page sets it:
+    /// `light`, `dark` or `follow`. `$REIN_LOOK` wins over the file, as an
+    /// environment variable does over every setting.
+    pub(crate) fn of(value: &str) -> Option<Wearing> {
+        match value.trim().trim_matches('"').trim() {
+            "light" => Some(Wearing::Light),
+            "dark" => Some(Wearing::Dark),
+            "follow" => Some(Wearing::System),
+            _ => None,
+        }
+    }
+
+    /// The look your settings keep, or your Mac's. The file is rein's
+    /// (`$REIN_HOME`, or `~/.config/rein`): read here, as it's the window's
+    /// own setting, and before any rein has started.
+    pub(crate) fn kept() -> Wearing {
+        if let Some(wearing) = std::env::var("REIN_LOOK").ok().as_deref().and_then(Wearing::of) {
+            return wearing;
+        }
+        let dir = std::env::var_os("REIN_HOME").map(std::path::PathBuf::from).or_else(|| std::env::home_dir().map(|home| home.join(".config").join("rein")));
+        let text = dir.and_then(|dir| std::fs::read_to_string(dir.join("config")).ok()).unwrap_or_default();
+        text.lines().filter_map(|line| line.split_once('=')).find(|(key, _)| key.trim() == "look").and_then(|(_, value)| Wearing::of(value)).unwrap_or_default()
+    }
+
     pub(crate) fn dark(self, appearance: WindowAppearance) -> bool {
         match self {
             Wearing::System => matches!(appearance, WindowAppearance::Dark | WindowAppearance::VibrantDark),
@@ -202,6 +232,9 @@ pub(crate) fn wear(dark: bool, cx: &mut App) {
         theme.primary_hover = look.teal_hover;
         theme.primary_active = look.teal_fill;
         theme.primary_foreground = look.on_teal;
+        // What a diff's added and removed lines are tinted with.
+        theme.success = look.add;
+        theme.danger = look.del;
         theme.radius = px(7.);
         theme.radius_lg = px(10.);
         theme.shadow = false;

@@ -108,6 +108,13 @@ fn about(rule: &Rule) -> &'static str {
 
 /// Adds the rule `line` says to yours, at the end of your file.
 fn add(line: &str, agent: &mut Agent<Llm>, terminal: &Terminal) -> CliResult {
+    let rule = added(line, agent)?;
+    say!("{}{} `{rule}` is one of your rules now, for every project", " ".repeat(GUTTER), terminal.err.green("✓"));
+    Ok(())
+}
+
+/// The same, saying nothing: the rule added.
+pub(crate) fn added(line: &str, agent: &mut Agent<Llm>) -> CliResult<Rule> {
     let line = line.trim();
     let line = line.strip_prefix("/permissions add").map_or(line, str::trim);
     let rule = Rule::parse(line, Whose::Yours)?;
@@ -117,21 +124,25 @@ fn add(line: &str, agent: &mut Agent<Llm>, terminal: &Terminal) -> CliResult {
     let (text, _) = load(&config_dir()?)?;
     let text = format!("{}{}{rule}\n", text, if text.is_empty() || text.ends_with('\n') { "" } else { "\n" });
     keep(&text, agent)?;
-    say!("{}{} `{rule}` is one of your rules now, for every project", " ".repeat(GUTTER), terminal.err.green("✓"));
-    Ok(())
+    Ok(rule)
 }
 
 /// Takes `rule` out of yours: every line that says it, and nothing else.
 fn remove(rule: &Rule, agent: &mut Agent<Llm>, terminal: &Terminal) -> CliResult {
+    removed(rule, agent)?;
+    say!("{}{} `{rule}` is out of your rules", " ".repeat(GUTTER), terminal.err.green("✓"));
+    Ok(())
+}
+
+/// The same, saying nothing.
+pub(crate) fn removed(rule: &Rule, agent: &mut Agent<Llm>) -> CliResult {
     let (text, _) = load(&config_dir()?)?;
     let says_it = |line: &str| Rule::parse(line, Whose::Yours).is_ok_and(|own| own.says_the_same(rule));
     let kept: Vec<&str> = text.lines().filter(|line| line.trim_start().starts_with('#') || !says_it(line)).collect();
     if kept.len() == text.lines().count() {
         return Err(format!("`{rule}` isn't one of your rules; /permissions lists them"));
     }
-    keep(&(kept.join("\n") + "\n"), agent)?;
-    say!("{}{} `{rule}` is out of your rules", " ".repeat(GUTTER), terminal.err.green("✓"));
-    Ok(())
+    keep(&(kept.join("\n") + "\n"), agent)
 }
 
 /// Writes `text` as your rules, once it reads as rules, and decides with

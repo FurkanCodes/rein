@@ -24,10 +24,7 @@ fn select(id: &str, name: &str, category: &str, current: &str, options: &[Value]
 }
 
 fn mode(mode: Mode, sandboxing: Sandboxing) -> Value {
-    let about = |mode: Mode| {
-        let description = crate::modes::description(mode, sandboxing);
-        description.split_once(": ").map_or(description, |(_, about)| about).to_owned()
-    };
+    let about = |mode: Mode| crate::modes::brief(mode, sandboxing).to_owned();
     let options: Vec<Value> = Mode::ALL.iter().map(|&one| choice(one.as_str(), &crate::modes::shown_name(one, sandboxing), &about(one))).collect();
     select("mode", "Mode", "mode", mode.as_str(), &options)
 }
@@ -68,17 +65,56 @@ fn sandbox(agent: &Agent<Llm>) -> Value {
     select("sandbox", "Sandbox", "_sandbox", if sandboxing == Sandboxing::Off { "off" } else { "on" }, &options)
 }
 
+/// Whether new conversations start in the mode and with the sandbox this
+/// one has now, as your settings file says: `on` keeps them there.
+fn keep(agent: &Agent<Llm>) -> Value {
+    let settings = crate::config_dir().and_then(|dir| crate::settings::Settings::load(&dir.join(crate::settings::FILE))).unwrap_or_default();
+    let kept_mode = settings.in_file("mode").and_then(|name| name.parse::<Mode>().ok()).unwrap_or_default();
+    // Off unless the file says on, as when rein starts.
+    let kept_sandbox = settings.in_file("sandbox") == Some("on");
+    let kept = kept_mode == agent.permissions.mode && kept_sandbox == (agent.permissions.sandboxing() != Sandboxing::Off);
+    let options = [choice("on", "on", "new conversations start this way"), choice("off", "off", "new conversations start as rein does")];
+    select("keep", "Keep for new conversations", "_keep", if kept { "on" } else { "off" }, &options)
+}
+
+/// Keeps the mode and sandbox `agent` has for new conversations, `on`, or
+/// takes them out of your settings, so rein's own hold.
+pub(super) fn set_keep(agent: &Agent<Llm>, on: bool) -> Result<(), String> {
+    let path = crate::config_dir()?.join(crate::settings::FILE);
+    if on {
+        crate::settings::set(&path, "mode", agent.permissions.mode.as_str())?;
+        crate::settings::set(&path, "sandbox", if agent.permissions.sandboxing() == Sandboxing::Off { "off" } else { "on" })
+    } else {
+        crate::settings::unset(&path, "mode")?;
+        crate::settings::unset(&path, "sandbox")
+    }
+}
+
+/// What `rein` says the command a check runs is, beside its switch.
+const COMMAND: &str = "io.github.furkancodes/command";
+
+/// The check after edits, as a switch, where the project has one.
+fn check(agent: &Agent<Llm>) -> Option<Value> {
+    let (name, on) = crate::check::switch(agent)?;
+    let options = [choice("on", "on", "runs after a step changes files"), choice("off", "off", "doesn't run")];
+    let mut option = select("check", "Check after edits", "_check", if on { "on" } else { "off" }, &options);
+    option["_meta"] = json!({ COMMAND: name });
+    Some(option)
+}
+
 /// All of them, as they stand.
 pub(super) fn all(agent: &Agent<Llm>, setup: &Setup) -> Value {
     let mut options = vec![mode(agent.permissions.mode, agent.permissions.sandboxing()), model(agent, setup)];
     options.extend(effort(agent));
     options.push(sandbox(agent));
+    options.push(keep(agent));
+    options.extend(check(agent));
     Value::Array(options)
 }
 
 /// The command that sets `option` to `value`.
 pub(super) fn command(option: &str, value: &str) -> Result<Slash, Refused> {
-    if !matches!(option, "mode" | "model" | "effort" | "sandbox") {
+    if !matches!(option, "mode" | "model" | "effort" | "sandbox" | "check") {
         return Err(Refused::params(format!("rein has no option {option}")));
     }
     match commands::parse(&format!("/{option} {value}")) {
@@ -98,6 +134,7 @@ mod tests {
         assert_eq!(command("mode", "edits").ok(), Some(Slash::Mode(Some(Mode::Edits))));
         assert_eq!(command("model", "groq/llama").ok(), Some(Slash::Model(Some("groq/llama".to_owned()))));
         assert_eq!(command("sandbox", "on").ok(), Some(Slash::Sandbox(Some(true))));
+        assert!(command("check", "off").is_ok(), "the switch is /check off");
     }
 
     #[test]

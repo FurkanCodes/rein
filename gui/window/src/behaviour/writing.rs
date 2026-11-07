@@ -40,14 +40,15 @@ fn a_command_waits_for_the_end_of_the_turn_and_then_runs() {
     let file = scratch("waits");
     let pane = desk.pane(&file);
     desk.send(&pane, "go");
-    desk.box_says(&pane, "/status");
+    // `/status` alone opens the Context panel, which needn't wait.
+    desk.box_says(&pane, "/skills");
     assert_eq!(in_box(&mut desk, &pane), "", "it's on its way");
-    assert_eq!(desk.read(&pane, Pane::waiting_for_test), ["/status"]);
+    assert_eq!(desk.read(&pane, Pane::waiting_for_test), ["/skills"]);
     desk.said(&pane, vec![Said::TurnOver]);
     assert!(desk.read(&pane, Pane::waiting_for_test).is_empty());
     let_go(&mut desk, &pane);
     let prompts: Vec<Value> = sent_to(&file).into_iter().filter(|line| line["method"] == "session/prompt").map(|line| line["params"]["prompt"][0]["text"].clone()).collect();
-    assert_eq!(prompts, [json!("go"), json!("/status")]);
+    assert_eq!(prompts, [json!("go"), json!("/skills")]);
 }
 
 #[test]

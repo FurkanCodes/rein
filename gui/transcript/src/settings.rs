@@ -22,10 +22,14 @@ pub struct Setting {
     pub choices: Vec<Choosable>,
     /// What an effort comes to: `default` is a choice, not a level.
     pub level: Option<String>,
+    /// What a switch for a command runs: the check's `cargo check`.
+    pub command: Option<String>,
 }
 
 /// Marks the level an effort comes to.
 const LEVEL: &str = "io.github.furkancodes/level";
+/// Marks what a switch for a command runs.
+const COMMAND: &str = "io.github.furkancodes/command";
 
 impl Setting {
     /// Read from `configOptions`, which group their choices or not. One with
@@ -47,6 +51,7 @@ impl Setting {
             current: option["currentValue"].as_str()?.to_owned(),
             choices,
             level: option["_meta"][LEVEL].as_str().map(str::to_owned),
+            command: option["_meta"][COMMAND].as_str().map(str::to_owned),
         })
     }
 

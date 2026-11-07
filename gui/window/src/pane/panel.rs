@@ -22,6 +22,7 @@ const TASKS_EVERY: Duration = Duration::from_secs(1);
 /// Which part it shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
+    Changes,
     Context,
     Tasks,
 }
@@ -38,6 +39,22 @@ pub(super) struct Panel {
 }
 
 impl Pane {
+    /// Whether `tab` is what's showing beside the conversation.
+    pub(super) fn panel_shows(&self, tab: Tab) -> bool {
+        self.panel.as_ref().is_some_and(|panel| panel.tab == tab)
+    }
+
+    /// Whether you're partway through writing something beside the
+    /// conversation. A question that comes up leaves the keys there: a `y`
+    /// meant for your comment would say yes to something you never read.
+    pub(super) fn half_written_beside(&self, window: &Window, cx: &App) -> bool {
+        let underway = |input: &Entity<InputState>| {
+            let input = input.read(cx);
+            input.focus_handle(cx).is_focused(window) && !input.value().trim().is_empty()
+        };
+        self.panel.iter().map(|panel| &panel.focus).chain(self.comment_box()).any(underway)
+    }
+
     /// Opens `tab`, or closes it if that's what's showing.
     pub(super) fn open_panel(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if self.panel.as_ref().is_some_and(|panel| panel.tab == tab) {
@@ -66,6 +83,9 @@ impl Pane {
             }
         }
         self.ask_room();
+        if tab == Tab::Changes {
+            self.ask_changes();
+        }
         self.keep_watching(cx);
     }
 
@@ -134,8 +154,9 @@ impl Pane {
     pub(super) fn beside(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let panel = self.panel.as_ref()?;
         let look = Look::of(cx);
-        let tab = |id: &'static str, name: &'static str, which: Tab, cx: &mut Context<Self>| {
+        let tab = |id: &'static str, name: &'static str, which: Tab, count: Option<usize>, cx: &mut Context<Self>| {
             let on = panel.tab == which;
+            let count = count.filter(|&count| count > 0).map(|count| div().ml(px(5.)).font_weight(FontWeight::NORMAL).text_color(look.ink_3).child(count.to_string()));
             div()
                 .id(id)
                 .relative()
@@ -151,6 +172,7 @@ impl Pane {
                     }
                 }))
                 .child(name)
+                .children(count)
                 .when(on, |it| it.child(div().absolute().left_0().right_0().bottom(px(-1.)).h(px(2.)).bg(look.ink)))
         };
         let close = Press::new("panel-close").ghost().square().named("Close the panel").child("×").on_click(cx.listener(|pane, _, _, cx| {
@@ -167,11 +189,13 @@ impl Pane {
             .pr(px(8.))
             .border_b_1()
             .border_color(look.line)
-            .child(tab("tab-context", "Context", Tab::Context, cx))
-            .child(tab("tab-tasks", "Tasks", Tab::Tasks, cx))
+            .child(tab("tab-changes", "Changes", Tab::Changes, Some(self.files_changed()), cx))
+            .child(tab("tab-context", "Context", Tab::Context, None, cx))
+            .child(tab("tab-tasks", "Tasks", Tab::Tasks, Some(usize::try_from(self.background).unwrap_or(usize::MAX)), cx))
             .child(div().flex_1())
             .child(close);
         let body = match panel.tab {
+            Tab::Changes => self.changes_tab(cx).into_any_element(),
             Tab::Context => self.context_tab(panel, cx).into_any_element(),
             Tab::Tasks => self.tasks_tab(panel, cx).into_any_element(),
         };
@@ -187,7 +211,8 @@ impl Pane {
                 .bg(look.bg)
                 .shadow(vec![crate::parts::halo(look.line, 1.)])
                 .child(tabs)
-                .child(div().id("panel-body").flex_1().min_h_0().overflow_y_scroll().child(body)),
+                // The lines of a change scroll by themselves.
+                .child(div().id("panel-body").flex_1().min_h_0().when(panel.tab != Tab::Changes, |it| it.overflow_y_scroll()).child(body)),
         )
     }
 
@@ -336,15 +361,46 @@ impl Pane {
         } else {
             background.children(tasks).child(div().text_size(px(12.)).text_color(look.ink_3).child("They stop with the conversation."))
         };
-        let check = self.transcript.last_check().map(|(said, state)| {
-            let color = if state == rein_transcript::StepState::Failed { look.red } else { look.ink_3 };
-            let change = Press::new("check-change").ghost().small().label("Change").on_click(cx.listener(|pane, _, _, cx| pane.run("/check", Vec::new(), cx)));
+        let check = self.check_part(cx);
+        div().flex().flex_col().children(plan_part).child(background).children(check).into_any_element()
+    }
+    /// The check after edits: what it runs, how the last one went, and a
+    /// switch, from before it ever runs. A project rein knows no check for
+    /// has none to show.
+    fn check_part(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let look = Look::of(cx);
+        let mono = cx.global::<crate::parts::Monospace>().0.clone();
+        let setting = self.setting("check")?;
+        let on = setting.current == "on";
+        let running = self.transcript.last_check().is_some_and(|(_, state)| state == rein_transcript::StepState::Running);
+        let checked = self.transcript.last_checked();
+        let (said, color) = match checked {
+            _ if running => ("running".to_owned(), look.ink_3),
+            Some(checked) => (checked.said(), if matches!(checked.verdict, rein_transcript::Verdict::New(_)) { look.red } else { look.ink_3 }),
+            None if on => ("hasn't run yet".to_owned(), look.ink_3),
+            None => ("off".to_owned(), look.ink_3),
+        };
+        let flip = cx.listener(move |pane, _: &ClickEvent, _, cx| pane.set_option(rein_transcript::Sets { option: "check", value: if on { "off" } else { "on" } }, cx));
+        let before = checked.map_or(0, |checked| checked.before);
+        let note = match before {
+            0 => "Tells the model only what this turn broke.".to_owned(),
+            1 => "Tells the model only what this turn broke. 1 error from before its first change isn't counted.".to_owned(),
+            before => format!("Tells the model only what this turn broke. {before} errors from before its first change aren't counted."),
+        };
+        Some(
             sect(&look)
                 .child(heading("Check after edits", None, &look))
-                .child(div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().text_size(px(12.)).text_color(color).child(said.to_owned())).child(change))
-                .child(div().text_size(px(12.)).line_height(px(16.)).text_color(look.ink_3).child("Tells the model only what this turn broke."))
-        });
-        div().flex().flex_col().children(plan_part).child(background).children(check).into_any_element()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().flex_1().min_w_0().truncate().font_family(mono).text_size(px(12.)).child(setting.command.clone().unwrap_or_default()))
+                        .child(div().flex_none().text_size(px(12.)).text_color(color).child(said))
+                        .child(super::pickers::switch("check-switch", on, &look).on_click(flip)),
+                )
+                .child(div().text_size(px(12.)).line_height(px(16.)).text_color(look.ink_3).child(note)),
+        )
     }
 }
 

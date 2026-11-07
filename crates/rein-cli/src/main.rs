@@ -123,7 +123,7 @@ async fn run(args: Vec<String>) -> CliResult {
         ["serve", ..] => serve::run(&http, args[1..].to_vec()).await,
         _ => {
             let settings = Settings::load(&config_dir()?.join(settings::FILE))?;
-            let compact_at = settings.get("compact_at", "REIN_COMPACT_AT");
+            let compact_at = settings.get("compact_at");
             ask(&http, AskArgs::parse(args, &settings)?, compact_at).await
         }
     }

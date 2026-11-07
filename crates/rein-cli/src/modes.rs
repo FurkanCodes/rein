@@ -59,6 +59,26 @@ pub(crate) fn description(mode: Mode, sandboxing: Sandboxing) -> &'static str {
     }
 }
 
+/// What `mode` lets through, in a sentence for a list that has room for a
+/// line under each name. With the sandbox on and nowhere to run, it's said
+/// in full: that's the case a short line would get wrong.
+pub(crate) fn brief(mode: Mode, sandboxing: Sandboxing) -> &'static str {
+    use Sandboxing::{Missing, Off, On};
+    match (mode, sandboxing) {
+        (_, Missing) => description(mode, sandboxing).split_once(": ").map_or("", |(_, about)| about),
+        (Mode::Trust, On) => "Everything runs, in the sandbox unless a command needs to leave it.",
+        (Mode::Ask, On) => "Asks before changing files, or writing from a command. Looks run.",
+        (Mode::Edits, On) => "Changes files. Asks before a command needs the network or to leave the sandbox.",
+        (Mode::Auto, On) => "Never asks. What would go past the walls is refused.",
+        (Mode::ReadOnly, On) => "No file changes. Commands that only look run; the rest are refused.",
+        (Mode::Trust, Off) => "Everything runs, except what your rules hold back.",
+        (Mode::Ask, Off) => "Asks before file changes and commands.",
+        (Mode::Edits, Off) => "Changes files in this folder. Asks before commands.",
+        (Mode::Auto, Off) => "Never asks. Every command runs, except what an ask rule names.",
+        (Mode::ReadOnly, Off) => "No file changes. Commands that only look ask first; the rest are refused.",
+    }
+}
+
 /// What's said even where a switch shows the sandbox: on, with nothing to
 /// run in, the switch alone would have you think commands have walls.
 pub(crate) fn walls_missing(sandboxing: Sandboxing, sandbox: &Sandbox) -> Option<String> {
@@ -165,6 +185,18 @@ async fn keep_setting(keep: Keep, kept: impl Fn(&crate::settings::Settings) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mode_said_briefly_is_a_sentence_and_with_no_sandbox_here_its_said_whole() {
+        for mode in Mode::ALL {
+            for sandboxing in [Sandboxing::On, Sandboxing::Off] {
+                let said = brief(mode, sandboxing);
+                assert!(said.ends_with('.') && said.chars().next().is_some_and(char::is_uppercase), "{mode} {sandboxing:?}: {said}");
+            }
+            let whole = description(mode, Sandboxing::Missing);
+            assert!(whole.ends_with(brief(mode, Sandboxing::Missing)), "{mode}: the case a short line would get wrong");
+        }
+    }
 
     #[test]
     fn a_sandbox_that_isnt_here_is_said_though_its_switch_shows_on() {

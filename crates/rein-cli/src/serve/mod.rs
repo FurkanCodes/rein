@@ -12,7 +12,9 @@
 //! the client starts when it's asked to, and drives like any other.
 
 mod beside;
+mod config;
 mod options;
+mod signing;
 mod ui;
 mod wire;
 
@@ -62,6 +64,9 @@ struct Link {
     panes: Rc<Cell<bool>>,
     /// The client can show what a command asks.
     can_ask: Rc<Cell<bool>>,
+    /// The client has a switch of its own for keeping the mode and sandbox
+    /// for new conversations, so changing them asks nothing.
+    keeps: Rc<Cell<bool>>,
     /// What's asked of the conversation beside a turn.
     beside: Rc<RefCell<Option<Beside>>>,
 }
@@ -101,6 +106,9 @@ struct Session {
     in_a_row: usize,
     /// What commands need, and it holds the conversation's MCP servers.
     setup: conversation::Setup,
+    /// It's another rein's sub-agent: a project's hooks it runs are only
+    /// those you've said yes to already, as in a tab.
+    sub_agent: bool,
 }
 
 /// Runs until the client closes standard input. `flags` are what a
@@ -126,7 +134,16 @@ pub(crate) async fn run(http: &rein_llm::reqwest::Client, flags: Vec<String>) ->
             }
         }
     });
-    let link = Link { out, asked: Rc::default(), asks: Rc::new(Cell::new(0)), heard: Rc::default(), panes: Rc::default(), can_ask: Rc::default(), beside: Rc::default() };
+    let link = Link {
+        out,
+        asked: Rc::default(),
+        asks: Rc::new(Cell::new(0)),
+        heard: Rc::default(),
+        panes: Rc::default(),
+        can_ask: Rc::default(),
+        keeps: Rc::default(),
+        beside: Rc::default(),
+    };
     let mut input: Input = BufReader::new(tokio::io::stdin()).lines();
     let mut session: Option<Session> = None;
     loop {
@@ -146,6 +163,10 @@ pub(crate) async fn run(http: &rein_llm::reqwest::Client, flags: Vec<String>) ->
                             session.served.commands(&crate::skills::offers(session.agent.skills()));
                             session.served.state();
                             session.served.terminal.meters.ask(&session.agent.model.client, &session.agent.model_name);
+                            // A project's hooks wait for a yes from someone who can give one.
+                            if link.can_ask.get() && !session.sub_agent && !ask_about_hooks(session, &link, &mut input).await {
+                                break;
+                            }
                         }
                     }
                     Incoming::Unreadable(refused) => link.send(wire::refuse(&Value::Null, &refused)),
@@ -187,6 +208,8 @@ pub(crate) async fn run(http: &rein_llm::reqwest::Client, flags: Vec<String>) ->
 enum Answer {
     Result(Value),
     Refused(Refused),
+    /// Turned down, with more said in the error's `data`.
+    RefusedWith(Refused, Value),
 }
 
 impl Answer {
@@ -194,6 +217,7 @@ impl Answer {
         link.send(match self {
             Answer::Result(result) => wire::answer(id, &result),
             Answer::Refused(refused) => wire::refuse(id, &refused),
+            Answer::RefusedWith(refused, data) => wire::refuse_with(id, &refused, &data),
         });
     }
 }
@@ -212,14 +236,26 @@ async fn handle(
         Err(refused) => return Some(Answer::Refused(refused)),
     };
     Some(match request {
-        Request::Initialize { panes, asks } => {
+        Request::Initialize { panes, asks, keeps } => {
             link.panes.set(panes);
             link.can_ask.set(asks);
+            link.keeps.set(keeps);
             Answer::Result(initialized())
         }
         Request::NewSession { .. } | Request::LoadSession { .. } if session.is_some() => {
             Answer::Refused(Refused::new("rein serve holds one conversation: start another rein serve for another"))
         }
+        // A client that can show a sign-in shows it, rather than a failure.
+        Request::NewSession { .. } if link.can_ask.get() && signing::signed_out(flags).unwrap_or(false) => match signing::ways() {
+            Ok(ways) => Answer::RefusedWith(Refused { code: wire::SIGNED_OUT, message: "you're signed in to nothing that runs the model".to_owned() }, ways),
+            Err(said) => Answer::Refused(Refused::new(said)),
+        },
+        Request::SignIn { way } => match alongside(signing::sign_in(way, http, link), false, link, input).await {
+            Alongside::ClientGone => return None,
+            Alongside::Done(Ok(true)) => Answer::Result(json!({ "signedIn": true })),
+            Alongside::Done(Ok(false)) | Alongside::Cancelled => Answer::Result(json!({ "signedIn": false })),
+            Alongside::Done(Err(why)) => Answer::Refused(Refused::new(why)),
+        },
         Request::NewSession { cwd } => match open(&cwd, Resume::New, flags, http, link).await {
             Ok(opened) => {
                 let result = json!({ "sessionId": opened.id, "modes": modes(opened.agent.permissions.mode, opened.sandboxing), "configOptions": options::all(&opened.agent, &opened.setup) });
@@ -245,9 +281,32 @@ async fn handle(
             Err(refused) => Answer::Refused(refused),
         },
         // `run` answers these, as `alongside` does.
-        Request::Sent { .. } | Request::Paths { .. } | Request::Background { .. } | Request::Tasks { .. } | Request::StopTask { .. } | Request::Room { .. } => {
-            Answer::Result(Value::Null)
-        }
+        Request::Ways
+        | Request::Sent { .. }
+        | Request::Paths { .. }
+        | Request::Background { .. }
+        | Request::Tasks { .. }
+        | Request::StopTask { .. }
+        | Request::Room { .. }
+        | Request::Config { .. }
+        | Request::SetConfig { .. } => Answer::Result(Value::Null),
+        Request::Rule { session: id, rule, add } => match mine(session, &id) {
+            Ok(session) => {
+                let done = if add {
+                    crate::rules::added(&rule, &mut session.agent).map(|_| ())
+                } else {
+                    rein_agent::permissions::Rule::parse(&rule, rein_agent::permissions::Whose::Yours).and_then(|rule| crate::rules::removed(&rule, &mut session.agent))
+                };
+                match done {
+                    Ok(()) => {
+                        link.room_changed(&session.agent, &session.served.terminal);
+                        Answer::Result(json!({}))
+                    }
+                    Err(why) => Answer::Refused(Refused::params(why)),
+                }
+            }
+            Err(refused) => Answer::Refused(refused),
+        },
         // The list goes out with the options, as the others' are looked up.
         Request::Models { session: id } => match mine(session, &id) {
             Ok(session) => {
@@ -255,6 +314,10 @@ async fn handle(
                 session.served.options(options::all(&session.agent, &session.setup));
                 Answer::Result(json!({}))
             }
+            Err(refused) => Answer::Refused(refused),
+        },
+        Request::Changes { session: id, span, lines } => match mine(session, &id) {
+            Ok(session) => Answer::Result(wire::changes(&session.agent.changes(span, lines).await, lines)),
             Err(refused) => Answer::Refused(refused),
         },
         Request::UndoTurns { session: id } => match mine(session, &id) {
@@ -284,6 +347,16 @@ async fn handle(
             }
             Err(refused) => Answer::Refused(refused),
         },
+        Request::SetOption { session: id, option, value } if option == "keep" => match mine(session, &id) {
+            Ok(session) => match value.as_str() {
+                "on" | "off" => match options::set_keep(&session.agent, value == "on") {
+                    Ok(()) => Answer::Result(json!({ "configOptions": options::all(&session.agent, &session.setup) })),
+                    Err(why) => Answer::Refused(Refused::new(why)),
+                },
+                other => Answer::Refused(Refused::params(format!("keep is on or off, not {other}"))),
+            },
+            Err(refused) => Answer::Refused(refused),
+        },
         Request::SetOption { session: id, option, value } => match mine(session, &id) {
             Ok(session) => match options::command(&option, &value) {
                 Ok(chosen) => match setting(session, chosen, link, input).await {
@@ -304,6 +377,17 @@ async fn handle(
             Err(refused) => Answer::Refused(refused),
         },
     })
+}
+
+/// Asks about the project's hooks that wait for a yes. `false`: the client
+/// went away.
+async fn ask_about_hooks(session: &mut Session, link: &Link, input: &mut Input) -> bool {
+    let Ok(dir) = config_dir() else { return true };
+    let Session { agent, served, .. } = &mut *session;
+    let _said = served.take_said();
+    let asked = alongside(crate::hooks::ask_waiting(agent, &mut served.terminal, &dir), false, link, input).await;
+    link.asked.borrow_mut().clear();
+    !matches!(asked, Alongside::ClientGone)
 }
 
 fn mine<'a>(session: &'a mut Option<Session>, id: &str) -> Result<&'a mut Session, Refused> {
@@ -329,11 +413,7 @@ fn initialized() -> Value {
 fn modes(mode: Mode, sandboxing: Sandboxing) -> Value {
     let available: Vec<Value> = Mode::ALL
         .iter()
-        .map(|&mode| {
-            let description = crate::modes::description(mode, sandboxing);
-            let about = description.split_once(": ").map_or(description, |(_, about)| about);
-            json!({ "id": mode.as_str(), "name": crate::modes::shown_name(mode, sandboxing), "description": about })
-        })
+        .map(|&mode| json!({ "id": mode.as_str(), "name": crate::modes::shown_name(mode, sandboxing), "description": crate::modes::brief(mode, sandboxing) }))
         .collect();
     json!({ "currentModeId": mode.as_str(), "availableModes": available })
 }
@@ -344,7 +424,7 @@ async fn open(cwd: &Path, resume: Resume, flags: &[String], http: &rein_llm::req
     std::env::set_current_dir(cwd).map_err(|e| format!("can't go into {}: {e}", cwd.display()))?;
     let dir = config_dir()?;
     let settings = Settings::load(&dir.join(settings::FILE))?;
-    let compact_at = settings.get("compact_at", "REIN_COMPACT_AT");
+    let compact_at = settings.get("compact_at");
     let mut args = AskArgs::parse(flags.to_vec(), &settings)?;
     args.resume = resume;
     let (mode, max_steps) = (args.mode, args.max_steps);
@@ -383,9 +463,11 @@ async fn open(cwd: &Path, resume: Resume, flags: &[String], http: &rein_llm::req
     let (root, sandbox, jobs) = (agent.tools.root().to_owned(), agent.tools.sandbox().clone(), agent.tools.jobs().clone());
     let sent = History::load(history::file(&dir, &root));
     let room = room(&agent, &terminal);
-    *link.beside.borrow_mut() = Some(Beside { session: id.clone(), root, sandbox, jobs, sent, room });
+    let looking = agent.tools.looking();
+    let found = config::found(&agent);
+    *link.beside.borrow_mut() = Some(Beside { session: id.clone(), root, sandbox, jobs, sent, room, looking, found, flags: flags.to_vec() });
     let served = Served::new(id.clone(), link.clone(), terminal);
-    Ok(Session { id, agent, served, max_steps, sandboxing, in_a_row: 0, setup })
+    Ok(Session { id, agent, served, max_steps, sandboxing, in_a_row: 0, setup, sub_agent: child.is_some() })
 }
 
 /// Where the conversations held in `cwd` are saved.
@@ -520,6 +602,7 @@ async fn alongside<T>(work: impl Future<Output = T>, steers: bool, link: &Link, 
                         link.steer(text);
                         link.send(wire::answer(&id, &json!({})));
                     }
+                    Incoming::Request { id, request: Ok(Request::Changes { session, span, lines }) } => link.changes_beside(&id, &session, span, lines),
                     Incoming::Request { id, request: Ok(request) } if request.beside_a_turn() => link.answer_beside(&id, &request),
                     Incoming::Request { id, .. } => link.send(wire::refuse(&id, &Refused::busy("a turn is running: stop it, or wait for it to end"))),
                     Incoming::Unreadable(refused) => link.send(wire::refuse(&Value::Null, &refused)),
@@ -677,10 +760,22 @@ async fn setting(session: &mut Session, chosen: Slash, link: &Link, input: &mut 
     let Session { id, agent, served, setup, max_steps, .. } = &mut *session;
     let unsaid = served.leave_unsaid();
     let done = match chosen {
+        // A client with a switch for keeping them asks nothing.
+        Slash::Mode(Some(mode)) if link.keeps.get() => {
+            conversation::set_mode(mode, agent, &mut served.terminal, *max_steps);
+            Alongside::Done(Ok(()))
+        }
         Slash::Mode(Some(mode)) => {
             conversation::set_mode(mode, agent, &mut served.terminal, *max_steps);
             served.options(options::all(agent, setup));
             alongside(crate::modes::keep_mode(mode, &mut served.terminal), false, link, input).await
+        }
+        Slash::Sandbox(Some(on)) if link.keeps.get() => {
+            conversation::set_sandbox(on, agent, &mut served.terminal);
+            if let Some(missing) = crate::modes::walls_missing(served.terminal.sandboxing, agent.permissions.sandbox()) {
+                link.send(wire::noted(id, &missing));
+            }
+            Alongside::Done(Ok(()))
         }
         Slash::Sandbox(Some(on)) => {
             conversation::set_sandbox(on, agent, &mut served.terminal);

@@ -51,6 +51,9 @@ fn left(asking: &Asking) -> Value {
     }
 }
 
+/// The most of what a question's about that shows before it scrolls.
+const COMMAND_MOST: f32 = 220.;
+
 /// The answer a key gives. Esc goes by its name, as the terminal's does.
 fn answer_for<'a>(answers: &'a [Offered], key: &Keystroke) -> Option<&'a Offered> {
     let bare = !key.modifiers.platform && !key.modifiers.control && !key.modifiers.alt;
@@ -98,6 +101,9 @@ impl Pane {
         let yes = matches!(asking, Asking::Yes { .. });
         self.asking = Some(Open { asker, asking, input: input.clone(), at, since: Instant::now() });
         cx.defer_in(window, move |pane, window, cx| {
+            if pane.half_written_beside(window, cx) {
+                return;
+            }
             if yes {
                 pane.card.focus(window, cx);
             } else {
@@ -245,7 +251,13 @@ impl Pane {
                     .map(|(index, answer)| {
                         let key = answer.key.clone();
                         let pressed = cx.listener(move |pane, _, window, cx| pane.press_asking(&key, window, cx));
-                        Press::new(("answer", index)).label(answer.says.clone()).key(answer.key.clone()).width(width).on_click(pressed)
+                        let press = Press::new(("answer", index)).label(answer.says.clone()).key(answer.key.clone()).width(width).on_click(pressed);
+                        // The yes is the one to press, the no the quietest.
+                        match answer.key.as_str() {
+                            "y" => press.primary(),
+                            "n" => press.ghost(),
+                            _ => press,
+                        }
                     })
                     .collect();
                 card.track_focus(&self.card)
@@ -254,7 +266,21 @@ impl Pane {
                     .py(px(12.))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title.clone()))
                     .children(detail.clone().map(|detail| div().text_color(look.ink_3).child(detail)))
-                    .children(command.clone().map(|command| div().px(px(10.)).py(px(8.)).rounded(px(7.)).bg(look.bg).font_family(mono).text_size(px(12.5)).child(command)))
+                    .children(command.clone().map(|command| {
+                        // A script shown whole scrolls, rather than pushing its answers away.
+                        div()
+                            .id("asked-command")
+                            .max_h(px(COMMAND_MOST))
+                            .overflow_y_scroll()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .rounded(px(7.))
+                            .bg(look.bg)
+                            .font_family(mono)
+                            .text_size(px(12.5))
+                            .line_height(px(19.))
+                            .child(command)
+                    }))
                     .child(div().flex().flex_wrap().gap(px(6.)).children(buttons))
                     .into_any_element()
             }

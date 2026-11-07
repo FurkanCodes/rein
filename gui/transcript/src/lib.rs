@@ -4,7 +4,9 @@
 mod asking;
 mod blocks;
 pub mod boards;
+pub mod changes;
 pub mod composing;
+pub mod config;
 // One rule for finding a path, wherever it's typed.
 #[path = "../../../crates/rein-cli/src/ui/fuzzy.rs"]
 pub mod fuzzy;
@@ -15,6 +17,7 @@ mod narrow;
 mod question;
 mod saved;
 mod settings;
+pub mod signing;
 mod watch;
 
 use std::collections::HashMap;
@@ -65,7 +68,104 @@ pub struct Message {
     pub text: String,
     /// How a step stands: `in_progress`, `completed`, `failed`.
     pub status: Option<String>,
+    /// What a finished step came to, in short, as rein said it.
+    pub summary: Option<Summary>,
+    /// The rein that said it, for another rein's words.
+    pub from: Option<String>,
+    /// What a check after edits came to, for a check's step.
+    pub checked: Option<Checked>,
     blocks: Blocks,
+}
+
+/// What a check after edits came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    pub verdict: Verdict,
+    pub took: std::time::Duration,
+    /// How many errors there were before the turn's first change, which
+    /// aren't counted against it.
+    pub before: u64,
+}
+
+/// How a check after edits went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nothing new broke.
+    Clean,
+    /// This many errors the turn's changes brought in.
+    New(u64),
+    /// What the turn broke, it fixed.
+    Fixed,
+    /// It didn't run: another command had the build.
+    Busy,
+}
+
+/// Where `rein serve` says it, in a check's `_meta`.
+const CHECKED: &str = "io.github.furkancodes/checked";
+
+impl Checked {
+    fn of(said: &Value) -> Option<Checked> {
+        let verdict = match said["verdict"].as_str()? {
+            "clean" => Verdict::Clean,
+            "new" => Verdict::New(said["count"].as_u64().unwrap_or(1)),
+            "fixed" => Verdict::Fixed,
+            "busy" => Verdict::Busy,
+            _ => return None,
+        };
+        Some(Checked { verdict, took: std::time::Duration::from_millis(said["tookMs"].as_u64().unwrap_or(0)), before: said["before"].as_u64().unwrap_or(0) })
+    }
+
+    /// In a few words: `passed · 4.1s`.
+    pub fn said(&self) -> String {
+        let took = format!("{:.1}s", self.took.as_secs_f32());
+        match self.verdict {
+            Verdict::Clean => format!("passed · {took}"),
+            Verdict::New(1) => format!("1 new error · {took}"),
+            Verdict::New(count) => format!("{count} new errors · {took}"),
+            Verdict::Fixed => format!("fixed what it broke · {took}"),
+            Verdict::Busy => "not run: another command had the build".to_owned(),
+        }
+    }
+}
+
+/// What a finished step came to, in short: `exit 101`, how much an edit
+/// changed, how many lines a read brought in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// rein's word for how it went, for what has no number of its own.
+    pub status: String,
+    /// What it said after, where there's room: a command's last line.
+    pub said: String,
+    pub failed: bool,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+    pub lines: Option<u64>,
+}
+
+/// Where `rein serve` says it, in a step's `_meta`.
+const SUMMARY: &str = "io.github.furkancodes/summary";
+
+impl Summary {
+    fn of(said: &Value) -> Option<Summary> {
+        let text = |key: &str| said[key].as_str().unwrap_or_default().to_owned();
+        said.is_object().then(|| Summary {
+            status: text("status"),
+            said: text("said"),
+            failed: said["failed"] == true,
+            added: said["added"].as_u64(),
+            removed: said["removed"].as_u64(),
+            lines: said["lines"].as_u64(),
+        })
+    }
+}
+
+/// Reads one after another, said on one line: `a.rs, b.rs +1`, three files,
+/// so many lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reads {
+    pub paths: Vec<String>,
+    /// How many lines they brought in, if each one says.
+    pub lines: Option<u64>,
 }
 
 impl Message {
@@ -306,12 +406,40 @@ impl Transcript {
         Some((check.step_line().1, check.state()))
     }
 
+    /// What the last check after edits came to, once one has finished.
+    pub fn last_checked(&self) -> Option<&Checked> {
+        self.messages.iter().rev().find(|message| message.role == Role::Step && message.step_line().0 == "Check")?.checked.as_ref()
+    }
+
     pub fn len(&self) -> usize {
         self.messages.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+
+    /// Whether message `index` is a read that worked, which goes on the
+    /// line of the reads before it.
+    fn read_done(&self, index: usize) -> bool {
+        self.messages.get(index).is_some_and(|message| message.role == Role::Step && message.step_line().0 == "Read" && message.state() == StepState::Done)
+    }
+
+    /// Whether message `index` is said on the line of a read before it.
+    pub fn read_after_read(&self, index: usize) -> bool {
+        self.read_done(index) && index.checked_sub(1).is_some_and(|above| self.read_done(above))
+    }
+
+    /// The reads that start at message `index`, if there's more than one.
+    pub fn reads_from(&self, index: usize) -> Option<Reads> {
+        if !self.read_done(index) || self.read_after_read(index) {
+            return None;
+        }
+        let run: Vec<&Message> = (index..).take_while(|&at| self.read_done(at)).filter_map(|at| self.messages.get(at)).collect();
+        (run.len() > 1).then(|| Reads {
+            paths: run.iter().map(|message| message.step_line().1.to_owned()).collect(),
+            lines: run.iter().map(|message| message.summary.as_ref().and_then(|summary| summary.lines)).sum(),
+        })
     }
 
     pub fn get(&self, index: usize) -> Option<&Message> {
@@ -327,7 +455,7 @@ impl Transcript {
     /// The first line of the first thing you said, which a conversation with
     /// no name goes by.
     pub fn first_said(&self) -> Option<&str> {
-        self.messages.iter().find(|message| message.role == Role::You && !says_back(&message.text))?.text.lines().next()
+        self.messages.iter().find(|message| message.role == Role::You && !says_back(&message.text))?.text.lines().find(|line| !line.trim().is_empty())
     }
 
     /// What can be run from the box, as the agent last said.
@@ -461,7 +589,9 @@ impl Transcript {
 
     /// Another rein said `text`, which goes in as its own.
     pub fn heard(&mut self, from: &str, text: &str) -> Update {
-        let change = self.add_said(Role::Peer, &format!("**{from}**: {text}"));
+        // Its name goes above it, so its words are its words alone.
+        let change =
+            self.add(Message { role: Role::Peer, text: text.to_owned(), status: None, summary: None, from: Some(from.to_owned()), checked: None, blocks: Blocks::default() });
         self.rows_for(&change)
     }
 
@@ -539,7 +669,7 @@ impl Transcript {
     }
 
     fn add_said(&mut self, role: Role, text: &str) -> Change {
-        self.add(Message { role, text: text.to_owned(), status: None, blocks: Blocks::default() })
+        self.add(Message { role, text: text.to_owned(), status: None, summary: None, from: None, checked: None, blocks: Blocks::default() })
     }
 
     fn add(&mut self, message: Message) -> Change {
@@ -566,7 +696,7 @@ impl Transcript {
         let Some(id) = update["toolCallId"].as_str() else { return Change::Nothing };
         let title = update["title"].as_str().unwrap_or("a step");
         let status = update["status"].as_str().map(str::to_owned);
-        let change = self.add(Message { role: Role::Step, text: title.to_owned(), status, blocks: Blocks::default() });
+        let change = self.add(Message { role: Role::Step, text: title.to_owned(), status, summary: None, from: None, checked: None, blocks: Blocks::default() });
         if let Change::Added(index) = change {
             self.steps.insert(id.to_owned(), Step { index, question: Question::of(update) });
             self.turn.push((index, Reach::of(update["kind"].as_str())));
@@ -579,6 +709,12 @@ impl Transcript {
         let message = &mut self.messages[index];
         if let Some(status) = update["status"].as_str() {
             message.status = Some(status.to_owned());
+        }
+        if let Some(summary) = Summary::of(&update["_meta"][SUMMARY]) {
+            message.summary = Some(summary);
+        }
+        if let Some(checked) = Checked::of(&update["_meta"][CHECKED]) {
+            message.checked = Some(checked);
         }
         if let Some(shown) = update["content"][0]["content"]["text"].as_str() {
             let title = message.text.lines().next().unwrap_or_default().to_owned();
@@ -594,6 +730,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_step_keeps_what_it_came_to_and_reads_in_a_row_go_on_one_line() {
+        let mut transcript = Transcript::default();
+        let read = |id: &str, path: &str, lines: u64| {
+            vec![
+                json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": format!("Read {path}"), "kind": "read", "status": "in_progress" }),
+                json!({ "sessionUpdate": "tool_call_update", "toolCallId": id, "status": "completed", "_meta": { SUMMARY: { "status": format!("{lines} lines"), "said": "", "lines": lines } } }),
+            ]
+        };
+        for update in [read("a", "a.rs", 10), read("b", "b.rs", 5), read("c", "c.rs", 1)].concat() {
+            transcript.apply(&update);
+        }
+        transcript.apply(&json!({ "sessionUpdate": "tool_call", "toolCallId": "d", "title": "Run cargo test", "kind": "execute", "status": "in_progress" }));
+        transcript.apply(
+            &json!({ "sessionUpdate": "tool_call_update", "toolCallId": "d", "status": "failed", "_meta": { SUMMARY: { "status": "exit 101", "said": "", "failed": true } } }),
+        );
+        assert_eq!(transcript.reads_from(0), Some(Reads { paths: vec!["a.rs".to_owned(), "b.rs".to_owned(), "c.rs".to_owned()], lines: Some(16) }));
+        assert!(!transcript.read_after_read(0) && transcript.read_after_read(1) && transcript.read_after_read(2));
+        assert_eq!(transcript.reads_from(1), None, "it's on the first one's line");
+        assert!(!transcript.read_after_read(3), "a command isn't a read");
+        let failed = transcript.get(3).and_then(|message| message.summary.clone()).unwrap();
+        assert_eq!((failed.status.as_str(), failed.failed), ("exit 101", true));
+    }
+
+    #[test]
+    fn a_message_is_named_by_its_first_words_past_any_blank_lines() {
+        let mut transcript = Transcript::default();
+        transcript.you("\n  \npasted\nthe rest");
+        assert_eq!(transcript.first_said(), Some("pasted"), "an empty name would beat the one a conversation has until then");
+    }
 
     #[test]
     fn what_a_command_says_is_a_block_of_its_own_and_isnt_the_models() {
@@ -761,7 +928,7 @@ mod tests {
         let step = |id: &str, title: &str, input: Value| json!({ "sessionUpdate": "tool_call", "toolCallId": id, "title": title, "kind": "execute", "status": "pending", "rawInput": input });
         let command = "echo hi\nrm -rf ~/work";
         transcript.apply(&step("long", "Run echo hi …", json!({ "command": command })));
-        let asked = Question { title: "Run echo hi …".to_owned(), detail: Some(command.to_owned()), change: None };
+        let asked = Question { title: "Run echo hi …".to_owned(), detail: Some(command.to_owned()), change: None, task: None };
         assert_eq!(transcript.question("long"), Some(&asked), "a title has only the first line: the rest is what you'd be saying yes to");
 
         let printed = json!({ "sessionUpdate": "tool_call_update", "toolCallId": "long", "status": "in_progress", "content": [{ "type": "content", "content": { "type": "text", "text": "hi" } }] });
@@ -870,6 +1037,19 @@ mod tests {
     }
 
     #[test]
+    fn a_check_says_what_it_came_to_and_the_errors_from_before() {
+        let mut transcript = Transcript::default();
+        transcript
+            .apply(&json!({ "sessionUpdate": "tool_call", "toolCallId": "check-1", "title": "Check cargo check · no new errors · 4.1s", "kind": "other", "status": "completed" }));
+        assert_eq!(transcript.last_checked(), None, "an agent that doesn't say says nothing");
+        transcript.apply(&json!({ "sessionUpdate": "tool_call_update", "toolCallId": "check-1", "status": "completed", "_meta": { CHECKED: { "verdict": "clean", "count": 0, "tookMs": 4100, "before": 2 } } }));
+        let checked = transcript.last_checked().unwrap();
+        assert_eq!((checked.said(), checked.before), ("passed · 4.1s".to_owned(), 2));
+        assert_eq!(Checked::of(&json!({ "verdict": "new", "count": 3, "tookMs": 500 })).map(|checked| checked.said()), Some("3 new errors · 0.5s".to_owned()));
+        assert_eq!(Checked::of(&json!({ "verdict": "maybe" })), None);
+    }
+
+    #[test]
     fn the_last_check_is_the_latest_as_it_stands() {
         let mut transcript = Transcript::default();
         assert_eq!(transcript.last_check(), None);
@@ -908,6 +1088,7 @@ mod tests {
     fn another_reins_word_is_never_yours() {
         let mut transcript = Transcript::default();
         transcript.heard("tests", "they pass");
-        assert_eq!(transcript.get(0).unwrap().role, Role::Peer);
+        let said = transcript.get(0).unwrap();
+        assert_eq!((said.role, said.from.as_deref(), said.text.as_str()), (Role::Peer, Some("tests"), "they pass"));
     }
 }

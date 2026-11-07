@@ -22,6 +22,11 @@ struct Desk {
 }
 
 fn desk() -> Desk {
+    desk_serving(vec!["false".to_owned()])
+}
+
+/// The same, where an agent is started with `serve`.
+fn desk_serving(serve: Vec<String>) -> Desk {
     let app = TestAppContext::single();
     app.update(|cx| {
         gpui_kit::init(cx);
@@ -31,7 +36,7 @@ fn desk() -> Desk {
     let mut view = None;
     let window = app.update(|cx| {
         cx.open_window(Default::default(), |window, cx| {
-            let panes = cx.new(|cx| Panes::new(Probe::new(), vec!["false".to_owned()], Wearing::Light, window, cx));
+            let panes = cx.new(|cx| Panes::new(Probe::new(), serve, Wearing::Light, window, cx));
             view = Some(panes.clone());
             cx.new(|cx| Root::new(panes, window, cx))
         })
@@ -244,6 +249,46 @@ fn turn_line(desk: &mut Desk, pane: &Entity<Pane>, text: &str, turn: Option<u64>
     desk.said(pane, vec![Said::Update(line)]);
 }
 
+const CONFIG: &str = "_io.github.furkancodes/config";
+const SET_CONFIG: &str = "_io.github.furkancodes/set_config";
+
+fn config_page(effort: &str) -> Value {
+    json!({ "file": "~/.config/rein/config", "keys": [{ "key": "effort", "file": effort }], "starts": { "effort": effort, "mode": "trust" }, "choices": { "effort": ["low", "high"] }, "rules": [], "skills": [], "hooks": [], "notes": [], "servers": [] })
+}
+
+#[test]
+fn settings_open_with_a_key_set_one_through_the_rein_behind_the_pane_and_close_with_esc() {
+    use rein_transcript::config::Key;
+    let mut desk = desk();
+    let file = scratch("settings-page");
+    let pane = desk.pane(&file);
+    desk.key("cmd-,");
+    assert!(desk.read(&pane, Pane::shows_page), "⌘, opens it over the pane you're at");
+    let id = wait_for_ask(&file, CONFIG);
+    told(&mut desk, &pane, id, config_page("low"));
+    assert_eq!(desk.read(&pane, |pane| pane.page_starts_for_test(Key::Effort)), Some("low".to_owned()));
+    desk.cx.update(|_, cx| pane.update(cx, |pane, cx| pane.set_key_for_test(Key::Effort, Some("high"), cx)));
+    let set = wait_for_ask(&file, SET_CONFIG);
+    let asked = sent_to(&file).into_iter().find(|line| line["id"] == set).unwrap();
+    assert_eq!((asked["params"]["key"].clone(), asked["params"]["value"].clone()), (json!("effort"), json!("high")), "{asked}");
+    answers(&mut desk, &pane, set, CameTo::Done);
+    assert_eq!(asks_of(&file, CONFIG, 2), 2, "set, the page is read again");
+    desk.cx.update(|_, cx| pane.update(cx, |pane, cx| pane.set_key_for_test(Key::Effort, Some("loads"), cx)));
+    let refused = *asked_for(&file, SET_CONFIG).last().unwrap();
+    answers(&mut desk, &pane, refused, CameTo::Refused("effort should be one of low, high".to_owned()));
+    assert_eq!(desk.read(&pane, Pane::page_said_for_test), Some("effort should be one of low, high".to_owned()), "said where it was set");
+    desk.cx.update(|window, cx| pane.update(cx, |pane, cx| pane.add_rule_for_test("ask git push --force", window, cx)));
+    let rule = wait_for_ask(&file, "_io.github.furkancodes/rule");
+    answers(&mut desk, &pane, rule, CameTo::Busy("a turn is running".to_owned()));
+    assert_eq!(desk.cx.update(|_, cx| pane.read(cx).rule_box_for_test(cx)), "ask git push --force", "turned down, it's there to send again");
+    assert!(desk.read(&pane, Pane::page_said_for_test).is_some_and(|said| said.contains("once the turn")));
+    desk.key("escape");
+    assert!(desk.read(&pane, Pane::shows_page), "esc closes the rule's box first");
+    desk.key("escape");
+    assert!(!desk.read(&pane, Pane::shows_page), "then the page");
+    let_go(&mut desk, &pane);
+}
+
 fn model_setting() -> Said {
     let options = json!([
         { "id": "model", "currentValue": "openai/gpt-5", "options": [{ "group": "openai", "name": "OpenAI", "options": [{ "value": "openai/gpt-5", "name": "gpt-5", "description": "500000 tokens" }] }, { "group": "groq", "name": "Groq", "options": [{ "value": "groq/llama", "name": "groq/llama" }] }] },
@@ -371,8 +416,9 @@ fn hiding_or_closing_the_pane_youre_at_takes_you_to_another() {
     assert!(desk.read(&a, Pane::is_looking));
     assert!(desk.keys_in(&a), "and your keys came too");
     desk.told(&a, Told::Close);
-    let on_desk = desk.cx.update(|window, cx| desk.panes.read(cx).holds_keys_for_test(window));
-    assert!(on_desk, "with no pane left the window has them, or ⌘N reaches nothing");
+    desk.cx.run_until_parked();
+    let draft = desk.cx.update(|_, cx| desk.panes.read(cx).draft_for_test()).expect("with nothing on the desk, there's a box to start in");
+    assert!(desk.keys_in(&draft), "with no pane left the box to start in has them, and ⌘N still reaches the window");
 }
 #[test]
 fn a_press_on_another_pane_brings_the_keys_there() {
@@ -703,4 +749,114 @@ fn what_a_command_asks_isnt_a_turn_to_steer() {
 }
 
 mod boards;
+mod review;
 mod writing;
+
+/// What's been sent to `file`, once a line `wanted` is among it: the agent
+/// writing it is another process, which takes its time.
+fn sent_in_time(file: &Path, wanted: impl Fn(&Value) -> bool) -> Vec<Value> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let sent = sent_to(file);
+        if sent.iter().any(&wanted) {
+            return sent;
+        }
+        assert!(std::time::Instant::now() < until, "never sent: {sent:?}");
+        std::thread::yield_now();
+    }
+}
+
+/// A desk whose pane to start with keeps what it's sent in `file`.
+fn desk_with_draft(file: &Path) -> (Desk, Entity<Pane>) {
+    // It keeps every line, and lists no saved conversations when asked.
+    let script = format!(
+        r#"while read -r line; do printf '%s\n' "$line" >> {}; case "$line" in *session/list*) printf '%s\n' '{{"id":2,"result":{{"sessions":[]}}}}';; esac; done"#,
+        file.display()
+    );
+    let mut desk = desk_serving(vec!["sh".to_owned(), "-c".to_owned(), script]);
+    desk.cx.run_until_parked();
+    let draft = desk.cx.update(|_, cx| desk.panes.read(cx).draft_for_test()).expect("an empty desk has a box to start in");
+    (desk, draft)
+}
+
+#[test]
+fn the_box_to_start_with_becomes_a_conversation_in_the_list_once_it_sends() {
+    let file = scratch("draft-begins");
+    let (mut desk, draft) = desk_with_draft(&file);
+    assert!(desk.keys_in(&draft), "what you type goes in it from the start");
+    assert!(desk.cx.update(|_, cx| desk.panes.read(cx).panes()).is_empty(), "it isn't a conversation in the list yet");
+    desk.said(&draft, vec![Said::Started("session".to_owned())]);
+    desk.box_says(&draft, "fix the flaky test");
+    assert_eq!(desk.cx.update(|_, cx| desk.panes.read(cx).panes()), std::slice::from_ref(&draft), "sent, it's one of the agents");
+    assert!(desk.cx.update(|_, cx| desk.panes.read(cx).draft_for_test()).is_none());
+    assert!(desk.read(&draft, Pane::is_looking));
+    desk.told(&draft, Told::Close);
+    let again = desk.cx.update(|_, cx| desk.panes.read(cx).draft_for_test()).expect("closed, the desk is empty again, with a box to start in");
+    assert_ne!(again, draft);
+    sent_in_time(&file, |line| line["method"] == "session/prompt" && line["params"]["prompt"][0]["text"] == "fix the flaky test");
+}
+
+#[test]
+fn signed_out_the_box_to_start_with_offers_the_ways_and_opens_once_signed_in() {
+    use rein_transcript::signing::{Way, ways};
+    let file = scratch("draft-signs-in");
+    let (mut desk, draft) = desk_with_draft(&file);
+    let offered = ways(&json!({ "ways": [{ "way": "chatgpt" }, { "way": "key", "providers": ["Anthropic"] }] }));
+    desk.said(&draft, vec![Said::SignedOut(offered)]);
+    assert!(desk.read(&draft, Pane::is_signing));
+    desk.cx.update(|_, cx| draft.update(cx, |pane, cx| pane.sign_in_for_test(Way::Key, cx)));
+    let id = desk.read(&draft, Pane::last_request_for_test);
+    desk.said(&draft, vec![Said::Answer { id, came_to: CameTo::Told(json!({ "signedIn": true })) }]);
+    desk.said(&draft, vec![Said::Started("session".to_owned())]);
+    assert!(!desk.read(&draft, Pane::is_signing), "the conversation opened");
+    sent_in_time(&file, |line| line["id"] == id && line["method"] == "_io.github.furkancodes/sign_in" && line["params"]["way"] == "key");
+    let opened = sent_in_time(&file, |line| line["method"] == "session/new" && line["id"] == 2);
+    assert_eq!(opened.iter().filter(|line| line["method"] == "session/new").count(), 2, "opened again once signed in: {opened:?}");
+}
+
+#[test]
+fn a_pane_that_isnt_the_first_runs_shows_the_ways_to_sign_in_too() {
+    let mut desk = desk();
+    let file = scratch("pane-signs-in");
+    let pane = desk.pane(&file);
+    desk.said(&pane, vec![Said::SignedOut(rein_transcript::signing::ways(&json!({ "ways": [{ "way": "chatgpt" }] })))]);
+    desk.cx.run_until_parked();
+    desk.cx.update(|window, _| window.refresh());
+    desk.cx.run_until_parked();
+    assert!(desk.cx.debug_bounds("ways-in").is_some(), "drawn, not only known");
+    let_go(&mut desk, &pane);
+}
+
+#[test]
+fn a_sub_agents_step_opens_the_pane_it_runs_in() {
+    let mut desk = desk();
+    let file = scratch("open-sub-agent");
+    let parent = desk.pane(&file);
+    let about = |name: &str| About { name: Some(name.to_owned()), cwd: "/".to_owned(), parent: Some(parent.downgrade()), ..About::default() };
+    let (linux, docs) = (about("linux"), about("docs"));
+    let children = desk.cx.update(|window, cx| {
+        [linux, docs].map(|about| {
+            let pane = cx.new(|cx| Pane::new(None, about, window, cx));
+            desk.panes.update(cx, |panes, cx| panes.hold_for_test(pane.clone(), window, cx));
+            pane
+        })
+    });
+    desk.cx.update(|window, cx| desk.panes.update(cx, |panes, cx| panes.look_at(&parent, true, window, cx)));
+    desk.told(&parent, Told::OpenSubAgent("linux".to_owned()));
+    assert!(desk.read(&children[0], Pane::is_looking), "the one it named");
+    assert!(!desk.read(&children[1], Pane::is_looking));
+}
+
+#[test]
+fn status_and_compact_typed_alone_open_the_context_panel_and_send_nothing() {
+    let mut desk = desk();
+    let file = scratch("status-panel");
+    let pane = desk.pane(&file);
+    desk.box_says(&pane, "/status");
+    assert!(desk.read(&pane, |pane| pane.panel_shows_for_test(Tab::Context)));
+    desk.box_says(&pane, "/compact");
+    assert!(desk.read(&pane, |pane| pane.panel_shows_for_test(Tab::Context)), "it stays open: its Compact is a press away");
+    let sent = desk.answered(&pane, &file, 0);
+    assert_eq!(sent, None);
+    assert!(!sent_to(&file).iter().any(|line| line["method"] == "session/prompt"), "{:?}", sent_to(&file));
+}

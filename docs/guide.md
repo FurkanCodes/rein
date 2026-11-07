@@ -321,6 +321,7 @@ on`). Where the terminal doesn't say, it means you haven't touched a key for
 | `/sandbox [on\|off]` | run commands in the sandbox, or as you'd run them, in any mode ([The sandbox](#the-sandbox)) |
 | `/permissions [add\|remove <rule>]` | what asks first or is refused ([Rules](#rules)) |
 | `/undo` | put back what rein did to the project's files since a turn you pick ([Undo](#undo)) |
+| `/changes` | what this conversation changed in the project's files, file by file ([Undo](#undo)) |
 | `/check [on\|off\|command]` | the project's check after edits ([Checks](#checks-after-edits)) |
 | `/tasks` | the commands running in the background, to stop one |
 | `/search [auto\|off\|model]` | which model searches the web ([Web search](#web-search)) |
@@ -767,6 +768,13 @@ before a turn undoes the later ones too. A file that changed after rein last
 touched it, in your editor, say, is left as it is and named. The model is
 told what was undone.
 
+`/changes` shows what the conversation changed: each file with the lines
+added and taken away. It's the same comparison `/undo` makes, each file as it
+was before against how it is now, so what you see is what undoing would put
+back. Files that came back as they were don't show. Like `/undo`, it reaches
+back 30 turns that changed files: in a longer conversation, what came before
+them doesn't show.
+
 - **Commands too.** A command that changed files says so under its line:
   `↳ changed a.rs, made b.rs, removed c.txt`. rein looks at the project's
   files before and after each command that may change them (it skips one
@@ -900,7 +908,9 @@ works.
   in its `.claude/settings.json` and `settings.local.json` came with the
   project. As a conversation starts, rein lists each one that's new or
   changed (when it runs, its command, the scripts in the project it names,
-  like `.claude/hooks/check.py`) and asks once, with No first. Your yes is
+  like `.claude/hooks/check.py`) and asks once: "This project comes with a
+  hook", with Read it, which shows each script whole and asks again, Trust
+  it, and Not now, which leaves it off this time. Your yes is
   kept in rein's folder, and a commit that changes a hook's command or a
   script it names asks again. Claude Code asks once about the folder, so a
   hook from a later commit runs unasked. Codex asks about each hook, but not
@@ -1216,9 +1226,11 @@ another `rein serve`.
   you've changed that, so check it before you hand it to anything automatic.
   `session/new` lists the modes, ⚠ marks included, and `session/set_mode`
   changes it between turns.
-- **What a project brings.** Nobody's at a terminal to say yes, so a project's
-  hooks, MCP servers, skills and check stay off until you've said yes to them
-  in `rein`, as in a task run on its own.
+- **What a project brings.** A project's MCP servers, skills and check stay
+  off until you've said yes to them in `rein`, as in a task run on its own. Its
+  hooks are asked about as a conversation opens, as the terminal asks, of a
+  program that can show what a command asks (below); any other program, and a
+  sub-agent, runs only those you've said yes to.
 - **Model, effort, mode and sandbox.** `session/new` and `session/load` say
   them as ACP's `configOptions`, with the models by provider as far as they've
   been looked up. `session/set_config_option` changes one between turns, and
@@ -1306,9 +1318,46 @@ another `rein serve`.
   `putBack`, `takeAway`, `left` and `lost`, the files in each, and how many
   `turns` it undoes. Nothing changes until `_io.github.furkancodes/undo`, which
   takes the same `turn`, and says what it did as a command does.
+- **What changed.** `_io.github.furkancodes/changes` takes a `span`, `turn` for
+  the last turn that changed anything or `conversation`, and gives `turn`, the
+  one to undo, and `files`: each one's `path`, `became` (`changed`, `made` or
+  `removed`), `added`, `removed`, `since` if you or another program changed it
+  after rein did, which undoing leaves alone, and `unshown` (`binary`, `too_big`
+  or `not_kept`) if it has no lines to show. With `lines` true each has its
+  `patch`, a unified diff; a file over 1 MB shows none. It's answered during a
+  turn too, with what's been changed so far: a command that's running is left
+  to finish, and shows once it has.
 - **The list of models.** `configOptions` holds the providers looked up so far.
   `_io.github.furkancodes/models` looks up the others, a few seconds at most,
   and `config_option_update` brings them.
+- **Signed out.** A program that can show what a command asks gets
+  `session/new` turned down with the code `-32002` when you're signed in to
+  nothing that runs the model, and the error's `data` has `ways`: each a `way`
+  (`chatgpt`, `claude-code`, `key` or `local`), with the `providers` a key or
+  your own computer would reach, and `signedIn` for ChatGPT's. `_io.github.furkancodes/sign_in` takes a
+  `way` and signs in with no conversation, asking what it needs as `/login`
+  would, and answers `signedIn`; `session/new` then opens.
+  `_io.github.furkancodes/ways` lists the ways at any time, during a turn too.
+- **Keeping the mode.** A program with a switch of its own for keeping the mode
+  and sandbox for new conversations says so with
+  `"io.github.furkancodes/keeps": true` in `initialize`, and isn't asked as they
+  change: the `keep` option, `on` or `off`, writes them to your settings or
+  takes them out. Where the project has a check after edits, the `check` option
+  switches it, with its command under `"io.github.furkancodes/command"`.
+- **Steps in a few words.** A step that's done has
+  `"io.github.furkancodes/summary"` under its `_meta`, what the terminal's line
+  says of how it went: `status` and `said`, like `exit 101`, `failed` if it
+  did, `added` and `removed` for an edit, and `lines` written or read.
+- **Your settings.** `_io.github.furkancodes/config` gives what a settings page
+  needs, during a turn too: `file`, where your settings are; `keys`, each with
+  what the `file` says and the variable that wins `over` it, if one is set;
+  `starts`, what new conversations start with; `choices`; and what the
+  conversation found as of the last turn: `rules`, `skills`, `hooks`, `notes`
+  and `servers`. `_io.github.furkancodes/set_config` takes a `key` and a
+  `value`, or `null` to take it out, and writes it only if rein would start
+  with what the file then says; what's wrong comes back as the error.
+  `_io.github.furkancodes/rule` takes a `rule`, like `deny curl`, and `add`,
+  true or false, for one of yours; it waits for the turn, and counts at once.
 - **Flags.** `rein serve` takes what a conversation takes, such as `--mode`,
   `--sandbox`, `-m` and `--name`, but no message: its client sends those.
 - **Saved conversations.** `session/list` gives them 100 at a time, the most
@@ -1409,11 +1458,13 @@ sandbox = on
 | `bell` | `REIN_BELL` | `on` | the bell when rein needs you and you're away |
 | `compress` | `REIN_COMPRESS` | `on` | gzip request bodies |
 | `tab_command` | `REIN_TAB_COMMAND` | | your terminal's command to open a tab, with `{command}` and `{title}` |
+| `look` | `REIN_LOOK` | `follow` | the window's look: `light`, `dark`, or `follow` your computer's |
 
 A flag wins over the variable, which wins over the file. `/mode` and
 `/sandbox` write `mode` and `sandbox` here when you keep what you picked,
-`/search` writes `search`, and the first run writes `model` when you pick
-one of a provider's models, leaving the rest as it was. `REIN_HOME` moves
+`/search` writes `search`, the first run writes `model` when you pick
+one of a provider's models, and the window's settings page (`⌘,`) writes
+whatever you change there, leaving the rest as it was. `REIN_HOME` moves
 rein's whole folder (`~/.config/rein`), where everything above is kept,
 readable only by you.
 
