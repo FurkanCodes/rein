@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::client::{Client, EFFORT, HOLD_BACK, IMAGES, Optional};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
-use crate::{Api, Effort, Efforts, Error, Event, FindsTools, Item, Loading, ModelInfo, Opaque, Request, Result, Tool, ToolCall, Usage, found_text};
+use crate::{Api, Effort, Efforts, Error, Event, FindsTools, Harness, Item, Loading, ModelInfo, Opaque, Request, Result, Tool, ToolCall, Usage, found_text};
 
 /// What the Responses API may turn away: an effort level the model doesn't
 /// take, which OpenAI names as the error's `param`, and tools added partway
@@ -45,8 +45,13 @@ pub(crate) fn request_body(request: &Request<'_>) -> Value {
     // means nothing here.
     let holds_back = request.holds_back();
     let images = crate::images_of(request.input);
-    let input: Vec<Value> =
-        request.input.iter().filter(|item| !matches!(item, Item::Opaque(o) if o.api != Api::Responses)).flat_map(|item| item_json(item, request, holds_back, &images)).collect();
+    let custom = freeform_calls(request, request.input);
+    let input: Vec<Value> = request
+        .input
+        .iter()
+        .filter(|item| !matches!(item, Item::Opaque(o) if o.api != Api::Responses))
+        .flat_map(|item| item_json(item, request, holds_back, &images, &custom))
+        .collect();
     // Sign in with ChatGPT requires `store: false` and `stream: true`, and
     // rejects fields like `temperature` and `max_output_tokens`. Sending only
     // what it accepts keeps one request shape for both ways of paying.
@@ -63,12 +68,33 @@ pub(crate) fn request_body(request: &Request<'_>) -> Value {
     // Held back, a tool comes where the search found it, after the
     // conversation before, so the cache holds. The search is a function of
     // rein's: OpenAI's own (`tool_search`) isn't taken on a ChatGPT plan.
-    let shown: Vec<Value> =
-        if holds_back { request.tools.iter().filter(|t| t.loading != Loading::Found).map(function).collect() } else { request.all_tools().map(function).collect() };
+    let offered: Vec<&Tool> = if holds_back { request.tools.iter().filter(|t| t.loading != Loading::Found).collect() } else { request.all_tools().collect() };
+    let shown: Vec<Value> = offered.iter().filter(|tool| tool.grammar.is_none()).map(|tool| function(tool)).collect();
+    let mut tools = Vec::new();
     if !shown.is_empty() {
-        body["tools"] = json!([{ "type": "namespace", "name": NAMESPACE, "description": "rein's tools for working in the user's project.", "tools": shown }]);
+        tools.push(json!({ "type": "namespace", "name": NAMESPACE, "description": "rein's tools for working in the user's project.", "tools": shown }));
+    }
+    // A tool written in a grammar of its own goes as Codex sends it: a
+    // custom tool, by itself, the model held to its grammar.
+    tools.extend(offered.iter().filter_map(|tool| {
+        let grammar = tool.grammar.as_ref()?;
+        Some(json!({ "type": "custom", "name": tool.name, "description": tool.description, "format": { "type": "grammar", "syntax": grammar.syntax.as_str(), "definition": grammar.definition } }))
+    }));
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
     }
     body
+}
+
+/// Whether the tool `name` takes text in a grammar, not JSON: its calls go
+/// as custom tool calls.
+fn freeform(request: &Request<'_>, name: &str) -> bool {
+    request.tools.iter().any(|tool| tool.name == name && tool.grammar.is_some())
+}
+
+/// The calls in `input` to a tool that takes text in a grammar.
+fn freeform_calls<'a>(request: &Request<'_>, input: &'a [Item]) -> std::collections::HashSet<&'a str> {
+    input.iter().filter_map(|item| if let Item::ToolCall(call) = item { freeform(request, &call.name).then_some(call.call_id.as_str()) } else { None }).collect()
 }
 
 /// `tool` as a function the model may call.
@@ -79,10 +105,26 @@ fn function(tool: &Tool) -> Value {
 /// One conversation item in the Responses API's input format. Where tools
 /// are held back, what the search found is added to the model's tools
 /// right after its answer (`additional_tools`), in a namespace of their own.
-fn item_json(item: &Item, request: &Request<'_>, holds_back: bool, images: &std::collections::HashMap<&str, Vec<&crate::Image>>) -> Vec<Value> {
+fn item_json(
+    item: &Item,
+    request: &Request<'_>,
+    holds_back: bool,
+    images: &std::collections::HashMap<&str, Vec<&crate::Image>>,
+    custom: &std::collections::HashSet<&str>,
+) -> Vec<Value> {
     let one = match item {
         Item::User(text) => json!({ "role": "user", "content": text }),
         Item::Assistant(text) => json!({ "role": "assistant", "content": text }),
+        // The text the model wrote, as it wrote it.
+        Item::ToolCall(call) if custom.contains(call.call_id.as_str()) => {
+            let input = serde_json::from_str::<Value>(&call.arguments).ok().and_then(|args| args[crate::GRAMMAR_INPUT].as_str().map(str::to_owned)).unwrap_or_default();
+            json!({ "type": "custom_tool_call", "call_id": call.call_id, "name": call.name, "input": input })
+        }
+        // A custom tool's output is text: an image goes in words.
+        Item::ToolResult { call_id, output } if custom.contains(call_id.as_str()) => {
+            let (text, _) = crate::split_images(output, images.get(call_id.as_str()).map(Vec::as_slice).unwrap_or_default(), false);
+            json!({ "type": "custom_tool_call_output", "call_id": call_id, "output": text })
+        }
         Item::ToolCall(call) => json!({
             "type": "function_call",
             "call_id": call.call_id,
@@ -142,12 +184,15 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
                         None => FindsTools::Unknown,
                     },
                     sees: crate::sees_by(&m["input_modalities"]),
+                    // What Codex gives it to change files with is what it
+                    // was trained on.
+                    harness: if m["apply_patch_tool_type"].is_string() { Harness::Codex } else { Harness::of_name(id) },
                 })
             })
             .collect();
     }
     let ids = body["data"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str());
-    ids.map(ModelInfo::named).collect()
+    ids.map(|id| ModelInfo { harness: Harness::of_name(id), ..ModelInfo::named(id) }).collect()
 }
 
 /// A ChatGPT model's levels, each with what it's for, and its default. One
@@ -211,6 +256,12 @@ fn decode_item(item: &Value) -> Option<Item> {
             call_id: item["call_id"].as_str()?.to_owned(),
             name: item["name"].as_str()?.to_owned(),
             arguments: item["arguments"].as_str().unwrap_or("{}").to_owned(),
+        })),
+        // Text in a tool's grammar: JSON from here on, as every call is.
+        "custom_tool_call" => Some(Item::ToolCall(ToolCall {
+            call_id: item["call_id"].as_str()?.to_owned(),
+            name: item["name"].as_str()?.to_owned(),
+            arguments: json!({ crate::GRAMMAR_INPUT: item["input"].as_str().unwrap_or_default() }).to_string(),
         })),
 
         // Encrypted reasoning: the next request must carry it back as is.
@@ -277,7 +328,14 @@ mod tests {
     #[test]
     fn tools_go_in_a_namespace_and_calls_round_trip() {
         let call = ToolCall { call_id: "call_1".into(), name: "read".into(), arguments: r#"{"path":"a.rs"}"#.into() };
-        let tools = [Tool { loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }];
+        let tools = [Tool {
+            grammar: None,
+            loading: crate::Loading::UpFront,
+            strict: true,
+            name: "read".into(),
+            description: "Read a file.".into(),
+            parameters: json!({"type": "object"}),
+        }];
         let input = [
             Item::User("open a.rs".into()),
             Item::Opaque(Opaque::new(Api::Responses, json!({"type": "reasoning", "encrypted_content": "xyz"}))),
@@ -379,6 +437,46 @@ mod tests {
     }
 
     #[test]
+    fn a_model_gets_codexs_tools_where_codex_gives_them_to_it() {
+        let chatgpt = json!({"models": [{"slug": "gpt-6.1-sol", "apply_patch_tool_type": "freeform"}, {"slug": "plain"}, {"slug": "gpt-5.5"}]});
+        let given: Vec<Harness> = parse_models(&chatgpt).iter().map(|m| m.harness).collect();
+        assert_eq!(given, [Harness::Codex, Harness::Rein, Harness::Codex], "the list's word, else the name's");
+        let keyed = json!({"data": [{"id": "gpt-6.1-sol"}, {"id": "gpt-4.1"}, {"id": "o3"}, {"id": "codex-mini-latest"}, {"id": "gpt-5"}]});
+        let given: Vec<Harness> = parse_models(&keyed).iter().map(|m| m.harness).collect();
+        assert_eq!(given, [Harness::Codex, Harness::Rein, Harness::Rein, Harness::Codex, Harness::Codex]);
+    }
+
+    #[test]
+    fn a_tool_in_a_grammar_goes_as_codex_sends_it_and_its_calls_come_back_as_json() {
+        let patch = Tool {
+            grammar: Some(crate::Grammar { syntax: crate::Syntax::Lark, definition: "start: x".into() }),
+            loading: crate::Loading::UpFront,
+            strict: true,
+            name: "apply_patch".into(),
+            description: "Patch files.".into(),
+            parameters: json!({"type": "object"}),
+        };
+        let read = Tool { grammar: None, loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read".into(), parameters: json!({"type": "object"}) };
+        let tools = [read, patch];
+        let call = decode_item(&json!({"type": "custom_tool_call", "call_id": "p1", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"})).unwrap();
+        let Item::ToolCall(called) = &call else { panic!("{call:?}") };
+        assert_eq!(serde_json::from_str::<Value>(&called.arguments).unwrap(), json!({"input": "*** Begin Patch\n*** End Patch"}), "JSON inside rein");
+        let input = [Item::User("fix it".into()), call.clone(), Item::ToolResult { call_id: "p1".into(), output: "Success.".into() }];
+        let body = request_body(&crate::testing::request(&input, &tools, false));
+        assert_eq!(body["tools"][0]["tools"].as_array().unwrap().len(), 1, "the namespace holds the functions");
+        assert_eq!(
+            body["tools"][1],
+            json!({"type": "custom", "name": "apply_patch", "description": "Patch files.", "format": {"type": "grammar", "syntax": "lark", "definition": "start: x"}})
+        );
+        assert_eq!(
+            body["input"][1],
+            json!({"type": "custom_tool_call", "call_id": "p1", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"}),
+            "the text as the model wrote it"
+        );
+        assert_eq!(body["input"][2], json!({"type": "custom_tool_call_output", "call_id": "p1", "output": "Success."}));
+    }
+
+    #[test]
     fn session_ids_are_fresh_v4_uuids() {
         let (a, b) = (crate::new_session_id().unwrap(), crate::new_session_id().unwrap());
         assert_ne!(a, b);
@@ -396,6 +494,7 @@ mod tests {
         assert_eq!(
             parse_models(&chatgpt),
             [ModelInfo {
+                harness: crate::Harness::Rein,
                 id: "a".into(),
                 name: "Model A".into(),
                 context_window: Some(500_000),
@@ -409,6 +508,7 @@ mod tests {
         assert_eq!(
             parse_models(&api_key),
             [ModelInfo {
+                harness: crate::Harness::Rein,
                 id: "b".into(),
                 name: "b".into(),
                 context_window: None,

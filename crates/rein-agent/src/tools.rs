@@ -187,6 +187,38 @@ struct WriteArgs {
     content: String,
 }
 
+/// A patch, as the model wrote it: text in [`crate::patch::GRAMMAR`].
+#[derive(Deserialize)]
+struct PatchArgs {
+    input: String,
+}
+
+/// The patch `call` carries, read.
+pub fn patch_of(call: &ToolCall) -> Result<crate::patch::Patch, String> {
+    let args: PatchArgs = parse(&call.arguments)?;
+    crate::patch::parse(&args.input)
+}
+
+/// `apply_patch`, as Codex gives it: text in its grammar, which a format
+/// that takes one holds the model to, and arguments with that text in
+/// `input` for one that doesn't.
+pub fn patch_spec() -> Tool {
+    Tool {
+        grammar: Some(rein_llm::Grammar { syntax: rein_llm::Syntax::Lark, definition: crate::patch::GRAMMAR.to_owned() }),
+        loading: Loading::UpFront,
+        strict: true,
+        name: ToolName::ApplyPatch.as_str().into(),
+        description: crate::patch::ABOUT.into(),
+        parameters: object(json!({ rein_llm::GRAMMAR_INPUT: { "type": "string", "description": "The whole patch, from `*** Begin Patch` to `*** End Patch`." } })),
+    }
+}
+
+/// What a patch will do to one file, worked out before any is changed.
+enum Planned {
+    Write { spot: Spot, path: String, text: String },
+    Remove { spot: Spot },
+}
+
 #[derive(Deserialize)]
 struct EditArgs {
     path: String,
@@ -241,6 +273,9 @@ pub enum ToolName {
     Glob,
     Write,
     Edit,
+    /// Changing files with a patch, in Codex's shape: what GPT models are
+    /// given in place of `write` and `edit` ([`crate::patch`]).
+    ApplyPatch,
     Plan,
     Bash,
     /// Searching the conversation: rein's own, see `compact::recall`.
@@ -267,12 +302,13 @@ pub enum ToolName {
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 17] = [
+    pub const ALL: [ToolName; 18] = [
         Self::Read,
         Self::Grep,
         Self::Glob,
         Self::Write,
         Self::Edit,
+        Self::ApplyPatch,
         Self::Plan,
         Self::Bash,
         Self::Recall,
@@ -295,6 +331,7 @@ impl ToolName {
             Self::Glob => "glob",
             Self::Write => "write",
             Self::Edit => "edit",
+            Self::ApplyPatch => "apply_patch",
             Self::Plan => "plan",
             Self::Bash => "bash",
             Self::Recall => "recall",
@@ -323,7 +360,7 @@ impl ToolName {
 
     /// Changes files: undone with `/undo`, and allowed by file-change modes.
     pub const fn changes_files(self) -> bool {
-        matches!(self, Self::Write | Self::Edit)
+        matches!(self, Self::Write | Self::Edit | Self::ApplyPatch)
     }
 
     /// Reaches another rein, which the user's side of rein does.
@@ -577,6 +614,7 @@ impl Tools {
     pub fn specs(&self) -> Vec<Tool> {
         let mut specs = vec![
             Tool {
+                grammar: None,
                 loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Read.as_str().into(),
@@ -590,6 +628,7 @@ impl Tools {
                 })),
             },
             Tool {
+                grammar: None,
                 loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Grep.as_str().into(),
@@ -608,6 +647,7 @@ impl Tools {
                 })),
             },
             Tool {
+                grammar: None,
                 loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Glob.as_str().into(),
@@ -621,6 +661,7 @@ impl Tools {
                 })),
             },
             Tool {
+                grammar: None,
                 loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Write.as_str().into(),
@@ -633,6 +674,7 @@ impl Tools {
                 })),
             },
             Tool {
+                grammar: None,
                 loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Edit.as_str().into(),
@@ -648,6 +690,7 @@ impl Tools {
                 })),
             },
             Tool {
+                grammar: None,
                 loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Plan.as_str().into(),
@@ -671,6 +714,7 @@ impl Tools {
                 })),
             },
             Tool {
+                grammar: None,
                 loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Bash.as_str().into(),
@@ -688,6 +732,7 @@ impl Tools {
                 })),
             },
             Tool {
+                grammar: None,
                 loading: Loading::UpFront,
                 strict: true,
                 name: ToolName::Background.as_str().into(),
@@ -724,6 +769,7 @@ impl Tools {
             Some(ToolName::Background) => self.jobs.call(&call.arguments).await,
             Some(ToolName::Write) => self.write(&call.arguments).await,
             Some(ToolName::Edit) => self.edit(&call.arguments).await,
+            Some(ToolName::ApplyPatch) => self.apply_patch(&call.arguments).await,
             // The checklist is for showing; the model keeps it in its own words.
             Some(ToolName::Plan) => parse::<PlanArgs>(&call.arguments).map(|plan| {
                 let done = plan.steps.iter().filter(|step| step.status == StepStatus::Done).count();
@@ -905,6 +951,66 @@ impl Tools {
         self.changing(&spot, spot.write(edited.text.into_bytes())).await.map_err(|e| format!("can't write {}: {e}", args.path))?;
         let times = if edited.count == 1 { "1 place".to_owned() } else { format!("{} places", edited.count) };
         Ok(format!("edited {}: replaced {times}", args.path))
+    }
+
+    /// Applies a patch: every file it changes is worked out first, so a
+    /// change that can't be made changes nothing. Says what it did as
+    /// Codex does, the way the model knows.
+    async fn apply_patch(&self, arguments: &str) -> Result<String, String> {
+        let args: PatchArgs = parse(arguments)?;
+        let patch = crate::patch::parse(&args.input)?;
+        let mut planned = Vec::new();
+        let mut said = Vec::new();
+        for change in &patch.files {
+            no_hidden_key(&change.added())?;
+            match change {
+                crate::patch::FileChange::Add { path, lines } => {
+                    planned.push(Planned::Write { spot: self.writable(path)?, path: path.clone(), text: crate::patch::made(lines) });
+                    said.push(format!("A {path}"));
+                }
+                crate::patch::FileChange::Delete { path } => {
+                    let spot = self.inside_root(path)?;
+                    if !spot.full().is_file() {
+                        return Err(format!("can't delete {path}: it isn't a file"));
+                    }
+                    planned.push(Planned::Remove { spot });
+                    said.push(format!("D {path}"));
+                }
+                crate::patch::FileChange::Update { path, to, chunks } => {
+                    let spot = self.inside_root(path)?;
+                    let bytes = spot.read().await.map_err(|e| format!("can't read {path}: {e}"))?;
+                    let text = String::from_utf8(bytes).map_err(|_| format!("{path} isn't a UTF-8 text file"))?;
+                    let text = if chunks.is_empty() {
+                        text
+                    } else {
+                        crate::patch::updated(&text, chunks).map_err(|e| format!("{e}\nin {path}: read it again and write the patch from what it says"))?
+                    };
+                    match to {
+                        Some(to) => {
+                            planned.push(Planned::Write { spot: self.writable(to)?, path: to.clone(), text });
+                            planned.push(Planned::Remove { spot });
+                            said.push(format!("M {to}"));
+                        }
+                        None => {
+                            planned.push(Planned::Write { spot, path: path.clone(), text });
+                            said.push(format!("M {path}"));
+                        }
+                    }
+                }
+            }
+        }
+        for plan in planned {
+            match plan {
+                Planned::Write { spot, path, text } => self.changing(&spot, spot.write(text.into_bytes())).await.map_err(|e| format!("can't write {path}: {e}"))?,
+                Planned::Remove { spot } => {
+                    let (root, rel) = (spot.root.clone(), spot.rel.clone());
+                    let shown = rel.display().to_string();
+                    let gone = async move { tokio::task::spawn_blocking(move || files::remove(&root, &rel)).await.map_err(std::io::Error::other)? };
+                    self.changing(&spot, gone).await.map_err(|e| format!("can't delete {shown}: {e}"))?;
+                }
+            }
+        }
+        Ok(format!("Success. Updated the following files:\n{}", said.join("\n")))
     }
 
     /// Does `change` to the file at `spot`, kept for `/undo` before and after.
@@ -1430,6 +1536,58 @@ mod tests {
 
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall { call_id: "call_1".into(), name: name.into(), arguments: arguments.to_string() }
+    }
+
+    fn patch(input: &str) -> ToolCall {
+        call("apply_patch", json!({ "input": input }))
+    }
+
+    #[tokio::test]
+    async fn a_patch_changes_makes_moves_and_deletes_files_or_changes_none() {
+        let dir = project("patch", &[("a.txt", "one\ntwo\n"), ("old.txt", "old\n"), ("move.txt", "x\n")]);
+        let tools = Tools::new(&dir);
+        let done = run(
+            &tools,
+            &patch("*** Begin Patch\n*** Update File: a.txt\n@@\n-two\n+2\n*** Add File: new/b.txt\n+made\n*** Delete File: old.txt\n*** Update File: move.txt\n*** Move to: moved.txt\n@@\n-x\n+y\n*** End Patch"),
+        )
+        .await;
+        assert_eq!(done, "Success. Updated the following files:\nM a.txt\nA new/b.txt\nD old.txt\nM moved.txt", "as Codex says it");
+        let read = |path: &str| std::fs::read_to_string(dir.join(path)).ok();
+        assert_eq!(
+            (read("a.txt"), read("new/b.txt"), read("old.txt"), read("moved.txt"), read("move.txt")),
+            (Some("one\n2\n".into()), Some("made\n".into()), None, Some("y\n".into()), None)
+        );
+        // One change that can't be made: none is, and the model hears why.
+        let half = run(&tools, &patch("*** Begin Patch\n*** Add File: c.txt\n+c\n*** Update File: a.txt\n@@\n-missing\n+z\n*** End Patch")).await;
+        assert!(half.starts_with(ERROR) && half.contains("couldn't find the lines to change:\nmissing") && half.contains("in a.txt"), "{half}");
+        assert_eq!(read("c.txt"), None, "nothing written");
+        // Outside the project, and through `..`, it changes nothing.
+        for outside in ["*** Add File: ../escape.txt\n+x", "*** Update File: /etc/hosts\n@@\n-a\n+b", "*** Delete File: ../x"] {
+            let refused = run(&tools, &patch(&format!("*** Begin Patch\n{outside}\n*** End Patch"))).await;
+            assert!(refused.starts_with(ERROR), "{outside}: {refused}");
+        }
+        assert!(!dir.parent().unwrap().join("escape.txt").exists());
+        // A key rein hid from the model isn't written over the real one.
+        let hidden = run(&tools, &patch(&format!("*** Begin Patch\n*** Add File: k.env\n+KEY={}\n*** End Patch", crate::redact::HIDDEN))).await;
+        assert!(hidden.contains("stands for a key rein kept from you"), "{hidden}");
+        let bad = run(&tools, &call("apply_patch", json!({ "patch": "x" }))).await;
+        assert!(bad.starts_with(ERROR), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn what_a_patch_did_is_undone_with_the_rest() {
+        let dir = project("patch-undo", &[("a.txt", "one\n"), ("old.txt", "old\n")]);
+        let tools = Tools::new(&dir);
+        tools.turn("tidy up").await;
+        run(&tools, &patch("*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+1\n*** Add File: b.txt\n+b\n*** Delete File: old.txt\n*** End Patch")).await;
+        tools.turn("after").await;
+        let listed = tools.undo_list().await;
+        let mut done = tools.undo(listed[0].turn).await;
+        done.put_back.sort();
+        assert_eq!((done.put_back, done.take_away), (vec!["a.txt".to_owned(), "old.txt".to_owned()], vec!["b.txt".to_owned()]));
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        assert_eq!(std::fs::read_to_string(dir.join("old.txt")).unwrap(), "old\n", "a deleted file comes back");
+        assert!(!dir.join("b.txt").exists());
     }
 
     #[tokio::test]

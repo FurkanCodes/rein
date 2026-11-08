@@ -270,7 +270,37 @@ pub struct Tool {
     pub strict: bool,
     /// When the model is shown it.
     pub loading: Loading,
+    /// The shape the model writes its input in, where it's text in a
+    /// grammar of its own rather than JSON (Codex's `apply_patch`). A format
+    /// that takes one holds the model to it, and hands rein the text as
+    /// `{"input": "…"}`, so a call's arguments are JSON everywhere in rein;
+    /// any other takes `parameters`, which then say just that.
+    pub grammar: Option<Grammar>,
 }
+
+/// A grammar a tool's input keeps to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grammar {
+    pub syntax: Syntax,
+    pub definition: String,
+}
+
+/// How a [`Grammar`] is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Syntax {
+    Lark,
+}
+
+impl Syntax {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Syntax::Lark => "lark",
+        }
+    }
+}
+
+/// The argument a [`Grammar`] tool's text comes in, inside rein.
+pub const GRAMMAR_INPUT: &str = "input";
 
 /// The name of the tool search: the tool, the model's call to it, and what
 /// each format calls it are all this.
@@ -556,6 +586,28 @@ pub struct ModelInfo {
     pub finds_tools: FindsTools,
     /// Whether it can see images.
     pub sees: Sees,
+    /// The tools its own harness gives it, which it was trained on.
+    pub harness: Harness,
+}
+
+/// Whose tools a model is given: those of the harness it was trained in,
+/// where rein has them, as it would be given them there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Harness {
+    /// rein's own: `edit` with the exact text to replace, as Claude Code's.
+    #[default]
+    Rein,
+    /// Codex's: files changed with `apply_patch`, GPT models' own.
+    Codex,
+}
+
+impl Harness {
+    /// The harness a model called `id` was trained in, as far as its name
+    /// says, for a list that doesn't: GPT-5 on, and Codex's own models.
+    pub fn of_name(id: &str) -> Harness {
+        let generation = id.strip_prefix("gpt-").and_then(|rest| rest.split(['.', '-']).next()).and_then(|major| major.parse::<u32>().ok());
+        if generation.is_some_and(|major| major >= 5) || id.contains("codex") { Harness::Codex } else { Harness::Rein }
+    }
 }
 
 impl ModelInfo {
@@ -569,6 +621,7 @@ impl ModelInfo {
             efforts: Efforts::Unknown,
             finds_tools: FindsTools::Unknown,
             sees: Sees::Unknown,
+            harness: Harness::Rein,
         }
     }
 }
@@ -798,7 +851,8 @@ pub(crate) mod testing {
 
     /// One of rein's tools, one held back, and the search.
     pub(crate) fn held_back_tools() -> Vec<Tool> {
-        let tool = |name: &str, loading| Tool { name: name.into(), description: format!("{name}, said."), parameters: json!({"type": "object"}), strict: false, loading };
+        let tool =
+            |name: &str, loading| Tool { grammar: None, name: name.into(), description: format!("{name}, said."), parameters: json!({"type": "object"}), strict: false, loading };
         vec![tool("read", Loading::UpFront), tool("mcp__linear__create_issue", Loading::Found), tool(TOOL_SEARCH, Loading::Search)]
     }
 

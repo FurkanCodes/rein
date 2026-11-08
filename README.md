@@ -56,6 +56,10 @@ set up each one.
 
 ## What's in it
 
+- [Each model as its own harness runs it](docs/guide.md#what-rein-may-do):
+  Claude through your plan is one Claude Code session that calls rein's
+  tools as its own, and GPT models change files with Codex's
+  `apply_patch`, as they were trained to.
 - [Sub-agents](docs/guide.md#sub-agents): each one runs in a terminal tab
   of its own, in tmux, kitty, WezTerm, iTerm2, Ghostty or Terminal.app.
   You can watch it, type into it, and keep going with it after it's done.

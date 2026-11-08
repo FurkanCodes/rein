@@ -718,7 +718,7 @@ mod tests {
     }
 
     fn read_tool() -> Vec<Tool> {
-        vec![Tool { loading: Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({ "type": "object" }) }]
+        vec![Tool { grammar: None, loading: Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({ "type": "object" }) }]
     }
 
     /// Every event of a step, the error ending it if one does.

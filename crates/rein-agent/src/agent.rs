@@ -434,6 +434,8 @@ pub struct Agent<M> {
     /// Whether the model can have tools held back until it finds them, as
     /// its list says: one that can't is shown every tool from the start.
     pub finds_tools: rein_llm::FindsTools,
+    /// Whose tools the model is given: see [`Agent::set_harness`].
+    harness: rein_llm::Harness,
     /// Who searches the web for the model, if anyone: `web_search` is
     /// offered only then (see [`Agent::set_searcher`]).
     searcher: Option<crate::web::Searcher>,
@@ -737,6 +739,7 @@ impl<M: Model> Agent<M> {
         // A server's schema is as it wrote it, not to strict mode's rules.
         let loading = |held_back: bool| if held_back { Loading::Found } else { Loading::UpFront };
         self.specs.extend(listing.tools.into_iter().map(|tool| Tool {
+            grammar: None,
             name: tool.name,
             description: tool.description,
             parameters: tool.parameters,
@@ -1275,6 +1278,9 @@ impl<M: Model> Agent<M> {
     fn has_seen(&self, path: &str) -> bool {
         let path = path.trim_start_matches("./");
         self.window.full.iter().any(|item| match item {
+            Item::ToolCall(call) if ToolName::of(call) == Some(ToolName::ApplyPatch) => {
+                crate::tools::patch_of(call).is_ok_and(|patch| patch.paths().iter().any(|p| p.trim_start_matches("./") == path))
+            }
             Item::ToolCall(call) => matches!(ToolName::of(call), Some(ToolName::Read | ToolName::Write | ToolName::Edit)) && read_path(&call.arguments).as_deref() == Some(path),
             _ => false,
         })
@@ -1649,6 +1655,7 @@ impl<M> Agent<M> {
             efforts: rein_llm::Efforts::Unknown,
             max_output: None,
             finds_tools: rein_llm::FindsTools::Unknown,
+            harness: rein_llm::Harness::Rein,
             searcher: None,
             sees: rein_llm::Sees::Unknown,
             pasted: Vec::new(),
@@ -1702,6 +1709,7 @@ impl<M> Agent<M> {
             efforts,
             max_output,
             finds_tools,
+            harness,
             searcher,
             sees,
             pasted,
@@ -1731,6 +1739,7 @@ impl<M> Agent<M> {
             efforts,
             max_output,
             finds_tools,
+            harness,
             searcher,
             sees,
             pasted,
@@ -1793,6 +1802,27 @@ impl<M> Agent<M> {
     pub fn with_child_peer_tools(mut self) -> Self {
         self.specs.extend(crate::peers::child_specs());
         self
+    }
+
+    /// Gives the model the tools of the harness it was trained in: Codex's
+    /// `apply_patch` for its models, in place of `write` and `edit`, in
+    /// their place in the list. Only when that changes: the tool list
+    /// comes first in a request, and a change loses the whole cache.
+    pub fn set_harness(&mut self, harness: rein_llm::Harness) {
+        if self.harness == harness {
+            return;
+        }
+        self.harness = harness;
+        let ours = [ToolName::Write.as_str(), ToolName::Edit.as_str()];
+        let theirs = ToolName::ApplyPatch.as_str();
+        let swapped = |tool: &Tool| ours.contains(&tool.name.as_str()) || tool.name == theirs;
+        let at = self.specs.iter().position(swapped).unwrap_or(self.specs.len());
+        self.specs.retain(|tool| !swapped(tool));
+        let given = match harness {
+            rein_llm::Harness::Codex => vec![crate::tools::patch_spec()],
+            rein_llm::Harness::Rein => self.tools.specs().into_iter().filter(|tool| ours.contains(&tool.name.as_str())).collect(),
+        };
+        self.specs.splice(at.min(self.specs.len())..at.min(self.specs.len()), given);
     }
 
     /// Compact once a request would carry more than this many tokens.
@@ -2529,6 +2559,7 @@ mod tests {
             efforts: rein_llm::Efforts::Unknown,
             max_output: None,
             finds_tools: rein_llm::FindsTools::Unknown,
+            harness: rein_llm::Harness::Rein,
             searcher: None,
             sees: rein_llm::Sees::Unknown,
             pasted: Vec::new(),
@@ -2545,6 +2576,22 @@ mod tests {
             checking: crate::check::Checking::default(),
             changed_in_step: false,
         }
+    }
+
+    #[test]
+    fn a_model_gets_the_tools_its_own_harness_gives_it_in_their_place() {
+        let mut agent = agent("harness", Vec::new());
+        let names = |agent: &Agent<Scripted>| agent.specs.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
+        let rein = names(&agent);
+        agent.set_harness(rein_llm::Harness::Codex);
+        let codex = names(&agent);
+        let at = rein.iter().position(|name| name == "write").unwrap();
+        assert_eq!(codex[at], "apply_patch", "where write and edit were: {codex:?}");
+        assert!(!codex.contains(&"edit".to_owned()) && !codex.contains(&"write".to_owned()));
+        assert_eq!(codex.len(), rein.len() - 1);
+        assert!(agent.specs[at].grammar.is_some(), "in Codex's grammar");
+        agent.set_harness(rein_llm::Harness::Rein);
+        assert_eq!(names(&agent), rein, "and back, as they were");
     }
 
     #[tokio::test]
@@ -3015,7 +3062,7 @@ mod tests {
     fn a_held_back_tool_counts_only_once_it_is_found() {
         let mut agent = agent("estimate", vec![]);
         let bare = agent.estimated();
-        let tool = |name: &str, loading| Tool { loading, strict: false, name: name.into(), description: "x".repeat(40_000), parameters: json!({}) };
+        let tool = |name: &str, loading| Tool { grammar: None, loading, strict: false, name: name.into(), description: "x".repeat(40_000), parameters: json!({}) };
         agent.specs.push(tool("mcp__big__one", Loading::Found));
         agent.specs.push(tool(rein_llm::TOOL_SEARCH, Loading::Search));
         let held = agent.estimated();

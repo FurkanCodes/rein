@@ -593,6 +593,28 @@ rein's own tools are `read`, `grep`, `glob`, `write`, `edit` and `bash`, and
 they touch only files inside the folder you run it in. Before a file
 changes, you see the lines removed and added.
 
+**Each model changes files with the tool its own harness gives it.** GPT
+models (GPT-5 on, and Codex's) were trained in Codex, which gives them
+`apply_patch`, so that's what they get in place of `write` and `edit`: one
+patch adds, changes, moves and deletes files, each change found by the
+lines around it, and the model writes it as text in Codex's grammar, which
+OpenAI holds it to, not as JSON. Which models get it, ChatGPT's model list
+says (`apply_patch_tool_type`); with an API key, the model's name does.
+
+- It's a file change like any other: asked about as "Allow this patch?",
+  shown file by file before it runs, in `/undo`, and checked after, as
+  edits are.
+- What it deletes or moves away is decided as `rm` of it would be: your
+  rules have deleting ask first, in trust mode too, and a patch is no way
+  round them.
+- A patch is worked out whole before anything is written: if one change
+  can't be found, no file changes, and the model is told which lines it
+  couldn't find.
+- Hooks see it as `apply_patch`, since Claude Code has no such tool: a hook
+  for `Edit|Write` doesn't run on it.
+- Switching models mid-conversation switches the tool, and the cache with
+  it, as switching models does anyway.
+
 `grep` searches file contents with a regular expression, and `glob` finds
 files by name or path, like `src/**/*.rs`. Both only look, so they never
 ask, in any mode. The model uses them to find its way around instead of

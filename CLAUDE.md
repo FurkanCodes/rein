@@ -311,6 +311,14 @@ finding. Each says why in a line.
   one there as an injection, and ignored it. `--output-format stream-json
   --verbose` shows what the model did, turn by turn.
 
+- A model gets the tools its own harness trained it on, where rein has
+  them: GPT models get Codex's `apply_patch`, freeform in its grammar, in
+  place of `write` and `edit`. Inside rein its call is JSON like any other
+  (`{"input": "<patch>"}`); only the Responses format sends it as a custom
+  tool. Everything that reads a call's `path` (permissions, the turn's
+  changed files, the step shown) reads a patch's paths too: counted by
+  `path` alone, a patch's turn said it "changed no files".
+
 ## Encapsulation
 
 - Fields that must change together are private, behind methods. `Agent`'s

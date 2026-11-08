@@ -54,6 +54,7 @@ pub fn spec(skills: &Skills, room: usize) -> Option<Tool> {
         return None;
     }
     Some(Tool {
+        grammar: None,
         name: ToolName::Skill.as_str().into(),
         description: format!(
             "Load a skill: instructions for a kind of task, written to be followed. When a task fits one of these, load it \

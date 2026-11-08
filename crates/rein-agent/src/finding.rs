@@ -41,6 +41,7 @@ pub(crate) fn spec(tools: &[Tool]) -> Option<Tool> {
     }
     let listed: Vec<String> = servers.iter().map(|(server, names)| format!("- {server}: {}", names.join(", "))).collect();
     Some(Tool {
+        grammar: None,
         name: TOOL_SEARCH.into(),
         description: format!(
             "Find tools of the user's MCP servers that you aren't shown yet, and load them: you can call what it finds from \
@@ -154,7 +155,14 @@ mod tests {
     use super::*;
 
     fn tool(name: &str, description: &str, loading: Loading) -> Tool {
-        Tool { name: name.into(), description: description.into(), parameters: json!({"type": "object", "properties": {"team_id": {"type": "string"}}}), strict: false, loading }
+        Tool {
+            grammar: None,
+            name: name.into(),
+            description: description.into(),
+            parameters: json!({"type": "object", "properties": {"team_id": {"type": "string"}}}),
+            strict: false,
+            loading,
+        }
     }
 
     fn tools() -> Vec<Tool> {

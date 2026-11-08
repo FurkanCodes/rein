@@ -53,6 +53,7 @@ fn parse_models(body: &Value) -> Vec<ModelInfo> {
             // Each server calls it something else.
             let window = ["context_length", "context_window", "max_context_length", "max_model_len"].iter().find_map(|key| m[*key].as_u64());
             Some(ModelInfo {
+                harness: crate::Harness::Rein,
                 id: id.to_owned(),
                 name: m["name"].as_str().unwrap_or(id).to_owned(),
                 context_window: window.or(m["top_provider"]["context_length"].as_u64()),
@@ -453,7 +454,7 @@ mod tests {
 
     /// The tool every test request offers.
     static TOOLS: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
-        vec![Tool { loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
+        vec![Tool { grammar: None, loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
     });
 
     fn request(input: &[Item]) -> Request<'_> {
@@ -671,6 +672,7 @@ mod tests {
         assert_eq!(
             parse_models(&openrouter)[0],
             ModelInfo {
+                harness: crate::Harness::Rein,
                 id: "qwen/qwen3-coder".into(),
                 name: "Qwen3 Coder".into(),
                 context_window: Some(262_144),

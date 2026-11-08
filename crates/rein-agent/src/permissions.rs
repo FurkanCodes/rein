@@ -371,6 +371,15 @@ struct FileCall {
     path: String,
 }
 
+/// The stricter of two decisions: a refusal over a question over a yes.
+fn stricter(a: Decision, b: Decision) -> Decision {
+    match (a, b) {
+        (Decision::Deny(why), _) | (_, Decision::Deny(why)) => Decision::Deny(why),
+        (Decision::Ask, _) | (_, Decision::Ask) => Decision::Ask,
+        (a, _) => a,
+    }
+}
+
 /// What the model is told when auto mode refuses a command.
 fn auto_refuses(access: Access) -> String {
     format!(
@@ -469,6 +478,7 @@ impl Permissions {
             // save is a step you see; `background` reads or stops what was
             // already allowed to run.
             Some(tool) if tool.only_looks() || matches!(tool, ToolName::Plan | ToolName::Memory | ToolName::Background) => Decision::Allow,
+            Some(ToolName::ApplyPatch) => self.decide_patch(call),
             Some(tool) if tool.changes_files() => self.decide_change(call),
             // What doesn't read as a command doesn't run as one either.
             Some(ToolName::Bash) => match serde_json::from_str::<BashCall>(&call.arguments) {
@@ -512,6 +522,29 @@ impl Permissions {
     fn decide_change(&self, call: &ToolCall) -> Decision {
         // What runs code later is asked about in every mode that asks at all.
         let protected = serde_json::from_str::<FileCall>(&call.arguments).is_ok_and(|file| self.sandbox.places().protects(&file.path));
+        self.decide_change_of(protected)
+    }
+
+    /// A patch changes files as `write` and `edit` do, any of them
+    /// protected; and what it deletes, or moves away, is decided as `rm` of
+    /// it would be: your rules have deleting ask first, in trust too, and a
+    /// patch is no way round them. One rein can't read changes nothing:
+    /// the tool turns it down, reading it the same way.
+    fn decide_patch(&self, call: &ToolCall) -> Decision {
+        let Ok(patch) = crate::tools::patch_of(call) else { return self.decide_change_of(false) };
+        let protected = patch.paths().iter().any(|path| self.sandbox.places().protects(path));
+        let mut decision = self.decide_change_of(protected);
+        for change in &patch.files {
+            let gone = match change {
+                crate::patch::FileChange::Delete { path } | crate::patch::FileChange::Update { path, to: Some(_), .. } => path,
+                _ => continue,
+            };
+            decision = stricter(decision, self.decide_command(&format!("rm {}", quoted(gone)), Access::Write));
+        }
+        decision
+    }
+
+    fn decide_change_of(&self, protected: bool) -> Decision {
         match self.mode {
             Mode::ReadOnly => Decision::Deny(READ_ONLY_CHANGES.into()),
             Mode::Trust => Decision::Allow,
@@ -600,7 +633,7 @@ impl Permissions {
     /// file changes but protected ones; for an MCP server's tool, that tool.
     pub fn remember(&mut self, call: &ToolCall) {
         match ToolName::of(call) {
-            Some(ToolName::Write | ToolName::Edit) => self.approved_edits = true,
+            Some(ToolName::Write | ToolName::Edit | ToolName::ApplyPatch) => self.approved_edits = true,
             Some(ToolName::Bash) => {
                 if let Some(c) = BashCall::of(call)
                     && let Some(parts) = split_command(c.command())
@@ -1083,6 +1116,39 @@ mod tests {
         let mut p = Permissions::new(Mode::Trust, "").unwrap();
         p.set_yours(FIRST_RULES).unwrap();
         p
+    }
+
+    fn patch(input: &str) -> ToolCall {
+        ToolCall { call_id: "p".into(), name: "apply_patch".into(), arguments: json!({ "input": input }).to_string() }
+    }
+
+    #[test]
+    fn a_patch_is_a_file_change_and_what_it_deletes_is_asked_as_rm_would_be() {
+        let changes = patch("*** Begin Patch\n*** Update File: a.rs\n@@\n-a\n+b\n*** Add File: b.rs\n+x\n*** End Patch");
+        assert_eq!(Permissions::new(Mode::Ask, "").unwrap().decide(&changes), Decision::Ask);
+        assert_eq!(Permissions::new(Mode::Edits, "").unwrap().decide(&changes), Decision::Allow);
+        assert!(matches!(Permissions::new(Mode::ReadOnly, "").unwrap().decide(&changes), Decision::Deny(_)));
+        assert_eq!(trusting().decide(&changes), Decision::Allow);
+        // Your rules have deleting ask first, in trust too: a patch is no
+        // way round them, nor is moving a file away.
+        let deletes = patch("*** Begin Patch\n*** Delete File: old.rs\n*** End Patch");
+        let moves = patch("*** Begin Patch\n*** Update File: a.rs\n*** Move to: b.rs\n*** End Patch");
+        assert_eq!(trusting().decide(&deletes), Decision::Ask);
+        assert_eq!(trusting().decide(&moves), Decision::Ask);
+        assert_eq!(Permissions::new(Mode::Trust, "").unwrap().decide(&deletes), Decision::Allow, "without the rule, trust trusts");
+        assert!(matches!(Permissions::new(Mode::Trust, "deny rm").unwrap().decide(&deletes), Decision::Deny(_)));
+        let mut edits = Permissions::new(Mode::Edits, "").unwrap();
+        edits.set_yours("ask rm").unwrap();
+        assert_eq!(edits.decide(&deletes), Decision::Ask, "the stricter of the two");
+        // What runs code later asks, as an edit of it does.
+        let hook = patch("*** Begin Patch\n*** Add File: .git/hooks/pre-commit\n+evil\n*** End Patch");
+        assert_eq!(sandboxed(Mode::Edits, "", "protected-patch").decide(&hook), Decision::Ask);
+        // One rein can't read changes nothing: the tool turns it down.
+        assert_eq!(Permissions::new(Mode::Edits, "").unwrap().decide(&patch("not a patch")), Decision::Allow);
+        // "Don't ask again" covers patches, as it does every file change.
+        let mut asking = Permissions::new(Mode::Ask, "").unwrap();
+        asking.remember(&changes);
+        assert_eq!(asking.decide(&file("edit")), Decision::Allow);
     }
 
     #[test]

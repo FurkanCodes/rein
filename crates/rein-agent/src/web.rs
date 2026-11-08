@@ -96,6 +96,7 @@ fn said(found: &Searched, model: &str, web: Web) -> String {
 /// The tool, as the model is told of it: what it's for, and when.
 pub(crate) fn spec() -> Tool {
     Tool {
+        grammar: None,
         name: ToolName::WebSearch.as_str().into(),
         description: "Search the web, and get an answer with its sources: another model searches and reads for you, \
                       so ask a question in words, with what you know already. Use it for what changes, or what you \

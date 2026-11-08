@@ -50,6 +50,7 @@ pub fn specs() -> Vec<Tool> {
     let to = json!({ "type": "string", "description": "The other rein's name, as `peers` lists it, or `workspace/name` for one in another workspace." });
     vec![
         Tool {
+            grammar: None,
             loading: Loading::UpFront,
             strict: true,
             name: ToolName::Peers.as_str().into(),
@@ -59,6 +60,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({})),
         },
         Tool {
+            grammar: None,
             loading: Loading::UpFront,
             strict: true,
             name: ToolName::Message.as_str().into(),
@@ -69,6 +71,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({ "to": to, "text": { "type": "string", "description": "What to say." } })),
         },
         Tool {
+            grammar: None,
             loading: Loading::UpFront,
             strict: true,
             name: ToolName::Delegate.as_str().into(),
@@ -80,6 +83,7 @@ pub fn specs() -> Vec<Tool> {
             parameters: object(json!({ "to": to, "task": { "type": "string", "description": "The task, complete in itself." } })),
         },
         Tool {
+            grammar: None,
             loading: Loading::UpFront,
             strict: true,
             name: ToolName::Spawn.as_str().into(),

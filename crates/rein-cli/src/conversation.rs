@@ -219,6 +219,7 @@ pub(crate) async fn open(http: &rein_llm::reqwest::Client, args: AskArgs, compac
     agent.efforts = setup.efforts(&agent.model_name);
     agent.finds_tools = setup.finds_tools(&agent.model_name);
     agent.sees = setup.sees(&agent.model_name);
+    agent.set_harness(setup.harness(&agent.model_name));
     crate::search::follow(&mut agent, &setup).await;
     // A task run with -p asks nothing: a project's skills wait for a yes.
     let room = setup.skill_room(&agent.model_name);
@@ -412,6 +413,16 @@ impl Setup {
     /// its provider lists it.
     fn finds_tools(&self, model: &str) -> rein_llm::FindsTools {
         self.models.iter().find(|m| m.id == model).map(|m| m.finds_tools).unwrap_or_default()
+    }
+
+    /// The harness `model` was trained in, as its provider lists it, or
+    /// its name says when the list doesn't name it.
+    fn harness(&self, model: &str) -> rein_llm::Harness {
+        self.models.iter().find(|m| m.id == model).map_or_else(
+            // Only the Responses API takes Codex's tools as Codex sends them.
+            || if self.provider.api == rein_llm::Api::Responses { rein_llm::Harness::of_name(model) } else { rein_llm::Harness::Rein },
+            |m| m.harness,
+        )
     }
 
     /// Whether `model` can see images, as its provider lists it.
@@ -1155,6 +1166,7 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
     agent.efforts = setup.efforts(&model);
     agent.finds_tools = setup.finds_tools(&model);
     agent.sees = setup.sees(&model);
+    agent.set_harness(setup.harness(&model));
     terminal.model = provider::shown(&setup.provider, &model);
     agent.model_name = model;
     terminal.effort = crate::effort::now(agent);

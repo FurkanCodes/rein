@@ -502,6 +502,7 @@ pub(crate) fn skills_again(earlier: &[Item], kept: &[Item], id: &str) -> Vec<Ite
 /// The tool for searching the conversation, offered once it's been compacted.
 pub fn recall_spec() -> Tool {
     Tool {
+        grammar: None,
         loading: Loading::UpFront,
         strict: true,
         name: ToolName::Recall.as_str().into(),

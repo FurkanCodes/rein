@@ -456,7 +456,7 @@ fn tool_call(call: &ToolCall, status: &str) -> Value {
 fn kind(call: &ToolCall) -> &'static str {
     match ToolName::of(call) {
         Some(ToolName::Read) => "read",
-        Some(ToolName::Write | ToolName::Edit) => "edit",
+        Some(ToolName::Write | ToolName::Edit | ToolName::ApplyPatch) => "edit",
         Some(ToolName::Grep | ToolName::Glob | ToolName::Recall | ToolName::ToolSearch) => "search",
         Some(ToolName::Bash | ToolName::Background) => "execute",
         Some(ToolName::WebSearch) => "fetch",

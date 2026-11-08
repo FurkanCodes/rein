@@ -59,6 +59,7 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
         .filter_map(|m| {
             let id = m["name"].as_str()?.trim_start_matches("models/");
             Some(ModelInfo {
+                harness: crate::Harness::Rein,
                 id: id.to_owned(),
                 name: m["displayName"].as_str().unwrap_or(id).to_owned(),
                 context_window: m["inputTokenLimit"].as_u64(),
@@ -383,7 +384,7 @@ mod tests {
 
     /// The tool every test request offers.
     static TOOLS: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
-        vec![Tool { loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
+        vec![Tool { grammar: None, loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
     });
 
     fn request(input: &[Item]) -> Request<'_> {
@@ -545,6 +546,7 @@ mod tests {
         assert_eq!(
             parse_models(&page),
             [ModelInfo {
+                harness: crate::Harness::Rein,
                 id: "gemini-3.8-flash".into(),
                 name: "Gemini 3.8 Flash".into(),
                 context_window: Some(1_048_576),

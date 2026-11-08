@@ -407,6 +407,7 @@ fn civil(days: i64) -> (i64, u32, u32) {
 /// The memory tool, as the model is told of it.
 pub fn spec() -> rein_llm::Tool {
     rein_llm::Tool {
+        grammar: None,
         loading: rein_llm::Loading::UpFront,
         strict: true,
         name: crate::tools::ToolName::Memory.as_str().into(),

@@ -83,6 +83,7 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
         .filter_map(|m| {
             let id = m["id"].as_str()?;
             Some(ModelInfo {
+                harness: crate::Harness::Rein,
                 id: id.to_owned(),
                 name: m["display_name"].as_str().unwrap_or(id).to_owned(),
                 context_window: m["max_input_tokens"].as_u64(),
@@ -529,7 +530,7 @@ mod tests {
 
     /// The tool every test request offers.
     static TOOLS: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(|| {
-        vec![Tool { loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
+        vec![Tool { grammar: None, loading: crate::Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters: json!({"type": "object"}) }]
     });
 
     fn request<'a>(model: &'a str, input: &'a [Item]) -> Request<'a> {
@@ -763,6 +764,7 @@ mod tests {
         assert_eq!(
             models,
             [ModelInfo {
+                harness: crate::Harness::Rein,
                 id: "claude-opus-5-5".into(),
                 name: "Claude Opus 5.5".into(),
                 context_window: Some(1_000_000),

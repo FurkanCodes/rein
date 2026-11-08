@@ -12,7 +12,7 @@ How to work:
 - Look before you act. Read a file before editing it, and find out how the \
 project builds and tests itself instead of guessing.
 - Make the smallest change that does the job, in the style of the code around it. \
-To edit, copy old_text exactly from what you read.
+To edit, copy the lines you change exactly from what you read.
 - Find code with grep (what files say) and glob (what they're called), not \
 bash; read files with read, not cat. When you need several, ask for them in one step.
 - After a change, check it: run the tests or the program when you can.

@@ -27,6 +27,9 @@ enum Out {
     Call(&'static str, Value),
     /// Text citing a page, as a model that searched the web writes it.
     Cited(&'static str, &'static str),
+    /// A call of a tool that takes text in a grammar (Codex's
+    /// `apply_patch`), as the Responses API gives it.
+    Custom(&'static str, &'static str),
 }
 
 impl Out {
@@ -36,7 +39,7 @@ impl Out {
         match self {
             Out::Text(text) => text,
             Out::Cited(text, _) => text,
-            Out::Call(..) => "",
+            Out::Call(..) | Out::Custom(..) => "",
         }
     }
 }
@@ -386,6 +389,10 @@ fn sse(turn: &Turn) -> String {
                 let call = json!({ "type": "function_call", "call_id": call_id, "namespace": "rein", "name": tool, "arguments": arguments.to_string() });
                 event(json!({ "type": "response.output_item.done", "item": call }));
             }
+            Out::Custom(tool, input) => {
+                let call_id = format!("call_{}", CALLS.fetch_add(1, Ordering::Relaxed));
+                event(json!({ "type": "response.output_item.done", "item": { "type": "custom_tool_call", "call_id": call_id, "name": tool, "input": input } }));
+            }
         }
     }
     let usage = json!({ "input_tokens": 1200, "input_tokens_details": { "cached_tokens": 1000 }, "output_tokens": 20, "output_tokens_details": { "reasoning_tokens": 0 } });
@@ -410,6 +417,8 @@ fn messages_sse(turn: &Turn, n: usize, tokens: u64) -> String {
     for (i, item) in turn.out.iter().enumerate() {
         let index = i + 1;
         match item {
+            // Only the Responses API takes a tool in a grammar.
+            Out::Custom(..) => {}
             Out::Text(_) | Out::Cited(..) => {
                 let text = item.text();
                 event(json!({ "type": "content_block_start", "index": index, "content_block": { "type": "text", "text": "" } }));
@@ -446,6 +455,8 @@ fn chat_sse(turn: &Turn) -> String {
     let mut called = 0;
     for item in &turn.out {
         match item {
+            // Only the Responses API takes a tool in a grammar.
+            Out::Custom(..) => {}
             Out::Text(_) | Out::Cited(..) => {
                 let text = item.text();
                 for piece in text.split_inclusive(' ') {
@@ -484,6 +495,8 @@ fn gemini_sse(turn: &Turn, n: usize) -> String {
     let mut signed = false;
     for item in &turn.out {
         match item {
+            // Only the Responses API takes a tool in a grammar.
+            Out::Custom(..) => {}
             Out::Text(_) | Out::Cited(..) => {
                 let text = item.text();
                 for piece in text.split_inclusive(' ') {
@@ -6821,4 +6834,65 @@ fn in_trust_rein_serve_opens_a_sub_agents_pane_without_asking() {
     assert_eq!(mode, Some(&json!("trust")), "it's held to this rein's mode: {args:?}");
     rein.reply(&asked, &json!({}));
     assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
+}
+
+/// A patch, in Codex's shape: one file changed, one made, one deleted.
+const PATCH: &str = "*** Begin Patch\n*** Update File: a.txt\n@@\n one\n-two\n+2\n three\n*** Add File: b.txt\n+made\n*** Delete File: old.txt\n*** End Patch";
+
+#[test]
+fn a_gpt_model_changes_files_with_codexs_patch_asked_about_shown_and_undone() {
+    let model = Model::start(vec![
+        Turn { out: vec![Out::Custom("apply_patch", PATCH)] },
+        says("Patched."),
+        Turn { out: vec![Out::Custom("apply_patch", "*** Begin Patch\n*** Update File: a.txt\n@@\n-missing\n+x\n*** End Patch")] },
+        says("That one didn't apply."),
+    ])
+    .with_env("REIN_MODEL", "gpt-6.1-sol");
+    let mut term = Term::start_with(&model, "patch", 34, 110, &[("a.txt", "one\ntwo\nthree\n"), ("old.txt", "old\n")]);
+    term.wait_for(IDLE);
+    term.keys("tidy up\r");
+    // Asked about as a change to files, with what it changes shown.
+    term.wait_for("Allow this patch?");
+    let asked = term.text();
+    for part in ["Patch  a.txt, b.txt, old.txt", "- two", "+ 2", "new file b.txt", "deletes old.txt"] {
+        assert!(asked.contains(part), "{part:?} isn't shown:\n{asked}");
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("Patched.");
+    term.wait_for("changed 3 files");
+    term.wait_for(IDLE);
+    let project = term.dir.join("project");
+    assert_eq!(std::fs::read_to_string(project.join("a.txt")).unwrap(), "one\n2\nthree\n");
+    assert_eq!(std::fs::read_to_string(project.join("b.txt")).unwrap(), "made\n");
+    assert!(!project.join("old.txt").exists());
+    // The model was given Codex's tool, not rein's edit, and told what it
+    // did as Codex tells it.
+    let requests = model.requests();
+    let tools = requests[0]["tools"].as_array().unwrap();
+    let custom = tools.iter().find(|tool| tool["type"] == "custom").expect("apply_patch, as a custom tool");
+    assert_eq!((custom["name"].as_str(), custom["format"]["syntax"].as_str()), (Some("apply_patch"), Some("lark")));
+    let functions: Vec<&str> = tools[0]["tools"].as_array().unwrap().iter().filter_map(|tool| tool["name"].as_str()).collect();
+    assert!(!functions.contains(&"edit") && !functions.contains(&"write") && functions.contains(&"read"), "{functions:?}");
+    let answered = requests[1]["input"].as_array().unwrap().iter().find(|item| item["type"] == "custom_tool_call_output").expect("the patch's result").clone();
+    assert_eq!(answered["output"], "Success. Updated the following files:\nM a.txt\nA b.txt\nD old.txt");
+    // A patch that can't be applied changes nothing, and says why.
+    term.keys("once more\r");
+    term.wait_for("Allow this patch?");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("That one didn't apply.");
+    let told = model.requests()[3].to_string();
+    assert!(told.contains("couldn't find the lines to change:\\nmissing"), "{told}");
+    assert_eq!(std::fs::read_to_string(project.join("a.txt")).unwrap(), "one\n2\nthree\n");
+    // `/undo` puts it all back, the deleted file too.
+    term.wait_for(IDLE);
+    term.keys("/undo\r");
+    term.wait_for("Puts back a.txt and old.txt · takes away b.txt, which rein made");
+    std::thread::sleep(Duration::from_millis(700));
+    term.keys("y");
+    term.wait_for("✓ put back");
+    assert_eq!(std::fs::read_to_string(project.join("a.txt")).unwrap(), "one\ntwo\nthree\n");
+    assert_eq!(std::fs::read_to_string(project.join("old.txt")).unwrap(), "old\n");
+    assert!(!project.join("b.txt").exists());
 }

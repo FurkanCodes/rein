@@ -395,6 +395,13 @@ impl Terminal {
 
     /// `call` changed a file: the others in this folder hear which.
     fn changed_file(&mut self, call: &ToolCall) {
+        // A patch changes each file it names.
+        if let Ok(patch) = rein_agent::tools::patch_of(call) {
+            for path in patch.paths() {
+                self.changed_path(path.trim_start_matches("./").to_owned());
+            }
+            return;
+        }
         let args: rein_llm::serde_json::Value = rein_llm::serde_json::from_str(&call.arguments).unwrap_or_default();
         if let Some(path) = args["path"].as_str() {
             self.changed_path(path.trim_start_matches("./").to_owned());
@@ -1101,7 +1108,11 @@ impl Ui for Terminal {
         }
         // An edit made without asking shows what it changed; a question
         // showed it already. A new file's whole text is Ctrl-O away.
-        let change = if !asked && ToolName::of(call) == Some(ToolName::Edit) && outcome.ok == Some(true) { steps::change(call, &self.root, true) } else { Vec::new() };
+        let change = if !asked && matches!(ToolName::of(call), Some(ToolName::Edit | ToolName::ApplyPatch)) && outcome.ok == Some(true) {
+            steps::change(call, &self.root, true)
+        } else {
+            Vec::new()
+        };
         // A change asked about shows what it changes above it; under, that
         // it's in.
         let saved = asked && ToolName::of(call).is_some_and(ToolName::changes_files) && outcome.ok == Some(true);

@@ -32,6 +32,7 @@ impl Asked {
             (Some(ToolName::Bash), _) => (command_question(bash.as_ref(), sandboxing).to_owned(), "Yes, and don't ask again for this command", "this command"),
             (Some(ToolName::Edit), _) => ("Allow this edit?".to_owned(), "Yes, and don't ask again for file changes", "file changes"),
             (Some(ToolName::Write), _) => ("Allow writing this file?".to_owned(), "Yes, and don't ask again for file changes", "file changes"),
+            (Some(ToolName::ApplyPatch), _) => ("Allow this patch?".to_owned(), "Yes, and don't ask again for file changes", "file changes"),
             (Some(ToolName::Spawn), _) => ("Start a sub-agent in a new tab?".to_owned(), "Yes, and don't ask again in this conversation", "sub-agents"),
             (None, Some((server, tool))) => (format!("Let {server}'s {tool} run?"), "Yes, and don't ask again for this tool", "this tool"),
             _ => ("Allow this?".to_owned(), "Yes, and don't ask again", "this"),

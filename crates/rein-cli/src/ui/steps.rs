@@ -79,6 +79,7 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
         }
         Some(ToolName::Write) => ("Write", path),
         Some(ToolName::Edit) => ("Edit", path),
+        Some(ToolName::ApplyPatch) => ("Patch", patched(call)),
         Some(ToolName::Bash) => {
             let command = args["command"].as_str().unwrap_or_default();
             let first = command.lines().next().unwrap_or_default();
@@ -439,6 +440,7 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             let more = places.filter(|&n| n > 1).map(|n| style.dim(&format!(" · {n} places"))).unwrap_or_default();
             plain(Some(true), format!("{}{more}", change_counts(call, style)))
         }
+        Some(ToolName::ApplyPatch) => plain(Some(true), change_counts(call, style)),
         // `created a.rs (30 lines)` → `30 lines`: the step already says
         // which file.
         _ => {
@@ -490,6 +492,9 @@ pub enum Changed {
 /// file, so the line numbers come from where the new text is rather than
 /// the old.
 pub fn change(call: &ToolCall, root: &Path, applied: bool) -> Vec<Changed> {
+    if ToolName::of(call) == Some(ToolName::ApplyPatch) {
+        return patch_change(call);
+    }
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     let Some((old, new)) = sides(call, &args) else { return Vec::new() };
     let first = line_of(call, &args, root, if applied { new } else { old });
@@ -506,6 +511,58 @@ pub fn change(call: &ToolCall, root: &Path, applied: bool) -> Vec<Changed> {
     }
     if args["replace_all"].as_bool() == Some(true) {
         lines.push(Changed::Note("(every occurrence)".to_owned()));
+    }
+    lines
+}
+
+/// The files a patch changes, as a step names them: a few, and how many
+/// more.
+fn patched(call: &ToolCall) -> String {
+    let Ok(patch) = rein_agent::tools::patch_of(call) else { return String::new() };
+    let paths = patch.paths();
+    match paths.len() {
+        0..=3 => paths.join(", "),
+        n => format!("{} and {} more", paths[..2].join(", "), n - 2),
+    }
+}
+
+/// What a patch changes, file by file: what each change takes out and
+/// puts in, without what it keeps around it. A patch finds its places by
+/// the lines around them, so there are no line numbers to show.
+fn patch_change(call: &ToolCall) -> Vec<Changed> {
+    use rein_agent::patch::FileChange;
+    let Ok(patch) = rein_agent::tools::patch_of(call) else { return Vec::new() };
+    let several = patch.files.len() > 1;
+    let mut lines = Vec::new();
+    let side = |lines: &mut Vec<Changed>, added: bool, side: &[&str]| {
+        for text in side.iter().take(DIFF_LINES) {
+            lines.push(Changed::Line { added, number: None, text: (*text).to_owned() });
+        }
+        if side.len() > DIFF_LINES {
+            lines.push(Changed::Note(format!("… {} more lines", side.len() - DIFF_LINES)));
+        }
+    };
+    for change in &patch.files {
+        match change {
+            FileChange::Add { path, lines: added } => {
+                lines.push(Changed::Note(format!("new file {path}")));
+                side(&mut lines, true, &added.iter().map(String::as_str).collect::<Vec<_>>());
+            }
+            FileChange::Delete { path } => lines.push(Changed::Note(format!("deletes {path}"))),
+            FileChange::Update { path, to, chunks } => {
+                match to {
+                    Some(to) => lines.push(Changed::Note(format!("{path} → {to}"))),
+                    None if several => lines.push(Changed::Note(path.clone())),
+                    None => {}
+                }
+                for chunk in chunks {
+                    let (old, new) = (chunk.old.join("\n"), chunk.new.join("\n"));
+                    let (old, new, _) = changed_lines(&old, &new);
+                    side(&mut lines, false, &old);
+                    side(&mut lines, true, &new);
+                }
+            }
+        }
     }
     lines
 }
@@ -594,6 +651,11 @@ pub enum Sizes {
 
 /// How big the change `call` makes is, if it makes one.
 pub fn change_sizes(call: &ToolCall) -> Option<Sizes> {
+    if ToolName::of(call) == Some(ToolName::ApplyPatch) {
+        let patch = rein_agent::tools::patch_of(call).ok()?;
+        let (added, removed) = patch.files.iter().map(rein_agent::patch::FileChange::sizes).fold((0, 0), |(a, r), (added, removed)| (a + added, r + removed));
+        return Some(Sizes::Edited { added, removed });
+    }
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or_default();
     let (old, new) = sides(call, &args)?;
     if ToolName::of(call) == Some(ToolName::Write) {
