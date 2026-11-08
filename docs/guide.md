@@ -312,6 +312,16 @@ isn't in front, which most terminals report
 on`). Where the terminal doesn't say, it means you haven't touched a key for
 10 seconds. `bell = off` turns it off.
 
+**While you were away.** Come back to rein's tab after it worked without
+you, and over the box it says what happened meanwhile: how long you were
+gone, the steps it ran and how many failed, the files it changed, what the
+last check after edits found, and whether the turn is done or a question
+is waiting for you. A key and it goes; scrolling back keeps it. It comes
+only from the terminal saying its window went behind another (tmux needs
+`set -g focus-events on`): where it doesn't say, rein can't tell when you
+left, and says nothing. With sub-agents in tabs, switching to one is
+catching up on it.
+
 ## Keys and commands
 
 | Key | What it does |

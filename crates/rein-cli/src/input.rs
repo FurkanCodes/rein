@@ -257,6 +257,11 @@ struct Boxed {
     skills: Vec<Offer>,
     /// Whether the window is in front, once the terminal has said.
     focused: Option<bool>,
+    /// What happens while the window is behind another, for when it's
+    /// back in front.
+    away: crate::ui::away::Away,
+    /// What happened while you were away, over the box until you press a key.
+    caught: Option<crate::ui::away::Caught>,
     /// When you last pressed a key, scrolled or clicked.
     touched: Instant,
     /// The bell rings when rein needs you and you're away.
@@ -344,7 +349,7 @@ impl Boxed {
         }
         let s = Style::stderr();
         let pad = " ".repeat(GUTTER);
-        let mut above = Vec::new();
+        let mut above = self.caught.as_ref().map(|caught| caught.lines(&pad, screen::size().1, s)).unwrap_or_default();
         if let Some(Busy { what, since, step }) = &self.busy {
             let elapsed = since.elapsed();
             let frame = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
@@ -723,6 +728,15 @@ impl Boxed {
     fn key(&mut self, key: Key) {
         if let Key::Focus(focused) = key {
             self.focused = Some(focused);
+            let now = Instant::now();
+            if !focused {
+                self.away.leave(now);
+                return;
+            }
+            if let Some(caught) = self.away.back(now, self.asking.as_ref().map(|asking| asking.since)) {
+                self.caught = Some(caught);
+                self.draw();
+            }
             return;
         }
         // The terminal said its background: what's tinted is drawn again
@@ -779,6 +793,11 @@ impl Boxed {
             self.pinned.open_viewer(&shown);
             self.viewer = Some(viewer);
             return;
+        }
+        // You've read what happened while you were away once you press a
+        // key; scrolling to look further back keeps it.
+        if !matches!(key, Key::Mouse { .. } | Key::ScrollUp | Key::ScrollDown | Key::PageUp | Key::PageDown | Key::Redraw) && self.caught.take().is_some() {
+            self.draw();
         }
         // A menu takes the keys, but the wheel still scrolls the conversation.
         if self.picking.is_some() && !matches!(key, Key::Mouse { .. } | Key::ScrollUp | Key::ScrollDown | Key::Redraw) {
@@ -1286,6 +1305,8 @@ impl Input {
                 dismissed: None,
                 skills: Vec::new(),
                 focused: None,
+                away: crate::ui::away::Away::default(),
+                caught: None,
                 touched: Instant::now(),
                 bell,
                 ring: false,
@@ -1378,6 +1399,13 @@ impl Input {
     /// or you haven't touched a key for a while. Without a box, never.
     pub fn away(&self) -> bool {
         self.boxed.as_ref().is_some_and(|boxed| locked(boxed).away())
+    }
+
+    /// Notes `saw` for when you're back, if the window is behind another.
+    pub fn saw(&self, saw: crate::ui::away::Saw) {
+        if let Some(boxed) = &self.boxed {
+            locked(boxed).away.saw(saw);
+        }
     }
 
     /// How wide a line in the box can be.

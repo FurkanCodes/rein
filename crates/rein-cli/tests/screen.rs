@@ -1223,6 +1223,36 @@ fn the_bell_rings_when_rein_needs_you_and_youre_away() {
 }
 
 #[test]
+fn coming_back_to_the_tab_says_what_happened_while_you_were_away() {
+    let model = Model::start(vec![runs("echo hi > notes.txt"), says("Wrote it.")]);
+    let dir = std::env::temp_dir().join(format!("rein-screen-{}-away", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut term = Term::spawn_with(&model, dir, 24, 80, &["--mode", "trust"]);
+    term.wait_for(IDLE);
+    // Sent, and then the window goes behind another, both before the turn
+    // starts: all it does happens while you're away.
+    term.keys("\x1b[I");
+    term.keys("write notes\r\x1b[O");
+    term.wait_for("Wrote it.");
+    term.wait_for(IDLE);
+    assert!(!term.text().contains("while you were away"), "nothing's said while you're still away:\n{}", term.text());
+    // Back in front: what happened, over the box.
+    term.keys("\x1b[I");
+    term.wait_for("while you were away");
+    let screen = term.text();
+    assert!(screen.contains("1 step · done"), "{screen}");
+    assert!(screen.contains("changed notes.txt"), "{screen}");
+    // A key, and it's gone.
+    term.keys("x");
+    term.wait_until("the note gone", |text| !text.contains("while you were away"));
+    // Away and back with nothing happening says nothing.
+    term.keys("\x1b[O");
+    term.keys("\x1b[I");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!term.text().contains("while you were away"), "{}", term.text());
+}
+
+#[test]
 fn a_search_runs_without_asking() {
     let grep = json!({ "pattern": r"fn parse_\w+", "path": null, "glob": "*.rs", "ignore_case": false, "output": "lines", "context": null });
     let model = Model::start(vec![calls("grep", grep), says("It's in src/parser.rs, line 2.")]);

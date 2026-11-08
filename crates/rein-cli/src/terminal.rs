@@ -6,6 +6,7 @@ use crate::input::{Input, Menu, Question, Read};
 use crate::peers::node::Incoming;
 use crate::peers::{Node, State};
 use crate::ui::asked::{Asked, INSTEAD};
+use crate::ui::away::Saw;
 use crate::ui::history::History;
 use crate::ui::markdown::Markdown;
 use crate::ui::screen::Progress;
@@ -510,6 +511,7 @@ impl Terminal {
     pub(crate) fn step_finished(&mut self, call: &ToolCall, outcome: &steps::Outcome) {
         let (name, target) = steps::describe(call);
         crate::peers::farewell::stepped(&format!("{name} {target} · {}", strip(&outcome.status)));
+        self.input.saw(Saw::Step { ok: outcome.ok });
         if ToolName::of(call).is_some_and(ToolName::changes_files) && outcome.ok == Some(true) {
             self.changed_file(call);
         }
@@ -548,6 +550,7 @@ impl Terminal {
         if !self.turn.changed.contains(&path) {
             self.turn.changed.push(path.clone());
         }
+        self.input.saw(Saw::Changed(path.clone()));
         crate::peers::farewell::changed(&path);
         if let Some(peers) = &mut self.peers {
             peers.changed(&path);
@@ -962,6 +965,7 @@ impl Ui for Terminal {
         let s = self.err;
         let pad = " ".repeat(steps::INDENT);
         let said = check_said(checked);
+        self.input.saw(Saw::Checked { said: said.clone(), broke: matches!(checked.verdict, Verdict::New(_)) });
         let line = match checked.verdict {
             Verdict::Clean | Verdict::Busy => s.dim(&format!("↳ {said}")),
             Verdict::New(_) => s.red(&format!("✗ {said}")),

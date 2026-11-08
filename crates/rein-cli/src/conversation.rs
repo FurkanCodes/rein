@@ -511,6 +511,7 @@ pub(crate) async fn turn(agent: &mut Agent<Llm>, start: Start, terminal: &mut Te
     // Finished: the tab says so until the next turn starts. Stopped,
     // failed or cut short, it's just idle.
     terminal.state(if matches!(outcome, Ok(Outcome::Done)) { crate::peers::State::Done } else { crate::peers::State::Idle });
+    terminal.input.saw(crate::ui::away::Saw::Ended { done: matches!(outcome, Ok(Outcome::Done)) });
     // Done while you're away: your hooks on it run, as the bell rings.
     if matches!(outcome, Ok(Outcome::Done)) && terminal.input.away() {
         agent.hook(rein_agent::hooks::Event::Notification(rein_agent::hooks::Notice::Idle, "rein is waiting for your input"), terminal).await;

@@ -3,6 +3,7 @@
 //! status bar (see `crate::input`).
 
 pub mod asked;
+pub mod away;
 pub mod editor;
 pub mod fuzzy;
 pub mod history;

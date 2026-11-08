@@ -63,6 +63,7 @@ set up each one.
 - [Sub-agents](docs/guide.md#sub-agents): each one runs in a terminal tab
   of its own, in tmux, kitty, WezTerm, iTerm2, Ghostty or Terminal.app.
   You can watch it, type into it, and keep going with it after it's done.
+  Switch back to a tab and it says what happened while you were away.
 - [MCP](docs/guide.md#mcp-servers): add a server by name from the
   registry, import the ones you set up in Claude Code, Cursor, Codex and
   others, or connect to one by URL. A server with dozens of tools doesn't
