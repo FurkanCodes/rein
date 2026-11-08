@@ -498,10 +498,11 @@ read -r line; printf '%s' "$line" > "$0.input"
             "--no-session-persistence\n",
             "--setting-sources\nuser\n",
             "--model\nsonnet\n",
-            "--append-system-prompt\nrein rules\n",
         ] {
             assert!(args.contains(flag), "{flag:?} in {args}");
         }
+        let appended = format!("--append-system-prompt\n{}\n\nrein rules\n", live::FOLDER);
+        assert!(args.contains(&appended), "where the project is, then rein's instructions: {args}");
         // `--safe-mode` turns off every MCP server, rein's too; `--bare`
         // reads no sign-in.
         for flag in ["--safe-mode", "--bare", "--json-schema"] {

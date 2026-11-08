@@ -58,7 +58,9 @@ pub(super) enum Launcher {
 pub(super) struct Launch {
     pub(super) model: String,
     pub(super) effort: Option<Effort>,
-    pub(super) instructions: Option<String>,
+    /// What follows the CLI's own system prompt: where the project is,
+    /// then rein's instructions, if any.
+    pub(super) instructions: String,
     /// Where rein's tools are, and the token for them: `--mcp-config`.
     pub(super) mcp: Value,
 }
@@ -130,9 +132,7 @@ fn cli(program: &str, launch: &Launch, token: Option<&str>) -> Result<Spawned> {
         let effort = if effort == Effort::Minimal { Effort::Low } else { effort };
         command.args(["--effort", effort.as_str()]);
     }
-    if let Some(instructions) = &launch.instructions {
-        command.arg("--append-system-prompt").arg(instructions);
-    }
+    command.arg("--append-system-prompt").arg(&launch.instructions);
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
@@ -241,7 +241,7 @@ pub(super) async fn turn(sessions: &Sessions, launcher: &Launcher, token: Option
 impl Live {
     async fn start(launcher: &Launcher, token: Option<&str>, key: Key, tools: Vec<Value>) -> Result<Live> {
         let bridge = Bridge::start(tools).await?;
-        let launch = Launch { model: key.model.clone(), effort: key.effort, instructions: key.instructions.clone(), mcp: bridge.config() };
+        let launch = Launch { model: key.model.clone(), effort: key.effort, instructions: appended(key.instructions.as_deref()), mcp: bridge.config() };
         let spawned = launcher.launch(launch, token)?;
         Ok(Live {
             key,
@@ -377,6 +377,25 @@ fn told(new: &[Item], request: &Request<'_>) -> Value {
         }
     }
     json!({ "type": "user", "message": { "role": "user", "content": content }, "parent_tool_use_id": null })
+}
+
+/// What the model is told of its folder. The CLI runs in an empty one of
+/// rein's, so that no project's settings of Claude Code's load, and tells
+/// the model that's its working directory: Claude took the project for
+/// "outside my working folder", and changed a file with a script run
+/// through bash, which showed you no diff and ran no check.
+pub(super) const FOLDER: &str = "Claude Code's working directory above is an empty folder rein starts you in, with \
+    nothing of the user's in it. The user's project is the working folder that <environment> in the first message \
+    names. rein's tools (mcp__rein__*) work in it, with paths relative to it: read, search and change its files with \
+    them, never with scripts or other commands run through bash.";
+
+/// What follows the CLI's own system prompt: [`FOLDER`], then rein's
+/// `instructions`.
+fn appended(instructions: Option<&str>) -> String {
+    match instructions {
+        Some(instructions) if !instructions.trim().is_empty() => format!("{FOLDER}\n\n{instructions}"),
+        _ => FOLDER.to_owned(),
+    }
 }
 
 /// rein's tools as an MCP server lists them: those the model is told of.
@@ -669,6 +688,7 @@ mod tests {
         told: Arc<Mutex<Vec<Value>>>,
         gave: Arc<Mutex<Vec<Value>>>,
         listed: Arc<Mutex<Vec<Vec<String>>>>,
+        appended: Arc<Mutex<Vec<String>>>,
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -684,6 +704,7 @@ mod tests {
         Launcher::Fake(Arc::new(move |launch: Launch| {
             seen.launches.fetch_add(1, Ordering::SeqCst);
             lock(&seen.models).push(launch.model.clone());
+            lock(&seen.appended).push(launch.instructions.clone());
             let rein = &launch.mcp["mcpServers"]["rein"];
             let (url, auth) = (rein["url"].as_str().unwrap().to_owned(), rein["headers"]["Authorization"].as_str().unwrap().to_owned());
             let (ours, theirs) = tokio::io::duplex(1 << 20);
@@ -847,6 +868,23 @@ mod tests {
         let read: Value = serde_json::from_str(&call.arguments).unwrap();
         let wanted = json!({ "path": "a.rs", "start_line": null, "line_count": 20, "ratio": 0.5, "all": true, "note": "", "kept": "", "odd": "x" });
         assert_eq!(read, wanted, "text is left as it is where the tool takes text, or where it says nothing else");
+    }
+
+    /// The CLI runs in an empty folder of rein's and calls it the model's
+    /// working directory: Claude took the project for somewhere else, and
+    /// changed a file through bash. It's told where the project is.
+    #[tokio::test]
+    async fn the_model_is_told_the_project_isnt_the_clis_folder() {
+        let seen = Seen::default();
+        let (sessions, launcher, tools) = (Sessions::default(), fake(vec![vec![Act::Say("Hi."), Act::Done]], &seen), read_tool());
+        let input = vec![Item::User("hello".into())];
+        step(&sessions, &launcher, &request(&input, &tools, false)).await;
+        let started = lock(&seen.appended).clone();
+        assert_eq!(started.len(), 1);
+        assert!(started[0].starts_with(FOLDER), "{started:?}");
+        assert!(FOLDER.contains("<environment>") && FOLDER.contains("never with scripts"));
+        assert_eq!(appended(Some("Be brief.")), format!("{FOLDER}\n\nBe brief."));
+        assert_eq!(appended(None), FOLDER);
     }
 
     #[tokio::test]

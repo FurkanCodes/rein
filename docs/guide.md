@@ -187,7 +187,9 @@ How it runs:
 - The CLI runs in an empty private folder of its own, with
   `--setting-sources user`. Otherwise a project's `.claude/settings.json`
   could send your token to another server or run a command of its choosing.
-  rein doesn't use `--bare`, which reads no sign-in, or `--safe-mode`, which
+  The model is told that folder isn't your project, and that rein's tools
+  work in the project: otherwise Claude sometimes changed files with
+  scripts through `bash`, and you saw no diff. rein doesn't use `--bare`, which reads no sign-in, or `--safe-mode`, which
   turns off every MCP server, rein's tools too.
 - Up to four conversations keep a session each (in `rein serve`, say). A
   quiet CLI times out after five minutes; a call waits as long as rein does.

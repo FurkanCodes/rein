@@ -311,7 +311,11 @@ finding. Each says why in a line.
   one there as an injection, and ignored it. The CLI doesn't hold the
   model to rein's schemas: Claude sent `""` for a line number it meant to
   leave out, and the call failed, so a call is read against its tool's
-  schema as it comes in (`as_schema_says`). `--output-format stream-json
+  schema as it comes in (`as_schema_says`). The CLI runs in an empty
+  folder of rein's, and tells the model that's its working directory:
+  told nothing else, Claude took the project for "outside my working
+  folder" and changed files with scripts through bash in 2 runs of 5, so
+  it's told where the project is (`FOLDER`). `--output-format stream-json
   --verbose` shows what the model did, turn by turn.
 
 - A model gets the tools its own harness trained it on, where rein has
