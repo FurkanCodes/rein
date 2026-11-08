@@ -266,6 +266,9 @@ pub fn ended(output: &str) -> Option<(usize, Ended<'_>)> {
     })
 }
 
+/// What tells Python to print as it goes, to a pipe too.
+const UNBUFFERED: &str = "PYTHONUNBUFFERED";
+
 /// rein's tools. The model names one in each call; [`ToolName::of`] reads
 /// that name once, and everything after works with this, so a misspelt
 /// tool is a compile error, not a call that quietly does nothing.
@@ -1115,6 +1118,12 @@ impl Tools {
             }
         };
         command.current_dir(&self.root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        // Python holds back what it prints to a pipe until there's a lot:
+        // `python3 -m http.server` in the background never showed its
+        // "Serving" line, and the model waited on it for nothing. Yours wins.
+        if std::env::var_os(UNBUFFERED).is_none() {
+            command.env(UNBUFFERED, "1");
+        }
         // A group of its own, so stopping it stops what it started too.
         #[cfg(unix)]
         command.process_group(0);
@@ -1211,6 +1220,11 @@ fn result_of(text: String, exit: background::Exit, how: Run, restored: &[String]
     };
     if !restored.is_empty() {
         note.push_str(&format!("\n[The sandbox here can't keep a command from files that run code later, so rein put them back as they were: {}.]", restored.join(", ")));
+    }
+    // A line of its own: `rtk git commit` prints `ok` with no newline, and
+    // `ok[exit code 0]` read as a command that never said how it ended.
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
     }
     text.push_str(&exit.line());
     text + &note
@@ -1559,13 +1573,35 @@ mod tests {
         assert!(!running("sleep 42.23"), "the sleeps were left running");
     }
 
+    /// `rtk git commit` prints `ok` and no newline: the step read
+    /// `ok[exit code 0]` as no exit code, and showed a commit that worked
+    /// as failed.
+    #[tokio::test]
+    async fn how_a_command_ended_is_a_line_of_its_own_after_output_with_no_newline() {
+        let tools = Tools::new(project("no-newline", &[]));
+        let output = run(&tools, &bash_call("printf ok", None)).await;
+        assert_eq!(output, "ok\n[exit code 0]");
+        assert!(matches!(ended(&output), Some((1, Ended::Code("0")))), "{output}");
+    }
+
+    /// A Python server in the background never showed its ready line: it
+    /// held back what it printed to rein's pipe.
+    #[tokio::test]
+    async fn python_prints_as_it_goes() {
+        if std::env::var_os(UNBUFFERED).is_some() {
+            return;
+        }
+        let tools = Tools::new(project("unbuffered", &[]));
+        assert_eq!(run(&tools, &bash_call("echo $PYTHONUNBUFFERED", None)).await, "1\n[exit code 0]");
+    }
+
     #[tokio::test]
     async fn a_flood_of_output_isnt_all_kept() {
         let tools = Tools::new(project("flood", &[]));
         let output = run(&tools, &bash_call("head -c 20000000 /dev/zero | tr '\\0' x", None)).await;
         assert!(output.len() < 100_000, "{} bytes kept", output.len());
         assert!(output.contains("bytes in between not shown"), "{}", &output[output.len().saturating_sub(200)..]);
-        assert!(output.ends_with("x[exit code 0]"), "its end, with how it went, is kept: {}", &output[output.len().saturating_sub(200)..]);
+        assert!(output.ends_with("x\n[exit code 0]"), "its end, with how it went, is kept: {}", &output[output.len().saturating_sub(200)..]);
     }
 
     /// A fresh directory for one test, with `files` written into it.

@@ -4043,7 +4043,7 @@ fn your_claude_code_hooks_run_in_rein_as_they_are() {
     let text = term.text();
     assert!(text.contains("↳ printf added about 6 tokens"), "{text}");
     assert!(text.contains("printf rewritten") && text.contains("↳ echo rewrote it, from: printf original"), "{text}");
-    assert_eq!(results(&model), ["rewritten[exit code 0]"], "what ran is the hook's");
+    assert_eq!(results(&model), ["rewritten\n[exit code 0]"], "what ran is the hook's");
     let first = model.requests()[0]["input"].to_string();
     assert!(first.contains("[The user's hook printf, in its own words, not the user's:\\nthe code you asked about]"), "{first}");
     term.wait_for(IDLE);
@@ -4055,7 +4055,7 @@ fn your_claude_code_hooks_run_in_rein_as_they_are() {
     term.wait_for(IDLE);
     term.keys("again\r");
     term.wait_for("Ran it again.");
-    assert_eq!(results(&model), ["rewritten[exit code 0]", "original[exit code 0]"], "off: the model's own runs");
+    assert_eq!(results(&model), ["rewritten\n[exit code 0]", "original\n[exit code 0]"], "off: the model's own runs");
 }
 
 /// Your hooks run as you'd run them, in every mode: read-only walls in

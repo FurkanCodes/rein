@@ -3529,7 +3529,7 @@ mod tests {
         );
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("go".into(), &mut person).await.unwrap();
-        assert_eq!(result_of(&agent, "b1"), "done[exit code 0]\n[The user's hook cat, in its own words, not the user's:\nformatted 2 files]");
+        assert_eq!(result_of(&agent, "b1"), "done\n[exit code 0]\n[The user's hook cat, in its own words, not the user's:\nformatted 2 files]");
         assert!(!root_of("hook-after").join("failed.txt").exists(), "it didn't fail");
     }
 

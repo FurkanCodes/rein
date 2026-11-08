@@ -476,6 +476,9 @@ your next message.
   Ctrl-B on, and one that ends but leaves something running (`npm run dev
   &`). Otherwise that server holds the output open, and the turn waits until
   the timeout kills it.
+- **Ready lines show.** Commands run with `PYTHONUNBUFFERED=1` unless you
+  set it yourself: Python holds back what it prints to a pipe, and
+  `python3 -m http.server` never showed its "Serving" line to wait on.
 - **What you see.** A line under the box for each (`▸ b1 npm run dev · 2m 03s
   · ready on :3000`); Ctrl-O shows what each printed; `/tasks` stops one.
 - **Limits.** At most 8 run at once. A ninth is refused with the list, so
