@@ -320,8 +320,9 @@ impl Served {
         answer.await.map_or(Approval::Stop, |result| approval(result.as_ref()))
     }
 
-    /// What the model asked for with `spawn`: you're asked, then the client
-    /// starts a `rein serve` for it, which claims the task. What the model
+    /// What the model asked for with `spawn`: you're asked, in a mode that
+    /// asks, then the client starts a `rein serve` for it, which claims the
+    /// task. What the model
     /// is told of how that went.
     async fn spawn(&mut self, call: &ToolCall) -> String {
         match serde_json::from_str(&call.arguments) {
@@ -336,14 +337,15 @@ impl Served {
     }
 
     /// Has the client start a sub-agent, asking you first about what `call`
-    /// asked for.
+    /// asked for, if the mode asks
+    /// ([`rein_agent::permissions::Mode::asks_to_start_sub_agents`]).
     async fn start_sub_agent(&mut self, args: SpawnArgs, call: Option<&ToolCall>) -> String {
         let Some(node) = &self.terminal.peers else { return format!("{ERROR}this rein isn't among the others, so it can't start sub-agents") };
         let child = match Child::wanted(&args, &self.terminal.spec, node).await {
             Ok(child) => child,
             Err(e) => return format!("{ERROR}{e}"),
         };
-        if let Some(call) = call.filter(|_| !self.terminal.spawn_always) {
+        if let Some(call) = call.filter(|_| self.terminal.mode.asks_to_start_sub_agents() && !self.terminal.spawn_always) {
             let asked = Asked::of(call, None, self.terminal.sandboxing);
             match self.asked(call, &asked).await {
                 Approval::Yes => {}

@@ -1170,9 +1170,11 @@ it handed out always go in.
 
 ### Sub-agents
 
-When the model wants help, its `spawn` tool starts a sub-agent. rein asks
-first, then opens a new tab named for its role (`tests`, `docs`) and starts
-a rein there that's already working. `/spawn tests run the suite` starts
+When the model wants help, its `spawn` tool starts a sub-agent. In `ask`,
+`edits` and `read-only`, rein asks first; in `trust` and `auto` it doesn't,
+since the sub-agent runs in the same mode and sandbox, and can do nothing a
+command couldn't. Then it opens a new tab named for its role (`tests`,
+`docs`) and starts a rein there that's already working. `/spawn tests run the suite` starts
 one directly, without asking. It shows in your strip as `↳ tests`; watch it,
 type into it, answer what it asks, or stop it.
 
@@ -1370,6 +1372,8 @@ another `rein serve`.
   before it answers: what you typed, the model's answers and its steps, and
   what other reins said as `heard` (see below). What rein added for the model
   isn't shown. It needs a `rein serve` that holds no conversation yet.
+  The GUI's saved conversations list shows dates in your computer's local
+  timezone, not UTC.
 
 ### Agents side by side
 
@@ -1380,7 +1384,8 @@ then does this rein join the others, as a rein in a tab does: it gets the
 can start turns. A client that doesn't say so, like Zed, gets none of this.
 
 - **Starting a sub-agent.** When the model calls `spawn`, rein asks with
-  `session/request_permission`, then sends the request
+  `session/request_permission` in a mode that asks (as in the terminal:
+  not `trust` or `auto`), then sends the request
   `_io.github.furkancodes/open_pane` with `name`, `model`, `command`, `args`,
   `cwd` and `env`. Run `command` with `args` in `cwd`, with no shell between
   them and `env` (a list of `name` and `value`) added to its environment, and

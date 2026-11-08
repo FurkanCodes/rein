@@ -100,6 +100,19 @@ impl Mode {
             Mode::Trust => "trust",
         }
     }
+
+    /// Whether a sub-agent the model starts waits for your yes. It runs in
+    /// this mode and these walls, so it can do nothing this rein couldn't
+    /// with one command: trust and auto, which run commands without
+    /// asking, start it without asking too. Asked in every mode, trust
+    /// stopped for a yes that guarded nothing, and auto, which never
+    /// asks, would have waited for good.
+    pub const fn asks_to_start_sub_agents(self) -> bool {
+        match self {
+            Mode::Trust | Mode::Auto => false,
+            Mode::Ask | Mode::Edits | Mode::ReadOnly => true,
+        }
+    }
 }
 
 impl std::str::FromStr for Mode {
@@ -1191,6 +1204,12 @@ mod tests {
         let again = Rule::parse(&p.rules()[0].to_string(), Whose::Yours).unwrap();
         assert!(again.says_the_same(&p.rules()[0]));
         assert_eq!(p.set_yours("ask rm\npermit x").unwrap_err(), "line 2: start with allow, ask or deny");
+    }
+
+    #[test]
+    fn only_the_modes_that_ask_about_commands_ask_before_a_sub_agent() {
+        let asking: Vec<Mode> = Mode::ALL.into_iter().filter(|mode| mode.asks_to_start_sub_agents()).collect();
+        assert_eq!(asking, [Mode::Ask, Mode::Edits, Mode::ReadOnly], "trust and auto run commands unasked, and a sub-agent is held to the same mode");
     }
 
     #[test]

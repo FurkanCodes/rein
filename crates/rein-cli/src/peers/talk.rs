@@ -166,8 +166,9 @@ async fn work_on(incoming: Incoming, agent: &mut Agent<Llm>, terminal: &mut Term
     outcome.map(|_| ())
 }
 
-/// What the model asked for with `spawn`: you're asked, then a new tab
-/// opens with a rein in it, named for its role, which claims the task.
+/// What the model asked for with `spawn`: you're asked, in a mode that
+/// asks ([`Mode::asks_to_start_sub_agents`]), then a new tab opens with a
+/// rein in it, named for its role, which claims the task.
 /// What the model is told of how that went.
 pub(crate) async fn spawn(call: &rein_llm::ToolCall, terminal: &mut Terminal) -> String {
     let error = rein_agent::tools::ERROR;
@@ -198,8 +199,8 @@ pub(crate) fn carried() -> Vec<(String, String)> {
     CARRIED.iter().filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_owned(), value))).collect()
 }
 
-/// Starts the sub-agent `args` asks for, asking you first if `ask`: what
-/// the model is told of how it went.
+/// Starts the sub-agent `args` asks for, asking you first if `ask` and the
+/// mode asks: what the model is told of how it went.
 async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &mut Terminal) -> String {
     let error = rein_agent::tools::ERROR;
     let Some(node) = &terminal.peers else { return format!("{error}this rein isn't among the others, so it can't start sub-agents") };
@@ -208,7 +209,7 @@ async fn start_child(args: rein_agent::peers::SpawnArgs, ask: bool, terminal: &m
         Err(e) => return format!("{error}{e}"),
     };
     let (name, model) = (child.name.clone(), child.model.clone());
-    if ask && !terminal.spawn_always {
+    if ask && terminal.mode.asks_to_start_sub_agents() && !terminal.spawn_always {
         match ask_to_spawn(&name, &model, &args.task, args.edits, terminal).await {
             Some(true) => {}
             Some(false) => terminal.spawn_always = true,

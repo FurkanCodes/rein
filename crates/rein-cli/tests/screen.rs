@@ -3364,6 +3364,24 @@ fn a_sub_agent_starts_in_a_new_tab_works_where_you_see_it_and_reports_back() {
 }
 
 #[test]
+fn in_trust_a_sub_agent_the_model_starts_opens_without_asking() {
+    let (base, project, home) = tabs("spawn-trust");
+    let opened = base.join("opened");
+    let spawn = calls("spawn", json!({ "role": "tests", "task": "run the test suite", "model": null, "edits": false }));
+    let parent_model = Model::start(vec![spawn, says("Started tests."), says("tests is gone.")]).with_env("REIN_TAB_COMMAND", &format!("echo {{command}} >> {}", opened.display()));
+    let mut web = Term::spawn_in(&parent_model, base.clone(), &project, &home, 30, 100, &["--name", "web", "--mode", "trust"]);
+    web.wait_for(IDLE);
+    web.keys("get the tests run\r");
+    web.wait_for("sub-agent tests started in a new tab");
+    web.wait_for("Started tests.");
+    assert!(!web.text().contains("Start a sub-agent in a new tab?"), "trust runs any command unasked, and this is no more than one");
+    let script = std::fs::read_to_string(std::fs::read_to_string(&opened).unwrap().trim().strip_prefix("/bin/sh ").unwrap()).unwrap();
+    let args = child_args(&script);
+    let mode = args.iter().position(|arg| arg == "--mode").map(|at| args[at + 1].as_str());
+    assert_eq!(mode, Some("trust"), "it's held to this rein's mode, which is why nothing asks: {args:?}");
+}
+
+#[test]
 fn a_sub_agent_you_say_no_to_never_opens() {
     let (base, project, home) = tabs("decline");
     let opened = base.join("opened");
@@ -4892,6 +4910,15 @@ const YES: &str = "_io.github.furkancodes/yes";
 
 impl Client {
     fn start(model: &Model, name: &str) -> Client {
+        Client::start_with(model, name, &[])
+    }
+
+    /// The same, in `mode` rather than the `ask` the others start in.
+    fn start_in(model: &Model, name: &str, mode: &str) -> Client {
+        Client::start_with(model, name, &["--mode", mode])
+    }
+
+    fn start_with(model: &Model, name: &str, flags: &[&str]) -> Client {
         let dir = std::env::temp_dir().join(format!("rs-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("project")).unwrap();
@@ -4899,7 +4926,8 @@ impl Client {
         for (file, text) in &model.home {
             std::fs::write(dir.join("home").join(file), text).unwrap();
         }
-        Client::run(model, env!("CARGO_BIN_EXE_rein"), &["serve".to_owned()], dir, false)
+        let args: Vec<String> = std::iter::once("serve").chain(flags.iter().copied()).map(str::to_owned).collect();
+        Client::run(model, env!("CARGO_BIN_EXE_rein"), &args, dir, false)
     }
 
     /// What a client does when `rein` asks for a pane in `asked`: starts
@@ -6760,4 +6788,20 @@ fn a_program_changes_the_mode_between_turns() {
     let turn = rein.prompt(&session, "make it");
     assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
     assert!(rein.project().join("free.txt").exists() && !rein.seen.iter().any(|message| message["method"] == "session/request_permission"), "nothing asked");
+}
+
+#[test]
+fn in_trust_rein_serve_opens_a_sub_agents_pane_without_asking() {
+    let spawn = calls("spawn", json!({ "role": "tests", "task": "run the test suite", "model": null, "edits": false }));
+    let model = Model::start(vec![spawn, says("It didn't start.")]);
+    let mut rein = Client::start_in(&model, "pane-trust", "trust");
+    let session = rein.open_panes();
+    let turn = rein.prompt(&session, "get the tests run");
+    let asked = rein.asked(OPEN_PANE);
+    assert!(!rein.seen.iter().any(|message| message["method"] == "session/request_permission"), "trust asks nothing first");
+    let args = asked["params"]["args"].as_array().unwrap();
+    let mode = args.iter().position(|arg| arg == "--mode").map(|at| &args[at + 1]);
+    assert_eq!(mode, Some(&json!("trust")), "it's held to this rein's mode: {args:?}");
+    rein.reply(&asked, &json!({}));
+    assert_eq!(rein.answer(turn)["result"]["stopReason"], "end_turn");
 }
