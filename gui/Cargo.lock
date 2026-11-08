@@ -5700,6 +5700,7 @@ dependencies = [
 name = "rein-transcript"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "serde_json",
  "unicode-width",
 ]

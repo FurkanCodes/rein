@@ -36,9 +36,10 @@ impl Saved {
         folder_name(&self.cwd)
     }
 
-    /// Its day, from the agent's stamp.
-    pub fn day(&self) -> Option<&str> {
-        self.updated.as_deref().and_then(|stamp| stamp.get(..10))
+    /// Its calendar day in the computer's local timezone.
+    pub fn day(&self) -> Option<String> {
+        let at = chrono::DateTime::parse_from_rfc3339(self.updated.as_deref()?).ok()?;
+        Some(at.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
     }
 
     /// How long ago it was last used, at `now` (seconds since 1970), from
@@ -92,9 +93,42 @@ mod tests {
         assert_eq!(saved.iter().map(|saved| saved.id.as_str()).collect::<Vec<_>>(), ["abc", "no-title"]);
         assert_eq!(saved[0].title.as_deref(), Some("fix the tests"));
         assert_eq!(saved[0].folder(), "rein");
-        assert_eq!(saved[0].day(), Some("2026-11-07"));
+        assert!(saved[0].day().is_some());
         assert_eq!((saved[1].title.as_deref(), saved[1].day()), (None, None));
         assert!(Saved::listed(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_saved_day_is_local_on_both_sides_of_midnight() {
+        const CHILD: &str = "REIN_TEST_SAVED_DAY_ZONE";
+        if let Ok(zone) = std::env::var(CHILD) {
+            let cases = match zone.as_str() {
+                "UTC-3" => [("2026-12-31T22:30:00Z", "2027-01-01"), ("2026-11-07T00:30:00Z", "2026-11-07")],
+                "EST5EDT,M3.2.0,M11.1.0" => [("2026-11-08T02:30:00Z", "2026-11-07"), ("2026-07-08T04:30:00Z", "2026-07-08")],
+                "UTC0" => [("2026-11-07T22:30:00Z", "2026-11-07"), ("2026-11-08T00:30:00Z", "2026-11-08")],
+                _ => panic!("unexpected test timezone: {zone}"),
+            };
+            for (stamp, expected) in cases {
+                let saved = Saved { id: String::new(), cwd: String::new(), title: None, updated: Some(stamp.to_owned()) };
+                assert_eq!(saved.day().as_deref(), Some(expected), "{stamp} in {zone}");
+            }
+            for stamp in ["yesterday", "2026-02-31T10:00:00Z", "2026-11-07"] {
+                let saved = Saved { id: String::new(), cwd: String::new(), title: None, updated: Some(stamp.to_owned()) };
+                assert_eq!(saved.day(), None, "invalid stamp: {stamp}");
+            }
+            return;
+        }
+        // Each child starts with its own timezone: no mutation of this
+        // process's environment while the other tests run.
+        for zone in ["UTC-3", "EST5EDT,M3.2.0,M11.1.0", "UTC0"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "saved::tests::a_saved_day_is_local_on_both_sides_of_midnight", "--nocapture"])
+                .env("TZ", zone)
+                .env(CHILD, zone)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{zone}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
     }
 
     #[test]
