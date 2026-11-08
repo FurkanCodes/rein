@@ -108,6 +108,14 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             (if tool == ToolName::Message { "Message" } else { "Delegate" }, format!("{}: {first}{more}", args["to"].as_str().unwrap_or_default()))
         }
         Some(ToolName::Peers) => ("Peers", "the other reins".to_owned()),
+        Some(ToolName::Page) => {
+            let name = args["name"].as_str().unwrap_or_default();
+            match args["action"].as_str() {
+                Some("edit") => ("Page", format!("edit {name}")),
+                Some("read") => ("Page", format!("read {name}")),
+                _ => ("Page", name.to_owned()),
+            }
+        }
         // What's saved is said whole, as it's what later conversations get.
         Some(ToolName::Memory) => {
             let name = args["name"].as_str().unwrap_or_default();
@@ -172,6 +180,7 @@ pub fn doing(call: &ToolCall) -> String {
         "Sub-agent" => "Starting sub-agent",
         "Peers" => return "Looking at the other reins".to_owned(),
         "Memory" => return format!("Memory: {target}"),
+        "Page" => "Making the page",
         _ => "Using",
     };
     format!("{verb} {target}")
@@ -419,6 +428,17 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
                 _ => "read",
             };
             plain(Some(true), style.dim(said))
+        }
+        // Where to see it, under its line: `Made the page p.`, then the link.
+        Some(ToolName::Page) => {
+            let mut lines = output.lines();
+            let said = match lines.next().and_then(|first| first.split_whitespace().next()) {
+                Some("Made") => "made",
+                Some("Saved") => "saved",
+                _ => return plain(Some(true), style.dim("read")),
+            };
+            let details = lines.next().map(|link| vec![style.dim(link)]).unwrap_or_default();
+            Outcome { details, ..plain(Some(true), style.dim(said)) }
         }
         // `A line matched: ready on 3000`, `b1 (npm run dev) is still running.`
         Some(ToolName::Background) => {

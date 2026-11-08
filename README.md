@@ -73,6 +73,8 @@ set up each one.
 - [Hooks](docs/guide.md#hooks): Claude Code's hooks, as you wrote them.
 - [Memory](docs/guide.md#memory): notes kept across conversations, in
   Claude Code's format, and you see every save.
+- [Pages](docs/guide.md#pages): reports, diagrams and charts the model
+  makes open in your browser, and reload there as it changes them.
 - [Checks after edits](docs/guide.md#checks-after-edits): rein runs the
   project's own check (`cargo check`, `tsc`, `go vet`, pyright, mypy) and
   tells the model only about the errors it just introduced.

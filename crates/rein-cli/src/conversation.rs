@@ -169,6 +169,13 @@ pub(crate) async fn open(http: &rein_llm::reqwest::Client, args: AskArgs, compac
         Some(memory) => tools.with_memory(memory.clone()),
         None => tools,
     };
+    // Pages for your browser, kept by project beside the conversations:
+    // without a token nobody can guess, there are none.
+    terminal.pages = rein_agent::pages::Pages::for_project(&dir, &root).ok();
+    let tools = match &terminal.pages {
+        Some(pages) => tools.with_pages(pages.clone()),
+        None => tools,
+    };
     let setup = Setup {
         folder,
         personal: dir.join("AGENTS.md"),

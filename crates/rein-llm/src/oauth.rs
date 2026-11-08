@@ -25,7 +25,7 @@ pub(crate) fn new_uuid() -> Result<String> {
 }
 
 /// 32 random bytes as base64url: 43 characters, valid as a PKCE verifier.
-pub(crate) fn random_token() -> Result<String> {
+pub fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
     fill_random(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))

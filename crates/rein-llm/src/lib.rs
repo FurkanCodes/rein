@@ -26,6 +26,8 @@ pub mod store;
 
 pub use client::{Auth, Client, Compression, ResponseStream, Traffic};
 pub use meter::{Meter, Reading, Standing};
+/// 32 random bytes as base64url, for a token nobody can guess.
+pub use oauth::random_token;
 pub use reqwest;
 pub use serde_json;
 

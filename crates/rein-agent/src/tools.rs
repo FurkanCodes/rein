@@ -41,6 +41,9 @@ pub struct Tools {
     /// The notes that outlast a conversation, for the project; `None` with
     /// memory off.
     memory: Option<crate::memory::Memory>,
+    /// The pages the model makes for your browser; `None` where there's
+    /// no one to show them.
+    pages: Option<crate::pages::Pages>,
     /// The images each call gave, by its ID, until the agent takes them
     /// into the conversation after its result.
     pictures: std::sync::Mutex<std::collections::HashMap<String, Vec<rein_llm::Image>>>,
@@ -299,10 +302,12 @@ pub enum ToolName {
     /// Reading what a background command prints, or stopping it: see
     /// [`crate::background`].
     Background,
+    /// A page for your browser: see [`crate::pages`].
+    Page,
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 18] = [
+    pub const ALL: [ToolName; 19] = [
         Self::Read,
         Self::Grep,
         Self::Glob,
@@ -321,6 +326,7 @@ impl ToolName {
         Self::Spawn,
         Self::Memory,
         Self::Background,
+        Self::Page,
     ];
 
     /// The name the model knows it by.
@@ -344,6 +350,7 @@ impl ToolName {
             Self::Spawn => "spawn",
             Self::Memory => "memory",
             Self::Background => "background",
+            Self::Page => "page",
         }
     }
 
@@ -400,6 +407,7 @@ impl Tools {
             images: std::env::temp_dir().join(format!("rein-images-{}", std::process::id())),
             pictures: Default::default(),
             memory: None,
+            pages: None,
             jobs: Jobs::new(),
         }
     }
@@ -414,6 +422,12 @@ impl Tools {
     /// Keeps notes across conversations in `memory`, with the tool to.
     pub fn with_memory(mut self, memory: crate::memory::Memory) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Makes pages for your browser in `pages`, with the tool to.
+    pub fn with_pages(mut self, pages: crate::pages::Pages) -> Self {
+        self.pages = Some(pages);
         self
     }
 
@@ -753,6 +767,9 @@ impl Tools {
         if self.memory.is_some() {
             specs.push(crate::memory::spec());
         }
+        if self.pages.is_some() {
+            specs.push(crate::pages::spec());
+        }
         specs
     }
 
@@ -777,6 +794,10 @@ impl Tools {
             }),
             Some(ToolName::Memory) => match &self.memory {
                 Some(memory) => memory.run(&call.arguments, &crate::memory::today(), &|text| self.secrets.hide(text)),
+                None => Err(format!("there is no tool called {}", call.name)),
+            },
+            Some(ToolName::Page) => match &self.pages {
+                Some(pages) => pages.run(&call.arguments, &|text| self.secrets.hide(text)).await,
                 None => Err(format!("there is no tool called {}", call.name)),
             },
             // `recall` is the agent's own: it searches the conversation. The

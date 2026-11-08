@@ -154,6 +154,10 @@ pub(crate) struct Terminal {
     pub(crate) spec: String,
     /// The `tab_command` setting: how to open a tab here, if rein doesn't know.
     pub(crate) tab_command: Option<String>,
+    /// The pages the model makes, which open in your browser.
+    pub(crate) pages: Option<rein_agent::pages::Pages>,
+    /// Pages being opened in the browser: they stop with rein.
+    opening: tokio::task::JoinSet<bool>,
 }
 
 impl Drop for Terminal {
@@ -343,6 +347,8 @@ impl Terminal {
             said_tabs: false,
             spec: String::new(),
             tab_command: None,
+            pages: None,
+            opening: tokio::task::JoinSet::new(),
         }
     }
 
@@ -442,6 +448,18 @@ impl Terminal {
         if ToolName::of(call).is_some_and(ToolName::changes_files) && outcome.ok == Some(true) {
             self.changed_file(call);
         }
+        if ToolName::of(call) == Some(ToolName::Page) && outcome.ok == Some(true) {
+            self.open_page(call);
+        }
+    }
+
+    /// Opens the page a step saved in the browser, unless it's showing
+    /// there already: then it has reloaded itself.
+    fn open_page(&mut self, call: &ToolCall) {
+        let Some(name) = rein_agent::pages::Pages::saved_by(&call.arguments) else { return };
+        let Some(link) = self.pages.as_ref().and_then(|pages| pages.to_open(&name)) else { return };
+        while self.opening.try_join_next().is_some() {}
+        self.opening.spawn(async move { crate::browser::open(&link).await });
     }
 
     /// What a request used, which the others see.

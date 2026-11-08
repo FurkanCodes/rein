@@ -14,6 +14,7 @@ pub mod hooks;
 pub mod image;
 pub mod memory;
 pub mod mentions;
+pub mod pages;
 pub mod patch;
 pub mod peers;
 pub mod permissions;

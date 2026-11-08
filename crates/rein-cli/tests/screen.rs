@@ -659,11 +659,12 @@ impl Term {
             // one that wants rein's own defaults sets them empty.
             .env("REIN_MODE", "ask")
             .env("REIN_SANDBOX", "on")
+            // Links are shown, never opened in this computer's browser,
+            // unless a test gives one of its own.
+            .env("BROWSER", "false")
             .envs(model.env.iter().map(|(name, value)| (name, value)))
             // Copies go to the terminal (OSC 52), never this computer's clipboard.
             .env("SSH_CONNECTION", "screen-test")
-            // Links are shown, never opened in this computer's browser.
-            .env("BROWSER", "false")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -4227,6 +4228,75 @@ fn a_note_saved_is_seen_and_the_next_conversation_starts_with_it() {
     term.keys("y");
     term.wait_for("✓ rtk-hides-failures is forgotten");
     assert!(!folder.join("rtk-hides-failures.md").exists());
+}
+
+/// A page the model makes asks nothing, opens in the browser once, and
+/// reloads there when it's saved again, with no second tab.
+#[test]
+fn a_page_opens_in_the_browser_once_and_reloads_when_saved_again() {
+    use std::io::BufRead;
+    let dir = std::env::temp_dir().join(format!("rein-page-browser-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A browser that notes each link it's given, written by another process.
+    let browser = dir.join("browser");
+    let made = Command::new("sh").arg("-c").arg(r#"printf '#!/bin/sh\necho "$1" >> "$0.log"\n' > "$1" && chmod +x "$1""#).arg("sh").arg(&browser).status().unwrap();
+    assert!(made.success());
+    let save =
+        json!({ "action": "save", "name": "build-times", "html": "<!doctype html><title>Build times</title><body><h1>Builds</h1></body>", "old_text": null, "new_text": null });
+    let edit = json!({ "action": "edit", "name": "build-times", "html": null, "old_text": "<h1>Builds</h1>", "new_text": "<h1>Faster builds</h1>" });
+    let model = Model::start(vec![calls("page", save), says("Made it."), calls("page", edit), says("Changed.")]).with_env("BROWSER", browser.to_str().unwrap());
+    let mut term = Term::start(&model, "page", 30, 140);
+    term.wait_for(IDLE);
+    term.keys("show me the build times\r");
+    term.wait_for("Made it.");
+    assert!(model.requests()[0]["tools"].to_string().contains(r#""name":"page""#), "the model has the tool");
+    let log = browser.with_file_name("browser.log");
+    let opened = wait_for_file(&log);
+    let link = opened.trim();
+    assert!(link.starts_with("http://127.0.0.1:") && link.ends_with("/build-times.html"), "{opened}");
+    let text = term.text();
+    assert!(text.contains("Page   build-times  made") && text.contains(link), "the step, and where to see it:\n{text}");
+    assert!(!text.contains("Allow"), "making a page asks nothing, even in ask mode:\n{text}");
+
+    let (port, path) = link.trim_start_matches("http://127.0.0.1:").split_once('/').unwrap();
+    let mut page = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+    write!(page, "GET /{path} HTTP/1.1\r\n\r\n").unwrap();
+    let mut served = String::new();
+    page.read_to_string(&mut served).unwrap();
+    assert!(served.starts_with("HTTP/1.1 200") && served.contains("<h1>Builds</h1><script>"), "{served}");
+    // The page's tab, open: it hears of the next save.
+    let mut tab = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+    write!(tab, "GET /{} HTTP/1.1\r\n\r\n", path.replace(".html", ".events")).unwrap();
+    tab.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut tab = std::io::BufReader::new(tab);
+    let mut line = String::new();
+    while line != "\r\n" {
+        line.clear();
+        tab.read_line(&mut line).unwrap();
+    }
+
+    term.wait_for(IDLE);
+    term.keys("make the heading say faster\r");
+    term.wait_for("Changed.");
+    line.clear();
+    tab.read_line(&mut line).unwrap();
+    assert_eq!(line, "event: saved\n", "the open page reloads");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1, "no second tab for a page that's open");
+    assert!(term.text().contains("Page   edit build-times  saved"), "{}", term.text());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What `path` holds, once something's in it.
+fn wait_for_file(path: &std::path::Path) -> String {
+    let start = Instant::now();
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(text) if !text.is_empty() => return text,
+            _ if start.elapsed() > Duration::from_secs(20) => panic!("nothing in {}", path.display()),
+            _ => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 /// Claude Code's notes for the project carry over: the conversation starts

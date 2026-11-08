@@ -20,11 +20,12 @@ short version.
 13. [Skills](#skills)
 14. [Hooks](#hooks)
 15. [Memory](#memory)
-16. [MCP servers](#mcp-servers)
-17. [Reins in other tabs](#reins-in-other-tabs), and [sub-agents](#sub-agents)
-18. [What's left of your limits](#whats-left-of-your-limits)
-19. [Settings](#settings)
-20. [For contributors](#for-contributors): layout and tests
+16. [Pages](#pages)
+17. [MCP servers](#mcp-servers)
+18. [Reins in other tabs](#reins-in-other-tabs), and [sub-agents](#sub-agents)
+19. [What's left of your limits](#whats-left-of-your-limits)
+20. [Settings](#settings)
+21. [For contributors](#for-contributors): layout and tests
 
 ---
 
@@ -1001,6 +1002,47 @@ history or what the project's instructions say.
 
 `/memory` lists both, so you can read one or forget one of rein's. `memory =
 off` turns memory off.
+
+## Pages
+
+When something is clearer seen than read in a terminal (a report, a
+diagram, a chart, a comparison, a small tool), the model makes a page for
+it with its `page` tool, as Claude makes artifacts. Ask for "a page" and
+you get one. It opens in your browser, and the step shows where:
+
+```text
+● Page   build-times  made
+  └ http://127.0.0.1:52811/Jx3…/build-times.html
+```
+
+Saved again, or edited a piece at a time, the page reloads itself where
+it's open, keeping where you'd scrolled to. A page that's open isn't opened
+a second time. Making one asks nothing in any mode, since it's written to
+rein's folder, never the project.
+
+- **One file, kept.** Each page is a single HTML file with its styles and
+  scripts inside, in `~/.config/rein/pages/<project>/`, so pages from
+  earlier conversations are still there. The model can read one back and
+  change it. The keys rein knows are taken out before it's written.
+- **Served on this computer only.** rein serves pages on 127.0.0.1, on a
+  port of its own, under a random token in the address, from the first
+  page made until rein exits. Another user of this computer, or a web page
+  guessing ports, finds nothing. The bare address with the token lists the
+  project's pages.
+- **What a page may load.** Scripts come only from cdnjs, jsDelivr and
+  unpkg, fonts only from Google Fonts, and images from anywhere. A page
+  can't fetch from other servers, so the model puts its data in it, and it
+  sends no `Referer`, which would carry the token along. The model is
+  asked for light and dark colours, a layout that works at phone width,
+  and versions pinned exactly.
+- **Skills written for Claude's artifacts work.** Claude's Artifact tool
+  is a claude.ai service, offered neither through `claude -p` nor the API.
+  A skill that says to publish with it (Anthropic's `project-artifact`,
+  say) gets a page instead, and the model tells you the page is on your
+  computer, not on claude.ai.
+- **Not opened** when `$BROWSER` is `false`, or there's no browser to
+  open: the link is under the step. `rein serve` opens it too, and sends
+  the link to the client with the step's result.
 
 ## MCP servers
 

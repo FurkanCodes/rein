@@ -475,9 +475,10 @@ impl Permissions {
             // `read`, `grep` and `glob` can only look, and only inside the
             // project; `plan` only writes a checklist on screen; `memory`
             // writes notes in rein's own folder, never the project, and each
-            // save is a step you see; `background` reads or stops what was
+            // save is a step you see; `page` writes a page in rein's folder
+            // too, for your browser; `background` reads or stops what was
             // already allowed to run.
-            Some(tool) if tool.only_looks() || matches!(tool, ToolName::Plan | ToolName::Memory | ToolName::Background) => Decision::Allow,
+            Some(tool) if tool.only_looks() || matches!(tool, ToolName::Plan | ToolName::Memory | ToolName::Page | ToolName::Background) => Decision::Allow,
             Some(ToolName::ApplyPatch) => self.decide_patch(call),
             Some(tool) if tool.changes_files() => self.decide_change(call),
             // What doesn't read as a command doesn't run as one either.
