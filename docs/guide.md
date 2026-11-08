@@ -159,22 +159,39 @@ aren't loaded.
 
 How it runs:
 
-- rein runs `claude -p`, never sends the token through its own HTTP
-  provider, and strips inherited API keys, endpoint overrides and
-  alternate-provider switches from the CLI's environment.
-- The token reaches the CLI through a pipe instead of its environment, where
-  other programs could read it.
-- Each run happens in its own empty private folder, with
+- **As Claude Code runs it.** A conversation is one session of the CLI's,
+  kept going: the model keeps what it said, called and thought, the prompt
+  cache keeps working, and each step sends only what's new. Text and
+  thinking appear as they're written. The CLI's own system prompt stays,
+  with rein's after it, and so does your `~/.claude/CLAUDE.md`.
+- **rein's tools are the model's tools.** rein serves them to the CLI as an
+  MCP server on this computer (127.0.0.1, behind a token only the CLI gets),
+  and the model calls them as it calls any tool of its own, several at once
+  where it likes. Each call waits there until rein has run it, through
+  rein's approvals, sandbox and `/undo`, then hands back what it gave. A
+  tool the search finds is added to the list at once. The CLI's built-in
+  tools are off, and so are its hooks, which rein runs itself.
+- **A message you send mid-task is yours**, sent as a message of the user's
+  once the step's calls are answered, never inside what a tool gave: the
+  model takes words in a tool's result for the tool's.
+- **A new session starts** when the model, its effort or rein's instructions
+  change, after a compaction or `/resume`, or after Esc stopped the model
+  midway (Esc during a command keeps the session). It's told the
+  conversation so far in one message.
+- rein never sends the token through its own HTTP provider, and strips
+  inherited API keys, endpoint overrides and alternate-provider switches
+  from the CLI's environment. The token reaches the CLI through a pipe
+  instead of its environment, where other programs could read it.
+- The CLI runs in an empty private folder of its own, with
   `--setting-sources user`. Otherwise a project's `.claude/settings.json`
   could send your token to another server or run a command of its choosing.
-  rein doesn't use `--bare`. It needs a recent CLI, with `--safe-mode` and
-  `--json-schema`.
-- The CLI's customizations, MCP servers and built-in tools are off.
-  Structured answers ask for rein's tools, which still go through rein's
-  approvals and sandbox.
-- Each step starts a fresh CLI with the conversation, so text appears when
-  the step is done, not word by word. Output is capped at 16 MiB per pipe.
-  A quiet CLI times out after five minutes, and a step after ten.
+  rein doesn't use `--bare`, which reads no sign-in, or `--safe-mode`, which
+  turns off every MCP server, rein's tools too.
+- Up to four conversations keep a session each (in `rein serve`, say). A
+  quiet CLI times out after five minutes; a call waits as long as rein does.
+
+What a Claude plan gets in Claude Code's own window and not here: its
+artifacts. The CLI doesn't offer them when it's run for another program.
 
 rein keeps saved tokens in a private `claude-code.json` in its folder.
 `rein logout claude-code` removes it, but doesn't sign the CLI out, revoke a
@@ -552,8 +569,8 @@ The model sees images that tools give it: a screenshot from an MCP server
 
 - **Each goes as its provider takes it:** inside the tool's result for
   OpenAI (a ChatGPT plan too), Anthropic and Gemini; in a message after the
-  results for Chat Completions, whose tool messages take only text; and to
-  `claude -p` as streamed JSON.
+  results for Chat Completions, whose tool messages take only text; and in
+  what a call gives Claude Code's CLI, as MCP content.
 - **A model that can't see** (its list says so, or it turned one down,
   learned per model) is told of the image in words, and the image stays for
   one that can.

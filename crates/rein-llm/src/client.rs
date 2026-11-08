@@ -346,7 +346,7 @@ impl Client {
     /// Sends the request and returns the answer as a stream of events.
     pub async fn stream(&self, request: &Request<'_>) -> Result<ResponseStream> {
         if let Some(backend) = &self.claude_code {
-            return Ok(ResponseStream { source: StreamSource::Buffered(backend.respond(request, self.idle).await?) });
+            return Ok(ResponseStream { source: StreamSource::Claude(Box::new(backend.respond(request, self.idle).await?)) });
         }
         let mut omitted = self.omitted();
         let mut request = *request;
@@ -508,7 +508,8 @@ pub struct ResponseStream {
 
 enum StreamSource {
     Http(Box<HttpStream>),
-    Buffered(std::collections::VecDeque<Result<Event>>),
+    /// A step of a Claude Code session, read as the CLI prints it.
+    Claude(Box<crate::claude_code::Turn>),
 }
 
 impl ResponseStream {
@@ -522,7 +523,7 @@ impl ResponseStream {
     pub async fn next(&mut self) -> Option<Result<Event>> {
         match &mut self.source {
             StreamSource::Http(stream) => stream.next().await,
-            StreamSource::Buffered(events) => events.pop_front(),
+            StreamSource::Claude(turn) => turn.next().await,
         }
     }
 }

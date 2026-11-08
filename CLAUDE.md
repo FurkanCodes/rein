@@ -300,12 +300,15 @@ finding. Each says why in a line.
   its socket each second. A closed tab once left rein's parent waiting for
   good, the sub-agent counted toward the four at once, and Claude Code's
   lead showed a teammate whose pane was closed as running.
-- A CLI used only as the model (`claude -p`) is told it has one tool, the
-  one it answers with, and that the tools listed are rein's: told only
-  "don't run tools yourself", the model called `mcp__linear__list_teams` as
-  its own, was told there's no such tool, and often gave up on the call.
-  A server's schema isn't held to there either: the CLI turned a whole
-  answer away for a null it didn't allow. `--output-format stream-json
+- A CLI used as the model (`claude -p`) gets rein's tools as tools of its
+  own, from an MCP server of rein's, and one session for the conversation,
+  as its own harness keeps it. Told to answer in a JSON shape naming rein's
+  tools, the model called `mcp__linear__list_teams` as its own, wrote
+  calls as text, and was started over every step with the whole
+  conversation. `--safe-mode` turns off every MCP server, rein's too: the
+  model, given no tools, wrote `<invoke>` as text. A message that comes in
+  mid-task goes as the user's, never inside what a tool gave: Claude read
+  one there as an injection, and ignored it. `--output-format stream-json
   --verbose` shows what the model did, turn by turn.
 
 ## Encapsulation

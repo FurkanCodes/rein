@@ -2923,16 +2923,28 @@ fn claude_code_subprocess_keeps_reins_tools_and_uses_subscription_auth() {
 [ -z "$OPENAI_API_KEY$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$ANTHROPIC_BASE_URL" ] || exit 11
 pwd -P >> "$0.pwd"
 printf '%s\n' "$@" > "$0.args"
-/bin/cat > "$0.input"
+# rein's tools: an MCP server on this computer, as Claude Code reaches one.
+while [ $# -gt 0 ]; do [ "$1" = --mcp-config ] && mcp="$2"; shift; done
+url=$(/usr/bin/sed -n 's/.*"url":"\([^"]*\)".*/\1/p' "$mcp")
+auth=$(/usr/bin/sed -n 's/.*"Authorization":"\([^"]*\)".*/\1/p' "$mcp")
 now=$(/bin/date +%s)
-printf '%s\n' '{"type":"system","subtype":"init"}'
-printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","unifiedWindows":{"five_hour":{"utilization":0.28,"resetsAt":'$((now + 3600))',"status":"allowed"},"seven_day":{"utilization":0.75,"resetsAt":'$((now + 7200))',"status":"allowed_warning"}}}}'
-if [ -f "$0.called" ]; then
-    printf '%s\n' '{"type":"result","structured_output":{"text":"Read through rein, not Claude tools.","tool_calls":[]}}'
-else
-    : > "$0.called"
-    printf '%s\n' '{"type":"result","structured_output":{"text":"Inspecting the fixture.","tool_calls":[{"name":"read","arguments":{"path":"example.txt","start_line":null,"line_count":null}}]}}'
-fi
+limits='{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","unifiedWindows":{"five_hour":{"utilization":0.28,"resetsAt":'$((now + 3600))',"status":"allowed"},"seven_day":{"utilization":0.75,"resetsAt":'$((now + 7200))',"status":"allowed_warning"}}}}'
+said() { printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"'"$1"'"}]},"parent_tool_use_id":null}'; }
+ended() {
+    printf '%s\n' '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"'"$1"'"},"usage":{"output_tokens":4}},"parent_tool_use_id":null}'
+    printf '%s\n' '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null}'
+}
+read -r line; printf '%s\n' "$line" >> "$0.input"
+printf '%s\n' '{"type":"system","subtype":"init"}' "$limits"
+said "Inspecting the fixture."
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"mcp__rein__read","input":{"path":"example.txt","start_line":null,"line_count":null}}]},"parent_tool_use_id":null}'
+ended tool_use
+/usr/bin/curl -s -H "Authorization: $auth" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read","arguments":{"path":"example.txt","start_line":null,"line_count":null},"_meta":{"claudecode/toolUseId":"toolu_1"}}}' "$url" > "$0.gave"
+printf '%s\n' "$limits"
+said "Read through rein, not Claude tools."
+ended end_turn
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false}'
+/bin/cat > /dev/null
 "#,
     )
     .unwrap();
@@ -2949,15 +2961,18 @@ fi
     term.wait_for("Read through rein, not Claude tools.");
     term.wait_for(IDLE);
     let input = std::fs::read_to_string(bin.join("claude.input")).unwrap();
-    assert!(input.contains("subprocess fixture contents"), "{input}");
+    assert!(input.contains("read example.txt"), "{input}");
+    // The model called rein's read as a tool of its own; rein ran it.
+    let gave = std::fs::read_to_string(bin.join("claude.gave")).unwrap();
+    assert!(gave.contains("subprocess fixture contents"), "{gave}");
     assert!(model.requests.lock().unwrap().is_empty(), "no native HTTP requests");
     assert!(!term.text().contains("subscription-test"));
     // Never in the project, whose `.claude` settings could send the token
     // elsewhere; and never reading a project's settings at all.
     let project = term.dir.join("project").canonicalize().unwrap();
     let places = std::fs::read_to_string(bin.join("claude.pwd")).unwrap();
-    assert_eq!(places.lines().count(), 2, "{places}");
-    assert!(places.lines().all(|place| !std::path::Path::new(place).starts_with(&project) && !std::path::Path::new(place).exists()), "{places}");
+    assert_eq!(places.lines().count(), 1, "one session for the conversation: {places}");
+    assert!(places.lines().all(|place| !std::path::Path::new(place).starts_with(&project)), "{places}");
     let args = std::fs::read_to_string(bin.join("claude.args")).unwrap();
     assert!(args.contains("--setting-sources\nuser\n"), "{args}");
     // What the CLI said of the plan: in the bar, and said once, though
@@ -5896,11 +5911,13 @@ fn a_plans_limits_said_with_an_answer_reach_a_program() {
     std::fs::write(
         bin.join("claude"),
         r#"#!/bin/sh
-/bin/cat > /dev/null
+read -r line
 now=$(/bin/date +%s)
 printf '%s\n' '{"type":"system","subtype":"init"}'
 printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","unifiedWindows":{"five_hour":{"utilization":0.28,"resetsAt":'$((now + 3600))',"status":"allowed"},"seven_day":{"utilization":0.75,"resetsAt":'$((now + 7200))',"status":"allowed_warning"}}}}'
-printf '%s\n' '{"type":"result","structured_output":{"text":"Hello.","tool_calls":[]}}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Hello."}]},"parent_tool_use_id":null}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false}'
+/bin/cat > /dev/null
 "#,
     )
     .unwrap();
