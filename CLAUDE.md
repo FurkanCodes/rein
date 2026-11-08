@@ -308,7 +308,10 @@ finding. Each says why in a line.
   conversation. `--safe-mode` turns off every MCP server, rein's too: the
   model, given no tools, wrote `<invoke>` as text. A message that comes in
   mid-task goes as the user's, never inside what a tool gave: Claude read
-  one there as an injection, and ignored it. `--output-format stream-json
+  one there as an injection, and ignored it. The CLI doesn't hold the
+  model to rein's schemas: Claude sent `""` for a line number it meant to
+  leave out, and the call failed, so a call is read against its tool's
+  schema as it comes in (`as_schema_says`). `--output-format stream-json
   --verbose` shows what the model did, turn by turn.
 
 - A model gets the tools its own harness trained it on, where rein has

@@ -11,7 +11,7 @@
 //! turn was stopped midway) starts a new session, told the conversation so
 //! far in one message.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -222,6 +222,7 @@ pub(super) async fn turn(sessions: &Sessions, launcher: &Launcher, token: Option
     let key = Key::of(request);
     let input: Vec<u64> = request.input.iter().map(digest).collect();
     let tools = offered(request);
+    let schemas = tools.iter().filter_map(|tool| Some((tool["name"].as_str()?.to_owned(), tool["inputSchema"].clone()))).collect();
     let carried_on = match live.as_mut() {
         Some(session) if session.follows(&key, &input) => tokio::time::timeout(idle, session.carry_on(request, tools.clone())).await.unwrap_or(Ok(false)),
         _ => Ok(false),
@@ -234,7 +235,7 @@ pub(super) async fn turn(sessions: &Sessions, launcher: &Launcher, token: Option
         tokio::time::timeout(idle, session.say(&told)).await.map_err(|_| Error::Incomplete("Claude Code took nothing in".into()))??;
         *live = Some(session);
     }
-    Ok(Turn { live, input, produced: Vec::new(), asked: Vec::new(), queued: VecDeque::new(), usage: Usage::default(), stop: None, streamed: false, idle, over: false })
+    Ok(Turn { live, input, schemas, produced: Vec::new(), asked: Vec::new(), queued: VecDeque::new(), usage: Usage::default(), stop: None, streamed: false, idle, over: false })
 }
 
 impl Live {
@@ -383,6 +384,38 @@ fn offered(request: &Request<'_>) -> Vec<Value> {
     shown(request).into_iter().map(|tool| json!({ "name": tool.name, "description": tool.description, "inputSchema": tool.parameters })).collect()
 }
 
+/// A call's `input`, with each argument the CLI sent as text read as what
+/// `schema` says it is. The CLI doesn't hold the model to rein's schemas,
+/// and Claude sent `""` for a line number it meant to leave out, which
+/// failed the call: `""` for what may be null is null, and `"20"` or
+/// `"true"` for what can't be text is the number or the yes it says.
+fn as_schema_says(input: &Value, schema: Option<&Value>) -> Value {
+    let (Some(arguments), Some(properties)) = (input.as_object(), schema.and_then(|schema| schema["properties"].as_object())) else { return input.clone() };
+    let read = |name: &String, value: &Value| {
+        let (Some(text), Some(property)) = (value.as_str(), properties.get(name)) else { return value.clone() };
+        let types: Vec<&str> = match &property["type"] {
+            Value::String(one) => vec![one.as_str()],
+            Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        if types.contains(&"string") {
+            return value.clone();
+        }
+        let text = text.trim();
+        let number = || {
+            types
+                .contains(&"integer")
+                .then(|| text.parse::<i64>().ok().map(Value::from))
+                .flatten()
+                .or_else(|| types.contains(&"number").then(|| text.parse::<f64>().ok().map(Value::from)).flatten())
+        };
+        let yes = || types.contains(&"boolean").then(|| text.parse::<bool>().ok().map(Value::Bool)).flatten();
+        let none = || (text.is_empty() && types.contains(&"null")).then_some(Value::Null);
+        none().or_else(number).or_else(yes).unwrap_or_else(|| value.clone())
+    };
+    Value::Object(arguments.iter().map(|(name, value)| (name.clone(), read(name, value))).collect())
+}
+
 /// An item, told apart from any other: rein's conversation is checked
 /// against the session's this way, without a copy of it kept.
 fn digest(item: &Item) -> u64 {
@@ -406,6 +439,8 @@ fn digest(item: &Item) -> u64 {
 pub(crate) struct Turn {
     live: OwnedMutexGuard<Option<Live>>,
     input: Vec<u64>,
+    /// Each tool's arguments, by its name, which a call is read against.
+    schemas: HashMap<String, Value>,
     produced: Vec<u64>,
     asked: Vec<String>,
     queued: VecDeque<Result<Event>>,
@@ -525,7 +560,8 @@ impl Turn {
                     return;
                 };
                 self.asked.push(id.to_owned());
-                self.item(Item::ToolCall(ToolCall { call_id: id.to_owned(), name: name.to_owned(), arguments: block["input"].to_string() }));
+                let arguments = as_schema_says(&block["input"], self.schemas.get(name)).to_string();
+                self.item(Item::ToolCall(ToolCall { call_id: id.to_owned(), name: name.to_owned(), arguments }));
             }
             _ => {}
         }
@@ -782,6 +818,35 @@ mod tests {
         assert_eq!(seen.launches.load(Ordering::SeqCst), 1, "one session for the whole conversation");
         let told: Vec<Vec<String>> = lock(&seen.told).iter().map(texts).collect();
         assert_eq!(told, [vec!["read a.rs and b.rs".to_owned()], vec!["thanks".to_owned()]], "only what's new is sent");
+    }
+
+    /// Claude, through the CLI, sent `""` for a skill's line number it
+    /// meant to leave out, and the call failed: what it sends as text is
+    /// read as the tool's schema says.
+    #[tokio::test]
+    async fn arguments_sent_as_text_are_read_as_the_schema_says() {
+        let seen = Seen::default();
+        let sent = json!({ "path": "a.rs", "start_line": "", "line_count": " 20 ", "ratio": "0.5", "all": "true", "note": "", "kept": "", "odd": "x" });
+        let script = vec![vec![Act::Call("toolu_1", "read", sent), Act::Ran, Act::Done]];
+        let parameters = json!({ "type": "object", "properties": {
+            "path": { "type": "string" },
+            "start_line": { "type": ["integer", "null"] },
+            "line_count": { "type": ["integer", "null"] },
+            "ratio": { "type": "number" },
+            "all": { "type": "boolean" },
+            "note": { "type": ["string", "null"] },
+            "kept": { "type": "integer" },
+            "odd": { "type": ["integer", "null"] }
+        } });
+        let tools = vec![Tool { grammar: None, loading: Loading::UpFront, strict: true, name: "read".into(), description: "Read a file.".into(), parameters }];
+        let (sessions, launcher) = (Sessions::default(), fake(script, &seen));
+        let input = vec![Item::User("read a.rs".into())];
+        let events = step(&sessions, &launcher, &request(&input, &tools, false)).await;
+        let said = items(&events);
+        let [Item::ToolCall(call)] = said.as_slice() else { panic!("{events:?}") };
+        let read: Value = serde_json::from_str(&call.arguments).unwrap();
+        let wanted = json!({ "path": "a.rs", "start_line": null, "line_count": 20, "ratio": 0.5, "all": true, "note": "", "kept": "", "odd": "x" });
+        assert_eq!(read, wanted, "text is left as it is where the tool takes text, or where it says nothing else");
     }
 
     #[tokio::test]
