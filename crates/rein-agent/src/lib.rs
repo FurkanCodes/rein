@@ -3,6 +3,7 @@
 //! rein-llm's `Item`s and `Event`s.
 
 pub mod agent;
+pub mod ask;
 pub mod background;
 pub mod check;
 pub mod claude;

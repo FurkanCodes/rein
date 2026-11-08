@@ -21,11 +21,12 @@ short version.
 14. [Hooks](#hooks)
 15. [Memory](#memory)
 16. [Pages](#pages)
-17. [MCP servers](#mcp-servers)
-18. [Reins in other tabs](#reins-in-other-tabs), and [sub-agents](#sub-agents)
-19. [What's left of your limits](#whats-left-of-your-limits)
-20. [Settings](#settings)
-21. [For contributors](#for-contributors): layout and tests
+17. [Questions](#questions)
+18. [MCP servers](#mcp-servers)
+19. [Reins in other tabs](#reins-in-other-tabs), and [sub-agents](#sub-agents)
+20. [What's left of your limits](#whats-left-of-your-limits)
+21. [Settings](#settings)
+22. [For contributors](#for-contributors): layout and tests
 
 ---
 
@@ -1043,6 +1044,33 @@ rein's folder, never the project.
 - **Not opened** when `$BROWSER` is `false`, or there's no browser to
   open: the link is under the step. `rein serve` opens it too, and sends
   the link to the client with the step's result.
+
+## Questions
+
+When the model can't settle something from your request, the code or a
+sensible default, and the answer changes what it does next, it asks you,
+up to four questions at once, each with a few choices:
+
+```text
+  ? Which database?
+╭ Database · esc skips ─────────────────────────────╮
+│ › Postgres (Recommended)   what you run already    │
+│   SQLite                   one file                │
+│   Write my own answer      instead of these        │
+╰────────────────────────────────────────────────────╯
+```
+
+Pick one, or write your own answer. Where it lets you pick several, Enter
+marks each and Done ends. Esc skips a question, and the model goes on with
+its best judgment and says what it assumed. What you answered stays
+under the step (`Which database? → SQLite`). A task run on its own has
+nobody to ask, and the model is told so. Questions never stand in for
+permission: what runs is still asked about as the mode says.
+
+Each model asks the way its own harness taught it. GPT models get Codex's
+`request_user_input` and hear the answers as Codex gives them; the others
+get Claude Code's AskUserQuestion, as `ask`. Hooks see `ask` as
+`AskUserQuestion`. In `rein serve`, the client shows the choices.
 
 ## MCP servers
 

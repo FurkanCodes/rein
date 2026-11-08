@@ -108,6 +108,12 @@ pub fn describe(call: &ToolCall) -> (&'static str, String) {
             (if tool == ToolName::Message { "Message" } else { "Delegate" }, format!("{}: {first}{more}", args["to"].as_str().unwrap_or_default()))
         }
         Some(ToolName::Peers) => ("Peers", "the other reins".to_owned()),
+        Some(ToolName::Ask | ToolName::RequestUserInput) => {
+            let asked = args["questions"].as_array().map(Vec::as_slice).unwrap_or_default();
+            let first = asked.first().map(|question| question["question"].as_str().unwrap_or_default()).unwrap_or_default();
+            let more = if asked.len() > 1 { format!(" (+{} more)", asked.len() - 1) } else { String::new() };
+            ("Ask", format!("{first}{more}"))
+        }
         Some(ToolName::Page) => {
             let name = args["name"].as_str().unwrap_or_default();
             match args["action"].as_str() {
@@ -181,6 +187,7 @@ pub fn doing(call: &ToolCall) -> String {
         "Peers" => return "Looking at the other reins".to_owned(),
         "Memory" => return format!("Memory: {target}"),
         "Page" => "Making the page",
+        "Ask" => return format!("Asking you: {target}"),
         _ => "Using",
     };
     format!("{verb} {target}")
@@ -429,6 +436,15 @@ pub fn outcome(call: &ToolCall, output: &str, style: Style) -> Outcome {
             };
             plain(Some(true), style.dim(said))
         }
+        // You saw the questions and gave the answers: how it went is enough.
+        Some(ToolName::Ask | ToolName::RequestUserInput) => match output {
+            rein_agent::ask::UNANSWERED => plain(None, style.dim("not answered")),
+            rein_agent::ask::NOBODY => plain(None, style.dim("nobody to answer")),
+            _ => {
+                let details: Vec<String> = rein_agent::ask::shown(output);
+                Outcome { more: 0, details, ..plain(Some(true), style.dim("answered")) }
+            }
+        },
         // Where to see it, under its line: `Made the page p.`, then the link.
         Some(ToolName::Page) => {
             let mut lines = output.lines();

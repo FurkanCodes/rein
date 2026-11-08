@@ -304,10 +304,15 @@ pub enum ToolName {
     Background,
     /// A page for your browser: see [`crate::pages`].
     Page,
+    /// Asking the user questions with choices, as Claude Code's
+    /// AskUserQuestion: see [`crate::ask`]. The agent asks through its `Ui`.
+    Ask,
+    /// The same, as Codex's `request_user_input`, for GPT models.
+    RequestUserInput,
 }
 
 impl ToolName {
-    pub const ALL: [ToolName; 19] = [
+    pub const ALL: [ToolName; 21] = [
         Self::Read,
         Self::Grep,
         Self::Glob,
@@ -327,6 +332,8 @@ impl ToolName {
         Self::Memory,
         Self::Background,
         Self::Page,
+        Self::Ask,
+        Self::RequestUserInput,
     ];
 
     /// The name the model knows it by.
@@ -351,6 +358,8 @@ impl ToolName {
             Self::Memory => "memory",
             Self::Background => "background",
             Self::Page => "page",
+            Self::Ask => "ask",
+            Self::RequestUserInput => "request_user_input",
         }
     }
 
@@ -368,6 +377,11 @@ impl ToolName {
     /// Changes files: undone with `/undo`, and allowed by file-change modes.
     pub const fn changes_files(self) -> bool {
         matches!(self, Self::Write | Self::Edit | Self::ApplyPatch)
+    }
+
+    /// Asks the user, which the user's side of rein does.
+    pub const fn asks_user(self) -> bool {
+        matches!(self, Self::Ask | Self::RequestUserInput)
     }
 
     /// Reaches another rein, which the user's side of rein does.
@@ -770,6 +784,7 @@ impl Tools {
         if self.pages.is_some() {
             specs.push(crate::pages::spec());
         }
+        specs.push(crate::ask::spec());
         specs
     }
 
@@ -802,9 +817,18 @@ impl Tools {
             },
             // `recall` is the agent's own: it searches the conversation. The
             // peers are reached by whoever runs the agent.
-            Some(ToolName::Recall | ToolName::ToolSearch | ToolName::WebSearch | ToolName::Skill | ToolName::Peers | ToolName::Message | ToolName::Delegate | ToolName::Spawn) => {
-                Err(format!("there is no tool called {}", call.name))
-            }
+            Some(
+                ToolName::Recall
+                | ToolName::ToolSearch
+                | ToolName::WebSearch
+                | ToolName::Skill
+                | ToolName::Peers
+                | ToolName::Message
+                | ToolName::Delegate
+                | ToolName::Spawn
+                | ToolName::Ask
+                | ToolName::RequestUserInput,
+            ) => Err(format!("there is no tool called {}", call.name)),
             None => match &self.mcp {
                 Some(servers) if rein_mcp::is_mcp(&call.name) => {
                     let said = servers.call(&call.name, &call.arguments).await;

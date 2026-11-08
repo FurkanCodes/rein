@@ -23,6 +23,7 @@ pub(crate) fn name(call: &ToolCall) -> String {
         Some(ToolName::WebSearch) => "WebSearch".into(),
         Some(ToolName::Skill) => "Skill".into(),
         Some(ToolName::Plan) => "TodoWrite".into(),
+        Some(ToolName::Ask) => "AskUserQuestion".into(),
         Some(other) => other.as_str().into(),
         None => call.name.clone(),
     }

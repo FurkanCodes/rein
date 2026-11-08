@@ -4287,6 +4287,65 @@ fn a_page_opens_in_the_browser_once_and_reloads_when_saved_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The model asks you questions with choices: you pick one, mark several,
+/// write your own answer, or skip, asked nothing about running it, and the
+/// model hears each as Claude Code says it.
+#[test]
+fn the_model_asks_and_you_pick_mark_write_or_skip() {
+    let first = json!({ "questions": [
+        { "question": "Which database?", "header": "Database", "options": [{ "label": "Postgres", "description": "what you run" }, { "label": "SQLite", "description": "one file" }], "multiSelect": false },
+        { "question": "Which checks?", "header": "Checks", "options": [{ "label": "Tests", "description": "" }, { "label": "Lint", "description": "" }, { "label": "Docs", "description": "" }], "multiSelect": true }
+    ] });
+    let second = json!({ "questions": [{ "question": "Which cache?", "header": "Cache", "options": [{ "label": "Redis", "description": "" }, { "label": "None", "description": "" }], "multiSelect": false }] });
+    let third = json!({ "questions": [{ "question": "Which name?", "header": "Name", "options": [{ "label": "rein", "description": "" }, { "label": "reins", "description": "" }], "multiSelect": false }] });
+    let model = Model::start(vec![calls("ask", first), calls("ask", second), calls("ask", third), says("Set up.")]);
+    let mut term = Term::start(&model, "ask", 30, 120);
+    term.wait_for(IDLE);
+    term.keys("set up the store\r");
+    term.wait_for("? Which database?");
+    pick(&mut term, "SQLite");
+    term.wait_for("? Which checks?");
+    pick(&mut term, "Tests");
+    term.wait_for("☑ Tests");
+    pick(&mut term, "Docs");
+    term.wait_for("☑ Docs");
+    pick(&mut term, "Done");
+    term.wait_for("? Which cache?");
+    pick(&mut term, "Write my own");
+    term.wait_for("your answer ›");
+    term.keys("Memcached\r");
+    term.wait_for("? Which name?");
+    term.wait_for(PICKING);
+    term.keys("\x1b");
+    term.wait_for("Set up.");
+
+    let outputs: Vec<String> = model
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            request["input"]
+                .as_array()
+                .and_then(|input| input.iter().rev().find(|item| item["type"] == "function_call_output"))
+                .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+        })
+        .collect();
+    assert_eq!(
+        outputs,
+        [
+            "User has answered your questions: \"Which database?\"=\"SQLite\", \"Which checks?\"=\"Tests, Docs\". You can now continue with the user's answers in mind.",
+            "User has answered your questions: \"Which cache?\"=\"Memcached\". You can now continue with the user's answers in mind.",
+            rein_agent::ask::UNANSWERED,
+        ]
+    );
+    let text = term.text();
+    assert!(text.contains("Ask    Which database? (+1 more)  answered") && text.contains("Ask    Which name?  not answered"), "{text}");
+    assert!(
+        text.contains("Which database? → SQLite") && text.contains("Which checks? → Tests, Docs") && text.contains("Which cache? → Memcached"),
+        "what you answered stays in view:\n{text}"
+    );
+    assert!(!text.contains("Allow"), "asking you asks nothing first, even in ask mode:\n{text}");
+}
+
 /// What `path` holds, once something's in it.
 fn wait_for_file(path: &std::path::Path) -> String {
     let start = Instant::now();

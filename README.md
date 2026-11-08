@@ -75,6 +75,8 @@ set up each one.
   Claude Code's format, and you see every save.
 - [Pages](docs/guide.md#pages): reports, diagrams and charts the model
   makes open in your browser, and reload there as it changes them.
+- [Questions](docs/guide.md#questions): when the answer changes the work,
+  the model asks you, with choices to pick from or your own words.
 - [Checks after edits](docs/guide.md#checks-after-edits): rein runs the
   project's own check (`cargo check`, `tsc`, `go vet`, pyright, mypy) and
   tells the model only about the errors it just introduced.

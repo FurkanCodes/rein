@@ -2,7 +2,7 @@
 //! happens, and how it asks, as the agent's [`Ui`].
 
 use crate::format::thousands;
-use crate::input::{Input, Question, Read};
+use crate::input::{Input, Menu, Question, Read};
 use crate::peers::node::Incoming;
 use crate::peers::{Node, State};
 use crate::ui::asked::{Asked, INSTEAD};
@@ -272,6 +272,71 @@ pub(crate) fn check_said(checked: &rein_agent::check::Checked) -> String {
 pub(crate) const ECHO_LINES: usize = 12;
 
 impl Terminal {
+    /// Asks you the model's `questions`, one at a time, each as a list of
+    /// its choices with one more to write your own; Esc skips one. `None`
+    /// where there's nobody to ask: a task run on its own.
+    pub(crate) async fn ask_user(&mut self, questions: &[rein_agent::ask::Question]) -> Option<Vec<rein_agent::ask::Answer>> {
+        if !self.input.can_ask() && !std::io::stdin().is_terminal() {
+            return None;
+        }
+        self.end_line();
+        self.quiet();
+        self.input.busy(None, std::time::Instant::now());
+        crate::ui::screen::progress(Progress::Waiting);
+        let mut answers = Vec::new();
+        for question in questions {
+            let (text, s) = (question.question.clone(), self.err);
+            self.show(move |width| {
+                let mut wrap = Wrap::new(width, steps::INDENT, steps::INDENT);
+                let wrapped = wrap.push(&s.bold(&format!("? {text}"))) + &wrap.finish();
+                wrapped.lines().map(|line| format!("{}{line}", " ".repeat(steps::INDENT))).collect()
+            });
+            answers.push(self.answer_one(question).await);
+        }
+        Some(answers)
+    }
+
+    /// Your answer to one question: what you picked, what you wrote, or
+    /// nothing. Picking from several marks each, until Done.
+    async fn answer_one(&mut self, question: &rein_agent::ask::Question) -> rein_agent::ask::Answer {
+        use rein_agent::ask::Answer;
+        const WRITE: &str = "Write my own answer";
+        let choices = &question.choices;
+        let mut marked = vec![false; choices.len()];
+        let mut at = None;
+        loop {
+            let mut items: Vec<(String, String)> = choices
+                .iter()
+                .zip(&marked)
+                .map(|(choice, &on)| (if question.many { format!("{} {}", if on { "☑" } else { "☐" }, choice.label) } else { choice.label.clone() }, choice.description.clone()))
+                .collect();
+            if question.many {
+                items.push(("Done".into(), "with what's marked".into()));
+            }
+            items.push((WRITE.into(), "instead of these".into()));
+            let menu = Menu { title: format!("{} · esc skips", question.header), items, current: None, at };
+            let Some(picked) = self.input.choose(menu).await else { return Answer::Skipped };
+            match picked {
+                i if i < choices.len() && question.many => {
+                    marked[i] = !marked[i];
+                    at = Some(i);
+                }
+                i if i < choices.len() => return Answer::Picked(vec![choices[i].label.clone()]),
+                i if i == choices.len() && question.many => {
+                    let picked: Vec<String> = choices.iter().zip(&marked).filter(|(_, on)| **on).map(|(choice, _)| choice.label.clone()).collect();
+                    return if picked.is_empty() { Answer::Skipped } else { Answer::Picked(picked) };
+                }
+                _ => {
+                    let pad = " ".repeat(steps::INDENT);
+                    return match self.input.read(&format!("{pad}your answer › "), false).await {
+                        Read::Line(text) if !text.trim().is_empty() => Answer::Wrote(text.trim().to_owned()),
+                        _ => Answer::Skipped,
+                    };
+                }
+            }
+        }
+    }
+
     /// The key of the answer you chose to `question`. With nothing to show
     /// its answers on, it's asked as yes or no, and comes to `y` or `n`.
     pub(crate) async fn answer(&mut self, question: Question) -> Option<String> {
@@ -1012,6 +1077,10 @@ impl Ui for Terminal {
             self.noted = Some(asking.wont_ask_again());
         }
         answer
+    }
+
+    async fn ask(&mut self, questions: &[rein_agent::ask::Question]) -> Option<Vec<rein_agent::ask::Answer>> {
+        self.ask_user(questions).await
     }
 
     async fn peer(&mut self, call: &ToolCall) -> String {

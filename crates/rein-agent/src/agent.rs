@@ -165,6 +165,11 @@ pub trait Ui {
     fn peer(&mut self, call: &ToolCall) -> impl Future<Output = String> {
         std::future::ready(format!("{}there are no other reins to reach from here: {}", crate::tools::ERROR, call.name))
     }
+    /// Asks you `questions`, and gives how you answered each, in order;
+    /// `None` where nobody's there to answer.
+    fn ask(&mut self, _questions: &[crate::ask::Question]) -> impl Future<Output = Option<Vec<crate::ask::Answer>>> {
+        std::future::ready(None)
+    }
     /// What the user's message pointed at with `@`, read for them.
     fn attached(&mut self, call: &ToolCall, output: &str) {
         self.tool_started(call);
@@ -1038,6 +1043,22 @@ impl<M: Model> Agent<M> {
                 }
                 continue;
             }
+            // Asking you is the user's side's to do: the model waits.
+            if ToolName::of(&call).is_some_and(ToolName::asks_user) {
+                ui.tool_started(&call);
+                let output = match crate::ask::questions(&call) {
+                    Ok(questions) => match ui.ask(&questions).await {
+                        Some(answers) => crate::ask::told(&call, &questions, &answers),
+                        None => crate::ask::NOBODY.to_owned(),
+                    },
+                    Err(why) => format!("{}{why}", crate::tools::ERROR),
+                };
+                let output = self.after(&call, output, began, &pre.context, ui).await;
+                if let Some(stuck) = self.finish(&call, output, repeats, closing.as_deref(), ui)? {
+                    return self.stop_stuck(stuck, &calls[next..], ui);
+                }
+                continue;
+            }
             // Searching the conversation is rein's own business: no
             // permission needed, nothing outside is touched.
             if ToolName::of(&call) == Some(ToolName::Recall) {
@@ -1805,24 +1826,31 @@ impl<M> Agent<M> {
     }
 
     /// Gives the model the tools of the harness it was trained in: Codex's
-    /// `apply_patch` for its models, in place of `write` and `edit`, in
-    /// their place in the list. Only when that changes: the tool list
-    /// comes first in a request, and a change loses the whole cache.
+    /// `apply_patch` for its models, in place of `write` and `edit`, and
+    /// its `request_user_input` in place of `ask`, each in their place in
+    /// the list. Only when that changes: the tool list comes first in a
+    /// request, and a change loses the whole cache.
     pub fn set_harness(&mut self, harness: rein_llm::Harness) {
         if self.harness == harness {
             return;
         }
         self.harness = harness;
-        let ours = [ToolName::Write.as_str(), ToolName::Edit.as_str()];
-        let theirs = ToolName::ApplyPatch.as_str();
-        let swapped = |tool: &Tool| ours.contains(&tool.name.as_str()) || tool.name == theirs;
-        let at = self.specs.iter().position(swapped).unwrap_or(self.specs.len());
-        self.specs.retain(|tool| !swapped(tool));
-        let given = match harness {
-            rein_llm::Harness::Codex => vec![crate::tools::patch_spec()],
-            rein_llm::Harness::Rein => self.tools.specs().into_iter().filter(|tool| ours.contains(&tool.name.as_str())).collect(),
-        };
-        self.specs.splice(at.min(self.specs.len())..at.min(self.specs.len()), given);
+        let swaps = [
+            (vec![ToolName::Write, ToolName::Edit], ToolName::ApplyPatch, crate::tools::patch_spec as fn() -> Tool),
+            (vec![ToolName::Ask], ToolName::RequestUserInput, crate::ask::codex_spec as fn() -> Tool),
+        ];
+        let ours = self.tools.specs();
+        for (rein, codex, codex_spec) in swaps {
+            let swapped = |tool: &Tool| tool.name == codex.as_str() || rein.iter().any(|name| tool.name == name.as_str());
+            // Only what this conversation was given: no `ask` where it has none.
+            let Some(at) = self.specs.iter().position(swapped) else { continue };
+            self.specs.retain(|tool| !swapped(tool));
+            let given = match harness {
+                rein_llm::Harness::Codex => vec![codex_spec()],
+                rein_llm::Harness::Rein => ours.iter().filter(|tool| rein.iter().any(|name| tool.name == name.as_str())).cloned().collect(),
+            };
+            self.specs.splice(at.min(self.specs.len())..at.min(self.specs.len()), given);
+        }
     }
 
     /// Compact once a request would carry more than this many tokens.
@@ -2590,6 +2618,11 @@ mod tests {
         assert!(!codex.contains(&"edit".to_owned()) && !codex.contains(&"write".to_owned()));
         assert_eq!(codex.len(), rein.len() - 1);
         assert!(agent.specs[at].grammar.is_some(), "in Codex's grammar");
+        let asks = rein.iter().position(|name| name == "ask").expect("rein's models are asked through ask");
+        let asks_now = codex.iter().position(|name| name == "request_user_input").expect("Codex's through its own");
+        // Two tools before it became one if write and edit came first.
+        assert_eq!(asks_now, if at < asks { asks - 1 } else { asks }, "in ask's place: {codex:?}");
+        assert!(!codex.contains(&"ask".to_owned()));
         agent.set_harness(rein_llm::Harness::Rein);
         assert_eq!(names(&agent), rein, "and back, as they were");
     }
@@ -3095,7 +3128,7 @@ mod tests {
         let folder = root.join(".sessions");
         agent.session =
             Some(Session::new(&folder, "t", crate::session::Header { id: "session-1".into(), cwd: "/p".into(), started: "now".into(), model: "m".into(), instructions: None }));
-        agent.window.limit = 2_000;
+        agent.window.limit = 2_500;
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         agent.send("where is the needle?".into(), &mut person).await.unwrap();
 
@@ -3353,7 +3386,7 @@ mod tests {
         let root = root_of("compact-twice");
         std::fs::write(root.join("one.txt"), "hay one\n".repeat(2000)).unwrap();
         std::fs::write(root.join("two.txt"), "hay two\n".repeat(2000)).unwrap();
-        agent.window.limit = 2_000;
+        agent.window.limit = 2_500;
         let mut person = Person { answer: Approval::Yes, log: Vec::new() };
         assert_eq!(agent.send("read both".into(), &mut person).await.unwrap(), Outcome::Done);
         let requests = agent.model.requests.borrow().clone();

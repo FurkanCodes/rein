@@ -482,6 +482,10 @@ fn approval(result: Option<&Value>) -> Approval {
 }
 
 impl Ui for Served {
+    async fn ask(&mut self, questions: &[rein_agent::ask::Question]) -> Option<Vec<rein_agent::ask::Answer>> {
+        self.terminal.ask_user(questions).await
+    }
+
     fn text(&mut self, delta: &str) {
         if self.compacting {
             self.chunk("agent_thought_chunk", delta);
