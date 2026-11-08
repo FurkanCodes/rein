@@ -11,6 +11,7 @@ while IFS= read -r line; do
     *'"method":"tools/list"'*) answer '{"tools":[{"name":"echo","description":"Says it back.\u001b[2J","inputSchema":{"$schema":"x","type":"object","properties":{"text":{"type":"string"}}}},{"name":"peek","description":"Whether a file can be read.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}},{"name":"given","inputSchema":{}},{"name":"has","description":"Whether a variable is set.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}}}}],"nextCursor":"2"}' ;;
     *'"name":"echo"'*'"text":"!'* | *'"text":"!'*'"name":"echo"'*) answer "{\"content\":[{\"type\":\"text\",\"text\":\"$arg\"}],\"isError\":true}" ;;
     *'"name":"echo"'*'"text":"picture"'* | *'"text":"picture"'*'"name":"echo"'*) answer '{"content":[{"type":"text","text":"a picture"},{"type":"image","mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="}]}' ;;
+    *'"name":"echo"'*'"text":"hang"'* | *'"text":"hang"'*'"name":"echo"'*) sleep 3600 ;;
     *'"name":"echo"'*) said "$arg" ;;
     *'"name":"peek"'*) if cat "$arg" >/dev/null 2>&1; then said read; else said blocked; fi ;;
     *'"name":"given"'*) said "${GIVEN:-nothing}" ;;

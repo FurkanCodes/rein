@@ -397,8 +397,8 @@ impl Connection {
 
     /// Calls `tool`: what it said, or that it failed, in its words; or
     /// what kept rein from asking.
-    async fn call(&self, tool: &str, arguments: Value) -> Result<Result<clean::Said, String>, Error> {
-        let result = self.channel.request("tools/call", json!({ "name": tool, "arguments": arguments }), CALL).await;
+    async fn call(&self, tool: &str, arguments: Value, waits: Duration) -> Result<Result<clean::Said, String>, Error> {
+        let result = self.channel.request("tools/call", json!({ "name": tool, "arguments": arguments }), waits).await;
         match result {
             Ok(result) => Ok(clean::result(result)),
             // A tool's error as the server answered it is the tool's.
@@ -482,12 +482,55 @@ struct Entry {
     state: Arc<tokio::sync::Mutex<State>>,
     /// Its start, stopped if it's removed before it's done.
     start: tokio::task::AbortHandle,
+    /// It was left on a call it didn't answer: one that ran out of time,
+    /// or that you stopped after a long wait. Its next call starts it
+    /// again first: Playwright's server kept working on a call it had
+    /// been told was cancelled, and every call after it waited behind it.
+    stuck: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The most the line saying how the servers did takes in full: past it,
+/// each is named with its count of tools, and `/mcp` says the rest. Five
+/// servers took two lines of every conversation's start.
+const LONG_NOTE: usize = 100;
+
+/// A call stopped after waiting this long is taken for one its server
+/// is stuck on.
+pub const STUCK_AFTER: Duration = Duration::from_secs(30);
+
+/// A call on its way: dropped before its answer came (you stopped the
+/// turn) after a long wait, it marks its server stuck.
+struct Waiting {
+    stuck: Arc<std::sync::atomic::AtomicBool>,
+    since: std::time::Instant,
+    answered: bool,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if !self.answered && self.since.elapsed() >= STUCK_AFTER {
+            self.stuck.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Why a server was started again for a call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Again {
+    No,
+    /// It had stopped.
+    Stopped,
+    /// It was stuck on an earlier call.
+    Stuck,
 }
 
 /// The servers rein started, and the tools of theirs the model is offered.
 pub struct Servers {
     /// Each lock is held only to look or change, never across an `.await`.
     entries: Mutex<Vec<Arc<Entry>>>,
+    /// How long a call is waited on, in milliseconds: [`CALL`], but for
+    /// tests.
+    waits: std::sync::atomic::AtomicU64,
     launch: Launch,
     /// The tools last offered, by the names the model knows them by: which
     /// server's, and its own name for it.
@@ -539,11 +582,25 @@ impl Servers {
     /// Starts each of `servers` at once, in the background. Inside a
     /// runtime: the starts are its tasks.
     pub fn start(servers: Vec<Server>, launch: Launch) -> Servers {
-        let started = Servers { entries: Mutex::default(), launch, offered: Mutex::default(), starts: Mutex::default(), told: Mutex::default(), held_back: Mutex::default() };
+        let started = Servers {
+            entries: Mutex::default(),
+            launch,
+            offered: Mutex::default(),
+            starts: Mutex::default(),
+            told: Mutex::default(),
+            held_back: Mutex::default(),
+            waits: std::sync::atomic::AtomicU64::new(u64::try_from(CALL.as_millis()).unwrap_or(u64::MAX)),
+        };
         for server in servers {
             started.add(server);
         }
         started
+    }
+
+    /// Waits this long on a call from now on, in place of [`CALL`].
+    #[cfg(test)]
+    fn set_waits(&self, waits: Duration) {
+        self.waits.store(u64::try_from(waits.as_millis()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Starts `server` in the background, in place of one of its name.
@@ -564,7 +621,7 @@ impl Servers {
                 };
             })
         };
-        lock(&self.entries).push(Arc::new(Entry { server, state, start }));
+        lock(&self.entries).push(Arc::new(Entry { server, state, start, stuck: Arc::default() }));
     }
 
     /// Stops the server called `name`, and its tools aren't called from
@@ -589,7 +646,7 @@ impl Servers {
     pub fn offer(&self, name: &str, offered: Offered) {
         for entry in lock(&self.entries).iter_mut().filter(|entry| entry.server.name == name) {
             let server = Server { offered, ..entry.server.clone() };
-            *entry = Arc::new(Entry { server, state: entry.state.clone(), start: entry.start.clone() });
+            *entry = Arc::new(Entry { server, state: entry.state.clone(), start: entry.start.clone(), stuck: entry.stuck.clone() });
         }
     }
 
@@ -604,7 +661,7 @@ impl Servers {
     pub fn allow(&self, name: &str, allow: &[String]) {
         for entry in lock(&self.entries).iter_mut().filter(|entry| entry.server.name == name) {
             let server = Server { allow: allow.to_vec(), ..entry.server.clone() };
-            *entry = Arc::new(Entry { server, state: entry.state.clone(), start: entry.start.clone() });
+            *entry = Arc::new(Entry { server, state: entry.state.clone(), start: entry.start.clone(), stuck: entry.stuck.clone() });
         }
     }
 
@@ -678,6 +735,8 @@ impl Servers {
     /// what the conversation offers from now on.
     pub async fn list(&self) -> Listing {
         let (mut listing, mut offered, mut said, mut failed) = (Listing::default(), HashMap::new(), Vec::new(), false);
+        // The same, briefly, for a line that would wrap: a name and a count.
+        let mut brief: Vec<String> = Vec::new();
         let mut held_back = HashSet::new();
         for entry in self.entries() {
             let state = entry.state.lock().await;
@@ -685,11 +744,13 @@ impl Servers {
                 State::Ready(connection) => connection.clone(),
                 State::Failed(why) => {
                     said.push(format!("{} didn't start: {why}", entry.server.name));
+                    brief.push(format!("{} didn't start: {why}", entry.server.name));
                     failed = true;
                     continue;
                 }
                 State::Starting => {
                     said.push(format!("{} didn't start", entry.server.name));
+                    brief.push(format!("{} didn't start", entry.server.name));
                     failed = true;
                     continue;
                 }
@@ -723,11 +784,14 @@ impl Servers {
             let found = if held_back.contains(&entry.server.name) { ", found when needed" } else { "" };
             let left_out = if left_out > 0 { format!(", {left_out} left out: their names are too long or taken") } else { String::new() };
             said.push(format!("{} ({tools}{found}{left_out})", entry.server.name));
+            brief.push(format!("{} ({count})", entry.server.name));
         }
         *lock(&self.offered) = offered;
         *lock(&self.held_back) = held_back;
         let fix = if failed { ". /mcp says what to do" } else { "" };
-        listing.note = (!said.is_empty()).then(|| format!("MCP servers: {}{fix}", said.join("; ")));
+        let full = format!("MCP servers: {}{fix}", said.join("; "));
+        let note = if full.chars().count() <= LONG_NOTE { full } else { format!("MCP servers: {} · /mcp{fix}", brief.join(", ")) };
+        listing.note = (!said.is_empty()).then_some(note);
         listing
     }
 
@@ -742,12 +806,21 @@ impl Servers {
             Ok(_) => return Err("bad arguments: they should be an object".into()),
             Err(e) => return Err(format!("bad arguments: {e}")),
         };
+        let waits = Duration::from_millis(self.waits.load(std::sync::atomic::Ordering::Relaxed));
         let (connection, mut again) = self.ready(&entry).await?;
-        let mut said = connection.call(&tool, arguments.clone()).await;
+        let mut waiting = Waiting { stuck: entry.stuck.clone(), since: std::time::Instant::now(), answered: false };
+        let mut said = connection.call(&tool, arguments.clone(), waits).await;
         if matches!(said, Err(Error::SessionEnded)) {
             let (connection, _) = self.ready(&entry).await?;
-            said = connection.call(&tool, arguments).await;
-            again = false;
+            said = connection.call(&tool, arguments, waits).await;
+            again = Again::No;
+        }
+        waiting.answered = true;
+        drop(waiting);
+        // Out of time is stuck too: its next call starts it again.
+        let timed_out = matches!(said, Err(Error::TimedOut { .. }));
+        if timed_out {
+            entry.stuck.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let name = &entry.server.name;
         let said = match said {
@@ -759,7 +832,14 @@ impl Servers {
             }
             Err(e) => Err(e.to_string()),
         };
-        let mut note = if again { format!("\n[rein: the {name} server had stopped, so rein started it again for this call.]") } else { String::new() };
+        let mut note = match again {
+            Again::No => String::new(),
+            Again::Stopped => format!("\n[rein: the {name} server had stopped, so rein started it again for this call.]"),
+            Again::Stuck => format!("\n[rein: the {name} server was stuck on an earlier call, so rein started it again for this one: what it had open is gone.]"),
+        };
+        if timed_out {
+            note.push_str(&format!("\n[rein: the {name} server is taken for stuck, and starts again at its next call: what it has open will be gone.]"));
+        }
         // A server that can't reach what it needs says so in its own
         // words, which may not say why: "the screen is locked".
         if said.is_err()
@@ -776,10 +856,17 @@ impl Servers {
 
     /// `entry`'s server, ready to call: started again first if it stopped,
     /// or its session ended, and whether it was.
-    async fn ready(&self, entry: &Entry) -> Result<(Arc<Connection>, bool), String> {
+    async fn ready(&self, entry: &Entry) -> Result<(Arc<Connection>, Again), String> {
         let mut state = entry.state.lock().await;
-        let again = !matches!(&*state, State::Ready(connection) if connection.channel.alive());
-        if again {
+        let stuck = entry.stuck.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let again = if stuck {
+            Again::Stuck
+        } else if matches!(&*state, State::Ready(connection) if connection.channel.alive()) {
+            Again::No
+        } else {
+            Again::Stopped
+        };
+        if again != Again::No {
             *state = match self.launch.start(&entry.server).await {
                 Ok(connection) => State::Ready(Arc::new(connection)),
                 Err(why) => State::Failed(why),

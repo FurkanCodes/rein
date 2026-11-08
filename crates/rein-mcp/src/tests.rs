@@ -318,3 +318,57 @@ fn a_servers_tools_are_held_back_once_theyd_take_more_than_a_little_of_every_req
     assert!(!holds_back(Offered::UpFront, &many), "as your file says");
     assert!(!holds_back(Offered::OnSearch, &[]), "nothing to find");
 }
+
+/// Playwright's server kept working on a call it was told was cancelled,
+/// and every call after it waited behind it, five minutes each. A server
+/// that runs out of time on a call is started again at its next.
+#[tokio::test]
+async fn a_server_stuck_on_a_call_is_started_again_for_the_next() {
+    let (mut server, launch, _) = fake("stuck", Access::Outside).await;
+    let pidfile = launch.root.join("pid");
+    local(&mut server).env.insert("PIDFILE".into(), pidfile.display().to_string());
+    let servers = Servers::start(vec![server], launch);
+    servers.list().await;
+    assert_eq!(servers.call("mcp__fake__echo", r#"{"text":"hi"}"#).await, Ok("hi".into()));
+    let first = std::fs::read_to_string(&pidfile).unwrap().trim().to_owned();
+
+    servers.set_waits(Duration::from_millis(300));
+    let stuck = servers.call("mcp__fake__echo", r#"{"text":"hang"}"#).await.unwrap_err();
+    assert!(stuck.contains("didn't answer tools/call") && stuck.contains("is taken for stuck, and starts again at its next call"), "{stuck}");
+
+    servers.set_waits(Duration::from_secs(10));
+    let said = servers.call("mcp__fake__echo", r#"{"text":"again"}"#).await.unwrap();
+    assert!(said.text.starts_with("again") && said.text.contains("was stuck on an earlier call, so rein started it again"), "{}", said.text);
+    let second = std::fs::read_to_string(&pidfile).unwrap().trim().to_owned();
+    assert_ne!(first, second, "a new process");
+    assert!(gone(&first).await, "the stuck one was stopped");
+    assert_eq!(servers.call("mcp__fake__echo", r#"{"text":"fine"}"#).await, Ok("fine".into()), "and it's started only the once");
+}
+
+/// A call you stop after a long wait leaves its server taken for stuck; one
+/// stopped at once, or answered, doesn't.
+#[test]
+fn a_call_stopped_after_a_long_wait_marks_its_server_stuck() {
+    let stuck = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let long_ago = std::time::Instant::now().checked_sub(STUCK_AFTER).unwrap();
+    drop(Waiting { stuck: stuck.clone(), since: std::time::Instant::now(), answered: false });
+    assert!(!stuck.load(std::sync::atomic::Ordering::SeqCst), "stopped at once");
+    drop(Waiting { stuck: stuck.clone(), since: long_ago, answered: true });
+    assert!(!stuck.load(std::sync::atomic::Ordering::SeqCst), "answered");
+    drop(Waiting { stuck: stuck.clone(), since: long_ago, answered: false });
+    assert!(stuck.load(std::sync::atomic::Ordering::SeqCst), "stopped after a long wait");
+}
+
+/// One server is said in full; several that would take two lines are each
+/// named with their count, and /mcp says the rest.
+#[tokio::test]
+async fn several_servers_are_said_by_name_and_count() {
+    let (server, launch, _) = fake("note-one", Access::Outside).await;
+    let one = Servers::start(vec![server.clone()], launch.clone());
+    assert_eq!(one.list().await.note.as_deref(), Some("MCP servers: fake (5 tools)"));
+
+    let named = |name: &str| Server { name: name.into(), ..server.clone() };
+    let many = Servers::start(["chrome-devtools", "playwright-browser", "codegraph", "node_repl"].map(named).to_vec(), launch);
+    let note = many.list().await.note.unwrap();
+    assert_eq!(note, "MCP servers: chrome-devtools (5), playwright-browser (5), codegraph (5), node_repl (5) · /mcp");
+}

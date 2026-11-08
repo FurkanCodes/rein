@@ -51,6 +51,27 @@ pub enum Read {
     Paste,
 }
 
+/// What rein is doing, over the box: since when the turn, and since when
+/// this step.
+struct Busy {
+    what: String,
+    since: Instant,
+    step: Instant,
+}
+
+/// One step waited on this long gets a clock of its own beside the turn's.
+const LONG_STEP: Duration = Duration::from_secs(30);
+
+/// The busy line's hint: the turn's time, and a step's own once it's
+/// long, so a call stuck for minutes doesn't hide in the turn's total.
+fn busy_hint(turn: Duration, step: Duration) -> String {
+    if step >= LONG_STEP && turn.saturating_sub(step) >= Duration::from_secs(1) {
+        format!("(this step {} · {} in all · esc to stop)", seconds(step), seconds(turn))
+    } else {
+        format!("({} · esc to stop)", seconds(turn))
+    }
+}
+
 /// What the keyboard is for right now.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Waiting {
@@ -204,8 +225,8 @@ struct Boxed {
     /// A menu to choose from.
     picking: Option<Picking>,
     asking: Option<Asking>,
-    /// What rein is doing, and since when its turn started.
-    busy: Option<(String, Instant)>,
+    /// What rein is doing, since when its turn started, and its step.
+    busy: Option<Busy>,
     /// Messages typed while rein worked, sent with Enter: they steer the
     /// turn, going in at its next step.
     steering: Vec<String>,
@@ -324,10 +345,10 @@ impl Boxed {
         let s = Style::stderr();
         let pad = " ".repeat(GUTTER);
         let mut above = Vec::new();
-        if let Some((what, since)) = &self.busy {
+        if let Some(Busy { what, since, step }) = &self.busy {
             let elapsed = since.elapsed();
             let frame = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
-            let hint = format!("({} · esc to stop)", seconds(elapsed));
+            let hint = busy_hint(elapsed, step.elapsed());
             // A long command is cut, so the time and the hint stay in view.
             let room = screen::size().1.saturating_sub(GUTTER + 6 + width(&hint));
             let what = fit(what, room.max(10));
@@ -1545,7 +1566,12 @@ impl Input {
     pub fn busy(&self, what: Option<String>, since: Instant) {
         self.with(|boxed| {
             boxed.worked |= what.is_some();
-            boxed.busy = what.map(|what| (what, since));
+            // The same step goes on; another starts its own clock.
+            let step = match &boxed.busy {
+                Some(busy) if what.as_deref() == Some(busy.what.as_str()) => busy.step,
+                _ => Instant::now(),
+            };
+            boxed.busy = what.map(|what| Busy { what, since, step });
         });
     }
 
@@ -1619,6 +1645,15 @@ impl Drop for Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_step_shows_its_own_time_beside_the_turns() {
+        let s = Duration::from_secs;
+        assert_eq!(busy_hint(s(12), s(3)), "(12s · esc to stop)");
+        assert_eq!(busy_hint(s(468), s(29)), "(7m 48s · esc to stop)", "not yet long");
+        assert_eq!(busy_hint(s(468), s(300)), "(this step 5m 00s · 7m 48s in all · esc to stop)");
+        assert_eq!(busy_hint(s(40), s(40)), "(40s · esc to stop)", "the step is the whole turn");
+    }
     use crate::ui::style::strip;
 
     #[test]

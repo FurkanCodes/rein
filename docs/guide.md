@@ -967,8 +967,10 @@ with everything it started, when it takes too long (10 minutes, as in Claude
 Code; 30 s on your message) or the turn stops. iTerm2's status program for
 Claude Code is off unless you turn it on, since rein sets the tab's status
 itself. `disableAllHooks` in Claude Code's settings turns them off here too.
-rein starts by saying which hooks run. `/hooks` lists each one, where it's
-set and how it last did, so you can turn it off or on.
+rein starts by saying which hooks run, and when, while that fits on a
+line; with more, just their names, and `/hooks` says when each runs.
+`/hooks` lists each one, where it's set and how it last did, so you can
+turn it off or on.
 
 ## Memory
 
@@ -1170,6 +1172,18 @@ Claude Code and Cursor use:
   result is cut, and kept whole in a temp file for the model to read in
   parts. A server that stops is restarted on its next call. When one fails
   in the sandbox, the model is told once that the sandbox may be why.
+- **A stuck server starts again.** A call that runs out of its 5 minutes,
+  or one you stop with Esc after it has waited 30 seconds, leaves its
+  server taken for stuck, and its next call starts it again first, with
+  the model told that what it had open is gone. Playwright's server kept
+  working on a call it had been told was cancelled, and every call after
+  it waited behind it. Once one step has waited 30 seconds, the line over
+  the box shows its own time beside the turn's
+  (`this step 1m 10s · 4m 02s in all`).
+- **One line at the start.** The first message says how the servers did,
+  in full while that fits on a line, or else each by name and its count of
+  tools (`playwright (25), codegraph (1) · /mcp`). One that didn't start is
+  always said in full.
 
 ### Tool search
 

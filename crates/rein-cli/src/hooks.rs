@@ -103,6 +103,9 @@ pub(crate) async fn ask_waiting(agent: &mut Agent<Llm>, terminal: &mut Terminal,
     }
 }
 
+/// The most the hooks' line takes in full: past it, only their names.
+const LONG_LINE: usize = 100;
+
 /// The hooks there are, in a line: those that run, and those that don't
 /// and why, briefly. `None` with none.
 fn said(hooks: &Hooks) -> Option<String> {
@@ -119,20 +122,30 @@ fn said(hooks: &Hooks) -> Option<String> {
         }
     }
     let mut parts = Vec::new();
+    let mut brief = Vec::new();
     for name in names {
         let mine: Vec<&Hook> = all.iter().filter(|hook| hook.name() == name).collect();
         let mut whens: Vec<String> = mine.iter().filter(|hook| hook.runs()).map(|hook| when(hook)).collect();
         whens.dedup();
         match mine.iter().find(|hook| !hook.runs()) {
-            Some(off) if whens.is_empty() => parts.push(format!("{name} off ({})", why_off(&off.state))),
-            _ => parts.push(format!("{name} {}", whens.join(" and "))),
+            Some(off) if whens.is_empty() => {
+                parts.push(format!("{name} off ({})", why_off(&off.state)));
+                brief.push(format!("{name} off"));
+            }
+            _ => {
+                parts.push(format!("{name} {}", whens.join(" and ")));
+                brief.push(name);
+            }
         }
     }
     if !hooks.left_out().is_empty() {
         let count = hooks.left_out().len();
         parts.push(format!("{count} rein can't run"));
+        brief.push(format!("{count} rein can't run"));
     }
-    Some(format!("Hooks: {} · /hooks", parts.join(", ")))
+    let full = format!("Hooks: {} · /hooks", parts.join(", "));
+    // Seven of yours took three lines of every start; /hooks says when each runs.
+    Some(if full.chars().count() <= LONG_LINE { full } else { format!("Hooks: {} · /hooks says when", brief.join(", ")) })
 }
 
 /// When `hook` runs, in a few words.
@@ -365,5 +378,47 @@ fn command_line(hook: &Hook) -> String {
     match &hook.command.args {
         Some(args) => format!("{} {}", hook.command.line, args.join(" ")),
         None => hook.command.line.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hooks as Claude Code's settings in a home of `settings` give them.
+    fn hooks(name: &str, settings: &rein_llm::serde_json::Value) -> Hooks {
+        let base = std::env::temp_dir().join(format!("rein-hooks-said-{name}-{}", std::process::id()));
+        let (home, rein, root) = (base.join("home"), base.join("rein"), base.join("project"));
+        for dir in [home.join(".claude"), rein.clone(), root.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(home.join(".claude/settings.json"), settings.to_string()).unwrap();
+        Hooks::load(&rein, Some(&home), &root, &Chosen::default(), &[])
+    }
+
+    #[test]
+    fn a_few_hooks_are_said_in_full_and_many_by_name() {
+        use rein_llm::serde_json::json;
+        let few = hooks("few", &json!({ "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "rtk-rewrite.sh" }] }] } }));
+        assert_eq!(said(&few).as_deref(), Some("Hooks: rtk-rewrite.sh before Bash · /hooks"));
+
+        let command = |name: &str| json!({ "type": "command", "command": format!("~/.claude/hooks/{name}.py") });
+        let many = hooks(
+            "many",
+            &json!({ "hooks": {
+                "PreToolUse": [{ "matcher": "Bash", "hooks": [command("rewrite-commands")] }, { "matcher": "Read|Grep|Glob", "hooks": [command("look-first")] }],
+                "PostToolUse": [{ "hooks": [command("handoff-at-limit")] }],
+                "UserPromptSubmit": [{ "hooks": [command("handoff-at-limit"), command("codegraph-context")] }],
+                "SessionStart": [{ "hooks": [command("handoff-pickup")] }],
+                "Stop": [{ "hooks": [command("handoff-clear")] }]
+            } }),
+        );
+        let line = said(&many).unwrap();
+        let full = format!("{} before Bash", "rewrite-commands.py");
+        assert!(line.chars().count() < 160 && !line.contains(&full), "names only, where in full it would take three lines: {line}");
+        assert!(line.starts_with("Hooks: ") && line.ends_with(" · /hooks says when") && !line.contains(" before ") && !line.contains(" after "), "{line}");
+        for name in ["rewrite-commands.py", "look-first.py", "handoff-at-limit.py", "codegraph-context.py", "handoff-pickup.py", "handoff-clear.py"] {
+            assert!(line.contains(name), "{name} in {line}");
+        }
     }
 }
