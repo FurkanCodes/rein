@@ -248,7 +248,7 @@ impl Client {
                 .into_iter()
                 // rein says its tools to the CLI in words: what's held back
                 // is said once it's found, whatever the model.
-                .map(|id| ModelInfo { finds_tools: crate::FindsTools::Yes, ..ModelInfo::named(id) })
+                .map(|id| ModelInfo { finds_tools: crate::FindsTools::Yes, efforts: crate::claude_code::efforts(), ..ModelInfo::named(id) })
                 .collect());
         }
         match self.api {

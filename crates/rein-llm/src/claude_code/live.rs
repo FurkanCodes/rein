@@ -128,8 +128,8 @@ fn cli(program: &str, launch: &Launch, token: Option<&str>) -> Result<Spawned> {
         // Only the user's own settings: a project's, even from another
         // folder, can set `env` and `apiKeyHelper`.
         .args(["--setting-sources", "user", "--model", &launch.model]);
-    if let Some(effort) = launch.effort {
-        let effort = if effort == Effort::Minimal { Effort::Low } else { effort };
+    // A model named in full isn't in the list, so it may come with any level.
+    if let Some(effort) = super::efforts().sent(launch.effort) {
         command.args(["--effort", effort.as_str()]);
     }
     command.arg("--append-system-prompt").arg(&launch.instructions);

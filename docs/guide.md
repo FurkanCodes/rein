@@ -223,7 +223,8 @@ It was removed because rein never signs in as another app. If
   providers' model lists say which. Sign in with ChatGPT, Anthropic,
   OpenRouter, xAI and DeepSeek list them, and Sign in with ChatGPT and
   OpenRouter name each model's default. Gemini's levels go by
-  generation. `/effort` offers only the levels the current model takes, and names its
+  generation. The Claude Code CLI takes `low` to `max`, whichever model
+  you name, so `off` and `minimal` send `low`. `/effort` offers only the levels the current model takes, and names its
   default. You choose a level once (`off`, `minimal`, `low`, `medium`,
   `high`, `xhigh` or `max`), and each model gets the closest it has without
   going over: `max` on a model whose top is `xhigh` sends `xhigh`. The bar

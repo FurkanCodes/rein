@@ -24,6 +24,14 @@ use crate::{Error, Loading, Request, Result, Tool};
 /// overrides, provider switches, or executable hooks.
 const PASSED: [&str; 9] = ["HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR"];
 
+/// The levels the CLI's `--effort` takes (`claude --help`): it turns down
+/// any other, and the turn fails. Less than `low` is `low`, as the newest
+/// models can't stop thinking.
+pub(crate) fn efforts() -> crate::Efforts {
+    use crate::Effort;
+    crate::Efforts::listed([Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max].map(|level| (level, None)), None)
+}
+
 #[derive(Clone)]
 pub(crate) struct Backend {
     token: Option<String>,
@@ -520,6 +528,36 @@ read -r line; printf '%s' "$line" > "$0.input"
         assert!(matches!(&events[1], Ok(Event::Item(Item::Assistant(text))) if text == "Hello from CLI"), "{events:?}");
         assert!(matches!(events.last(), Some(Ok(Event::Completed { usage })) if usage.input_tokens == 9 && usage.output_tokens == 5 && usage.cached_input_tokens == 3));
         assert!(!format!("{backend:?}").contains("test-secret"));
+    }
+
+    #[tokio::test]
+    async fn the_cli_is_given_only_an_effort_its_flag_takes() {
+        use crate::Effort;
+        let fake = Fake::new(&format!("printf '%s\\n' \"$@\" > \"$0.args\"\nread -r line\n{ANSWERED}\n/bin/cat > /dev/null"));
+        let input = [Item::User("hello".into())];
+        // A model named in full isn't in the list, so it comes with any level.
+        let cases = [
+            (None, None),
+            (Some(Effort::Off), Some("low")),
+            (Some(Effort::Minimal), Some("low")),
+            (Some(Effort::Medium), Some("medium")),
+            (Some(Effort::XHigh), Some("xhigh")),
+            (Some(Effort::Max), Some("max")),
+        ];
+        for (chosen, flag) in cases {
+            let request = Request { model: "claude-opus-5-5", input: &input, reasoning_effort: chosen, ..request() };
+            let mut turn = backend(&fake, None).respond(&request, Duration::from_secs(5)).await.unwrap();
+            while turn.next().await.is_some() {}
+            let args = std::fs::read_to_string(format!("{}.args", fake.program)).unwrap();
+            let args: Vec<&str> = args.lines().collect();
+            let sent = args.iter().position(|arg| *arg == "--effort").and_then(|at| args.get(at + 1)).copied();
+            assert_eq!(sent, flag, "{chosen:?}");
+        }
+        let listed = crate::Client::claude_code(reqwest::Client::new(), None).list_models().await.unwrap();
+        for model in listed {
+            let levels: Vec<Effort> = model.efforts.offered().iter().map(|level| level.effort).collect();
+            assert_eq!(levels, [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max], "{}", model.id);
+        }
     }
 
     #[tokio::test]
