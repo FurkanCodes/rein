@@ -1589,10 +1589,13 @@ fn claude_thinking_always_goes_back_after_what_it_was_signed_with() {
         says("Bye."),
     ])
     // Under the third request, over the second: see below. Sizes are
-    // tuned by hand, so nothing else goes in the first message, and the
-    // prompt differs by system: 10000 to 10500 suits macOS and Linux.
+    // tuned by hand, so nothing else goes in the first message, and no
+    // tools come and go by system: peers are on on Linux and off on
+    // macOS, whose temp folder is too long a path for their socket, and
+    // their four tools put Linux's second request over the line.
     .with_env("REIN_COMPACT_AT", "10250")
-    .with_env("REIN_MEMORY", "off");
+    .with_env("REIN_MEMORY", "off")
+    .with_env("REIN_PEERS", "off");
     let mut term = Term::start_with(&model, "claude-compact", 30, 100, &[("big.txt", &big)]);
     term.wait_for(IDLE);
     term.keys("read big.txt\r");
