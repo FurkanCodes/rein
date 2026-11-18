@@ -631,13 +631,15 @@ impl Tools {
              changed. Depending on the mode, a command, or more access, may need the user's approval, or be refused. \
              A command still running after 60 seconds, or the timeout you ask for (up to 600, for slow builds and \
              test suites), goes on in the background. Start servers, watchers and anything else that keeps running \
-             with background: rein answers at once with its name, and tells you when it ends."
+             with background: rein answers at once with its name, and tells you when it ends. Don't send what a \
+             background command prints to a file: rein keeps it, for you and the user to read as it comes."
         } else {
             "Run a shell command in the project root and return its output and exit code. Say what it needs in \
              access. Depending on the mode, the user may approve each command before it runs. A command still \
              running after 60 seconds, or the timeout you ask for (up to 600, for slow builds and test suites), goes \
              on in the background. Start servers, watchers and anything else that keeps running with background: \
-             rein answers at once with its name, and tells you when it ends."
+             rein answers at once with its name, and tells you when it ends. Don't send what a background command \
+             prints to a file: rein keeps it, for you and the user to read as it comes."
         }
     }
 
@@ -770,7 +772,9 @@ impl Tools {
                 description: "Check on a command running in the background, or stop it. You're told when one ends \
                               without asking, so never poll in a loop or sleep. read: what it printed since you last \
                               read, and whether it still runs; with until, it first waits for a line matching that \
-                              regular expression (a server's \"ready\" line, say), or for the command to end. stop: \
+                              regular expression (a server's \"ready\" line, say), for the command to end, or for a \
+                              message from the user, which comes next. Match what failure looks like too, not only \
+                              success: a watcher that waits for all its work goes on long after one part fails. stop: \
                               stops it and everything it started. Commands stop when the conversation ends."
                     .into(),
                 parameters: object(json!({

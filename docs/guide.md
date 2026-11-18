@@ -345,7 +345,7 @@ catching up on it.
 | Esc or Ctrl-C while rein works | stop the turn; the conversation goes on |
 | Ctrl-C at the prompt | clear the line; press again within two seconds to leave |
 | Alt-← / Alt-→ | a word left or right |
-| Ctrl-O | the full output of every step and background command: ↑↓ scroll, ←→ other steps, `/` search, Esc back |
+| Ctrl-O | the full output of every step and background command, a running one as it comes: ↑↓ scroll, `G` follow the end, ←→ other steps, `/` search, Esc back |
 | Ctrl-B while a command runs, nothing typed | the command goes on in the background, and so does the turn; with something typed, it moves the cursor a letter left |
 | Mouse wheel, PgUp / PgDn, Shift-↑↓ | scroll the conversation |
 | Drag over text | select and copy it |
@@ -481,7 +481,8 @@ The model can run a dev server, a watcher or a long test suite in the
 background (`bash` with `background`) and keep working. rein answers at once
 with its name, `b1`, and keeps what it prints: the first 64 KB and the
 latest 1 MB. With its `background` tool the model reads what's new, waits
-for a line (`until: "ready"`, up to 10 minutes), or stops it.
+for a line (`until: "ready"`, up to 10 minutes), or stops it. A message you
+send ends that wait: the model reads it then, not when the wait is up.
 
 The model never has to poll: when one ends, it's told once, with its exit
 code and last lines, in the current turn if one is running, or in a turn of
@@ -497,7 +498,11 @@ your next message.
   set it yourself: Python holds back what it prints to a pipe, and
   `python3 -m http.server` never showed its "Serving" line to wait on.
 - **What you see.** A line under the box for each (`▸ b1 npm run dev · 2m 03s
-  · ready on :3000`); Ctrl-O shows what each printed; `/tasks` stops one.
+  · ready on :3000`); Ctrl-O shows what each printed, and keeps showing
+  what a running one prints: it opens at the end and follows it, and stays
+  where you scroll until `G` or End; `/tasks` stops one. The model is told
+  to leave a background command's output to rein, not a file, so you can
+  watch it.
 - **Limits.** At most 8 run at once. A ninth is refused with the list, so
   the model stops one itself and nothing is dropped behind its back.
 - **Walls and undo.** They keep the walls they started in, and `/undo`

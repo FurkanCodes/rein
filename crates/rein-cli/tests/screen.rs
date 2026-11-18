@@ -4959,6 +4959,51 @@ fn a_background_command_that_ends_while_you_wait_is_told_to_the_model() {
     );
 }
 
+/// The model waited ten minutes for a line, and what you typed waited
+/// with it: the wait ends once you send a message, and the message goes
+/// in after it.
+#[test]
+fn a_message_you_send_ends_the_models_wait_for_a_line() {
+    let model = Model::start(vec![
+        starts("echo watching; sleep 47.61"),
+        calls("background", json!({ "id": "b1", "action": "read", "until": "run exit=", "seconds": 600 })),
+        says("It's still going."),
+    ])
+    .with_env("REIN_MODE", "trust");
+    let mut term = Term::start(&model, "heard-waits", 30, 110);
+    term.wait_for(IDLE);
+    term.keys("watch the run\r");
+    term.wait_for("Using b1 for run exit=");
+    term.keys("why is this taking so long?\r");
+    term.wait_for("It's still going.");
+    let waited = model.requests()[2].to_string();
+    assert!(waited.contains("Stopped waiting for a line matching run exit=: a message came in"), "{waited}");
+    assert!(waited.contains("why is this taking so long?"), "{waited}");
+    term.keys("/exit\r");
+    term.wait_exit();
+    assert!(!alive("sleep 47.61"), "the command was left running");
+}
+
+/// Ctrl-O showed what a background command had printed when it opened,
+/// and nothing after: you couldn't watch it.
+#[test]
+fn ctrl_o_follows_what_a_background_command_prints() {
+    let command = "i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo tick $i; sleep 0.1; done";
+    let model = Model::start(vec![starts(command), says("It runs.")]).with_env("REIN_MODE", "trust");
+    let mut term = Term::start(&model, "ctrl-o-live", 30, 110);
+    term.wait_for(IDLE);
+    term.keys("run it\r");
+    term.wait_for("It runs.");
+    term.wait_for("· tick ");
+    term.keys("\x0f");
+    term.wait_for("following what it prints");
+    term.wait_for("tick 40");
+    term.keys("\x1b");
+    term.wait_for(IDLE);
+    term.keys("/exit\r");
+    term.wait_exit();
+}
+
 #[test]
 fn ctrl_b_moves_a_command_to_the_background_and_leaving_stops_it() {
     let model = Model::start(vec![runs("echo going; sleep 48.17"), says("It goes on.")]).with_env("REIN_MODE", "trust");

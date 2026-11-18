@@ -481,6 +481,11 @@ impl Terminal {
     }
 
     /// What came in from the other reins, oldest first.
+    /// Whether another rein has sent something, left where it is.
+    pub(crate) fn incoming(&self) -> bool {
+        self.peers.as_ref().is_some_and(|peers| !peers.inbox.is_empty())
+    }
+
     pub(crate) fn take_incoming(&mut self) -> Vec<Incoming> {
         let mut incoming = Vec::new();
         if let Some(peers) = &mut self.peers {
@@ -1304,6 +1309,10 @@ impl Ui for Terminal {
             heard.extend(self.heard_of(one));
         }
         heard
+    }
+
+    fn heard_waiting(&self) -> bool {
+        self.input.steers() || self.incoming()
     }
 
     fn waiting(&mut self) -> Vec<Heard> {

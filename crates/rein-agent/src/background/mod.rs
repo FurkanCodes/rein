@@ -37,6 +37,9 @@ const MOST_WAIT: Duration = Duration::from_secs(600);
 /// The most of a command's last lines a note of its end carries.
 const NOTE_LINES: usize = 20;
 
+/// How a wait for a line that a message cut short is told.
+pub(crate) const STOPPED_WAITING: &str = "Stopped waiting for a line matching";
+
 /// How a note of a command's end starts: it's rein's, not the user's.
 const NOTE: &str = "[rein: the background command ";
 
@@ -227,6 +230,17 @@ pub struct Listed {
     pub last: Option<String>,
 }
 
+/// What a background command printed, for you to read whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Printed {
+    pub id: String,
+    /// Its name, command and how it's doing: `b1  npm run dev · running`.
+    pub title: String,
+    pub text: String,
+    /// It's still running, and printing.
+    pub running: bool,
+}
+
 /// A command's end, for the model, and in a line for you.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ended {
@@ -245,6 +259,9 @@ struct State {
     /// Goes up with every change you'd see: a command started, ended, or
     /// printed.
     version: u64,
+    /// Goes up each time a message comes in for the turn: a wait for a
+    /// line that started before it ends.
+    heard: u64,
 }
 
 /// The commands of one conversation's tools. Dropped, each is stopped,
@@ -378,6 +395,14 @@ impl Jobs {
         }
     }
 
+    /// A message came in for the turn: a wait for a line ends, so the
+    /// model reads it now and not when the wait is up, ten minutes later
+    /// at most.
+    pub(crate) fn stop_waiting(&self) {
+        lock(&self.state).heard += 1;
+        self.changed.notify_waiters();
+    }
+
     /// Ctrl-B was pressed: the command waited for in the foreground, if
     /// one is, goes on in the background.
     pub fn detach(&self) {
@@ -458,6 +483,7 @@ impl Jobs {
         };
         let wait = seconds.map_or(WAIT, |s| Duration::from_secs(s).clamp(Duration::from_secs(1), MOST_WAIT));
         let deadline = tokio::time::Instant::now() + wait;
+        let heard = lock(&self.state).heard;
         let found = loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -471,6 +497,9 @@ impl Jobs {
             }
             if !running {
                 break Some(Err(Waited::Ended));
+            }
+            if lock(&self.state).heard != heard {
+                break Some(Err(Waited::Heard));
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
                 break Some(Err(Waited::TimedOut));
@@ -489,6 +518,7 @@ impl Jobs {
             (Some(Ok(line)), _) => format!("A line matched: {line}\n"),
             (Some(Err(Waited::Ended)), Some(until)) => format!("It ended before a line matched {until}.\n"),
             (Some(Err(Waited::TimedOut)), Some(until)) => format!("No line matched {until} in {}s.\n", wait.as_secs()),
+            (Some(Err(Waited::Heard)), Some(until)) => format!("{STOPPED_WAITING} {until}: a message came in, which follows.\n"),
         };
         let new = if new.is_empty() { "Nothing new since you last read.".to_owned() } else { fit(&new, crate::tools::MAX_OUTPUT - 500) };
         Ok(format!("{waited}{said}\n{new}"))
@@ -636,10 +666,10 @@ impl Jobs {
     }
 
     /// What each background command printed, kept, for the viewer
-    /// (Ctrl-O): its title and its output.
-    pub fn outputs(&self) -> Vec<(String, String)> {
+    /// (Ctrl-O), which asks again as it changes ([`Jobs::version`]).
+    pub fn outputs(&self) -> Vec<Printed> {
         let state = lock(&self.state);
-        let all: Vec<(String, String)> = state
+        let all: Vec<Printed> = state
             .jobs
             .iter()
             .filter(|job| job.background)
@@ -648,11 +678,11 @@ impl Jobs {
                     Life::Over(exit) => exit.said(),
                     _ => "running".to_owned(),
                 };
-                (format!("{}  {} · {ended}", job.id, job.command), job.output.all())
+                Printed { id: job.id.to_string(), title: format!("{}  {} · {ended}", job.id, job.command), text: job.output.all(), running: job.running() }
             })
             .collect();
         drop(state);
-        all.into_iter().map(|(title, output)| (self.hidden(title), self.hidden(output))).collect()
+        all.into_iter().map(|printed| Printed { title: self.hidden(printed.title), text: self.hidden(printed.text), ..printed }).collect()
     }
 
     /// Stops every command, each asked first and killed if it hasn't
@@ -702,6 +732,8 @@ enum Action {
 enum Waited {
     Ended,
     TimedOut,
+    /// A message came in for the turn.
+    Heard,
 }
 
 /// How a command is doing, in a line for the model.

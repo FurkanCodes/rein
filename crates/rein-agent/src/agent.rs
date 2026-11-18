@@ -32,6 +32,9 @@ const REPEATS_NOTED: usize = 3;
 const REPEATS_STOP: usize = 5;
 /// The longest cycle of calls that counts as repeating: `a, b, a, b`.
 const LONGEST_CYCLE: usize = 4;
+/// How often a wait for a background command's line looks for a message
+/// that came in for the turn.
+const HEARD_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// What streams in while the model answers.
 pub enum Streamed<'a> {
@@ -146,6 +149,11 @@ pub trait Ui {
     }
     /// Something heard has gone into the conversation, here.
     fn steered(&mut self, _heard: &Heard) {}
+    /// Whether something waits that [`Ui::steering`] would take, left
+    /// where it is: a wait for a background command's line ends for it.
+    fn heard_waiting(&self) -> bool {
+        false
+    }
     /// What came in while no turn ran, taken as one starts: it goes in
     /// before what starts it, so the model knows it from its first step.
     fn waiting(&mut self) -> Vec<Heard> {
@@ -1156,7 +1164,7 @@ impl<M: Model> Agent<M> {
                 Ok(()) => {
                     let began = std::time::Instant::now();
                     ui.tool_started(&call);
-                    let output = self.tools.run(&call, self.permissions.how(&call)).await;
+                    let output = self.run_tool(&call, ui).await;
                     if let Some(watched) = self.tools.take_watched() {
                         self.changed_in_step |= matches!(&watched, Watched::Changed(changed) if !changed.is_empty());
                         ui.watched(&call, &watched);
@@ -1248,6 +1256,28 @@ impl<M: Model> Agent<M> {
             self.record(Item::Found { call_id: call.call_id.clone(), names })?;
         }
         Ok((times >= REPEATS_STOP).then(|| Ran::Stuck { call: call.clone(), times }))
+    }
+
+    /// Runs `call`. A wait for a background command's line ends when a
+    /// message comes in, which goes in after the step: the model asked to
+    /// wait up to ten minutes, and what you wrote waited with it.
+    async fn run_tool(&self, call: &ToolCall, ui: &mut impl Ui) -> String {
+        let run = self.tools.run(call, self.permissions.how(call));
+        if ToolName::of(call) != Some(ToolName::Background) {
+            return run.await;
+        }
+        tokio::pin!(run);
+        let mut look = tokio::time::interval(HEARD_EVERY);
+        loop {
+            tokio::select! {
+                output = &mut run => return output,
+                _ = look.tick() => {
+                    if ui.heard_waiting() {
+                        self.tools.jobs().stop_waiting();
+                    }
+                }
+            }
+        }
     }
 
     /// Stops a turn that's going round in circles: what it didn't get to
@@ -2257,6 +2287,59 @@ mod tests {
                 other => format!("steered {other:?}"),
             });
         }
+    }
+
+    /// Approves everything, and writes `message` once `after` has gone by,
+    /// whatever runs then.
+    struct Writer {
+        message: Option<Heard>,
+        at: std::time::Instant,
+        after: std::time::Duration,
+        results: Vec<String>,
+    }
+
+    impl Ui for Writer {
+        fn text(&mut self, _: &str) {}
+        async fn approve(&mut self, _: &ToolCall, _: Option<&Rule>) -> Approval {
+            Approval::Yes
+        }
+        fn tool_started(&mut self, _: &ToolCall) {}
+        fn tool_blocked(&mut self, _: &ToolCall, _: &str) {}
+        fn tool_finished(&mut self, _: &ToolCall, output: &str) {
+            self.results.push(output.to_owned());
+        }
+        fn usage(&mut self, _: &Usage) {}
+        fn heard_waiting(&self) -> bool {
+            self.message.is_some() && self.at.elapsed() >= self.after
+        }
+        fn steering(&mut self) -> Vec<Heard> {
+            if self.heard_waiting() { self.message.take().into_iter().collect() } else { Vec::new() }
+        }
+    }
+
+    /// The model asked to wait ten minutes for a line, and what you wrote
+    /// waited with it: the wait ends when a message comes in, and the
+    /// message goes in after it.
+    #[tokio::test]
+    async fn a_message_ends_a_wait_for_a_background_commands_line() {
+        let call = |id: &str, name: &str, arguments: Value| Item::ToolCall(ToolCall { call_id: id.into(), name: name.into(), arguments: arguments.to_string() });
+        let turns = vec![
+            vec![
+                call("c1", "bash", json!({ "command": "echo started; sleep 30", "background": true })),
+                call("c2", "background", json!({ "id": "b1", "action": "read", "until": "never", "seconds": 600 })),
+            ],
+            vec![Item::Assistant("Looking.".into())],
+        ];
+        let mut agent = agent("heard-waits", turns);
+        let mut writer =
+            Writer { message: Some(Heard::You("why so long?".into())), at: std::time::Instant::now(), after: std::time::Duration::from_millis(500), results: Vec::new() };
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(10), agent.send("watch it".into(), &mut writer)).await;
+        assert_eq!(sent.expect("the wait ended for the message").unwrap(), Outcome::Done);
+        assert!(writer.results[1].starts_with(&format!("{} never: a message came in", crate::background::STOPPED_WAITING)), "{:?}", writer.results);
+        assert!(writer.results[1].contains("started"), "what it printed comes with it: {:?}", writer.results);
+        let last = agent.model.requests.borrow()[1].input.last().cloned();
+        assert_eq!(last, Some(Item::User("why so long?".into())));
+        agent.tools.jobs().stop_all().await;
     }
 
     /// An MCP server's tools are in the conversation's first request, and

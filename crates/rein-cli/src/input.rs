@@ -782,10 +782,7 @@ impl Boxed {
             return;
         }
         // Every step's output, then each background command's as it is now.
-        let backgrounds: Vec<crate::ui::viewer::Entry> = match (&key, self.jobs.as_ref().and_then(std::sync::Weak::upgrade)) {
-            (Key::CtrlO, Some(jobs)) => jobs.outputs().into_iter().map(|(title, output)| crate::ui::viewer::Entry::new(title, &output)).collect(),
-            _ => Vec::new(),
-        };
+        let backgrounds = if key == Key::CtrlO { self.backgrounds() } else { Vec::new() };
         if key == Key::CtrlO && !(self.outputs.is_empty() && backgrounds.is_empty()) {
             let mut viewer = Viewer::new(self.outputs.iter().cloned().chain(backgrounds).collect());
             let (rows, cols) = screen::size();
@@ -1077,6 +1074,12 @@ impl Boxed {
 
     /// The clock's tick: the spinner moves, old notes go, and the bell rings
     /// for a question that's still waiting once you're away.
+    /// What each background command printed, as it is now, for the viewer.
+    fn backgrounds(&self) -> Vec<crate::ui::viewer::Entry> {
+        let Some(jobs) = self.jobs.as_ref().and_then(std::sync::Weak::upgrade) else { return Vec::new() };
+        jobs.outputs().into_iter().map(|printed| crate::ui::viewer::Entry::command(printed.id, printed.title, &printed.text, printed.running)).collect()
+    }
+
     fn tick(&mut self) {
         if self.ring && self.asking.is_some() && self.call() {
             self.ring = false;
@@ -1089,14 +1092,24 @@ impl Boxed {
         // each second while one runs, for its time.
         let jobs = self.jobs.as_ref().and_then(std::sync::Weak::upgrade);
         let (drawn, at) = self.jobs_drawn;
+        let mut printed = false;
         let due = jobs.is_some_and(|jobs| {
             let version = jobs.version();
-            let due = (version != drawn && at.elapsed() >= Duration::from_millis(300)) || (jobs.running() > 0 && at.elapsed() >= Duration::from_secs(1));
+            printed = version != drawn && at.elapsed() >= Duration::from_millis(300);
+            let due = printed || (jobs.running() > 0 && at.elapsed() >= Duration::from_secs(1));
             if due {
                 self.jobs_drawn = (version, Instant::now());
             }
             due
         });
+        // The viewer, open, shows what they printed since.
+        if printed && self.viewer.is_some() {
+            let entries = self.outputs.iter().cloned().chain(self.backgrounds()).collect();
+            if let Some(viewer) = &mut self.viewer {
+                viewer.update(entries);
+            }
+            self.redraw();
+        }
         if expired || self.busy.is_some() || due {
             self.draw();
         }
@@ -1601,6 +1614,11 @@ impl Input {
             };
             boxed.busy = what.map(|what| Busy { what, since, step });
         });
+    }
+
+    /// Whether a message was sent to steer the turn, left where it is.
+    pub fn steers(&self) -> bool {
+        self.boxed.as_ref().is_some_and(|boxed| !locked(boxed).steering.is_empty())
     }
 
     /// The messages sent to steer the turn, taken out, oldest first.

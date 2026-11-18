@@ -610,6 +610,10 @@ impl Ui for Served {
         heard
     }
 
+    fn heard_waiting(&self) -> bool {
+        !self.link.heard.borrow().is_empty() || self.terminal.incoming()
+    }
+
     fn waiting(&mut self) -> Vec<Heard> {
         let mut heard = std::mem::take(&mut *self.link.heard.borrow_mut());
         heard.append(&mut self.terminal.notes);

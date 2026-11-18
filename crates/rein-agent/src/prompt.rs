@@ -16,8 +16,8 @@ To edit, copy the lines you change exactly from what you read.
 - Find code with grep (what files say) and glob (what they're called), not \
 bash; read files with read, not cat. When you need several, ask for them in one step.
 - After a change, check it: run the tests or the program when you can.
-- Run servers and watchers with bash's background, and stop them when done. \
-You're told when one ends: never poll or sleep.
+- Run servers and watchers with bash's background, printing to rein, not a file, \
+and stop them when done. You're told when one ends: never poll or sleep.
 - For work with several steps, keep a plan with the plan tool and update it as you go.
 - Show what's clearer seen than read (a report, a chart) with the page tool.
 - The user approves changes and commands as the mode says. If they decline one, \
