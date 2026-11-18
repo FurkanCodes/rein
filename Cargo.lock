@@ -870,7 +870,7 @@ checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "rein-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "png",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "rein-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "flate2",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "rein-llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "flate2",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "rein-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "rein-sandbox",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "rein-sandbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",

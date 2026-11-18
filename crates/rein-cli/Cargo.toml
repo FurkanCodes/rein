@@ -7,9 +7,9 @@ rust-version.workspace = true
 description = "rein: a tiny, fast agent harness. You hold the reins."
 
 [dependencies]
-rein-agent = { version = "0.1.0", path = "../rein-agent" }
-rein-llm = { version = "0.1.0", path = "../rein-llm" }
-rein-mcp = { version = "0.1.0", path = "../rein-mcp" }
+rein-agent = { version = "0.1.1", path = "../rein-agent" }
+rein-llm = { version = "0.1.1", path = "../rein-llm" }
+rein-mcp = { version = "0.1.1", path = "../rein-mcp" }
 base64 = "0.23.1"
 libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -22,7 +22,7 @@ name = "rein"
 path = "src/main.rs"
 
 [dev-dependencies]
-rein-mcp = { version = "0.1.0", path = "../rein-mcp", features = ["test-support"] }
+rein-mcp = { version = "0.1.1", path = "../rein-mcp", features = ["test-support"] }
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 # A terminal on screen in memory, for the tests that run rein in one.
 vt100 = "0.16.2"
