@@ -129,8 +129,8 @@ key_env = MY_OPENROUTER_KEY
 Servers that speak an API don't all take every field of it. When one
 rejects a request and names a field rein can do without (`stream_options`
 on a server that has none, say), rein sends it again without that field and
-leaves it out from then on. An effort level is left out only for the model
-that rejected it. rein knows per provider what an error can't say, like
+leaves it out from then on. An effort level is turned down only for the
+model that rejected it, which gets the nearest level it takes instead. rein knows per provider what an error can't say, like
 Mistral's nine-character tool call IDs.
 
 ### Switching models
@@ -229,9 +229,15 @@ It was removed because rein never signs in as another app. If
   `high`, `xhigh` or `max`), and each model gets the closest it has without
   going over: `max` on a model whose top is `xhigh` sends `xhigh`. The bar
   shows what was sent. Where the list says nothing (an OpenAI API key, Groq,
-  Ollama), every level is offered, and one the model turns down is reported
-  once and not sent again. Claude models from before adaptive thinking get a
-  thinking budget.
+  Ollama), every level is offered. A level the model turns down is reported
+  once, and from then on the model gets the nearest level it takes, the
+  closest below first, never its own default, which is often its most. A
+  model that takes no reasoning at all (gpt-4.1) is sent none, and no
+  other level is tried on it. Claude models from before adaptive thinking
+  (Opus 4.5 too, though its list names effort levels) get a thinking
+  budget, and none at `off`. DeepSeek turns thinking off with a switch of
+  its own, which `off` sends. An OpenAI organization that isn't verified
+  gets no summaries of the model's thinking, and keeps its effort.
 - **Gemini's signatures.** Gemini's thought signatures must come back on the
   parts they arrived on, and Gemini rejects a function call without one.
   rein keeps each signature with its part, and marks the calls Gemini didn't

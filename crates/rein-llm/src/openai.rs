@@ -7,7 +7,7 @@ pub mod signin;
 
 use serde_json::{Value, json};
 
-use crate::client::{Client, EFFORT, HOLD_BACK, IMAGES, Optional};
+use crate::client::{Client, EFFORT, HOLD_BACK, IMAGES, Optional, SUMMARY};
 use crate::decode::{Decoder, Translate};
 use crate::sse::SseEvent;
 use crate::{Api, Effort, Efforts, Error, Event, FindsTools, Harness, Item, Loading, ModelInfo, Opaque, Request, Result, Tool, ToolCall, Usage, found_text};
@@ -15,7 +15,13 @@ use crate::{Api, Effort, Efforts, Error, Event, FindsTools, Harness, Item, Loadi
 /// What the Responses API may turn away: an effort level the model doesn't
 /// take, which OpenAI names as the error's `param`, and tools added partway
 /// through the conversation, for what the tool search found.
-pub(crate) const OPTIONAL: Optional = &[("reasoning.effort", "reasoning", EFFORT), ("additional_tools", "additional_tools", HOLD_BACK), ("image", "input_image", IMAGES)];
+pub(crate) const OPTIONAL: Optional = &[
+    ("reasoning.effort", "reasoning", EFFORT),
+    // An organization OpenAI hasn't verified gets none, whatever the model.
+    ("reasoning.summary", "summary", SUMMARY),
+    ("additional_tools", "additional_tools", HOLD_BACK),
+    ("image", "input_image", IMAGES),
+];
 
 pub const API_BASE: &str = "https://api.openai.com/v1";
 

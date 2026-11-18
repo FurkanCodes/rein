@@ -8,13 +8,16 @@ use rein_agent::agent::{Agent, Llm};
 use rein_llm::{Effort, Efforts};
 
 /// The level the model thinks at now: what it's sent, or, when that's
-/// nothing or it turned that down, its own default. `None` where that isn't
-/// known, or for a model that takes none.
+/// nothing, its own default. `None` where that isn't known, or for a model
+/// that takes none.
 pub(crate) fn now(agent: &Agent<Llm>) -> Option<Effort> {
-    match agent.effort() {
-        Some(level) if !turned_down(agent).contains(&level) => Some(level),
-        _ => agent.efforts.default(),
-    }
+    sent(agent).or_else(|| agent.efforts.default())
+}
+
+/// What the model is sent: the level its list gives for yours, or, where
+/// it turned that down, the nearest it takes.
+fn sent(agent: &Agent<Llm>) -> Option<Effort> {
+    agent.model.client.effort_for(&agent.model_name, agent.effort())
 }
 
 fn turned_down(agent: &Agent<Llm>) -> Vec<Effort> {
@@ -28,9 +31,10 @@ pub(crate) fn unlike_chosen(agent: &Agent<Llm>) -> Option<String> {
     if agent.efforts == Efforts::NotTaken {
         return Some(format!("{model} takes no effort setting, so {chosen} waits for a model that does"));
     }
-    match agent.effort() {
-        Some(sent) if turned_down(agent).contains(&sent) => Some(format!("{model} turned {sent} down, so it thinks as it does by default")),
-        Some(sent) if sent != chosen => Some(format!("{model} has no {chosen}, so it gets {sent}")),
+    match (agent.effort(), sent(agent)) {
+        (Some(_), None) => Some(format!("{model} turned effort down, so it thinks as it does by default")),
+        (Some(listed), Some(sent)) if sent != listed => Some(format!("{model} turned {listed} down, so it gets {sent}")),
+        (Some(listed), _) if listed != chosen => Some(format!("{model} has no {chosen}, so it gets {listed}")),
         _ => None,
     }
 }
@@ -41,7 +45,7 @@ pub(crate) fn words(agent: &Agent<Llm>) -> String {
     if agent.efforts == Efforts::NotTaken {
         return format!("none: {} takes no effort setting", agent.model_name);
     }
-    let level = match (now(agent), agent.effort().is_some_and(|sent| now(agent) == Some(sent))) {
+    let level = match (now(agent), sent(agent).is_some()) {
         (Some(level), true) => level.to_string(),
         (Some(level), false) => format!("{level}, the model's default"),
         (None, _) => "the model's default".to_owned(),
@@ -105,7 +109,7 @@ pub(crate) struct Watch {
 }
 
 pub(crate) fn watch(agent: &Agent<Llm>) -> Watch {
-    Watch { sent: agent.effort(), before: turned_down(agent) }
+    Watch { sent: sent(agent), before: turned_down(agent) }
 }
 
 impl Watch {
@@ -113,7 +117,15 @@ impl Watch {
     /// the turn: said once, as it isn't sent again.
     pub(crate) fn said(self, agent: &Agent<Llm>) -> Option<String> {
         let level = self.sent?;
-        (!self.before.contains(&level) && turned_down(agent).contains(&level))
-            .then(|| format!("({} doesn't take effort {level}, so it thought as it does by default; /effort shows what it takes)", agent.model_name))
+        let now = sent(agent);
+        let refused = turned_down(agent).contains(&level) || agent.model.client.unthinking(&agent.model_name);
+        if self.before.contains(&level) || !refused {
+            return None;
+        }
+        let model = &agent.model_name;
+        Some(match now {
+            Some(now) => format!("({model} doesn't take effort {level}, so it thought at {now}; /effort shows what it takes)"),
+            None => format!("({model} doesn't take effort {level}, so it thought as it does by default; /effort shows what it takes)"),
+        })
     }
 }

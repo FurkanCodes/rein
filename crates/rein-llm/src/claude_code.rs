@@ -553,11 +553,15 @@ read -r line; printf '%s' "$line" > "$0.input"
             let sent = args.iter().position(|arg| *arg == "--effort").and_then(|at| args.get(at + 1)).copied();
             assert_eq!(sent, flag, "{chosen:?}");
         }
-        let listed = crate::Client::claude_code(reqwest::Client::new(), None).list_models().await.unwrap();
-        for model in listed {
-            let levels: Vec<Effort> = model.efforts.offered().iter().map(|level| level.effort).collect();
-            assert_eq!(levels, [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max], "{}", model.id);
+        let client = crate::Client::claude_code(reqwest::Client::new(), None);
+        let five = [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max];
+        let levels = |efforts: crate::Efforts| efforts.offered().iter().map(|level| level.effort).collect::<Vec<_>>();
+        for model in client.list_models().await.unwrap() {
+            assert_eq!(levels(model.efforts), five, "{}", model.id);
         }
+        // A model named in full, which the list doesn't hold, is offered them too.
+        assert_eq!(levels(client.unlisted_efforts()), five);
+        assert_eq!(crate::Client::new(reqwest::Client::new(), crate::Api::Anthropic, "https://x.example", crate::Auth::None).unlisted_efforts(), crate::Efforts::Unknown);
     }
 
     #[tokio::test]

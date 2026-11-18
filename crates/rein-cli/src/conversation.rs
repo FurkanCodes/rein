@@ -223,7 +223,7 @@ pub(crate) async fn open(http: &rein_llm::reqwest::Client, args: AskArgs, compac
     }
     agent.max_output = max_output;
     agent.reasoning_effort = args.effort;
-    agent.efforts = setup.efforts(&agent.model_name);
+    agent.efforts = setup.efforts(&agent.model_name, &agent.model.client);
     agent.finds_tools = setup.finds_tools(&agent.model_name);
     agent.sees = setup.sees(&agent.model_name);
     agent.set_harness(setup.harness(&agent.model_name));
@@ -411,9 +411,10 @@ impl Setup {
         self.models.iter().find(|m| m.id == model).and_then(|m| m.max_output)
     }
 
-    /// The effort levels `model` takes, as its provider lists them.
-    fn efforts(&self, model: &str) -> rein_llm::Efforts {
-        self.models.iter().find(|m| m.id == model).map(|m| m.efforts.clone()).unwrap_or_default()
+    /// The effort levels `model` takes, as its provider lists them, or,
+    /// for one it doesn't list, as `client` knows them.
+    fn efforts(&self, model: &str, client: &rein_llm::Client) -> rein_llm::Efforts {
+        self.models.iter().find(|m| m.id == model).map_or_else(|| client.unlisted_efforts(), |m| m.efforts.clone())
     }
 
     /// Whether `model` can have tools held back until it finds them, as
@@ -1171,7 +1172,7 @@ pub(crate) async fn use_model(spec: &str, agent: &mut Agent<Llm>, terminal: &mut
     agent.set_limit(setup.limit(&model)?);
     terminal.context_limit = agent.limit();
     agent.max_output = setup.max_output(&model);
-    agent.efforts = setup.efforts(&model);
+    agent.efforts = setup.efforts(&model, &agent.model.client);
     agent.finds_tools = setup.finds_tools(&model);
     agent.sees = setup.sees(&model);
     agent.set_harness(setup.harness(&model));

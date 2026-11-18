@@ -103,18 +103,23 @@ fn parse_models(page: &Value) -> Vec<ModelInfo> {
 /// A model's levels, from what its `capabilities` say it supports. The
 /// older models think only with a budget, which rein sets from its own
 /// levels, and not at all when told none. Claude's list doesn't say which
-/// level a model uses by default.
+/// level a model uses by default. A model with a budget and no adaptive
+/// thinking gets the budget's levels even where it lists effort too, as
+/// that's what it's sent: Opus 4.5 lists low to high, and told off it
+/// thought with a budget of 4,096.
 fn efforts(capabilities: &Value) -> Efforts {
     if !capabilities.is_object() {
         return Efforts::Unknown;
     }
     let supported = |value: &Value| value["supported"] == true;
+    let types = &capabilities["thinking"]["types"];
+    let budget_only = supported(&types["enabled"]) && !supported(&types["adaptive"]);
     let effort = &capabilities["effort"];
-    if supported(effort) {
+    if supported(effort) && !budget_only {
         let levels = [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max].into_iter().filter(|level| supported(&effort[level.as_str()]));
         return Efforts::listed(levels.map(|level| (level, None)), None);
     }
-    if supported(&capabilities["thinking"]["types"]["enabled"]) {
+    if supported(&types["enabled"]) {
         return Efforts::listed([Effort::Off, Effort::Minimal, Effort::Low, Effort::Medium, Effort::High].map(|level| (level, None)), Some(Effort::Off));
     }
     Efforts::NotTaken
@@ -789,6 +794,10 @@ mod tests {
         let budget = json!({ "effort": { "supported": false }, "thinking": { "supported": true, "types": { "adaptive": no, "enabled": yes } } });
         assert_eq!(efforts(&budget).default(), Some(Effort::Off));
         assert_eq!(efforts(&budget).sent(Some(Effort::Max)), Some(Effort::High), "its biggest budget");
+        // Opus 4.5 lists effort, but thinks with a budget, which it can do without.
+        let opus_4_5 = json!({ "effort": { "supported": true, "low": yes, "medium": yes, "high": yes, "xhigh": no, "max": no }, "thinking": { "supported": true, "types": { "adaptive": no, "enabled": yes } } });
+        assert_eq!(efforts(&opus_4_5).sent(Some(Effort::Off)), Some(Effort::Off), "told off, it doesn't think");
+        assert_eq!(efforts(&opus_4_5).default(), Some(Effort::Off));
         let neither = json!({ "effort": { "supported": false }, "thinking": { "supported": false, "types": { "adaptive": no, "enabled": no } } });
         assert_eq!(efforts(&neither), Efforts::NotTaken);
         assert_eq!(efforts(&Value::Null), Efforts::Unknown, "a gateway's list without them");

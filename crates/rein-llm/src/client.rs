@@ -93,6 +93,8 @@ struct Wire {
     shown_all: Mutex<Vec<String>>,
     /// Models that turned an image down: they're told of images in words.
     blind: Mutex<Vec<String>>,
+    /// Models that take no reasoning at all: no effort, and no summary.
+    unthinking: Mutex<Vec<String>>,
 }
 
 /// What requests have cost on the wire so far.
@@ -123,6 +125,15 @@ pub(crate) type Optional = &'static [(&'static str, &'static str, &'static str)]
 /// that turns it down is turned down one level at a time: another level
 /// may well do.
 pub(crate) const EFFORT: &str = "effort";
+
+/// What the Responses format calls the summary of the model's thinking,
+/// which a server can turn away for every model of a key.
+pub(crate) const SUMMARY: &str = "reasoning.summary";
+
+/// The provider's code for a field the model doesn't take at all, as
+/// OpenAI and the servers that copy it send it: unlike one for a value it
+/// doesn't take (`unsupported_value`), no other level will do.
+const NO_SUCH_FIELD: &str = "unsupported_parameter";
 
 /// What every format calls holding tools back for the tool search. A model
 /// that turns it down gets every tool from the start: per model, as some
@@ -232,11 +243,37 @@ impl Client {
         self.wire.omitted.lock().map(|o| o.clone()).unwrap_or_default()
     }
 
-    /// The effort levels `model` turned down, which go as none from then
-    /// on, so it thinks as it does by default.
+    /// The effort levels a model its provider doesn't list takes: the
+    /// Claude Code CLI's flag takes its five whatever the model's name,
+    /// and of anyone else's nothing is known.
+    pub fn unlisted_efforts(&self) -> crate::Efforts {
+        if self.claude_code.is_some() { crate::claude_code::efforts() } else { crate::Efforts::Unknown }
+    }
+
+    /// The effort levels `model` turned down, which it isn't sent again.
     pub fn turned_down(&self, model: &str) -> Vec<Effort> {
         let turned_down = self.wire.turned_down.lock().map(|t| t.clone()).unwrap_or_default();
         turned_down.into_iter().filter(|(which, _)| which == model).map(|(_, effort)| effort).collect()
+    }
+
+    /// Whether `model` turned effort down altogether: no level will do.
+    pub fn unthinking(&self, model: &str) -> bool {
+        self.wire.unthinking.lock().is_ok_and(|models| models.iter().any(|which| which == model))
+    }
+
+    /// What `model` is sent for `effort`: it, or where the model turned it
+    /// down, the nearest level it hasn't, the closest below first, so it
+    /// costs no more than you chose; none once it takes none. Its default
+    /// is often its most: Gemini 3 Pro, turned down at `medium`, thought
+    /// at `high`.
+    pub fn effort_for(&self, model: &str, effort: Option<Effort>) -> Option<Effort> {
+        let effort = effort?;
+        if self.unthinking(model) {
+            return None;
+        }
+        let out = self.turned_down(model);
+        let open = || Effort::ALL.into_iter().filter(|level| !out.contains(level));
+        open().filter(|&level| level <= effort).max().or_else(|| open().find(|&level| level > effort))
     }
 
     /// The models this credential can use, in the server's order.
@@ -309,6 +346,8 @@ impl Client {
 
     fn body(&self, request: &Request<'_>, omitted: &[&str]) -> Value {
         match self.api {
+            // An organization OpenAI hasn't verified gets no summaries.
+            Api::Responses if omitted.contains(&SUMMARY) => openai::request_body(&Request { reasoning_summary: false, ..*request }),
             Api::Responses => openai::request_body(request),
             Api::Anthropic => anthropic::request_body(request, omitted, &self.base_url),
             Api::Chat => chat::request_body(request, omitted, self.quirks),
@@ -350,8 +389,12 @@ impl Client {
         }
         let mut omitted = self.omitted();
         let mut request = *request;
-        if request.reasoning_effort.is_some_and(|effort| self.turned_down(request.model).contains(&effort)) {
-            request.reasoning_effort = None;
+        // The Responses format asks for a summary inside the effort's
+        // field, which a model that takes neither turns down whole.
+        let summary_in_effort = self.api == Api::Responses;
+        request.reasoning_effort = self.effort_for(request.model, request.reasoning_effort);
+        if summary_in_effort && self.unthinking(request.model) {
+            request.reasoning_summary = false;
         }
         if self.wire.shown_all.lock().is_ok_and(|models| models.iter().any(|model| model == request.model)) {
             request.hold_back = false;
@@ -367,15 +410,25 @@ impl Client {
                 }
                 // The server named a field it doesn't take: once more
                 // without it, and never again with it. For effort, that's
-                // this level for this model; for holding tools back, this
-                // model.
+                // this level for this model, which gets the nearest it
+                // takes, or, where it takes no reasoning at all, none; for
+                // holding tools back, this model.
                 Err(e) if let Some(field) = rejected_field(&e, &body, self.optional(), &omitted) => match (field, request.reasoning_effort) {
-                    (EFFORT, Some(effort)) => {
+                    (EFFORT, Some(effort)) if names_level(&e, &body) => {
                         if let Ok(mut turned_down) = self.wire.turned_down.lock() {
                             turned_down.push((request.model.to_owned(), effort));
                         }
-                        request.reasoning_effort = None;
+                        request.reasoning_effort = self.effort_for(request.model, Some(effort));
                     }
+                    // No level will do, or only a summary was asked for.
+                    (EFFORT, _) if request.reasoning_effort.is_some() || (summary_in_effort && request.reasoning_summary) => {
+                        if let Ok(mut unthinking) = self.wire.unthinking.lock() {
+                            unthinking.push(request.model.to_owned());
+                        }
+                        request.reasoning_effort = None;
+                        request.reasoning_summary &= !summary_in_effort;
+                    }
+                    (EFFORT, _) => return Err(e),
                     (HOLD_BACK, _) if request.hold_back => {
                         if let Ok(mut shown_all) = self.wire.shown_all.lock() {
                             shown_all.push(request.model.to_owned());
@@ -454,6 +507,25 @@ fn rejected_field(error: &Error, body: &Value, optional: Optional, omitted: &[&s
     let message = format!("{} {}", message.to_lowercase(), param.as_deref().unwrap_or_default().to_lowercase());
     let body = body.to_string();
     optional.iter().find(|(word, key, field)| message.contains(word) && !omitted.contains(field) && body.contains(&format!("\"{key}\""))).map(|(_, _, field)| *field)
+}
+
+/// Where each format says the level, in the body it sends.
+const LEVEL_AT: [&str; 4] = ["/reasoning/effort", "/reasoning_effort", "/output_config/effort", "/generationConfig/thinkingConfig/thinkingLevel"];
+
+/// Whether `error`, turning effort down, is about the level `body` sent
+/// and not the field: it names the level (`'minimal' is not supported`,
+/// `Thinking level MINIMAL`), and isn't a field the model doesn't take
+/// at all. xAI's "Argument not supported on this model: reasoningEffort"
+/// is the field's: another level would go the same way, one request each.
+/// A level said in no word (a budget) is the level's.
+fn names_level(error: &Error, body: &Value) -> bool {
+    let Error::Api { message, .. } = error else { return false };
+    if error.code() == Some(NO_SUCH_FIELD) {
+        return false;
+    }
+    let Some(level) = LEVEL_AT.iter().find_map(|at| body.pointer(at)?.as_str()) else { return true };
+    let level = level.to_lowercase();
+    message.to_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).any(|word| word == level)
 }
 
 /// `bytes` gzipped. Level 6, zlib's own default: within a few percent of the
@@ -601,8 +673,9 @@ mod tests {
         assert!(!client(Api::Responses).holds_back(&Request { hold_back: false, ..request }), "a model that can't find tools");
     }
 
-    #[tokio::test]
-    async fn a_level_a_model_turns_down_goes_as_none_from_then_on_for_that_model_only() {
+    /// A server that turns a body away with the error `refuse` gives for
+    /// it, if any, and answers the rest; and every body it was sent.
+    async fn refusing(refuse: fn(&Value) -> Option<String>) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -620,40 +693,113 @@ mod tests {
                 }
                 let text = String::from_utf8_lossy(&bytes).into_owned();
                 let body: Value = serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-                // As OpenAI says it, naming the field apart from the message.
-                let reply = if body["model"] == "picky" && body["reasoning"]["effort"] == "minimal" {
-                    let error = r#"{"error":{"message":"Unsupported value: 'minimal' is not supported with the 'picky' model.","type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}"#;
-                    format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}", error.len())
-                } else {
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                let reply = match refuse(&body) {
+                    Some(error) => format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}", error.len()),
+                    None => "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned(),
                 };
                 seen.lock().unwrap().push(body);
                 socket.write_all(reply.as_bytes()).await.unwrap();
             }
         });
-        let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None);
-        let input = [crate::Item::User("hi".into())];
-        let request = |model| Request {
+        (base, bodies, server)
+    }
+
+    /// OpenAI's error, naming the field apart from the message.
+    fn openai_error(message: &str, param: &str, code: &str) -> String {
+        json!({ "error": { "message": message, "type": "invalid_request_error", "param": param, "code": code } }).to_string()
+    }
+
+    fn effort_request<'a>(model: &'a str, input: &'a [crate::Item], effort: Option<Effort>, summary: bool) -> Request<'a> {
+        Request {
             model,
             instructions: None,
-            input: &input,
+            input,
             tools: &[],
-            reasoning_effort: Some(Effort::Minimal),
-            reasoning_summary: false,
+            reasoning_effort: effort,
+            reasoning_summary: summary,
             session_id: None,
             max_output_tokens: None,
             hold_back: false,
             images: false,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn a_level_a_model_turns_down_goes_as_the_nearest_it_takes_for_that_model_only() {
+        // picky takes low and up, as gpt-5 does: not none, not minimal.
+        let (base, bodies, server) = refusing(|body| {
+            let level = body["reasoning"]["effort"].as_str()?;
+            (body["model"] == "picky" && ["none", "minimal"].contains(&level))
+                .then(|| openai_error(&format!("Unsupported value: '{level}' is not supported with the 'picky' model."), "reasoning.effort", "unsupported_value"))
+        })
+        .await;
+        let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None);
+        let input = [crate::Item::User("hi".into())];
+        let request = |model| effort_request(model, &input, Some(Effort::Minimal), false);
         assert!(client.stream(&request("picky")).await.is_ok());
-        assert_eq!(client.turned_down("picky"), [Effort::Minimal]);
+        assert_eq!(client.turned_down("picky"), [Effort::Minimal, Effort::Off]);
+        assert_eq!(client.effort_for("picky", Some(Effort::Minimal)), Some(Effort::Low));
+        assert_eq!(client.effort_for("picky", Some(Effort::High)), Some(Effort::High), "what it takes goes as it is");
         assert!(client.stream(&request("picky")).await.is_ok());
         assert!(client.stream(&request("easy")).await.is_ok());
-        let bodies = bodies.lock().unwrap();
-        let efforts: Vec<&Value> = bodies.iter().map(|b| &b["reasoning"]["effort"]).collect();
-        // Turned down, sent again without; then never again for it; another model still gets it.
-        assert_eq!(efforts, [&json!("minimal"), &Value::Null, &Value::Null, &json!("minimal")]);
+        let efforts: Vec<Value> = bodies.lock().unwrap().iter().map(|b| b["reasoning"]["effort"].clone()).collect();
+        // Turned down: the closest below, then the closest above, never its
+        // default; then straight there; another model still gets it.
+        assert_eq!(efforts, [json!("minimal"), json!("none"), json!("low"), json!("low"), json!("minimal")]);
         assert!(client.turned_down("easy").is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_model_that_takes_no_reasoning_is_sent_none_and_no_level_is_tried_on_it() {
+        // As OpenAI turns reasoning down on gpt-4.1, naming the effort even
+        // when only a summary was asked for.
+        let (base, bodies, server) = refusing(|body| {
+            (body["model"] == "gpt-4.1" && body.get("reasoning").is_some())
+                .then(|| openai_error("Unsupported parameter: 'reasoning.effort' is not supported with this model.", "reasoning.effort", "unsupported_parameter"))
+        })
+        .await;
+        let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None);
+        let input = [crate::Item::User("hi".into())];
+        assert!(client.stream(&effort_request("gpt-4.1", &input, None, true)).await.is_ok(), "a summary alone");
+        assert!(client.stream(&effort_request("gpt-4.1", &input, Some(Effort::High), true)).await.is_ok());
+        assert!(client.stream(&effort_request("gpt-5", &input, Some(Effort::High), true)).await.is_ok());
+        let sent: Vec<Value> = bodies.lock().unwrap().iter().map(|b| b.get("reasoning").cloned().unwrap_or_default()).collect();
+        assert_eq!(sent, [json!({ "summary": "auto" }), Value::Null, Value::Null, json!({ "effort": "high", "summary": "auto" })]);
+        assert!(client.turned_down("gpt-4.1").is_empty(), "no level was to blame");
+        assert!(client.unthinking("gpt-4.1") && !client.unthinking("gpt-5"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unverified_organization_gets_no_summaries_and_keeps_its_effort() {
+        let (base, bodies, server) = refusing(|body| {
+            body["reasoning"].get("summary").map(|_| openai_error("Your organization must be verified to generate reasoning summaries.", "reasoning.summary", "unsupported_value"))
+        })
+        .await;
+        let client = Client::new(reqwest::Client::new(), Api::Responses, base, Auth::None);
+        let input = [crate::Item::User("hi".into())];
+        assert!(client.stream(&effort_request("gpt-5", &input, Some(Effort::High), true)).await.is_ok());
+        assert!(client.stream(&effort_request("gpt-6.1-sol", &input, Some(Effort::Low), true)).await.is_ok());
+        let sent: Vec<Value> = bodies.lock().unwrap().iter().map(|b| b["reasoning"].clone()).collect();
+        assert_eq!(sent, [json!({ "effort": "high", "summary": "auto" }), json!({ "effort": "high" }), json!({ "effort": "low" })], "for every model of the key");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn xai_turning_effort_down_on_a_model_is_the_fields_not_a_levels() {
+        // xAI's own error, which names the field as its code does.
+        let (base, bodies, server) = refusing(|body| {
+            (body["model"] == "grok-code-fast-1" && body.get("reasoning_effort").is_some())
+                .then(|| json!({ "code": "Client specified an invalid argument", "error": "Argument not supported on this model: reasoningEffort" }).to_string())
+        })
+        .await;
+        let client = Client::new(reqwest::Client::new(), Api::Chat, base, Auth::None);
+        let input = [crate::Item::User("hi".into())];
+        assert!(client.stream(&effort_request("grok-code-fast-1", &input, Some(Effort::High), true)).await.is_ok());
+        assert!(client.stream(&effort_request("grok-code-fast-1", &input, Some(Effort::Low), true)).await.is_ok());
+        let sent: Vec<Value> = bodies.lock().unwrap().iter().map(|b| b.get("reasoning_effort").cloned().unwrap_or_default()).collect();
+        assert_eq!(sent, [json!("high"), Value::Null, Value::Null], "one refusal, and no other level tried");
         server.abort();
     }
 

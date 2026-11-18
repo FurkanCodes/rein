@@ -29,6 +29,10 @@ pub struct Quirks {
     pub short_ids: bool,
     /// A tool's result names the tool, as Mistral wants.
     pub tool_names: bool,
+    /// Thinking is turned off with a switch of its own,
+    /// `"thinking": {"type": "disabled"}`, as DeepSeek has it: its list
+    /// gives no level for none, and the switch wins over any level.
+    pub thinking_switch: bool,
 }
 
 pub(crate) const OPTIONAL: Optional = &[
@@ -36,6 +40,8 @@ pub(crate) const OPTIONAL: Optional = &[
     ("reasoning_content", "reasoning_content", "replay"),
     ("reasoning_details", "reasoning_details", "replay"),
     ("reasoning_effort", "reasoning_effort", EFFORT),
+    // xAI names it as its own code does: `reasoningEffort`.
+    ("reasoningeffort", "reasoning_effort", EFFORT),
     ("reasoning", "reasoning", EFFORT),
     ("image", "image_url", IMAGES),
 ];
@@ -92,8 +98,12 @@ fn efforts(m: &Value) -> Efforts {
     if let Some(listed) = levels(&m["capabilities"]["reasoning_effort"]) {
         return Efforts::listed(listed, level(&m["capabilities"]["default_reasoning_effort"]));
     }
-    // DeepSeek: `{"effort": {"supported_levels": [...], "default_level": ..}}`.
-    if let Some(listed) = levels(&m["effort"]["supported_levels"]) {
+    // DeepSeek: `{"effort": {"supported_levels": [...], "default_level": ..}}`,
+    // and off, which is its switch (`Quirks::thinking_switch`), not a level.
+    if let Some(mut listed) = levels(&m["effort"]["supported_levels"]) {
+        if !listed.iter().any(|(e, _)| *e == Effort::Off) {
+            listed.insert(0, (Effort::Off, None));
+        }
         return Efforts::listed(listed, level(&m["effort"]["default_level"]));
     }
     // Mistral says only whether the model thinks.
@@ -140,7 +150,9 @@ pub(crate) fn request_body(request: &Request<'_>, omitted: &[&str], quirks: Quir
     // Each level in its own word. Only a level the model listed comes
     // here, or any where its server lists none; one it turns down then
     // goes as none (see `Client::turned_down`).
-    if let Some(effort) = request.reasoning_effort {
+    if quirks.thinking_switch && request.reasoning_effort == Some(Effort::Off) {
+        body["thinking"] = json!({ "type": "disabled" });
+    } else if let Some(effort) = request.reasoning_effort {
         let effort = effort.wire();
         if quirks.effort_object {
             body["reasoning"] = json!({ "effort": effort });
@@ -656,6 +668,19 @@ mod tests {
         let deepseek = json!({ "data": [{ "id": "deepseek-flash", "effort": { "supported_levels": ["low", "high", "max"], "default_level": "high" } }] });
         let flash = &parse_models(&deepseek)[0].efforts;
         assert_eq!((flash.sent(Some(Effort::Medium)), flash.default()), (Some(Effort::Low), Some(Effort::High)), "the closest without going over");
+        assert_eq!(flash.sent(Some(Effort::Off)), Some(Effort::Off), "it can stop thinking, though its list says no none");
+        let switched = request_body(
+            &Request { reasoning_effort: Some(Effort::Off), ..crate::testing::request(&[Item::User("hi".into())], &[], false) },
+            &[],
+            Quirks { thinking_switch: true, ..Quirks::default() },
+        );
+        assert_eq!((&switched["thinking"], switched.get("reasoning_effort")), (&json!({ "type": "disabled" }), None), "the switch, and no level beside it");
+        let thinking = request_body(
+            &Request { reasoning_effort: Some(Effort::High), ..crate::testing::request(&[Item::User("hi".into())], &[], false) },
+            &[],
+            Quirks { thinking_switch: true, ..Quirks::default() },
+        );
+        assert_eq!((thinking.get("thinking"), &thinking["reasoning_effort"]), (None, &json!("high")));
         let mistral = json!({ "data": [{ "id": "codestral", "capabilities": { "reasoning": false } }, { "id": "mistral-large-4-0", "capabilities": { "reasoning": true } }] });
         let models = parse_models(&mistral);
         assert_eq!((&models[0].efforts, &models[1].efforts), (&Efforts::NotTaken, &Efforts::Unknown));

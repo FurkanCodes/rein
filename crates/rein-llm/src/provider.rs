@@ -135,7 +135,10 @@ pub fn builtin() -> Vec<Provider> {
             ..chat("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY").keys_at("https://openrouter.ai/keys")
         },
         chat("groq", "Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY").keys_at("https://console.groq.com/keys"),
-        chat("deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY").keys_at("https://platform.deepseek.com/api_keys"),
+        Provider {
+            quirks: Quirks { thinking_switch: true, ..Quirks::default() },
+            ..chat("deepseek", "DeepSeek", "https://api.deepseek.com", "DEEPSEEK_API_KEY").keys_at("https://platform.deepseek.com/api_keys")
+        },
         chat("xai", "xAI", "https://api.x.ai/v1", "XAI_API_KEY").keys_at("https://console.x.ai"),
         Provider {
             quirks: Quirks { short_ids: true, tool_names: true, ..Quirks::default() },

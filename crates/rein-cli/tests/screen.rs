@@ -3329,15 +3329,17 @@ fn a_level_the_model_turns_down_is_said_once_and_not_offered_again() {
     bar_says(&mut term, "gpt-6.1-sol minimal");
     term.keys("hello\r");
     term.wait_for("One.");
-    term.wait_for("doesn't take effort minimal, so it thought as it does by default");
+    term.wait_for("doesn't take effort minimal, so it thought at off");
     term.wait_for(IDLE);
     term.keys("again\r");
     term.wait_for("Two.");
     term.wait_for(IDLE);
     assert_eq!(model.turned_away(), 1, "turned down once, then never sent again");
-    assert!(model.requests().iter().all(|r| r["reasoning"]["effort"].is_null()), "{:?}", model.requests());
+    // The nearest it takes, below first: never its own default, which may be its most.
+    let efforts: Vec<Value> = model.requests().iter().map(|r| r["reasoning"]["effort"].clone()).collect();
+    assert_eq!(efforts, [json!("none"), json!("none")], "what was answered");
     assert_eq!(term.text().matches("doesn't take effort minimal").count(), 1, "said once:\n{}", term.text());
-    assert!(term.text().lines().last().is_some_and(|bar| !bar.contains("minimal")), "{}", term.text());
+    bar_says(&mut term, "gpt-6.1-sol off");
     term.keys("/effort\r");
     term.wait_for("how hard gpt-6.1-sol thinks");
     // Its last item, so the list is drawn.
